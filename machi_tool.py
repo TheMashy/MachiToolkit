@@ -36,7 +36,7 @@ import http.server
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -100,9 +100,20 @@ CONFIG_DEFAUT = {
     "mode": "applications",          # applications | ecran | mixte
     "ecran_source": "actif",         # "actif" ou numero d'ecran (1, 2, ...)
     "ecran_saturation": 1.5,
-    "ecran_suit_luminance": True,
-    "ecran_luminance_min": 0.15,
+    "ecran_finesse": 4,              # colonnes de la vignette : 4 -> ~12 pixels
     "douceur_ecran": 0.35,
+
+    # Ce que la luminance de l'ecran fait bouger, meme logique qu'en mode Son.
+    "ecran_cible": "luminosite",     # luminosite | saturation | les_deux | rien
+    "ecran_luminosite_base": 1.0,    # tenue quand l'ecran ne pilote pas l'eclat
+    "ecran_luminance_min": 0.15,     # plancher de sortie : jamais tout a fait noir
+
+    # Etalonnage de l'entree. Un ecran ne va jamais du noir absolu au blanc
+    # pur : sans ces bornes, la guirlande n'utilise qu'une tranche etroite de
+    # sa dynamique. Les valeurs par defaut reproduisent l'ancien calcul.
+    "ecran_noir": 0.0,
+    "ecran_blanc": 0.62,
+    "ecran_gamma": 0.5,              # 0.5 = lineaire
 
     "regles": [
         {"nom": "Netflix",    "couleur": "#E50914", "mots": ["netflix"]},
@@ -196,6 +207,9 @@ ETAT = {
     "occupe": False,
     "resultat": "",
     "ecrans": 0,
+    "ecran_luminance": 0.0,   # ce que l'ecran renvoie, avant etalonnage
+    "ecran_gain": 0.0,        # luminosite finalement envoyee
+    "ecran_sat": 0.0,         # saturation finalement envoyee
     "forcage": None,     # {"couleur", "nom", "expire"}
     "api": "arretee",
 }
@@ -207,12 +221,23 @@ ACCENT_DEPART = "#B79CF5"   # accent au repos, avant la premiere couleur
 
 def charger_config():
     cfg = json.loads(json.dumps(CONFIG_DEFAUT))
+    enregistre = {}
     if os.path.exists(FICHIER_CONFIG):
         try:
             with open(FICHIER_CONFIG, encoding="utf-8") as f:
-                cfg.update(json.load(f))
+                enregistre = json.load(f)
+            cfg.update(enregistre)
         except Exception as e:
             print("config.json illisible :", e)
+
+    # ecran_suit_luminance a ete remplace par ecran_cible en 1.3. Une case
+    # decochee doit le rester apres la mise a jour. La question se pose sur
+    # ce qui est ecrit dans le fichier, pas sur cfg : les valeurs par defaut
+    # y sont deja, ecran_cible y serait donc toujours present.
+    if "ecran_cible" not in enregistre and \
+            enregistre.get("ecran_suit_luminance") is False:
+        cfg["ecran_cible"] = "rien"
+    cfg.pop("ecran_suit_luminance", None)
     return cfg
 
 
@@ -314,7 +339,92 @@ def _ecran_actif(sct):
     return 1
 
 
-def couleur_ecran(source, boost):
+def _vignette_gdi(zone, colonnes, lignes):
+    """Reduit une zone de l'ecran a colonnes x lignes pixels, cote Windows.
+
+    C'est ce qui separe 30 images par seconde de 5. Recopier un ecran 4K,
+    c'est 33 Mo par image a faire transiter puis a moyenner en Python. Ici
+    GDI fait la reduction dans le pilote et on ne relit que la vignette,
+    quelques centaines d'octets. Le mode HALFTONE moyenne vraiment les
+    pixels au lieu d'en prelever un sur mille : sans lui, un curseur qui
+    passe suffirait a faire sauter la couleur.
+
+    Les contextes de peripherique sont gardes d'une image sur l'autre :
+    les recreer coute plus cher que la capture elle-meme.
+
+    Renvoie une liste de (r, v, b), ou None si GDI n'est pas disponible.
+    """
+    try:
+        import win32gui, win32ui, win32con
+    except ImportError:
+        return None
+
+    garde = getattr(_local, "gdi", None)
+    if garde is None or garde["taille"] != (colonnes, lignes):
+        if garde is not None:
+            _liberer_gdi(garde)
+        try:
+            fenetre = win32gui.GetDesktopWindow()
+            dc_ecran = win32gui.GetWindowDC(fenetre)
+            source = win32ui.CreateDCFromHandle(dc_ecran)
+            memoire = source.CreateCompatibleDC()
+            image = win32ui.CreateBitmap()
+            image.CreateCompatibleBitmap(source, colonnes, lignes)
+            memoire.SelectObject(image)
+            garde = {"fenetre": fenetre, "dc": dc_ecran, "source": source,
+                     "memoire": memoire, "image": image,
+                     "taille": (colonnes, lignes)}
+            _local.gdi = garde
+        except Exception as e:
+            print("Capture GDI indisponible :", e)
+            _local.gdi = None
+            return None
+
+    try:
+        try:
+            garde["memoire"].SetStretchBltMode(win32con.HALFTONE)
+        except Exception:
+            garde["memoire"].SetStretchBltMode(win32con.COLORONCOLOR)
+        garde["memoire"].StretchBlt(
+            (0, 0), (colonnes, lignes),
+            garde["source"], (zone["left"], zone["top"]),
+            (zone["width"], zone["height"]), win32con.SRCCOPY)
+        octets = garde["image"].GetBitmapBits(True)
+    except Exception as e:
+        # Un changement de resolution ou une session verrouillee invalide
+        # les contextes : on les jette, la prochaine image les refera.
+        print("Capture GDI perdue :", e)
+        _liberer_gdi(garde)
+        _local.gdi = None
+        return None
+
+    # GetBitmapBits rend du BGRA, ligne par ligne.
+    return [(octets[i + 2], octets[i + 1], octets[i])
+            for i in range(0, len(octets), 4)]
+
+
+def _liberer_gdi(garde):
+    try:
+        garde["memoire"].DeleteDC()
+    except Exception:
+        pass
+    try:
+        import win32gui
+        win32gui.ReleaseDC(garde["fenetre"], garde["dc"])
+    except Exception:
+        pass
+
+
+def _vignette_mss(zone, colonnes, lignes):
+    """Repli portable : capture complete puis reduction par Pillow."""
+    from PIL import Image
+    brut = _capteur().grab(zone)
+    im = Image.frombytes("RGB", brut.size, brut.rgb).resize(
+        (colonnes, lignes), Image.BILINEAR)
+    return list(im.getdata())
+
+
+def couleur_ecran(source, boost, colonnes=4):
     """((r, v, b), luminance 0-1, numero d'ecran) ou None.
 
     La moyenne brute d'un ecran donne toujours un gris sale. On fait donc une
@@ -322,15 +432,19 @@ def couleur_ecran(source, boost):
     pixels ternes et le noir ne votent presque pas, les zones colorees
     dominent. La luminance reste une moyenne simple."""
     try:
-        from PIL import Image
         sct = _capteur()
         index = _ecran_actif(sct) if source == "actif" else int(source)
         index = max(1, min(index, len(sct.monitors) - 1))
-        brut = sct.grab(sct.monitors[index])
-        im = Image.frombytes("RGB", brut.size, brut.rgb).resize((48, 27), Image.BILINEAR)
+        zone = sct.monitors[index]
+
+        colonnes = max(2, min(32, int(colonnes)))
+        lignes = max(2, int(round(colonnes * zone["height"] / max(1, zone["width"]))))
+
+        pixels = _vignette_gdi(zone, colonnes, lignes)
+        if not pixels:
+            pixels = _vignette_mss(zone, colonnes, lignes)
 
         sx = sy = poids = sat_tot = val_tot = 0.0
-        pixels = list(im.getdata())
         for r, v, b in pixels:
             h, s, val = colorsys.rgb_to_hsv(r / 255, v / 255, b / 255)
             w = (s ** 1.5) * val
@@ -475,10 +589,40 @@ def arreter_audio():
     SON["marche"] = False
 
 
+def appliquer_niveaux(valeur, noir, blanc, gamma=None):
+    """Etale [noir, blanc] sur [0, 1], avec une courbe optionnelle.
+
+    Meme calcul que les niveaux d'un logiciel d'image : on decide ce qui
+    compte comme noir, ce qui compte comme blanc, et comment se repartit ce
+    qu'il y a entre les deux. gamma vaut 0.5 pour une reponse lineaire ;
+    en dessous les valeurs faibles sont relevees, au dessus elles sont
+    ecrasees et seules les pointes ressortent.
+    """
+    if blanc - noir < 1e-4:
+        return 1.0 if valeur >= blanc else 0.0
+    x = (valeur - noir) / (blanc - noir)
+    x = max(0.0, min(1.0, x))
+    if gamma is not None:
+        x = x ** (4.0 ** ((float(gamma) - 0.5) * 2.0))
+    return x
+
+
 def resaturer(rgb, saturation):
     """Repose une couleur a la saturation voulue, teinte et valeur gardees."""
     t, _, v = colorsys.rgb_to_hsv(*[c / 255.0 for c in rgb])
     r, g, b = colorsys.hsv_to_rgb(t, max(0.0, min(1.0, saturation)), v)
+    return (r * 255, g * 255, b * 255)
+
+
+def resaturer_vers(rgb, facteur):
+    """Module la saturation deja presente, au lieu de la remplacer.
+
+    L'ecran a deja une saturation qui veut dire quelque chose — une scene
+    verte est verte. La poser a une valeur absolue effacerait cette
+    information ; on la met a l'echelle.
+    """
+    t, sat, v = colorsys.rgb_to_hsv(*[c / 255.0 for c in rgb])
+    r, g, b = colorsys.hsv_to_rgb(t, max(0.0, min(1.0, sat * facteur)), v)
     return (r * 255, g * 255, b * 255)
 
 
@@ -797,7 +941,8 @@ async def une_session(cfg):
                     resultat = await boucle.run_in_executor(
                         None, couleur_ecran,
                         cfg.get("ecran_source", "actif"),
-                        float(cfg.get("ecran_saturation", 1.5)))
+                        float(cfg.get("ecran_saturation", 1.5)),
+                        int(cfg.get("ecran_finesse", 4)))
                     if resultat:
                         (re, ve, be), luminance, index = resultat
                         if mode == "mixte":
@@ -807,9 +952,28 @@ async def une_session(cfg):
                             rc, vc, bc = re, ve, be
                             nom = f"Ecran {index}"
                         douceur = float(cfg.get("douceur_ecran", 0.35))
-                        if cfg.get("ecran_suit_luminance", True):
-                            plancher = float(cfg.get("ecran_luminance_min", 0.15))
-                            gain = plancher + (1 - plancher) * min(1.0, luminance * 1.6)
+
+                        cible = cfg.get("ecran_cible", "luminosite")
+                        module = appliquer_niveaux(
+                            luminance,
+                            float(cfg.get("ecran_noir", 0.0)),
+                            float(cfg.get("ecran_blanc", 0.62)),
+                            float(cfg.get("ecran_gamma", 0.5)))
+                        base = float(cfg.get("ecran_luminosite_base", 1.0))
+                        plancher = float(cfg.get("ecran_luminance_min", 0.15))
+
+                        if cible in ("luminosite", "les_deux"):
+                            gain = plancher + (1 - plancher) * module
+                        else:
+                            gain = base
+                        if cible in ("saturation", "les_deux"):
+                            rc, vc, bc = resaturer_vers(
+                                (rc, vc, bc), plancher + (1 - plancher) * module)
+
+                        ETAT["ecran_luminance"] = luminance
+                        ETAT["ecran_gain"] = gain
+                        ETAT["ecran_sat"] = colorsys.rgb_to_hsv(
+                            rc / 255.0, vc / 255.0, bc / 255.0)[1]
 
                 ETAT["regle"] = nom
 
@@ -1649,9 +1813,61 @@ class Panneau:
         self.var_douceur_ecran = self.reglette(f, "douceur_ecran", "Reactivite",
                                                0.05, 1.0, 0.05,
                                                "Haut = colle a l'image. Bas = fondu doux.")
-        self.var_lum = tk.IntVar(value=1 if self.cfg.get("ecran_suit_luminance", True) else 0)
-        self.case(f, "La luminosite suit celle de l'ecran — scene sombre, "
-                     "guirlande sombre", self.var_lum).pack(fill="x")
+        self.var_finesse = self.reglette(
+            f, "ecran_finesse", "Finesse de la capture", 2, 16, 1,
+            "Colonnes de la vignette lue sur l'ecran. 4 donne une douzaine "
+            "de pixels moyennes, largement assez pour une couleur dominante. "
+            "Monter affine le vote des petites zones colorees ; le cout reste "
+            "negligeable, c'est la vignette elle-meme qui fait la vitesse.",
+            entier=True)
+
+        self.separateur(f, 14, 10)
+        self.titre(f, "ce que la luminosite de l'ecran fait bouger").pack(
+            fill="x", pady=(0, 4))
+        self.var_cible_ecran = tk.StringVar(
+            value=self.cfg.get("ecran_cible", "luminosite"))
+        for cle, libelle in (
+                ("luminosite", "La luminosite — scene sombre, guirlande sombre"),
+                ("saturation", "La saturation — eclat constant, couleur qui palit "
+                               "sur les scenes sombres"),
+                ("les_deux",   "Les deux"),
+                ("rien",       "Rien — la guirlande garde la luminosite de base")):
+            self.radio(f, libelle, self.var_cible_ecran, cle).pack(fill="x")
+
+        self.separateur(f, 14, 8)
+        self.titre(f, "etalonnage de l'ecran").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Un ecran ne descend jamais au noir absolu ni ne monte au "
+                      "blanc pur. Ces trois reglages disent ce qui compte comme "
+                      "noir, ce qui compte comme blanc, et comment se repartit "
+                      "ce qu'il y a entre les deux.", BRUME, 8,
+                   largeur=490).pack(fill="x", pady=(0, 10))
+        self.var_ecran_noir = self.reglette(
+            f, "ecran_noir", "Niveau de noir", 0.0, 0.6, 0.02,
+            "En dessous, l'ecran est considere comme eteint.")
+        self.var_ecran_blanc = self.reglette(
+            f, "ecran_blanc", "Niveau de blanc", 0.2, 1.0, 0.02,
+            "Au dessus, l'ecran est considere comme a fond. Baisse-le si tes "
+            "scenes claires n'allument jamais la guirlande a pleine puissance.")
+        self.var_ecran_gamma = self.reglette(
+            f, "ecran_gamma", "Courbe", 0.1, 0.9, 0.05,
+            "0.50 = reponse lineaire. En dessous, les scenes sombres sont "
+            "relevees. Au dessus, seules les scenes vraiment claires sortent.")
+        self.var_ecran_plancher = self.reglette(
+            f, "ecran_luminance_min", "Plancher de sortie", 0.0, 0.6, 0.05,
+            "Luminosite minimale envoyee : la guirlande ne s'eteint jamais "
+            "completement.")
+        self.var_ecran_base = self.reglette(
+            f, "ecran_luminosite_base", "Luminosite de base", 0.05, 1.0, 0.05,
+            "Luminosite tenue quand l'ecran ne pilote pas l'eclat — quand "
+            "seule la saturation le suit, ou quand il ne pilote rien.")
+
+        self.separateur(f, 14, 8)
+        self.titre(f, "effet de l'ecran en direct").pack(fill="x", pady=(0, 6))
+        self.jauge_ecran_entree = self.jauge(f, "Luminosite lue sur l'ecran")
+        self.jauge_ecran_lum = self.jauge(f, "Luminosite envoyee")
+        self.jauge_ecran_sat = self.jauge(f, "Saturation envoyee")
+        self.texte(f, "Barre en couleur : l'ecran la pilote. Barre sourde : "
+                      "elle est tenue.", BRUME, 8, largeur=490).pack(fill="x")
 
     # ------------------------------------------------------------------
     #  Page Son
@@ -1785,9 +2001,10 @@ class Panneau:
             "Minutes sans clavier ni souris avant de basculer en braise sourde.",
             entier=True)
         self.curseurs["images_par_seconde"] = self.reglette(
-            f, "images_par_seconde", "Images par seconde", 2, 25, 1,
-            "Cadence de capture et d'ecriture. 6 a 8 suffit pour l'ecran, "
-            "15 a 20 pour le son. Baisse si la guirlande saccade.",
+            f, "images_par_seconde", "Images par seconde", 2, 30, 1,
+            "Cadence de capture et d'ecriture. Depuis que la capture passe "
+            "par une vignette, 20 a 30 tiennent sans effort en mode Ecran ; "
+            "15 a 20 suffisent pour le son. Baisse si la guirlande saccade.",
             entier=True)
 
         self.var_cpu = tk.IntVar(value=1 if self.cfg.get("reaction_processeur", True) else 0)
@@ -2046,7 +2263,13 @@ class Panneau:
         self.cfg["ecran_source"] = source if source == "actif" else int(source)
         self.cfg["ecran_saturation"] = round(self.var_sat.get(), 2)
         self.cfg["douceur_ecran"] = round(self.var_douceur_ecran.get(), 2)
-        self.cfg["ecran_suit_luminance"] = bool(self.var_lum.get())
+        self.cfg["ecran_finesse"] = int(self.var_finesse.get())
+        self.cfg["ecran_cible"] = self.var_cible_ecran.get()
+        self.cfg["ecran_noir"] = round(self.var_ecran_noir.get(), 2)
+        self.cfg["ecran_blanc"] = round(self.var_ecran_blanc.get(), 2)
+        self.cfg["ecran_gamma"] = round(self.var_ecran_gamma.get(), 2)
+        self.cfg["ecran_luminance_min"] = round(self.var_ecran_plancher.get(), 2)
+        self.cfg["ecran_luminosite_base"] = round(self.var_ecran_base.get(), 2)
         self.cfg["son_bande"] = self.var_bande.get()
         self.cfg["son_palette"] = self.var_palette.get()
         self.cfg["son_sensibilite"] = round(self.var_sens.get(), 2)
@@ -2127,6 +2350,19 @@ class Panneau:
         self.txt_notes.configure(text=notes[:1500] if notes else "-")
 
         self.txt_audio.configure(text="Capture " + AUDIO.get("message", "arretee"))
+
+        cible_ecran = self.cfg.get("ecran_cible", "luminosite")
+        en_ecran = self.cfg.get("mode") in ("ecran", "mixte")
+        self.poser_jauge(self.jauge_ecran_entree,
+                         ETAT["ecran_luminance"] if en_ecran else 0.0, en_ecran)
+        self.poser_jauge(
+            self.jauge_ecran_lum,
+            ETAT["ecran_gain"] if en_ecran
+            else self.cfg.get("ecran_luminosite_base", 1.0),
+            en_ecran and cible_ecran in ("luminosite", "les_deux"))
+        self.poser_jauge(
+            self.jauge_ecran_sat, ETAT["ecran_sat"] if en_ecran else 0.0,
+            en_ecran and cible_ecran in ("saturation", "les_deux"))
 
         cible = self.cfg.get("son_cible", "luminosite")
         en_son = self.cfg.get("mode") == "son" and AUDIO.get("actif")

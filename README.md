@@ -19,6 +19,16 @@ qui se passe a l'ecran.
 | Son | ce qui sort des haut-parleurs : bande de frequences et brillance du spectre |
 | Mixte | moitie regle, moitie ecran |
 
+En mode Ecran, la capture passe par une vignette : Windows reduit lui-meme
+l'ecran a une douzaine de pixels et l'application ne relit que ceux-la, au
+lieu de recopier puis reduire l'image entiere. C'est ce qui permet de monter
+a 30 images par seconde. Trois reglages etalonnent la reponse — niveau de
+noir, niveau de blanc, courbe — pour qu'un ecran qui ne descend jamais au
+noir absolu ni ne monte au blanc pur utilise quand meme toute la dynamique
+de la guirlande. Comme en mode Son, on choisit ce que la luminosite de
+l'ecran fait bouger, et une luminosite de base est tenue quand elle ne
+pilote pas l'eclat.
+
 En mode Son, on choisit ce que la musique fait bouger : la **luminosite**
 (la couleur reste franche en permanence, seul l'eclat suit le rythme), la
 **saturation** (eclat constant, la couleur palit dans les passages calmes),
