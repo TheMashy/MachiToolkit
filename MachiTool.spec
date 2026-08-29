@@ -33,6 +33,12 @@ for paquet in ('bleak', 'winrt', 'mss', 'soundcard'):
 
 icone = os.path.join(RACINE, 'icone.ico')
 
+# L'icone sert deux fois : gravee dans le .exe par le parametre icon
+# ci-dessous, et embarquee comme donnee pour que la fenetre puisse la
+# poser a l'execution. Sans cette seconde copie, Tk affiche sa plume.
+if os.path.exists(icone):
+    datas += [(icone, '.')]
+
 a = Analysis(
     [os.path.join(RACINE, 'machi_tool.py')],
     pathex=[RACINE],
