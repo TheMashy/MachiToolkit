@@ -1,0 +1,2065 @@
+"""
+Guirlande ambiante — eclairage procedural pilote par ce qui est a l'ecran.
+
+Compile en un seul .exe par Compiler.bat. Cet exe fait tout :
+  - lance depuis n'importe ou    -> s'installe dans %LOCALAPPDATA%, se lance
+  - relance depuis n'importe ou  -> met a jour la version installee
+  - lance depuis l'installation  -> tourne normalement
+
+Modes de couleur :
+  applications  couleur par regle (programme ou site web)
+  ecran         couleur dominante de l'ecran, luminance suivie
+  mixte         moitie regle, moitie ecran
+"""
+
+import asyncio
+import sys
+import os
+import json
+import time
+import math
+import shutil
+import secrets
+import colorsys
+import threading
+import subprocess
+import http.server
+
+VERSION = "1.0"
+NOM_EXE = "GuirlandeAmbiante.exe"
+
+# Fige = lance depuis l'exe compile. Les donnees vont alors dans LOCALAPPDATA,
+# pour qu'une mise a jour de l'exe n'efface jamais la configuration.
+FIGE = getattr(sys, "frozen", False)
+
+if FIGE:
+    DOSSIER = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                           "GuirlandeAmbiante")
+else:
+    DOSSIER = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    os.makedirs(DOSSIER, exist_ok=True)
+except Exception:
+    pass
+
+FICHIER_CONFIG = os.path.join(DOSSIER, "config.json")
+FICHIER_JOURNAL = os.path.join(DOSSIER, "journal.log")
+CIBLE_EXE = os.path.join(DOSSIER, NOM_EXE)
+
+# Sans console, sys.stdout vaut None et le moindre print() leverait une
+# exception. On redirige tout vers un fichier journal.
+try:
+    if sys.stdout is None or not hasattr(sys.stdout, "write"):
+        _j = open(FICHIER_JOURNAL, "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = _j
+        print(f"\n--- demarrage {time.strftime('%Y-%m-%d %H:%M:%S')} v{VERSION} ---")
+except Exception:
+    pass
+
+# ==========================================================================
+#  Reglages par defaut
+#  L'ordre des regles compte : la premiere qui correspond gagne.
+#  Les sites sont donc places avant les navigateurs.
+# ==========================================================================
+
+CONFIG_DEFAUT = {
+    "adresse": "",
+
+    "mode": "applications",          # applications | ecran | mixte
+    "ecran_source": "actif",         # "actif" ou numero d'ecran (1, 2, ...)
+    "ecran_saturation": 1.5,
+    "ecran_suit_luminance": True,
+    "ecran_luminance_min": 0.15,
+    "douceur_ecran": 0.35,
+
+    "regles": [
+        {"nom": "Netflix",    "couleur": "#E50914", "mots": ["netflix"]},
+        {"nom": "YouTube",    "couleur": "#FF0033", "mots": ["youtube"]},
+        {"nom": "Twitch",     "couleur": "#9146FF", "mots": ["twitch"]},
+        {"nom": "GitHub",     "couleur": "#2DBA4E", "mots": ["github"]},
+        {"nom": "Claude",     "couleur": "#D97757", "mots": ["claude.ai", "chatgpt"]},
+        {"nom": "Messagerie", "couleur": "#EA4335", "mots": ["gmail", "outlook.", "proton mail"]},
+        {"nom": "Docs",       "couleur": "#4285F4", "mots": ["google docs", "google sheets", "notion.so"]},
+        {"nom": "Reseaux",    "couleur": "#1D9BF0", "mots": ["twitter", " / x", "reddit", "instagram", "linkedin"]},
+
+        {"nom": "Code",       "couleur": "#2563EB", "mots": ["code.exe", "devenv.exe", "pycharm", "sublime_text"]},
+        {"nom": "Terminal",   "couleur": "#0EA5E9", "mots": ["powershell", "cmd.exe", "wt.exe", "windowsterminal"]},
+        {"nom": "Jeu",        "couleur": "#DC2626", "mots": ["steam", "epicgames", "battle.net", "riotclient"]},
+        {"nom": "Video",      "couleur": "#7C3AED", "mots": ["vlc.exe", "mpc-hc", "potplayer"]},
+        {"nom": "Musique",    "couleur": "#16A34A", "mots": ["spotify", "deezer", "foobar"]},
+        {"nom": "Discussion", "couleur": "#6366F1", "mots": ["discord", "slack", "teams", "telegram"]},
+        {"nom": "Creation",   "couleur": "#DB2777", "mots": ["photoshop", "figma", "blender", "davinci", "premiere"]},
+        {"nom": "Bureau",     "couleur": "#F59E0B", "mots": ["excel", "winword", "powerpnt", "obsidian"]},
+        {"nom": "Web",        "couleur": "#06B6D4", "mots": ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]},
+    ],
+
+    "couleur_defaut": "#8B5CF6",
+    "veille_minutes": 6,
+    "couleur_veille": "#3B1F0B",
+    "veille_luminosite": 0.18,
+    "reaction_processeur": True,
+    "luminosite_min": 0.45,
+    "luminosite_max": 1.00,
+    "amplitude_respiration": 0.10,
+    "periode_respiration": 11.0,
+    "douceur": 0.06,
+    "images_par_seconde": 8,
+
+    "son_bande": "graves",           # graves | mediums | aigus | tout
+    "son_palette": "chaud_froid",    # chaud_froid | arc | regle
+    "son_sensibilite": 1.0,
+    "son_plancher": 0.06,
+    "son_attaque": 0.55,             # montee : eleve = coup sec
+    "son_chute": 0.12,               # descente : bas = trainee douce
+
+    # Passerelle HTTP locale : permet a un site web de piloter la guirlande.
+    # Fermee par defaut — sans jeton ni liste d'origines, n'importe quelle page
+    # ouverte dans le navigateur pourrait allumer les lumieres du salon.
+    "api_active": False,
+    "api_port": 7373,
+    "api_jeton": "",
+    "api_origines": ["https://braindebugger-production.up.railway.app",
+                     "http://localhost:3000"],
+}
+
+# ==========================================================================
+#  Protocole HiLighting (port serie BLE, service Nordic UART)
+#  Une seule couleur pour tout le brin : le controleur n'a aucune commande
+#  d'adressage par segment.
+# ==========================================================================
+
+UUID_ECRITURE = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+TRAME_ON  = bytearray([0x55, 0x01, 0x02, 0x01])
+TRAME_OFF = bytearray([0x55, 0x01, 0x02, 0x00])
+def trame_rgb(r, g, b): return bytearray([0x55, 0x07, 0x01, r, g, b])
+def trame_lum(n):       return bytearray([0x55, 0x03, 0x01, 0xFF, n])
+
+# ==========================================================================
+
+ETAT = {
+    "connecte": False,
+    "message": "Demarrage...",
+    "couleur": (0, 0, 0),
+    "regle": "-",
+    "contexte": "",
+    "pause": False,
+    "en_marche": True,
+    "demande": None,
+    "adresse_test": "",
+    "appareils": [],
+    "occupe": False,
+    "resultat": "",
+    "ecrans": 0,
+    "forcage": None,     # {"couleur", "nom", "expire"}
+    "api": "arretee",
+}
+
+CFG = {}
+
+ACCENT_DEPART = "#B79CF5"   # accent au repos, avant la premiere couleur
+
+
+def charger_config():
+    cfg = json.loads(json.dumps(CONFIG_DEFAUT))
+    if os.path.exists(FICHIER_CONFIG):
+        try:
+            with open(FICHIER_CONFIG, encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            print("config.json illisible :", e)
+    return cfg
+
+
+def sauver_config(cfg):
+    propre = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    with open(FICHIER_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(propre, f, indent=2, ensure_ascii=False)
+
+
+def hex_vers_rgb(h):
+    h = str(h).lstrip("#")
+    if len(h) != 6:
+        return (139, 92, 246)
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (139, 92, 246)
+
+
+def rgb_vers_hex(rgb):
+    return "#" + "".join(f"{max(0, min(255, int(c))):02X}" for c in rgb)
+
+
+def fenetre_active():
+    """'processus.exe | titre', en minuscules. Le titre d'un navigateur
+    contient le nom du site, ce qui suffit a distinguer Netflix de GitHub
+    sans avoir a lire la barre d'adresse."""
+    try:
+        import win32gui, win32process, psutil
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        titre = win32gui.GetWindowText(hwnd) or ""
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        try:
+            nom = psutil.Process(pid).name()
+        except Exception:
+            nom = ""
+        return f"{nom} | {titre}".lower()
+    except Exception:
+        return ""
+
+
+def rectangle_fenetre_active():
+    try:
+        import win32gui
+        hwnd = win32gui.GetForegroundWindow()
+        return win32gui.GetWindowRect(hwnd) if hwnd else None
+    except Exception:
+        return None
+
+
+def secondes_inactivite():
+    try:
+        import win32api
+        return (win32api.GetTickCount() - win32api.GetLastInputInfo()) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def couleur_cible(cfg, contexte):
+    for regle in cfg.get("regles", []):
+        for mot in regle.get("mots", []):
+            if mot and mot.lower() in contexte:
+                return hex_vers_rgb(regle["couleur"]), regle.get("nom", "?")
+    return hex_vers_rgb(cfg.get("couleur_defaut", "#8B5CF6")), "Defaut"
+
+
+# ==========================================================================
+#  Capture d'ecran
+# ==========================================================================
+
+_local = threading.local()
+
+
+def _capteur():
+    import mss
+    if not hasattr(_local, "sct"):
+        _local.sct = mss.mss()
+    return _local.sct
+
+
+def nombre_ecrans():
+    try:
+        return max(0, len(_capteur().monitors) - 1)
+    except Exception:
+        return 0
+
+
+def _ecran_actif(sct):
+    rect = rectangle_fenetre_active()
+    if not rect:
+        return 1
+    cx, cy = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+    for i, m in enumerate(sct.monitors[1:], start=1):
+        if m["left"] <= cx < m["left"] + m["width"] and \
+           m["top"] <= cy < m["top"] + m["height"]:
+            return i
+    return 1
+
+
+def couleur_ecran(source, boost):
+    """((r, v, b), luminance 0-1, numero d'ecran) ou None.
+
+    La moyenne brute d'un ecran donne toujours un gris sale. On fait donc une
+    moyenne circulaire des teintes ponderee par saturation x valeur : les
+    pixels ternes et le noir ne votent presque pas, les zones colorees
+    dominent. La luminance reste une moyenne simple."""
+    try:
+        from PIL import Image
+        sct = _capteur()
+        index = _ecran_actif(sct) if source == "actif" else int(source)
+        index = max(1, min(index, len(sct.monitors) - 1))
+        brut = sct.grab(sct.monitors[index])
+        im = Image.frombytes("RGB", brut.size, brut.rgb).resize((48, 27), Image.BILINEAR)
+
+        sx = sy = poids = sat_tot = val_tot = 0.0
+        pixels = list(im.getdata())
+        for r, v, b in pixels:
+            h, s, val = colorsys.rgb_to_hsv(r / 255, v / 255, b / 255)
+            w = (s ** 1.5) * val
+            angle = 2 * math.pi * h
+            sx += math.cos(angle) * w
+            sy += math.sin(angle) * w
+            sat_tot += s * w
+            poids += w
+            val_tot += val
+
+        luminance = val_tot / len(pixels)
+        if poids < 0.4:                        # ecran quasi gris ou noir
+            teinte, saturation = 0.09, 0.12    # blanc chaud
+        else:
+            teinte = (math.atan2(sy, sx) / (2 * math.pi)) % 1.0
+            saturation = min(1.0, (sat_tot / poids) * boost)
+
+        r, v, b = colorsys.hsv_to_rgb(teinte, saturation, 1.0)
+        return (int(r * 255), int(v * 255), int(b * 255)), luminance, index
+    except Exception as e:
+        print("Capture ecran impossible :", e)
+        return None
+
+
+# ==========================================================================
+#  Analyse du son
+#
+#  On capte ce qui sort des haut-parleurs (boucle WASAPI), pas le micro.
+#  Trois mesures en sortent :
+#    - l'energie de chaque bande, graves / mediums / aigus ;
+#    - le centroide spectral, centre de gravite du spectre. Un morceau sourd
+#      le pousse vers le bas, des cymbales vers le haut. C'est lui qui donne
+#      la teinte : rouge quand ca pese, cyan quand ca brille.
+#
+#  Deux precautions font toute la difference a l'oreille comme a l'oeil :
+#    - un gain automatique par bande, sinon un morceau doux n'allume rien
+#      et un morceau fort sature en permanence ;
+#    - une enveloppe asymetrique, montee rapide et descente lente. C'est ce
+#      qui donne le coup sec sur la grosse caisse au lieu d'une bouillie.
+# ==========================================================================
+
+AUDIO = {
+    "graves": 0.0, "mediums": 0.0, "aigus": 0.0, "tout": 0.0,
+    "centroide": 0.5,
+    "actif": False,
+    "message": "arrete",
+}
+
+BANDES = (("graves", 30, 250), ("mediums", 250, 2000), ("aigus", 2000, 16000))
+SON = {"marche": False}
+
+
+def fil_audio(cfg):
+    """Tourne dans son propre fil : la capture est bloquante."""
+    try:
+        import numpy as np
+        import soundcard as sc
+    except ImportError as e:
+        AUDIO["message"] = f"bibliotheque manquante ({e.name})"
+        return
+
+    taille = 2048                      # ~43 ms a 48 kHz, soit environ 23 mesures/s
+    fenetre = np.hanning(taille)
+    plafonds = {nom: 1e-3 for nom, _, _ in BANDES}
+    plafonds["tout"] = 1e-3
+    lisses = {nom: 0.0 for nom in list(plafonds)}
+
+    while SON["marche"]:
+        try:
+            haut_parleur = sc.default_speaker()
+            micro = sc.get_microphone(haut_parleur.name, include_loopback=True)
+            AUDIO["message"] = f"ecoute {haut_parleur.name[:28]}"
+            with micro.recorder(samplerate=48000, blocksize=taille) as source:
+                AUDIO["actif"] = True
+                while SON["marche"]:
+                    bloc = source.record(numframes=taille)
+                    mono = bloc.mean(axis=1) if bloc.ndim > 1 else bloc
+                    if len(mono) < taille:
+                        continue
+
+                    spectre = np.abs(np.fft.rfft(mono[:taille] * fenetre))
+                    freqs = np.fft.rfftfreq(taille, 1 / 48000)
+
+                    mesures = {}
+                    for nom, bas, haut in BANDES:
+                        masque = (freqs >= bas) & (freqs < haut)
+                        mesures[nom] = float(np.sqrt(
+                            (spectre[masque] ** 2).mean())) if masque.any() else 0.0
+                    mesures["tout"] = float(np.sqrt((spectre ** 2).mean()))
+
+                    # Centroide calcule sur les trois bandes plutot que sur le
+                    # spectre brut : un centroide classique est tire vers le haut
+                    # par les aigus residuels, et un morceau a grosse basse
+                    # ressortait vert. Ici graves = 0, mediums = 0.5, aigus = 1,
+                    # ponderes par leur energie. Lisse a part pour que la teinte
+                    # ne clignote pas au rythme des transitoires.
+                    poids = mesures["graves"] + mesures["mediums"] + mesures["aigus"]
+                    if poids > 1e-6:
+                        brut_centre = (0.0 * mesures["graves"]
+                                       + 0.5 * mesures["mediums"]
+                                       + 1.0 * mesures["aigus"]) / poids
+                        AUDIO["centroide"] += (brut_centre - AUDIO["centroide"]) * 0.18
+
+                    sensibilite = float(cfg.get("son_sensibilite", 1.0))
+                    attaque = float(cfg.get("son_attaque", 0.55))
+                    chute = float(cfg.get("son_chute", 0.12))
+
+                    for nom, brut in mesures.items():
+                        # gain automatique : le plafond suit les pics et retombe
+                        plafonds[nom] = max(brut, plafonds[nom] * 0.9992, 1e-4)
+                        valeur = min(1.0, (brut / plafonds[nom]) * sensibilite)
+                        k = attaque if valeur > lisses[nom] else chute
+                        lisses[nom] += (valeur - lisses[nom]) * k
+                        AUDIO[nom] = lisses[nom]
+
+        except Exception as e:
+            AUDIO["actif"] = False
+            AUDIO["message"] = f"capture impossible : {str(e)[:44]}"
+            print("Audio :", e)
+            for _ in range(30):
+                if not SON["marche"]:
+                    break
+                time.sleep(0.1)
+
+    AUDIO["actif"] = False
+    AUDIO["message"] = "arrete"
+
+
+def demarrer_audio(cfg):
+    if SON["marche"]:
+        return
+    SON["marche"] = True
+    threading.Thread(target=fil_audio, args=(cfg,), daemon=True).start()
+
+
+def arreter_audio():
+    SON["marche"] = False
+
+
+def couleur_son(cfg, couleur_regle):
+    """((r, v, b), gain) a partir de la derniere analyse."""
+    bande = cfg.get("son_bande", "graves")
+    niveau = AUDIO.get(bande, AUDIO["tout"])
+    palette = cfg.get("son_palette", "chaud_froid")
+
+    if palette == "regle":
+        rvb = couleur_regle
+    else:
+        if palette == "arc":
+            teinte = AUDIO["centroide"]
+        else:                                   # chaud vers froid
+            teinte = 0.02 + 0.52 * AUDIO["centroide"]
+        r, v, b = colorsys.hsv_to_rgb(teinte % 1.0, 0.92, 1.0)
+        rvb = (r * 255, v * 255, b * 255)
+
+    plancher = float(cfg.get("son_plancher", 0.06))
+    return rvb, plancher + (1.0 - plancher) * niveau
+
+
+# ==========================================================================
+#  Passerelle HTTP locale
+#
+#  Un site web ne peut pas parler Bluetooth. Il parle a ce petit serveur,
+#  qui pose une couleur forcee avec une date de peremption : si le site
+#  arrete d'emettre, la guirlande revient d'elle-meme au mode normal.
+#
+#  Deux obstacles cotes navigateur, traites ici :
+#   - une page HTTPS qui appelle une adresse locale doit recevoir
+#     Access-Control-Allow-Private-Network sur le prevol OPTIONS ;
+#   - l'origine doit etre explicitement autorisee, sinon n'importe quelle
+#     page ouverte pourrait piloter les lumieres.
+# ==========================================================================
+
+SERVEUR = {"http": None}
+
+
+def jeton_courant(cfg):
+    if not cfg.get("api_jeton"):
+        cfg["api_jeton"] = secrets.token_urlsafe(12)
+        sauver_config(cfg)
+    return cfg["api_jeton"]
+
+
+def couleur_de_regle(cfg, nom):
+    """Retrouve la couleur d'une regle par son nom, sans tenir compte de la casse."""
+    cible = (nom or "").strip().lower()
+    for regle in cfg.get("regles", []):
+        if regle.get("nom", "").strip().lower() == cible:
+            return hex_vers_rgb(regle["couleur"])
+    return None
+
+
+class Passerelle(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_):
+        pass                                   # pas de bruit dans le journal
+
+    # ---------- entetes ----------
+
+    def entetes_cors(self):
+        origine = self.headers.get("Origin", "")
+        autorisees = CFG.get("api_origines", [])
+        if "*" in autorisees:
+            self.send_header("Access-Control-Allow-Origin", origine or "*")
+        elif origine and origine in autorisees:
+            self.send_header("Access-Control-Allow-Origin", origine)
+        self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Headers", "content-type, x-jeton")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "600")
+
+    def repondre(self, code, charge):
+        corps = json.dumps(charge).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(corps)))
+        self.entetes_cors()
+        self.end_headers()
+        self.wfile.write(corps)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.entetes_cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    # ---------- lecture de la requete ----------
+
+    def origine_permise(self):
+        origine = self.headers.get("Origin", "")
+        autorisees = CFG.get("api_origines", [])
+        return ("*" in autorisees) or (not origine) or (origine in autorisees)
+
+    def jeton_permis(self, corps):
+        attendu = CFG.get("api_jeton", "")
+        if not attendu:
+            return True
+        fourni = self.headers.get("X-Jeton", "") or (corps.get("jeton", "")
+                                                     if isinstance(corps, dict) else "")
+        return secrets.compare_digest(str(fourni), str(attendu))
+
+    def lire_corps(self):
+        try:
+            taille = int(self.headers.get("Content-Length", 0))
+            if not taille:
+                return {}
+            return json.loads(self.rfile.read(taille).decode("utf-8"))
+        except Exception:
+            return {}
+
+    # ---------- routes ----------
+
+    def do_GET(self):
+        chemin = self.path.split("?")[0].rstrip("/") or "/"
+        if not self.origine_permise():
+            return self.repondre(403, {"erreur": "origine non autorisee"})
+        if chemin == "/etat":
+            r, v, b = ETAT["couleur"]
+            forcage = ETAT.get("forcage")
+            return self.repondre(200, {
+                "version": VERSION,
+                "connecte": ETAT["connecte"],
+                "couleur": rgb_vers_hex((r, v, b)),
+                "rvb": [r, v, b],
+                "source": ETAT["regle"],
+                "mode": CFG.get("mode", "applications"),
+                "force": bool(forcage and time.time() < forcage["expire"]),
+                "humeurs": [r_["nom"] for r_ in CFG.get("regles", [])],
+            })
+        return self.repondre(404, {"erreur": "route inconnue"})
+
+    def do_POST(self):
+        chemin = self.path.split("?")[0].rstrip("/") or "/"
+        if not self.origine_permise():
+            return self.repondre(403, {"erreur": "origine non autorisee"})
+        corps = self.lire_corps()
+        if not self.jeton_permis(corps):
+            return self.repondre(401, {"erreur": "jeton invalide"})
+
+        duree = float(corps.get("duree", 30))
+        duree = max(1.0, min(3600.0, duree))
+
+        if chemin == "/couleur":
+            brut = corps.get("couleur")
+            if isinstance(brut, str):
+                rvb = hex_vers_rgb(brut)
+            elif isinstance(brut, (list, tuple)) and len(brut) == 3:
+                rvb = tuple(max(0, min(255, int(c))) for c in brut)
+            else:
+                return self.repondre(400, {"erreur": "couleur manquante"})
+            ETAT["forcage"] = {"couleur": rvb, "expire": time.time() + duree,
+                               "nom": corps.get("nom") or "Site web"}
+            return self.repondre(200, {"ok": True, "couleur": rgb_vers_hex(rvb),
+                                       "duree": duree})
+
+        if chemin == "/humeur":
+            nom = corps.get("humeur") or corps.get("nom")
+            rvb = couleur_de_regle(CFG, nom)
+            if not rvb:
+                return self.repondre(404, {
+                    "erreur": f"aucune regle nommee {nom!r}",
+                    "humeurs": [r_["nom"] for r_ in CFG.get("regles", [])]})
+            ETAT["forcage"] = {"couleur": rvb, "expire": time.time() + duree,
+                               "nom": str(nom)}
+            return self.repondre(200, {"ok": True, "humeur": nom,
+                                       "couleur": rgb_vers_hex(rvb), "duree": duree})
+
+        if chemin == "/relacher":
+            ETAT["forcage"] = None
+            return self.repondre(200, {"ok": True})
+
+        return self.repondre(404, {"erreur": "route inconnue"})
+
+
+def demarrer_api(cfg):
+    arreter_api()
+    if not cfg.get("api_active"):
+        ETAT["api"] = "arretee"
+        return
+    jeton_courant(cfg)
+    try:
+        port = int(cfg.get("api_port", 7373))
+        serveur = http.server.ThreadingHTTPServer(("127.0.0.1", port), Passerelle)
+        serveur.daemon_threads = True
+        SERVEUR["http"] = serveur
+        threading.Thread(target=serveur.serve_forever, daemon=True).start()
+        ETAT["api"] = f"a l'ecoute sur 127.0.0.1:{port}"
+        print("Passerelle HTTP demarree sur le port", port)
+    except Exception as e:
+        ETAT["api"] = f"echec : {str(e)[:40]}"
+        print("Passerelle HTTP impossible :", e)
+
+
+def arreter_api():
+    if SERVEUR.get("http"):
+        try:
+            SERVEUR["http"].shutdown()
+            SERVEUR["http"].server_close()
+        except Exception:
+            pass
+        SERVEUR["http"] = None
+    ETAT["api"] = "arretee"
+
+
+# ==========================================================================
+#  Fil Bluetooth
+# ==========================================================================
+
+async def lister_appareils(duree=8.0):
+    from bleak import BleakScanner
+    trouves = await BleakScanner.discover(timeout=duree)
+    return sorted(trouves, key=lambda d: (d.name is None, d.name or "", d.address))
+
+
+async def essai_connexion(adresse):
+    from bleak import BleakClient
+    async with BleakClient(adresse, timeout=20.0) as client:
+        await client.write_gatt_char(UUID_ECRITURE, TRAME_ON, response=False)
+        await asyncio.sleep(0.2)
+        await client.write_gatt_char(UUID_ECRITURE, trame_lum(15), response=False)
+        for c in [(0, 255, 90), (0, 0, 0), (0, 255, 90), (0, 0, 0), (0, 255, 90)]:
+            await client.write_gatt_char(UUID_ECRITURE, trame_rgb(*c), response=False)
+            await asyncio.sleep(0.35)
+        await client.write_gatt_char(UUID_ECRITURE, trame_rgb(139, 92, 246), response=False)
+
+
+async def une_session(cfg):
+    from bleak import BleakClient
+    import psutil
+
+    adresse = str(cfg.get("adresse", "")).strip()
+    boucle = asyncio.get_event_loop()
+    r_a = v_a = b_a = 0.0
+    dernier = (-9, -9, -9)
+    psutil.cpu_percent(interval=None)
+
+    try:
+        ETAT["message"] = "Connexion..."
+        async with BleakClient(adresse, timeout=20.0) as client:
+            ETAT["connecte"] = True
+            ETAT["message"] = "Connectee"
+            await client.write_gatt_char(UUID_ECRITURE, TRAME_ON, response=False)
+            await asyncio.sleep(0.15)
+            # Luminosite materielle au maximum : la modulation se fait dans les
+            # valeurs RGB, ce qui donne des fondus continus au lieu des 15
+            # paliers du controleur.
+            await client.write_gatt_char(UUID_ECRITURE, trame_lum(15), response=False)
+
+            depart = time.time()
+            while ETAT["en_marche"] and client.is_connected and not ETAT["demande"]:
+                intervalle = 1.0 / max(1, int(cfg.get("images_par_seconde", 8)))
+
+                if ETAT["pause"]:
+                    ETAT["message"] = "En pause"
+                    await asyncio.sleep(0.3)
+                    continue
+
+                contexte = fenetre_active()
+                ETAT["contexte"] = contexte[:90]
+                ETAT["message"] = "Connectee"
+                mode = cfg.get("mode", "applications")
+
+                (ra, va, ba), nom = couleur_cible(cfg, contexte)
+                rc, vc, bc = ra, va, ba
+                douceur = float(cfg.get("douceur", 0.06))
+                gain = None
+
+                forcage = ETAT.get("forcage")
+                if forcage and time.time() < forcage["expire"]:
+                    rc, vc, bc = forcage["couleur"]
+                    nom = forcage["nom"]
+                    mode = "force"
+                elif forcage:
+                    ETAT["forcage"] = None
+
+                if mode == "son":
+                    if AUDIO["actif"]:
+                        (rc, vc, bc), gain = couleur_son(cfg, (ra, va, ba))
+                        nom = "Son \u00b7 " + cfg.get("son_bande", "graves")
+                        douceur = 1.0      # l'enveloppe est deja faite cote audio
+                    else:
+                        nom = "Son indisponible"
+
+                if mode in ("ecran", "mixte"):
+                    resultat = await boucle.run_in_executor(
+                        None, couleur_ecran,
+                        cfg.get("ecran_source", "actif"),
+                        float(cfg.get("ecran_saturation", 1.5)))
+                    if resultat:
+                        (re, ve, be), luminance, index = resultat
+                        if mode == "mixte":
+                            rc, vc, bc = (re + ra) / 2, (ve + va) / 2, (be + ba) / 2
+                            nom = f"{nom} + ecran {index}"
+                        else:
+                            rc, vc, bc = re, ve, be
+                            nom = f"Ecran {index}"
+                        douceur = float(cfg.get("douceur_ecran", 0.35))
+                        if cfg.get("ecran_suit_luminance", True):
+                            plancher = float(cfg.get("ecran_luminance_min", 0.15))
+                            gain = plancher + (1 - plancher) * min(1.0, luminance * 1.6)
+
+                ETAT["regle"] = nom
+
+                inactif = secondes_inactivite() > float(cfg.get("veille_minutes", 6)) * 60
+                if inactif:
+                    rc, vc, bc = hex_vers_rgb(cfg.get("couleur_veille", "#3B1F0B"))
+                    gain = float(cfg.get("veille_luminosite", 0.18))
+                    douceur = float(cfg.get("douceur", 0.06))
+                    ETAT["regle"] = "Veille"
+                elif gain is None:
+                    if cfg.get("reaction_processeur", True):
+                        charge = psutil.cpu_percent(interval=None) / 100.0
+                        lo = float(cfg.get("luminosite_min", 0.45))
+                        hi = float(cfg.get("luminosite_max", 1.0))
+                        gain = lo + charge * (hi - lo)
+                    else:
+                        gain = float(cfg.get("luminosite_max", 1.0))
+
+                amp = float(cfg.get("amplitude_respiration", 0.1))
+                if amp > 0 and not inactif and mode == "applications":
+                    per = max(1.0, float(cfg.get("periode_respiration", 11.0)))
+                    gain *= 1.0 + amp * math.sin(2 * math.pi * (time.time() - depart) / per)
+
+                gain = max(0.03, min(1.0, gain))
+                rc, vc, bc = rc * gain, vc * gain, bc * gain
+
+                k = max(0.005, min(1.0, douceur))
+                r_a += (rc - r_a) * k
+                v_a += (vc - v_a) * k
+                b_a += (bc - b_a) * k
+
+                envoi = (int(r_a), int(v_a), int(b_a))
+                ETAT["couleur"] = envoi
+                if max(abs(x - y) for x, y in zip(envoi, dernier)) >= 2:
+                    try:
+                        await client.write_gatt_char(
+                            UUID_ECRITURE, trame_rgb(*envoi), response=False)
+                        dernier = envoi
+                    except Exception as e:
+                        ETAT["message"] = f"Ecriture perdue : {str(e)[:50]}"
+                        break
+
+                await asyncio.sleep(intervalle)
+
+    except Exception as e:
+        ETAT["message"] = f"Deconnectee ({str(e)[:55]})"
+    ETAT["connecte"] = False
+
+
+async def superviseur(cfg):
+    while ETAT["en_marche"]:
+        demande = ETAT["demande"]
+
+        if demande == "scan":
+            ETAT["demande"] = None
+            ETAT["occupe"] = True
+            ETAT["message"] = "Recherche Bluetooth (8 s)..."
+            try:
+                trouves = await lister_appareils()
+                ETAT["appareils"] = [(a.name or "(sans nom)", a.address) for a in trouves]
+                ETAT["message"] = f"{len(trouves)} appareil(s) trouve(s)"
+            except Exception as e:
+                ETAT["appareils"] = []
+                ETAT["message"] = f"Recherche impossible : {str(e)[:55]}"
+            ETAT["occupe"] = False
+
+        elif demande == "test":
+            ETAT["demande"] = None
+            ETAT["occupe"] = True
+            adr = ETAT["adresse_test"]
+            ETAT["message"] = f"Test de {adr}..."
+            try:
+                await essai_connexion(adr)
+                cfg["adresse"] = adr
+                sauver_config(cfg)
+                ETAT["resultat"] = "ok"
+                ETAT["message"] = "Guirlande enregistree"
+            except Exception as e:
+                ETAT["resultat"] = "echec"
+                ETAT["message"] = f"Echec : {str(e)[:55]}"
+            ETAT["occupe"] = False
+
+        elif demande == "reconnecter":
+            ETAT["demande"] = None
+
+        elif str(cfg.get("adresse", "")).strip():
+            await une_session(cfg)
+            for _ in range(100):
+                if not ETAT["en_marche"] or ETAT["demande"]:
+                    break
+                await asyncio.sleep(0.1)
+
+        else:
+            ETAT["message"] = "Aucune guirlande appairee"
+            await asyncio.sleep(0.4)
+
+
+# ==========================================================================
+#  Panneau
+#
+#  Direction : la fenetre porte la lumiere de l'objet qu'elle pilote.
+#  Un brin d'ampoules vivant tient l'en-tete et donne son accent au reste
+#  de l'interface — onglet actif, bouton principal, liseres. Tout le reste
+#  reste sourd pour que le brin soit la seule chose qui brille.
+# ==========================================================================
+
+NUIT    = "#140E1C"   # fond, presque noir violace
+VELOURS = "#1E1530"   # panneaux
+ENCRE   = "#191024"   # champs et creux
+FIL     = "#3B2A55"   # filets, comme le cable de la guirlande
+CRAIE   = "#EDE4F2"   # texte
+BRUME   = "#9683AA"   # texte secondaire
+VIF     = "#5CE6A4"   # connecte
+ALERTE  = "#FF8A6B"   # deconnecte
+
+NUIT_RGB = hex_vers_rgb(NUIT)
+
+SECTIONS = [("etat",      "Etat"),
+            ("regles",    "Regles"),
+            ("ecran",     "Ecran"),
+            ("son",       "Son"),
+            ("reglages",  "Reglages"),
+            ("site",      "Site web"),
+            ("appairage", "Appairage")]
+
+
+def melange(avant, arriere, part):
+    """Simule une transparence : tkinter ne connait pas le canal alpha."""
+    return rgb_vers_hex(tuple(avant[i] * part + arriere[i] * (1 - part) for i in range(3)))
+
+
+def lisible(rgb):
+    """Remonte la valeur d'une couleur trop sombre pour servir d'accent."""
+    h, s, v = colorsys.rgb_to_hsv(*[c / 255 for c in rgb])
+    r, g, b = colorsys.hsv_to_rgb(h, s, max(0.72, v))
+    return rgb_vers_hex((r * 255, g * 255, b * 255))
+
+
+class Panneau:
+    def __init__(self, cfg, quitter_tout):
+        import tkinter as tk
+        from tkinter import ttk, font as tkfont
+        self.tk, self.ttk = tk, ttk
+        self.cfg = cfg
+        self.quitter_tout = quitter_tout
+        self.lignes = []
+        self.pages = {}
+        self.onglets = {}
+        self.section = "etat"
+        self.reglettes = []
+        self.accent = ACCENT_DEPART
+        self.phase = 0.0
+
+        self.root = tk.Tk()
+        self.root.title("Guirlande ambiante")
+        self.root.geometry("780x700")
+        self.root.minsize(720, 640)
+        self.root.configure(bg=NUIT)
+        self.root.protocol("WM_DELETE_WINDOW", self.cacher)
+        try:
+            ico = os.path.join(DOSSIER, "icone.ico")
+            if os.path.exists(ico):
+                self.root.iconbitmap(ico)
+        except Exception:
+            pass
+
+        familles = {f.lower() for f in tkfont.families(self.root)}
+        def choisir(*noms):
+            for n in noms:
+                if n.lower() in familles:
+                    return n
+            return "Segoe UI"
+        self.f_titre = choisir("Bahnschrift", "Segoe UI Semibold", "Segoe UI")
+        self.f_ui    = choisir("Segoe UI", "Tahoma")
+        self.f_mono  = choisir("Cascadia Mono", "Consolas", "Courier New")
+
+        self.construire_entete()
+        self.construire_pied()
+
+        corps = tk.Frame(self.root, bg=NUIT)
+        corps.pack(fill="both", expand=True)
+
+        self.rail = tk.Frame(corps, bg=NUIT, width=152)
+        self.rail.pack(side="left", fill="y")
+        self.rail.pack_propagate(False)
+        self.construire_rail()
+
+        tk.Frame(corps, bg=FIL, width=1).pack(side="left", fill="y")
+
+        self.zone = tk.Frame(corps, bg=NUIT)
+        self.zone.pack(side="left", fill="both", expand=True)
+
+        self.page_etat()
+        self.page_regles()
+        self.page_ecran()
+        self.page_son()
+        self.page_reglages()
+        self.page_site()
+        self.page_appairage()
+        self.aller("etat")
+
+        self.animer()
+        self.rafraichir()
+
+    # ------------------------------------------------------------------
+    #  Signature : le brin d'ampoules
+    # ------------------------------------------------------------------
+
+    def construire_entete(self):
+        tk = self.tk
+        bande = tk.Frame(self.root, bg=NUIT)
+        bande.pack(fill="x")
+
+        self.brin = tk.Canvas(bande, height=104, bg=NUIT, highlightthickness=0)
+        self.brin.pack(fill="x")
+        self.n_bulbes = 26
+        self.cable = self.brin.create_line(0, 0, 0, 0, fill=FIL, width=1, smooth=True)
+        self.bulbes = []
+        for _ in range(self.n_bulbes):
+            halos = [self.brin.create_oval(0, 0, 0, 0, outline="", fill=NUIT)
+                     for _ in (19, 13, 8)]
+            coeur = self.brin.create_oval(0, 0, 0, 0, outline="", fill=NUIT)
+            self.bulbes.append([halos, coeur, 0.0, 0.0])
+        self.brin.bind("<Configure>", lambda e: self.placer_bulbes(e.width))
+
+        ligne = tk.Frame(self.root, bg=NUIT, padx=22)
+        ligne.pack(fill="x", pady=(0, 12))
+        self.txt_titre = tk.Label(ligne, text="G U I R L A N D E", bg=NUIT, fg=CRAIE,
+                                  font=(self.f_titre, 19), anchor="w")
+        self.txt_titre.pack(side="left")
+        self.txt_trame = tk.Label(ligne, text="", bg=NUIT, fg=BRUME,
+                                  font=(self.f_mono, 9), anchor="e")
+        self.txt_trame.pack(side="right")
+        self.txt_statut = tk.Label(ligne, text="", bg=NUIT, fg=BRUME,
+                                   font=(self.f_ui, 9), anchor="w")
+        self.txt_statut.pack(side="left", padx=(14, 0))
+
+        tk.Frame(self.root, bg=FIL, height=1).pack(fill="x")
+
+    def placer_bulbes(self, largeur):
+        marge, creux = 30, 21
+        pas = (largeur - 2 * marge) / max(1, self.n_bulbes - 1)
+        points = []
+        for i, bulbe in enumerate(self.bulbes):
+            x = marge + i * pas
+            y = 47 + math.sin(i / (self.n_bulbes - 1) * math.pi) * creux
+            bulbe[2], bulbe[3] = x, y
+            points += [x, y]
+            for r, h in zip((19, 13, 8), bulbe[0]):
+                self.brin.coords(h, x - r, y - r, x + r, y + r)
+            self.brin.coords(bulbe[1], x - 3.4, y - 3.4, x + 3.4, y + 3.4)
+        if len(points) >= 4:
+            self.brin.coords(self.cable, *points)
+
+    def animer(self):
+        self.phase += 0.09
+        couleur = ETAT["couleur"]
+        vive = hex_vers_rgb(self.accent)
+        eteinte = max(couleur) < 6
+        for i, (halos, coeur, _, _) in enumerate(self.bulbes):
+            if not ETAT["connecte"]:
+                force = 0.10 + 0.06 * math.sin(self.phase * 0.5 + i * 0.4)
+                teinte = (90, 74, 110)
+            else:
+                onde = math.sin(self.phase * 0.7 - i * 0.26)
+                force = 0.74 + 0.26 * onde
+                teinte = vive if eteinte else couleur
+            for part, h in zip((0.14, 0.28, 0.48), halos):
+                self.brin.itemconfig(h, fill=melange(teinte, NUIT_RGB, part * force))
+            self.brin.itemconfig(coeur, fill=melange(teinte, NUIT_RGB,
+                                                     min(1.0, 0.4 + 0.6 * force)))
+        self.peindre_vumetre()
+        self.root.after(70, self.animer)
+
+    # ------------------------------------------------------------------
+    #  Rail de navigation
+    # ------------------------------------------------------------------
+
+    def construire_rail(self):
+        tk = self.tk
+        tk.Frame(self.rail, bg=NUIT, height=10).pack()
+        for cle, libelle in SECTIONS:
+            rang = tk.Frame(self.rail, bg=NUIT, cursor="hand2")
+            rang.pack(fill="x")
+            barre = tk.Frame(rang, bg=NUIT, width=3)
+            barre.pack(side="left", fill="y")
+            etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=BRUME, anchor="w",
+                            font=(self.f_ui, 10), padx=14, pady=9)
+            etiq.pack(side="left", fill="x", expand=True)
+            for w in (rang, etiq):
+                w.bind("<Button-1>", lambda e, c=cle: self.aller(c))
+                w.bind("<Enter>", lambda e, r=rang, l=etiq, c=cle:
+                       self.survol(r, l, c, True))
+                w.bind("<Leave>", lambda e, r=rang, l=etiq, c=cle:
+                       self.survol(r, l, c, False))
+            self.onglets[cle] = (rang, barre, etiq)
+
+    def survol(self, rang, etiq, cle, dedans):
+        if cle == self.section:
+            return
+        fond = VELOURS if dedans else NUIT
+        rang.configure(bg=fond)
+        etiq.configure(bg=fond, fg=CRAIE if dedans else BRUME)
+
+    def aller(self, cle):
+        self.section = cle
+        for c, (rang, barre, etiq) in self.onglets.items():
+            actif = c == cle
+            fond = VELOURS if actif else NUIT
+            rang.configure(bg=fond)
+            etiq.configure(bg=fond, fg=CRAIE if actif else BRUME,
+                           font=(self.f_ui, 10, "bold" if actif else "normal"))
+            barre.configure(bg=self.accent if actif else fond)
+        for c, page in self.pages.items():
+            page.pack_forget()
+        self.pages[cle].pack(fill="both", expand=True)
+
+    def nouvelle_page(self, cle, marge_x=24, marge_y=18, defilante=False):
+        if not defilante:
+            cadre = self.tk.Frame(self.zone, bg=NUIT, padx=marge_x, pady=marge_y)
+            self.pages[cle] = cadre
+            return cadre
+        exterieur = self.tk.Frame(self.zone, bg=NUIT)
+        self.pages[cle] = exterieur
+        return self.zone_defilante(exterieur, marge_x, marge_y)
+
+    def zone_defilante(self, parent, marge_x=24, marge_y=18):
+        """Renvoie un cadre interieur qui defile si le contenu deborde.
+        La molette est branchee a l'entree du pointeur et debranchee a sa
+        sortie : un bind_all volerait la molette aux autres pages."""
+        tk = self.tk
+        toile = tk.Canvas(parent, bg=NUIT, highlightthickness=0)
+        barre = tk.Scrollbar(parent, orient="vertical", command=toile.yview,
+                             bg=VELOURS, troughcolor=NUIT, bd=0, relief="flat",
+                             activebackground=FIL, width=10)
+        interieur = tk.Frame(toile, bg=NUIT, padx=marge_x, pady=marge_y)
+        fenetre = toile.create_window((0, 0), window=interieur, anchor="nw")
+        interieur.bind("<Configure>",
+                       lambda e: toile.configure(scrollregion=toile.bbox("all")))
+        toile.bind("<Configure>", lambda e: toile.itemconfig(fenetre, width=e.width))
+        toile.configure(yscrollcommand=barre.set)
+        toile.pack(side="left", fill="both", expand=True)
+        barre.pack(side="right", fill="y")
+
+        def rouler(evenement):
+            if toile.bbox("all") and toile.bbox("all")[3] > toile.winfo_height():
+                toile.yview_scroll(int(-evenement.delta / 120), "units")
+        parent.bind("<Enter>", lambda e: toile.bind_all("<MouseWheel>", rouler))
+        parent.bind("<Leave>", lambda e: toile.unbind_all("<MouseWheel>"))
+        return interieur
+
+    # ------------------------------------------------------------------
+    #  Briques
+    # ------------------------------------------------------------------
+
+    def bouton(self, parent, texte, action, principal=False, compact=False):
+        b = self.tk.Button(
+            parent, text=texte, command=action, relief="flat", bd=0,
+            bg=(self.accent if principal else ENCRE),
+            fg=("#140E1C" if principal else CRAIE),
+            activebackground=(self.accent if principal else FIL),
+            activeforeground=("#140E1C" if principal else CRAIE),
+            font=(self.f_ui, 9, "bold" if principal else "normal"),
+            padx=(12 if compact else 18), pady=(6 if compact else 8),
+            cursor="hand2", highlightthickness=1,
+            highlightbackground=NUIT, highlightcolor=self.accent)
+        if principal:
+            self.bouton_principal = b
+        return b
+
+    def titre(self, parent, texte):
+        return self.tk.Label(parent, text=texte.upper(), bg=parent["bg"], fg=BRUME,
+                             font=(self.f_mono, 8), anchor="w")
+
+    def texte(self, parent, txt, couleur=BRUME, taille=9, gras=False, largeur=520):
+        return self.tk.Label(parent, text=txt, bg=parent["bg"], fg=couleur,
+                             font=(self.f_ui, taille, "bold" if gras else "normal"),
+                             anchor="w", justify="left", wraplength=largeur)
+
+    def champ(self, parent, valeur, largeur=18):
+        e = self.tk.Entry(parent, bg=ENCRE, fg=CRAIE, insertbackground=CRAIE,
+                          relief="flat", bd=6, width=largeur, font=(self.f_ui, 9),
+                          highlightthickness=1, highlightbackground=ENCRE,
+                          highlightcolor=self.accent)
+        e.insert(0, valeur)
+        return e
+
+    def case(self, parent, texte, variable, action=None):
+        return self.tk.Checkbutton(
+            parent, text="  " + texte, variable=variable, command=action,
+            bg=parent["bg"], fg=CRAIE, selectcolor=ENCRE, activebackground=parent["bg"],
+            activeforeground=CRAIE, relief="flat", bd=0, font=(self.f_ui, 9),
+            anchor="w", highlightthickness=0, wraplength=470, justify="left")
+
+    def radio(self, parent, texte, variable, valeur):
+        return self.tk.Radiobutton(
+            parent, text="  " + texte, variable=variable, value=valeur,
+            bg=parent["bg"], fg=CRAIE, selectcolor=ENCRE, activebackground=parent["bg"],
+            activeforeground=CRAIE, relief="flat", bd=0, font=(self.f_ui, 9),
+            anchor="w", highlightthickness=0)
+
+    def reglette(self, parent, cle, libelle, mini, maxi, pas, aide, entier=False):
+        """Curseur dessine a la main : tk.Scale peint sa poignee avec la
+        couleur de fond du widget, donc elle disparait sur un theme sombre."""
+        tk = self.tk
+        bloc = tk.Frame(parent, bg=NUIT)
+        bloc.pack(fill="x", pady=(0, 7))
+        haut = tk.Frame(bloc, bg=NUIT)
+        haut.pack(fill="x")
+        self.texte(haut, libelle, CRAIE, 9, True).pack(side="left")
+        val = tk.Label(haut, bg=NUIT, fg=BRUME, font=(self.f_mono, 9))
+        val.pack(side="right")
+        self.texte(bloc, aide, BRUME, 8, largeur=460).pack(fill="x", pady=(0, 2))
+
+        v = tk.DoubleVar(value=float(self.cfg.get(cle, mini)))
+        toile = tk.Canvas(bloc, height=22, bg=NUIT, highlightthickness=0,
+                          cursor="hand2", takefocus=1)
+        toile.pack(fill="x")
+        marge, y = 11, 11
+        rail = toile.create_line(0, y, 0, y, fill=ENCRE, width=6, capstyle="round")
+        plein = toile.create_line(0, y, 0, y, fill=self.accent, width=6, capstyle="round")
+        poignee = toile.create_oval(0, 0, 0, 0, fill=CRAIE, outline="")
+
+        def peindre(*_):
+            largeur = max(60, toile.winfo_width())
+            part = (v.get() - mini) / float(maxi - mini)
+            x = marge + part * (largeur - 2 * marge)
+            toile.coords(rail, marge, y, largeur - marge, y)
+            toile.coords(plein, marge, y, max(marge, x), y)
+            toile.coords(poignee, x - 7, y - 7, x + 7, y + 7)
+            toile.itemconfig(plein, fill=self.accent)
+            val.configure(text=f"{int(v.get())}" if entier else f"{v.get():.2f}")
+
+        def poser(evenement):
+            largeur = max(60, toile.winfo_width())
+            part = (evenement.x - marge) / float(largeur - 2 * marge)
+            brut = mini + max(0.0, min(1.0, part)) * (maxi - mini)
+            v.set(round(brut / pas) * pas)
+
+        def flecher(evenement):
+            delta = pas if evenement.keysym in ("Right", "Up") else -pas
+            v.set(max(mini, min(maxi, round((v.get() + delta) / pas) * pas)))
+
+        v.trace_add("write", peindre)
+        toile.bind("<Configure>", peindre)
+        toile.bind("<Button-1>", lambda e: (toile.focus_set(), poser(e)))
+        toile.bind("<B1-Motion>", poser)
+        toile.bind("<Key>", flecher)
+        toile.bind("<FocusIn>", lambda e: toile.itemconfig(poignee, outline=self.accent, width=3))
+        toile.bind("<FocusOut>", lambda e: toile.itemconfig(poignee, outline=""))
+        self.reglettes.append(peindre)
+        peindre()
+        return v
+
+    def separateur(self, parent, haut=14, bas=14):
+        self.tk.Frame(parent, bg=FIL, height=1).pack(fill="x", pady=(haut, bas))
+
+    # ------------------------------------------------------------------
+    #  Page Etat
+    # ------------------------------------------------------------------
+
+    def page_etat(self):
+        tk = self.tk
+        f = self.nouvelle_page("etat")
+
+        carte = tk.Frame(f, bg=VELOURS, padx=18, pady=16)
+        carte.pack(fill="x")
+        self.titre(carte, "source de la couleur").pack(fill="x")
+        self.txt_regle = tk.Label(carte, text="", bg=VELOURS, fg=CRAIE,
+                                  font=(self.f_titre, 17), anchor="w")
+        self.txt_regle.pack(fill="x", pady=(4, 6))
+        self.txt_contexte = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
+                                     font=(self.f_mono, 8), anchor="w")
+        self.txt_contexte.pack(fill="x")
+
+        self.separateur(f)
+
+        info = tk.Frame(f, bg=NUIT)
+        info.pack(fill="x")
+        self.titre(info, "guirlande").pack(fill="x")
+        self.txt_adresse = tk.Label(info, text="", bg=NUIT, fg=CRAIE,
+                                    font=(self.f_mono, 10), anchor="w")
+        self.txt_adresse.pack(fill="x", pady=(3, 0))
+        self.txt_detail = self.texte(info, "", BRUME, 8)
+        self.txt_detail.pack(fill="x", pady=(3, 0))
+
+        self.separateur(f)
+
+        self.titre(f, "activite recente").pack(fill="x", pady=(0, 5))
+        self.bande = tk.Canvas(f, height=26, bg=ENCRE, highlightthickness=0)
+        self.bande.pack(fill="x")
+        self.historique = []
+        self.traits = []
+
+        self.separateur(f)
+
+        self.var_pause = tk.IntVar(value=0)
+        self.case(f, "Mettre en pause — fige la couleur actuelle",
+                  self.var_pause, self.basculer_pause).pack(fill="x")
+        self.var_demarrage = tk.IntVar(value=1 if os.path.exists(chemin_demarrage()) else 0)
+        self.case(f, "Lancer au demarrage de Windows",
+                  self.var_demarrage, self.basculer_demarrage).pack(fill="x", pady=(4, 0))
+
+        self.texte(f, f"Version {VERSION} — {DOSSIER}", BRUME, 8).pack(
+            fill="x", side="bottom", pady=(12, 0))
+
+    # ------------------------------------------------------------------
+    #  Page Regles
+    # ------------------------------------------------------------------
+
+    def page_regles(self):
+        tk = self.tk
+        f = self.nouvelle_page("regles", marge_x=0, marge_y=0)
+
+        haut = tk.Frame(f, bg=NUIT, padx=24, pady=16)
+        haut.pack(fill="x")
+        self.titre(haut, "premiere correspondance gagnante").pack(fill="x")
+        self.texte(haut, "Les mots sont cherches dans le nom du programme et dans le "
+                         "titre de la fenetre. Le titre d'un navigateur contient le nom "
+                         "du site : \"netflix\" suffit. Garde les sites au-dessus des "
+                         "navigateurs, la fleche les fait remonter.",
+                   BRUME, 8, largeur=490).pack(fill="x", pady=(5, 0))
+
+        bas = tk.Frame(f, bg=NUIT, padx=24, pady=12)
+        bas.pack(fill="x", side="bottom")
+        self.bouton(bas, "Ajouter une regle", self.nouvelle_regle, compact=True).pack(side="left")
+        self.bouton(bas, "Detecter la fenetre active", self.detecter,
+                    compact=True).pack(side="left", padx=8)
+
+        conteneur = tk.Frame(f, bg=NUIT)
+        conteneur.pack(fill="both", expand=True, padx=(24, 8))
+        toile = tk.Canvas(conteneur, bg=NUIT, highlightthickness=0)
+        barre = tk.Scrollbar(conteneur, orient="vertical", command=toile.yview,
+                             bg=VELOURS, troughcolor=NUIT, bd=0, relief="flat",
+                             activebackground=FIL, width=10)
+        self.liste = tk.Frame(toile, bg=NUIT)
+        self.liste.bind("<Configure>",
+                        lambda e: toile.configure(scrollregion=toile.bbox("all")))
+        self.fenetre_liste = toile.create_window((0, 0), window=self.liste, anchor="nw")
+        toile.bind("<Configure>",
+                   lambda e: toile.itemconfig(self.fenetre_liste, width=e.width))
+        toile.configure(yscrollcommand=barre.set)
+        toile.pack(side="left", fill="both", expand=True)
+        barre.pack(side="right", fill="y")
+        def rouler(evenement):
+            toile.yview_scroll(int(-evenement.delta / 120), "units")
+        conteneur.bind("<Enter>", lambda e: toile.bind_all("<MouseWheel>", rouler))
+        conteneur.bind("<Leave>", lambda e: toile.unbind_all("<MouseWheel>"))
+
+        self.reconstruire(self.cfg.get("regles", []))
+
+    def regles_courantes(self):
+        return [{"nom": l["nom"].get().strip() or "?",
+                 "couleur": l["couleur"]["v"],
+                 "mots": [m.strip().lower() for m in l["mots"].get().split(",") if m.strip()]}
+                for l in self.lignes]
+
+    def reconstruire(self, regles):
+        for enfant in self.liste.winfo_children():
+            enfant.destroy()
+        self.lignes = []
+        for r in regles:
+            self.ajouter_ligne(r)
+
+    def nouvelle_regle(self):
+        self.ajouter_ligne({"nom": "Nouveau", "couleur": "#FFFFFF", "mots": []})
+
+    def ajouter_ligne(self, regle):
+        tk = self.tk
+        rang = tk.Frame(self.liste, bg=VELOURS, padx=8, pady=7)
+        rang.pack(fill="x", pady=2)
+
+        def monter():
+            regles = self.regles_courantes()
+            i = self.lignes.index(ligne)
+            if i > 0:
+                regles[i - 1], regles[i] = regles[i], regles[i - 1]
+                self.reconstruire(regles)
+        tk.Label(rang, text="\u2191", bg=VELOURS, fg=BRUME, font=(self.f_ui, 9),
+                 cursor="hand2", padx=6).pack(side="left")
+        rang.winfo_children()[-1].bind("<Button-1>", lambda e: monter())
+
+        couleur = {"v": regle.get("couleur", "#FFFFFF")}
+        boite = tk.Frame(rang, bg=couleur["v"], width=22, height=22, cursor="hand2")
+        boite.pack(side="left", padx=(0, 10))
+        boite.pack_propagate(False)
+
+        def choisir(*_):
+            from tkinter import colorchooser
+            res = colorchooser.askcolor(color=couleur["v"], parent=self.root)
+            if res and res[1]:
+                couleur["v"] = res[1].upper()
+                boite.configure(bg=couleur["v"])
+        boite.bind("<Button-1>", choisir)
+
+        nom = self.champ(rang, regle.get("nom", ""), 11)
+        nom.pack(side="left")
+
+        mots = self.champ(rang, ", ".join(regle.get("mots", [])), 24)
+        mots.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        ligne = {"nom": nom, "couleur": couleur, "mots": mots}
+
+        def supprimer():
+            rang.destroy()
+            if ligne in self.lignes:
+                self.lignes.remove(ligne)
+        tk.Button(rang, text="\u00d7", command=supprimer, relief="flat", bd=0, width=2,
+                  bg=VELOURS, fg=BRUME, activebackground=FIL, activeforeground=ALERTE,
+                  font=(self.f_ui, 11), cursor="hand2").pack(side="left", padx=(8, 0))
+
+        self.lignes.append(ligne)
+
+    def detecter(self):
+        self.root.withdraw()
+        def relever():
+            ctx = fenetre_active()
+            proc, _, titre = ctx.partition("|")
+            self.root.deiconify()
+            self.root.lift()
+            indice = titre.strip()[:28] or proc.strip()
+            if indice:
+                self.ajouter_ligne({"nom": indice[:14].title(),
+                                    "couleur": "#FFFFFF", "mots": [indice]})
+                self.aller("regles")
+        self.root.after(4000, relever)
+
+    # ------------------------------------------------------------------
+    #  Page Ecran
+    # ------------------------------------------------------------------
+
+    def page_ecran(self):
+        tk = self.tk
+        f = self.nouvelle_page("ecran", defilante=True)
+
+        self.texte(f, "Le controleur n'accepte qu'une seule couleur pour tout le brin : "
+                      "le gauche bleu et le droit vert sont impossibles. En revanche "
+                      "l'ecran choisi pilote l'ensemble.", BRUME, 8, largeur=490).pack(fill="x")
+
+        self.separateur(f, 14, 10)
+        self.titre(f, "mode").pack(fill="x", pady=(0, 4))
+        self.var_mode = tk.StringVar(value=self.cfg.get("mode", "applications"))
+        self.radio(f, "Regles — couleur fixe par programme ou site",
+                   self.var_mode, "applications").pack(fill="x")
+        self.radio(f, "Ecran — couleur dominante de l'ecran, en direct",
+                   self.var_mode, "ecran").pack(fill="x")
+        self.radio(f, "Mixte — moitie regle, moitie ecran",
+                   self.var_mode, "mixte").pack(fill="x")
+
+        self.separateur(f, 14, 10)
+        self.titre(f, "quel ecran").pack(fill="x", pady=(0, 4))
+        self.var_source = tk.StringVar(value=str(self.cfg.get("ecran_source", "actif")))
+        self.radio(f, "Celui de la fenetre active — suit ton attention",
+                   self.var_source, "actif").pack(fill="x")
+        n = nombre_ecrans()
+        ETAT["ecrans"] = n
+        for i in range(1, max(1, n) + 1):
+            self.radio(f, f"Toujours l'ecran {i}", self.var_source, str(i)).pack(fill="x")
+
+        self.separateur(f, 14, 10)
+        self.var_sat = self.reglette(f, "ecran_saturation", "Saturation", 1.0, 2.5, 0.1,
+                                     "1.0 = couleur brute, souvent fade. 1.5 a 2.0 "
+                                     "donne des couleurs franches.")
+        self.var_douceur_ecran = self.reglette(f, "douceur_ecran", "Reactivite",
+                                               0.05, 1.0, 0.05,
+                                               "Haut = colle a l'image. Bas = fondu doux.")
+        self.var_lum = tk.IntVar(value=1 if self.cfg.get("ecran_suit_luminance", True) else 0)
+        self.case(f, "La luminosite suit celle de l'ecran — scene sombre, "
+                     "guirlande sombre", self.var_lum).pack(fill="x")
+
+    # ------------------------------------------------------------------
+    #  Page Son
+    # ------------------------------------------------------------------
+
+    def page_son(self):
+        tk = self.tk
+        f = self.nouvelle_page("son", defilante=True)
+
+        self.radio(f, "Son \u2014 la musique pilote la guirlande",
+                   self.var_mode, "son").pack(fill="x")
+        self.txt_audio = self.texte(f, "", BRUME, 8)
+        self.txt_audio.pack(fill="x", pady=(4, 0))
+        self.texte(f, "Capte la sortie des haut-parleurs, pas le micro. "
+                      "Monte la cadence a 15-20 images par seconde dans Reglages "
+                      "pour que ca colle au rythme.", BRUME, 8,
+                   largeur=500).pack(fill="x", pady=(4, 0))
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "niveaux en direct").pack(fill="x", pady=(0, 5))
+        self.vumetre = tk.Canvas(f, height=66, bg=ENCRE, highlightthickness=0)
+        self.vumetre.pack(fill="x")
+        self.barres = []
+        for i in range(3):
+            fond = self.vumetre.create_rectangle(0, 0, 0, 0, outline="", fill=NUIT)
+            barre = self.vumetre.create_rectangle(0, 0, 0, 0, outline="", fill=self.accent)
+            nom = self.vumetre.create_text(0, 0, text="", fill=BRUME,
+                                           font=(self.f_mono, 8), anchor="w")
+            self.barres.append((fond, barre, nom))
+        self.curseur_centroide = self.vumetre.create_line(0, 0, 0, 0, fill=CRAIE, width=2)
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "ce qui fait reagir la luminosite").pack(fill="x", pady=(0, 4))
+        self.var_bande = tk.StringVar(value=self.cfg.get("son_bande", "graves"))
+        for cle, libelle in (("graves",  "Graves \u2014 30 a 250 Hz, la grosse caisse et la basse"),
+                             ("mediums", "Mediums \u2014 250 Hz a 2 kHz, voix et guitares"),
+                             ("aigus",   "Aigus \u2014 2 a 16 kHz, cymbales et souffle"),
+                             ("tout",    "Tout le spectre \u2014 suit le volume general")):
+            self.radio(f, libelle, self.var_bande, cle).pack(fill="x")
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "d'ou vient la couleur").pack(fill="x", pady=(0, 4))
+        self.var_palette = tk.StringVar(value=self.cfg.get("son_palette", "chaud_froid"))
+        for cle, libelle in (
+                ("chaud_froid", "Chaud vers froid \u2014 morceau sourd rouge, morceau brillant cyan"),
+                ("arc",         "Arc-en-ciel \u2014 toute la roue des teintes"),
+                ("regle",       "Couleur de la regle \u2014 le son ne fait que la luminosite")):
+            self.radio(f, libelle, self.var_palette, cle).pack(fill="x")
+
+        self.separateur(f, 12, 6)
+        self.var_sens = self.reglette(f, "son_sensibilite", "Sensibilite", 0.3, 3.0, 0.1,
+                                      "Multiplie le niveau apres gain automatique.")
+        self.var_attaque = self.reglette(f, "son_attaque", "Attaque", 0.1, 1.0, 0.05,
+                                         "Vitesse de montee. Eleve = coup sec sur le beat.")
+        self.var_chute = self.reglette(f, "son_chute", "Chute", 0.02, 0.6, 0.02,
+                                       "Vitesse de descente. Bas = trainee douce.")
+        self.var_plancher = self.reglette(f, "son_plancher", "Plancher", 0.0, 0.4, 0.02,
+                                          "Luminosite gardee dans les silences.")
+
+    def peindre_vumetre(self):
+        if not hasattr(self, "vumetre"):
+            return
+        largeur = max(60, self.vumetre.winfo_width())
+        hauteur = 66
+        marge, ecart = 10, 8
+        colonne = (largeur - 2 * marge - 2 * ecart) / 3
+        for i, (cle, _, _) in enumerate(BANDES):
+            fond, barre, nom = self.barres[i]
+            x = marge + i * (colonne + ecart)
+            self.vumetre.coords(fond, x, 10, x + colonne, hauteur - 18)
+            niveau = AUDIO.get(cle, 0.0)
+            haut = (hauteur - 28) * (1 - niveau)
+            self.vumetre.coords(barre, x, 10 + haut, x + colonne, hauteur - 18)
+            self.vumetre.itemconfig(barre, fill=self.accent)
+            self.vumetre.coords(nom, x, hauteur - 9)
+            self.vumetre.itemconfig(nom, text=f"{cle} {niveau:4.2f}")
+        x = marge + AUDIO.get("centroide", 0.5) * (largeur - 2 * marge)
+        self.vumetre.coords(self.curseur_centroide, x, 4, x, hauteur - 20)
+
+    # ------------------------------------------------------------------
+    #  Page Reglages
+    # ------------------------------------------------------------------
+
+    def page_reglages(self):
+        tk = self.tk
+        f = self.nouvelle_page("reglages", defilante=True)
+        self.curseurs = {}
+        self.curseurs["douceur"] = self.reglette(
+            f, "douceur", "Douceur du fondu", 0.01, 0.4, 0.01,
+            "Mode Regles. Bas = transition lente et fluide, haut = changement sec.")
+        self.curseurs["luminosite_min"] = self.reglette(
+            f, "luminosite_min", "Luminosite au repos", 0.05, 1.0, 0.05,
+            "Niveau quand le processeur ne fait rien.")
+        self.curseurs["luminosite_max"] = self.reglette(
+            f, "luminosite_max", "Luminosite a pleine charge", 0.1, 1.0, 0.05,
+            "Niveau quand le processeur est a 100 %.")
+        self.curseurs["amplitude_respiration"] = self.reglette(
+            f, "amplitude_respiration", "Respiration", 0.0, 0.4, 0.02,
+            "Oscillation lente permanente. Ignoree en mode Ecran.")
+        self.curseurs["veille_minutes"] = self.reglette(
+            f, "veille_minutes", "Veille apres", 1, 60, 1,
+            "Minutes sans clavier ni souris avant de basculer en braise sourde.",
+            entier=True)
+        self.curseurs["images_par_seconde"] = self.reglette(
+            f, "images_par_seconde", "Images par seconde", 2, 25, 1,
+            "Cadence de capture et d'ecriture. 6 a 8 suffit pour l'ecran, "
+            "15 a 20 pour le son. Baisse si la guirlande saccade.",
+            entier=True)
+
+        self.var_cpu = tk.IntVar(value=1 if self.cfg.get("reaction_processeur", True) else 0)
+        self.case(f, "La charge du processeur module la luminosite — mode Regles",
+                  self.var_cpu).pack(fill="x")
+
+    # ------------------------------------------------------------------
+    #  Page Site web
+    # ------------------------------------------------------------------
+
+    def page_site(self):
+        tk = self.tk
+        f = self.nouvelle_page("site", defilante=True)
+
+        self.texte(f, "Ouvre un petit serveur sur ta machine. Un site que tu "
+                      "developpes peut alors imposer une couleur, avec une date "
+                      "de peremption : s'il arrete d'emettre, la guirlande revient "
+                      "seule au mode normal.", BRUME, 8, largeur=500).pack(fill="x")
+
+        self.separateur(f, 12, 10)
+
+        self.var_api = tk.IntVar(value=1 if self.cfg.get("api_active") else 0)
+        self.case(f, "Activer la passerelle locale", self.var_api).pack(fill="x")
+        self.txt_api = self.texte(f, "", BRUME, 8)
+        self.txt_api.pack(fill="x", pady=(4, 0))
+
+        rang = tk.Frame(f, bg=NUIT)
+        rang.pack(fill="x", pady=(12, 0))
+        self.texte(rang, "Port", CRAIE, 9, True).pack(side="left")
+        self.champ_port = self.champ(rang, str(self.cfg.get("api_port", 7373)), 7)
+        self.champ_port.pack(side="left", padx=10)
+        self.texte(rang, "Jeton", CRAIE, 9, True).pack(side="left", padx=(16, 0))
+        self.champ_jeton = self.champ(
+            rang, self.cfg.get("api_jeton") or secrets.token_urlsafe(12), 20)
+        self.champ_jeton.pack(side="left", padx=10)
+        self.bouton(rang, "Copier", self.copier_jeton, compact=True).pack(side="left")
+        self.bouton(rang, "Regenerer", self.regenerer_jeton,
+                    compact=True).pack(side="left", padx=6)
+
+        self.titre(f, "sites autorises").pack(fill="x", pady=(16, 4))
+        self.texte(f, "Une origine par virgule, protocole compris. Toute autre "
+                      "page recevra une erreur.", BRUME, 8).pack(fill="x", pady=(0, 4))
+        self.champ_origines = self.champ(
+            f, ", ".join(self.cfg.get("api_origines", [])), 10)
+        self.champ_origines.pack(fill="x")
+
+        self.separateur(f, 14, 8)
+        self.titre(f, "a coller dans ton site").pack(fill="x", pady=(0, 5))
+        pied = tk.Frame(f, bg=NUIT)
+        pied.pack(fill="x", side="bottom", pady=(8, 0))
+        self.bouton(pied, "Copier le code", self.copier_code,
+                    compact=True).pack(side="left")
+
+        self.code = tk.Text(f, height=8, bg=ENCRE, fg=BRUME, relief="flat", bd=8,
+                            font=(self.f_mono, 8), wrap="none", highlightthickness=0,
+                            insertbackground=CRAIE)
+        self.code.pack(fill="both", expand=True)
+        self.ecrire_extrait()
+
+    def extrait_js(self):
+        port = self.champ_port.get().strip() or "7373"
+        jeton = self.champ_jeton.get().strip()
+        return (
+            "const GUIRLANDE = `http://127.0.0.1:%s`;\n"
+            "const JETON = \"%s\";\n"
+            "\n"
+            "async function humeur(nom, duree = 30) {\n"
+            "  try {\n"
+            "    await fetch(`${GUIRLANDE}/humeur`, {\n"
+            "      method: \"POST\",\n"
+            "      headers: { \"Content-Type\": \"application/json\", \"X-Jeton\": JETON },\n"
+            "      body: JSON.stringify({ humeur: nom, duree }),\n"
+            "    });\n"
+            "  } catch (e) { /* guirlande eteinte ou app fermee : on ignore */ }\n"
+            "}\n"
+            "\n"
+            "// humeur(\"Focus\")            -> couleur de la regle nommee Focus\n"
+            "// couleur(\"#22D3EE\")         -> couleur libre\n"
+            "async function couleur(hex, duree = 30) {\n"
+            "  try {\n"
+            "    await fetch(`${GUIRLANDE}/couleur`, {\n"
+            "      method: \"POST\",\n"
+            "      headers: { \"Content-Type\": \"application/json\", \"X-Jeton\": JETON },\n"
+            "      body: JSON.stringify({ couleur: hex, duree }),\n"
+            "    });\n"
+            "  } catch (e) {}\n"
+            "}\n" % (port, jeton))
+
+    def ecrire_extrait(self):
+        self.code.configure(state="normal")
+        self.code.delete("1.0", "end")
+        self.code.insert("1.0", self.extrait_js())
+
+    def copier_code(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.code.get("1.0", "end-1c"))
+        ETAT["message"] = "Code copie"
+
+    def copier_jeton(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.champ_jeton.get().strip())
+        ETAT["message"] = "Jeton copie"
+
+    def regenerer_jeton(self):
+        nouveau = secrets.token_urlsafe(12)
+        self.champ_jeton.delete(0, "end")
+        self.champ_jeton.insert(0, nouveau)
+        self.ecrire_extrait()
+
+    # ------------------------------------------------------------------
+    #  Page Appairage
+    # ------------------------------------------------------------------
+
+    def page_appairage(self):
+        tk = self.tk
+        f = self.nouvelle_page("appairage")
+
+        self.texte(f, "Ferme l'application HiLighting sur ton telephone avant de "
+                      "chercher : le controleur n'accepte qu'une seule connexion "
+                      "a la fois.", BRUME, 8, largeur=490).pack(fill="x", pady=(0, 12))
+
+        self.bouton(f, "Rechercher les appareils", self.lancer_scan,
+                    principal=True).pack(anchor="w")
+        self.txt_scan = self.texte(f, "Aucune recherche lancee pour l'instant.",
+                                   BRUME, 9)
+        self.txt_scan.pack(fill="x", pady=(10, 6))
+
+        self.boite = tk.Listbox(f, bg=ENCRE, fg=CRAIE, relief="flat", bd=0, height=9,
+                                font=(self.f_mono, 9), selectbackground=self.accent,
+                                selectforeground="#140E1C", highlightthickness=0,
+                                activestyle="none")
+        self.boite.pack(fill="both", expand=True, pady=(0, 12))
+
+        self.bouton(f, "Tester et utiliser", self.tester_choix).pack(anchor="w")
+        self.texte(f, "L'appareil selectionne doit clignoter en vert trois fois.",
+                   BRUME, 8).pack(fill="x", pady=(6, 0))
+
+    def lancer_scan(self):
+        if ETAT["occupe"]:
+            return
+        self.boite.delete(0, "end")
+        ETAT["appareils"] = []
+        ETAT["demande"] = "scan"
+
+    def tester_choix(self):
+        sel = self.boite.curselection()
+        if not sel or ETAT["occupe"]:
+            return
+        ETAT["adresse_test"] = ETAT["appareils"][sel[0]][1]
+        ETAT["resultat"] = ""
+        ETAT["demande"] = "test"
+
+    # ------------------------------------------------------------------
+    #  Pied
+    # ------------------------------------------------------------------
+
+    def construire_pied(self):
+        tk = self.tk
+        tk.Frame(self.root, bg=FIL, height=1).pack(fill="x", side="bottom")
+        pied = tk.Frame(self.root, bg=NUIT, padx=22, pady=12)
+        pied.pack(fill="x", side="bottom")
+        self.bouton(pied, "Enregistrer", self.enregistrer, principal=True).pack(side="left")
+        self.bouton(pied, "Reconnecter", self.reconnecter, compact=True).pack(side="left", padx=8)
+        self.bouton(pied, "Quitter", self.quitter_tout, compact=True).pack(side="right")
+        self.bouton(pied, "Reduire", self.cacher, compact=True).pack(side="right", padx=8)
+
+    # ------------------------------------------------------------------
+    #  Actions
+    # ------------------------------------------------------------------
+
+    def basculer_pause(self):
+        ETAT["pause"] = bool(self.var_pause.get())
+
+    def basculer_demarrage(self):
+        if self.var_demarrage.get():
+            installer_demarrage()
+        else:
+            retirer_demarrage()
+
+    def reconnecter(self):
+        ETAT["demande"] = "reconnecter"
+
+    def enregistrer(self):
+        self.cfg["regles"] = [r for r in self.regles_courantes() if r["mots"]]
+        for cle, var in self.curseurs.items():
+            val = var.get()
+            self.cfg[cle] = int(val) if cle in ("veille_minutes", "images_par_seconde") else round(val, 3)
+        self.cfg["reaction_processeur"] = bool(self.var_cpu.get())
+        self.cfg["mode"] = self.var_mode.get()
+        source = self.var_source.get()
+        self.cfg["ecran_source"] = source if source == "actif" else int(source)
+        self.cfg["ecran_saturation"] = round(self.var_sat.get(), 2)
+        self.cfg["douceur_ecran"] = round(self.var_douceur_ecran.get(), 2)
+        self.cfg["ecran_suit_luminance"] = bool(self.var_lum.get())
+        self.cfg["son_bande"] = self.var_bande.get()
+        self.cfg["son_palette"] = self.var_palette.get()
+        self.cfg["son_sensibilite"] = round(self.var_sens.get(), 2)
+        self.cfg["son_attaque"] = round(self.var_attaque.get(), 2)
+        self.cfg["son_chute"] = round(self.var_chute.get(), 2)
+        self.cfg["son_plancher"] = round(self.var_plancher.get(), 2)
+        self.cfg["api_active"] = bool(self.var_api.get())
+        try:
+            self.cfg["api_port"] = max(1024, min(65535, int(self.champ_port.get())))
+        except ValueError:
+            self.cfg["api_port"] = 7373
+        self.cfg["api_jeton"] = self.champ_jeton.get().strip()
+        self.cfg["api_origines"] = [o.strip() for o in
+                                    self.champ_origines.get().split(",") if o.strip()]
+        sauver_config(self.cfg)
+        if self.cfg["mode"] == "son":
+            demarrer_audio(self.cfg)
+        else:
+            arreter_audio()
+        demarrer_api(self.cfg)
+        self.champ_jeton.delete(0, "end")
+        self.champ_jeton.insert(0, self.cfg.get("api_jeton", ""))
+        self.ecrire_extrait()
+        ETAT["message"] = "Reglages enregistres"
+
+    def cacher(self):
+        self.root.withdraw()
+
+    def afficher(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    # ------------------------------------------------------------------
+    #  Rafraichissement
+    # ------------------------------------------------------------------
+
+    def rafraichir(self):
+        r, v, b = ETAT["couleur"]
+        hexa = rgb_vers_hex((r, v, b))
+        accent = lisible((r, v, b)) if max(r, v, b) > 8 else ACCENT_DEPART
+        if accent != self.accent:
+            self.accent = accent
+            self.appliquer_accent()
+
+        self.txt_statut.configure(text=ETAT["message"],
+                                  fg=VIF if ETAT["connecte"] else ALERTE)
+        self.txt_trame.configure(text=f"55 07 01 {r:02x} {v:02x} {b:02x}   {hexa}")
+        self.txt_titre.configure(fg=CRAIE)
+        self.txt_regle.configure(text=ETAT["regle"])
+        self.txt_contexte.configure(text=(ETAT["contexte"] or "aucune fenetre detectee")[:64])
+        self.txt_adresse.configure(
+            text=self.cfg.get("adresse", "") or "aucune guirlande appairee")
+        mode = {"applications": "mode Regles", "ecran": "mode Ecran",
+                "mixte": "mode Mixte"}.get(self.cfg.get("mode", "applications"), "")
+        self.txt_detail.configure(
+            text=f"{mode} — {ETAT['ecrans']} ecran(s) — "
+                 f"{self.cfg.get('images_par_seconde', 8)} images par seconde")
+
+        self.tracer_bande(hexa)
+
+        self.txt_audio.configure(text="Capture " + AUDIO.get("message", "arretee"))
+        self.txt_api.configure(text="Passerelle " + ETAT.get("api", "arretee"))
+
+        self.txt_scan.configure(
+            text=ETAT["message"] if ETAT["occupe"] or ETAT["appareils"]
+            else "Aucune recherche lancee pour l'instant.")
+        if len(ETAT["appareils"]) != self.boite.size():
+            self.boite.delete(0, "end")
+            for nom, adr in ETAT["appareils"]:
+                marque = "   probablement" if nom.upper().startswith("L") else ""
+                self.boite.insert("end", f" {nom[:22]:24} {adr}{marque}")
+        if ETAT["resultat"] == "ok":
+            ETAT["resultat"] = ""
+            self.aller("etat")
+
+        self.root.after(400, self.rafraichir)
+
+    def tracer_bande(self, hexa):
+        """Un trait par mesure : environ une minute d'historique visible."""
+        self.historique.append(hexa)
+        largeur = max(1, self.bande.winfo_width())
+        capacite = max(20, largeur // 4)
+        del self.historique[:-capacite]
+        while len(self.traits) < capacite:
+            self.traits.append(self.bande.create_rectangle(
+                0, 0, 0, 0, outline="", fill=ENCRE))
+        pas = largeur / capacite
+        debut = capacite - len(self.historique)
+        for i, trait in enumerate(self.traits[:capacite]):
+            j = i - debut
+            couleur = self.historique[j] if 0 <= j < len(self.historique) else ENCRE
+            x = i * pas
+            self.bande.coords(trait, x, 0, x + pas + 1, 26)
+            self.bande.itemconfig(trait, fill=couleur)
+
+    def appliquer_accent(self):
+        try:
+            self.bouton_principal.configure(bg=self.accent, activebackground=self.accent)
+            self.boite.configure(selectbackground=self.accent)
+            rang, barre, etiq = self.onglets[self.section]
+            barre.configure(bg=self.accent)
+            for peindre in self.reglettes:
+                peindre()
+        except Exception:
+            pass
+
+
+# ==========================================================================
+#  Installation, mise a jour, demarrage
+# ==========================================================================
+
+def commande_lancement():
+    """Ce qu'il faut executer pour demarrer l'application."""
+    if FIGE:
+        return f'"{CIBLE_EXE}"'
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+    return f'"{pythonw}" "{os.path.abspath(__file__)}"'
+
+
+def chemin_demarrage():
+    return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                        "Start Menu", "Programs", "Startup", "guirlande_ambiante.vbs")
+
+
+def installer_demarrage():
+    try:
+        cmd = commande_lancement().replace('"', '""')
+        with open(chemin_demarrage(), "w", encoding="utf-8") as f:
+            f.write(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\n')
+        return True
+    except Exception as e:
+        print("Ecriture dans Demarrage impossible :", e)
+        return False
+
+
+def retirer_demarrage():
+    p = chemin_demarrage()
+    if os.path.exists(p):
+        os.remove(p)
+
+
+def creer_lanceur():
+    """Pour le mode script uniquement."""
+    cmd = commande_lancement().replace('"', '""')
+    with open(os.path.join(DOSSIER, "Lancer.vbs"), "w", encoding="utf-8") as f:
+        f.write(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\n')
+
+
+def dialogue(titre, texte):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        racine = tk.Tk()
+        racine.withdraw()
+        messagebox.showinfo(titre, texte)
+        racine.destroy()
+    except Exception:
+        print(titre, ":", texte)
+
+
+def arreter_instances(chemin):
+    """Termine les copies deja lancees de l'application installee."""
+    try:
+        import psutil
+    except ImportError:
+        return
+    moi = os.getpid()
+    vises = []
+    for p in psutil.process_iter(["pid", "exe"]):
+        try:
+            if p.info["pid"] != moi and p.info["exe"] and \
+               os.path.normcase(p.info["exe"]) == os.path.normcase(chemin):
+                vises.append(p)
+        except Exception:
+            continue
+    for p in vises:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    if vises:
+        psutil.wait_procs(vises, timeout=6)
+        for p in vises:
+            try:
+                if p.is_running():
+                    p.kill()
+            except Exception:
+                pass
+
+
+def installer_ou_mettre_a_jour():
+    """Renvoie True si on a agi comme installeur et qu'il faut sortir."""
+    moi = os.path.abspath(sys.executable)
+    if os.path.normcase(moi) == os.path.normcase(CIBLE_EXE):
+        return False                       # on EST l'application installee
+
+    deja = os.path.exists(CIBLE_EXE)
+    try:
+        os.makedirs(DOSSIER, exist_ok=True)
+        arreter_instances(CIBLE_EXE)
+        for essai in range(10):            # le fichier peut rester verrouille
+            try:
+                shutil.copy2(moi, CIBLE_EXE)
+                break
+            except PermissionError:
+                time.sleep(0.6)
+        else:
+            dialogue("Guirlande ambiante",
+                     "Impossible de remplacer la version installee.\n"
+                     "Quitte l'application depuis son icone, puis relance ce fichier.")
+            return True
+
+        installer_demarrage()
+        subprocess.Popen([CIBLE_EXE], close_fds=True)
+        dialogue("Guirlande ambiante",
+                 (f"Mise a jour vers la version {VERSION} terminee.\n\n"
+                  "Tes reglages ont ete conserves."
+                  if deja else
+                  f"Installation terminee (version {VERSION}).\n\n"
+                  f"Installee dans :\n{DOSSIER}\n\n"
+                  "L'application demarre maintenant avec Windows.\n"
+                  "Son icone est en bas a droite, pres de l'horloge."))
+        return True
+    except Exception as e:
+        print("Installation impossible :", e)
+        dialogue("Guirlande ambiante", f"Installation impossible :\n{e}")
+        return True
+
+
+def deja_lance():
+    """Empeche deux copies simultanees."""
+    try:
+        import win32event, win32api, winerror
+        _mutex = win32event.CreateMutex(None, False, "GuirlandeAmbianteMutex")
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            return True
+        globals()["_mutex_garde"] = _mutex   # garde une reference vivante
+    except Exception:
+        pass
+    return False
+
+
+# ==========================================================================
+
+def image_icone(rgb):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGB", (64, 64), (23, 16, 31))
+    d = ImageDraw.Draw(img)
+    r, v, b = [max(30, int(c)) for c in rgb]
+    for i, x in enumerate(range(9, 60, 11)):
+        y = 26 + int(10 * math.sin(i * 1.1))
+        d.ellipse([x - 6, y - 6, x + 6, y + 6], fill=(r, v, b))
+    return img
+
+
+def ecrire_icone(chemin):
+    """Genere icone.ico pour la compilation."""
+    from PIL import Image, ImageDraw
+    grand = Image.new("RGB", (256, 256), (23, 16, 31))
+    d = ImageDraw.Draw(grand)
+    for i, x in enumerate(range(30, 240, 42)):
+        y = 105 + int(42 * math.sin(i * 1.1))
+        c = tuple(int(v * 255) for v in colorsys.hsv_to_rgb(i / 5.5, 0.8, 1))
+        d.ellipse([x - 24, y - 24, x + 24, y + 24], fill=c)
+    grand.save(chemin, sizes=[(256, 256), (64, 64), (48, 48), (32, 32), (16, 16)])
+    print("Icone ecrite :", chemin)
+
+
+def lancer():
+    global CFG
+    CFG = charger_config()
+    premiere_fois = not str(CFG.get("adresse", "")).strip()
+
+    boucle = asyncio.new_event_loop()
+
+    def fil_ble():
+        asyncio.set_event_loop(boucle)
+        try:
+            boucle.run_until_complete(superviseur(CFG))
+        except Exception as e:
+            print("Fil Bluetooth arrete :", e)
+
+    threading.Thread(target=fil_ble, daemon=True).start()
+    demarrer_api(CFG)
+    if CFG.get("mode") == "son":
+        demarrer_audio(CFG)
+
+    demande_ouverture = threading.Event()
+    demande_arret = threading.Event()
+
+    import pystray
+    panneau = Panneau(CFG, lambda: demande_arret.set())
+
+    icone = pystray.Icon("guirlande", image_icone((139, 92, 246)), "Guirlande ambiante")
+    icone.menu = pystray.Menu(
+        pystray.MenuItem("Ouvrir le panneau", lambda *_: demande_ouverture.set(), default=True),
+        pystray.MenuItem("Pause", lambda *_: ETAT.update(pause=not ETAT["pause"]),
+                         checked=lambda i: ETAT["pause"]),
+        pystray.MenuItem("Reconnecter", lambda *_: ETAT.update(demande="reconnecter")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quitter", lambda *_: demande_arret.set()),
+    )
+    threading.Thread(target=icone.run, daemon=True).start()
+
+    if premiere_fois:
+        panneau.aller("appairage")
+        panneau.afficher()
+    else:
+        panneau.root.withdraw()
+
+    dernier = [0.0]
+
+    def surveiller():
+        if demande_arret.is_set():
+            ETAT["en_marche"] = False
+            arreter_api()
+            arreter_audio()
+            try:
+                icone.stop()
+            except Exception:
+                pass
+            panneau.root.destroy()
+            return
+        if demande_ouverture.is_set():
+            demande_ouverture.clear()
+            panneau.afficher()
+        if time.time() - dernier[0] > 2.0:
+            dernier[0] = time.time()
+            try:
+                icone.icon = image_icone(ETAT["couleur"])
+            except Exception:
+                pass
+        panneau.root.after(150, surveiller)
+
+    panneau.root.after(150, surveiller)
+    panneau.root.mainloop()
+
+
+def main():
+    if "--icone" in sys.argv:
+        ecrire_icone(os.path.join(os.path.dirname(os.path.abspath(__file__)), "icone.ico"))
+        return
+    if "--lanceur" in sys.argv:
+        creer_lanceur()
+        installer_demarrage()
+        print("Lanceur cree et entree de demarrage installee.")
+        return
+    if "--retirer" in sys.argv:
+        retirer_demarrage()
+        print("Retire du demarrage.")
+        return
+
+    if FIGE:
+        if installer_ou_mettre_a_jour():
+            return
+        if deja_lance():
+            return
+    lancer()
+
+
+if __name__ == "__main__":
+    main()
