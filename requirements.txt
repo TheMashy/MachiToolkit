@@ -1,0 +1,10 @@
+# Dependances d'execution. Windows uniquement pour l'essentiel : la barre
+# des taches, la fenetre active et le Bluetooth passent par des API Windows.
+bleak
+psutil
+pystray
+pillow
+mss
+numpy
+soundcard
+pywin32; sys_platform == "win32"

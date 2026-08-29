@@ -63,11 +63,11 @@ echo.
 
 REM ---------- 2. dependances ----------
 echo   [2/4] Installation des bibliotheques (1 a 3 minutes)...
-echo         bleak, psutil, pywin32, pystray, pillow, mss, numpy, soundcard
+echo         liste tenue dans requirements.txt
 echo.
 
 %PY% -m pip install --upgrade --quiet --disable-pip-version-check pip
-%PY% -m pip install --quiet --disable-pip-version-check bleak psutil pywin32 pystray pillow mss numpy soundcard pyinstaller
+%PY% -m pip install --quiet --disable-pip-version-check -r "%~dp0requirements.txt" pyinstaller
 if errorlevel 1 (
     echo.
     echo   Echec. Clic droit sur ce fichier ^> "Executer en tant qu'administrateur".
@@ -91,49 +91,16 @@ echo.
 REM ---------- 3. icone ----------
 echo   [3/4] Generation de l'icone...
 %PY% "%~dp0guirlande_ambiante.py" --icone
-set "ICONE="
-if exist "%~dp0icone.ico" set "ICONE=--icon "%~dp0icone.ico""
 echo.
 
 REM ---------- 4. compilation ----------
 echo   [4/4] Compilation. Longue etape, ne ferme pas la fenetre.
 echo.
+echo         Recette : GuirlandeAmbiante.spec, la meme que celle du
+echo         workflow GitHub. Les deux sortent donc le meme exe.
+echo.
 
-%PY% -m PyInstaller --noconfirm --clean --onefile --noconsole ^
-  --name GuirlandeAmbiante ^
-  %ICONE% ^
-  --collect-all bleak ^
-  --collect-all winrt ^
-  --collect-all mss ^
-  --collect-all soundcard ^
-  --hidden-import win32gui ^
-  --hidden-import win32process ^
-  --hidden-import win32api ^
-  --hidden-import win32event ^
-  --hidden-import winerror ^
-  --hidden-import pystray._win32 ^
-  --hidden-import PIL._tkinter_finder ^
-  "%~dp0guirlande_ambiante.py"
-
-if errorlevel 1 (
-    echo.
-    echo   Premiere tentative echouee. Nouvel essai sans le paquet winrt...
-    echo.
-    %PY% -m PyInstaller --noconfirm --clean --onefile --noconsole ^
-      --name GuirlandeAmbiante ^
-      %ICONE% ^
-      --collect-all bleak ^
-      --collect-all mss ^
-      --collect-all soundcard ^
-      --hidden-import win32gui ^
-      --hidden-import win32process ^
-      --hidden-import win32api ^
-      --hidden-import win32event ^
-      --hidden-import winerror ^
-      --hidden-import pystray._win32 ^
-      --hidden-import PIL._tkinter_finder ^
-      "%~dp0guirlande_ambiante.py"
-)
+%PY% -m PyInstaller --noconfirm --clean "%~dp0GuirlandeAmbiante.spec"
 
 if not exist "%~dp0dist\GuirlandeAmbiante.exe" (
     echo.
@@ -155,9 +122,10 @@ echo   Double-clic dessus pour installer. Il se copie dans
 echo   %%LOCALAPPDATA%%\GuirlandeAmbiante, s'ajoute au demarrage
 echo   de Windows et se lance.
 echo.
-echo   Plus tard, pour mettre a jour : recompile et double-clique
-echo   le nouvel exe. Il detecte l'installation existante, remplace
-echo   l'ancienne version et garde tous tes reglages.
+echo   Une fois installee, l'application se met a jour toute seule :
+echo   elle surveille les publications du depot GitHub et propose la
+echo   nouvelle version depuis son icone. Compiler a la main ne sert
+echo   plus qu'a tester une version pas encore publiee.
 echo.
 
 start "" explorer "%~dp0dist"

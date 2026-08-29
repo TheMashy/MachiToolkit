@@ -1,10 +1,14 @@
 """
 Guirlande ambiante — eclairage procedural pilote par ce qui est a l'ecran.
 
-Compile en un seul .exe par Compiler.bat. Cet exe fait tout :
+Compile en un seul .exe portable. Cet exe fait tout :
   - lance depuis n'importe ou    -> s'installe dans %LOCALAPPDATA%, se lance
   - relance depuis n'importe ou  -> met a jour la version installee
   - lance depuis l'installation  -> tourne normalement
+
+Une fois installee, l'application surveille les publications du depot
+GitHub et se met a jour seule : elle telecharge le nouvel exe et le lance,
+qui reprend le premier cas ci-dessus. config.json n'est jamais touche.
 
 Modes de couleur :
   applications  couleur par regle (programme ou site web)
@@ -24,13 +28,23 @@ import colorsys
 import threading
 import subprocess
 import http.server
+import urllib.error
+import urllib.request
 
-VERSION = "1.0"
+VERSION = "1.1.0"
 NOM_EXE = "GuirlandeAmbiante.exe"
+
+# Depot d'ou viennent les mises a jour. Une seule ligne a changer si le
+# projet demenage ou si une autre application du toolkit reprend ce module.
+DEPOT_GITHUB = "TheMashy/MachiToolkit"
 
 # Fige = lance depuis l'exe compile. Les donnees vont alors dans LOCALAPPDATA,
 # pour qu'une mise a jour de l'exe n'efface jamais la configuration.
 FIGE = getattr(sys, "frozen", False)
+
+# Pose par la mise a jour automatique : l'exe telecharge s'installe alors
+# sans afficher la moindre fenetre.
+SILENCIEUX = "--maj-silencieuse" in sys.argv
 
 if FIGE:
     DOSSIER = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
@@ -121,6 +135,12 @@ CONFIG_DEFAUT = {
     "api_jeton": "",
     "api_origines": ["https://braindebugger-production.up.railway.app",
                      "http://localhost:3000"],
+
+    # Mises a jour depuis les publications GitHub du depot.
+    "maj_verifier": True,             # regarder si une version plus recente existe
+    "maj_installation_auto": False,   # poser la mise a jour sans rien demander
+    "maj_prereleases": False,         # accepter aussi les pre-versions
+    "maj_intervalle_heures": 6,       # delai entre deux verifications
 }
 
 # ==========================================================================
@@ -850,6 +870,7 @@ SECTIONS = [("etat",      "Etat"),
             ("ecran",     "Ecran"),
             ("son",       "Son"),
             ("reglages",  "Reglages"),
+            ("maj",       "Mises a jour"),
             ("site",      "Site web"),
             ("appairage", "Appairage")]
 
@@ -880,6 +901,8 @@ class Panneau:
         self.reglettes = []
         self.accent = ACCENT_DEPART
         self.phase = 0.0
+        # Remplace par lancer() : le panneau demande, la boucle principale agit.
+        self.declencher_maj = lambda quoi="verifier": None
 
         self.root = tk.Tk()
         self.root.title("Guirlande ambiante")
@@ -925,6 +948,7 @@ class Panneau:
         self.page_ecran()
         self.page_son()
         self.page_reglages()
+        self.page_maj()
         self.page_site()
         self.page_appairage()
         self.aller("etat")
@@ -1511,6 +1535,71 @@ class Panneau:
                   self.var_cpu).pack(fill="x")
 
     # ------------------------------------------------------------------
+    #  Page Mises a jour
+    # ------------------------------------------------------------------
+
+    def page_maj(self):
+        tk = self.tk
+        f = self.nouvelle_page("maj", defilante=True)
+
+        carte = tk.Frame(f, bg=VELOURS, padx=18, pady=16)
+        carte.pack(fill="x")
+        self.titre(carte, "version installee").pack(fill="x")
+        tk.Label(carte, text=VERSION, bg=VELOURS, fg=CRAIE,
+                 font=(self.f_titre, 17), anchor="w").pack(fill="x", pady=(4, 6))
+        self.txt_maj = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
+                                font=(self.f_ui, 9), anchor="w", justify="left",
+                                wraplength=460)
+        self.txt_maj.pack(fill="x")
+
+        barre = tk.Frame(f, bg=NUIT)
+        barre.pack(fill="x", pady=(14, 0))
+        self.bouton(barre, "Verifier maintenant",
+                    lambda: self.declencher_maj("verifier"),
+                    compact=True).pack(side="left")
+        self.bouton(barre, "Telecharger et installer",
+                    lambda: self.declencher_maj("installer"),
+                    compact=True).pack(side="left", padx=8)
+
+        self.separateur(f)
+
+        self.titre(f, "notes de la publication").pack(fill="x", pady=(0, 5))
+        self.txt_notes = self.texte(f, "-", BRUME, 8, largeur=460)
+        self.txt_notes.pack(fill="x")
+
+        self.separateur(f)
+
+        self.var_maj_verifier = tk.IntVar(
+            value=1 if self.cfg.get("maj_verifier", True) else 0)
+        self.case(f, "Verifier automatiquement toutes les %s heures"
+                  % self.cfg.get("maj_intervalle_heures", 6),
+                  self.var_maj_verifier, self.options_maj).pack(fill="x")
+        self.var_maj_auto = tk.IntVar(
+            value=1 if self.cfg.get("maj_installation_auto", False) else 0)
+        self.case(f, "Poser la mise a jour sans rien demander — l'application "
+                     "se ferme et redemarre seule, les reglages sont conserves",
+                  self.var_maj_auto, self.options_maj).pack(fill="x", pady=(4, 0))
+        self.var_maj_pre = tk.IntVar(
+            value=1 if self.cfg.get("maj_prereleases", False) else 0)
+        self.case(f, "Accepter aussi les pre-versions",
+                  self.var_maj_pre, self.options_maj).pack(fill="x", pady=(4, 0))
+
+        self.separateur(f)
+
+        self.texte(f, "Les versions viennent des publications de github.com/"
+                      + DEPOT_GITHUB + ". La verification est une simple lecture "
+                      "de l'API publique de GitHub : rien de la machine n'est "
+                      "envoye. Le nouvel exe remplace l'ancien dans "
+                      + DOSSIER + " et config.json n'est jamais touche.",
+                   BRUME, 8, largeur=460).pack(fill="x")
+
+    def options_maj(self):
+        self.cfg["maj_verifier"] = bool(self.var_maj_verifier.get())
+        self.cfg["maj_installation_auto"] = bool(self.var_maj_auto.get())
+        self.cfg["maj_prereleases"] = bool(self.var_maj_pre.get())
+        sauver_config(self.cfg)
+
+    # ------------------------------------------------------------------
     #  Page Site web
     # ------------------------------------------------------------------
 
@@ -1759,6 +1848,12 @@ class Panneau:
 
         self.tracer_bande(hexa)
 
+        self.txt_maj.configure(
+            text=MAJ["message"],
+            fg=VIF if MAJ["etat"] in ("disponible", "prete") else BRUME)
+        notes = (MAJ.get("notes") or "").strip()
+        self.txt_notes.configure(text=notes[:1500] if notes else "-")
+
         self.txt_audio.configure(text="Capture " + AUDIO.get("message", "arretee"))
         self.txt_api.configure(text="Passerelle " + ETAT.get("api", "arretee"))
 
@@ -1807,6 +1902,250 @@ class Panneau:
 
 
 # ==========================================================================
+#  Mises a jour depuis GitHub
+#
+#  L'exe publie est deja son propre installeur : lance depuis n'importe ou
+#  il se copie sur l'installation, garde la configuration et se relance
+#  (voir installer_ou_mettre_a_jour). Se mettre a jour revient donc a
+#  telecharger le .exe joint a la derniere publication et a l'executer.
+#
+#  Cote reseau, rien ne part d'ici : une requete GET anonyme sur l'API
+#  publique de GitHub, au plus une fois par intervalle. Aucune donnee de la
+#  machine n'est transmise, pas meme le numero de version installe.
+# ==========================================================================
+
+API_GITHUB = "https://api.github.com/repos/" + DEPOT_GITHUB
+PAGE_PUBLICATIONS = "https://github.com/" + DEPOT_GITHUB + "/releases"
+DOSSIER_MAJ = os.path.join(DOSSIER, "maj")
+
+MAJ = {
+    # repos | verification | a_jour | disponible | telechargement | prete | erreur
+    "etat": "repos",
+    "message": "Aucune verification depuis le demarrage.",
+    "version": "",
+    "notes": "",
+    "page": PAGE_PUBLICATIONS,
+    "url": "",
+    "taille": 0,
+    "progression": 0.0,
+    "fichier": "",
+    "verifie_le": 0.0,
+}
+
+
+def version_en_tuple(texte):
+    """Ordonne des versions du style 1.2.0 ou v1.2.0-beta.3.
+
+    Une pre-version passe avant la version finale portant le meme numero :
+    1.2.0-beta est plus ancienne que 1.2.0.
+    """
+    base = str(texte).strip().lstrip("vV").split("+")[0]
+    pre = ""
+    if "-" in base:
+        base, pre = base.split("-", 1)
+    nombres = []
+    for morceau in base.split("."):
+        chiffres = "".join(c for c in morceau if c.isdigit())
+        nombres.append(int(chiffres) if chiffres else 0)
+    while len(nombres) < 3:
+        nombres.append(0)
+    return (tuple(nombres[:3]), 0 if pre else 1, pre)
+
+
+def plus_recente(candidate, reference):
+    return version_en_tuple(candidate) > version_en_tuple(reference)
+
+
+def _contexte_ssl():
+    """Le magasin de Windows passe en premier : c'est lui qui contient les
+    autorites ajoutees par un antivirus ou un proxy d'entreprise, sans
+    lesquelles la connexion echouerait. certifi ne sert que si ce magasin
+    ressort vide, ce qui arrive sur certaines compilations."""
+    try:
+        import ssl
+    except Exception:
+        return None
+    try:
+        contexte = ssl.create_default_context()
+        if contexte.cert_store_stats().get("x509_ca", 0) > 0:
+            return contexte
+    except Exception:
+        contexte = None
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return contexte
+
+
+def _ouvrir(url, delai=20):
+    requete = urllib.request.Request(url, headers={
+        "User-Agent": "MachiToolkit/" + VERSION,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    return urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl())
+
+
+def derniere_publication(prereleases=False):
+    """Renvoie la publication GitHub la plus recente, ou None.
+
+    Le .exe est retrouve par son extension et non par son nom exact : le
+    jour ou une autre application du toolkit prend le relais, le nom du
+    fichier peut changer sans casser la mise a jour des exemplaires deja
+    installes.
+    """
+    url = (API_GITHUB + "/releases?per_page=20") if prereleases \
+        else (API_GITHUB + "/releases/latest")
+    with _ouvrir(url) as reponse:
+        donnees = json.loads(reponse.read().decode("utf-8"))
+
+    if isinstance(donnees, list):
+        publiees = [p for p in donnees if not p.get("draft")]
+        if not publiees:
+            return None
+        publiees.sort(key=lambda p: version_en_tuple(p.get("tag_name", "")),
+                      reverse=True)
+        donnees = publiees[0]
+
+    actif = None
+    for piece in donnees.get("assets", []):
+        if str(piece.get("name", "")).lower().endswith(".exe"):
+            actif = piece
+            break
+
+    return {
+        "version": str(donnees.get("tag_name", "")).lstrip("vV"),
+        "notes": donnees.get("body") or "",
+        "page": donnees.get("html_url") or PAGE_PUBLICATIONS,
+        "url": (actif or {}).get("browser_download_url", ""),
+        "nom": (actif or {}).get("name", ""),
+        "taille": int((actif or {}).get("size") or 0),
+    }
+
+
+def verifier_maj(cfg):
+    """Interroge GitHub. Renvoie la publication si elle est plus recente."""
+    MAJ["etat"] = "verification"
+    MAJ["message"] = "Recherche d'une mise a jour..."
+    try:
+        publication = derniere_publication(bool(cfg.get("maj_prereleases", False)))
+    except urllib.error.HTTPError as e:
+        MAJ["etat"] = "erreur"
+        MAJ["message"] = ("Aucune publication sur le depot pour l'instant."
+                          if e.code == 404 else
+                          "GitHub a repondu %s. Nouvel essai plus tard." % e.code)
+        return None
+    except Exception as e:
+        MAJ["etat"] = "erreur"
+        MAJ["message"] = "Verification impossible : %s" % e
+        return None
+
+    MAJ["verifie_le"] = time.time()
+    if not publication or not publication["version"]:
+        MAJ["etat"] = "a_jour"
+        MAJ["message"] = "Aucune publication trouvee sur le depot."
+        return None
+
+    MAJ["page"] = publication["page"]
+    if not plus_recente(publication["version"], VERSION):
+        MAJ["etat"] = "a_jour"
+        MAJ["message"] = "Version %s — a jour." % VERSION
+        return None
+
+    MAJ["version"] = publication["version"]
+    MAJ["notes"] = publication["notes"]
+    MAJ["url"] = publication["url"]
+    MAJ["taille"] = publication["taille"]
+
+    if not publication["url"]:
+        MAJ["etat"] = "erreur"
+        MAJ["message"] = ("Version %s publiee, mais sans .exe joint. "
+                          "A recuperer a la main." % publication["version"])
+        return None
+
+    MAJ["etat"] = "disponible"
+    MAJ["message"] = "Version %s disponible (installee : %s)." % (
+        publication["version"], VERSION)
+    return publication
+
+
+def telecharger_maj(publication):
+    """Ecrit le nouvel exe dans DOSSIER_MAJ. Leve en cas d'echec."""
+    os.makedirs(DOSSIER_MAJ, exist_ok=True)
+    cible = os.path.join(DOSSIER_MAJ,
+                         "GuirlandeAmbiante-%s.exe" % publication["version"])
+    partiel = cible + ".part"
+
+    MAJ["etat"] = "telechargement"
+    MAJ["progression"] = 0.0
+    MAJ["message"] = "Telechargement de la version %s..." % publication["version"]
+
+    recu = 0
+    with _ouvrir(publication["url"], delai=60) as flux:
+        total = int(flux.headers.get("Content-Length") or publication["taille"] or 0)
+        with open(partiel, "wb") as sortie:
+            while True:
+                bloc = flux.read(262144)
+                if not bloc:
+                    break
+                sortie.write(bloc)
+                recu += len(bloc)
+                if total:
+                    MAJ["progression"] = recu / float(total)
+                    MAJ["message"] = "Telechargement %d %%" % (recu * 100 // total)
+
+    if total and recu < total:
+        os.remove(partiel)
+        raise IOError("telechargement interrompu")
+
+    os.replace(partiel, cible)
+    MAJ["fichier"] = cible
+    MAJ["etat"] = "prete"
+    MAJ["message"] = ("Version %s telechargee, prete a etre posee."
+                      % publication["version"])
+    return cible
+
+
+def lancer_installeur_maj():
+    """Passe la main a l'exe telecharge : il arrete cette instance, se copie
+    sur l'installation et la relance. L'appelant doit quitter ensuite."""
+    chemin = MAJ.get("fichier")
+    if not FIGE:
+        MAJ["etat"] = "erreur"
+        MAJ["message"] = ("En mode script, la mise a jour se fait par "
+                          "git pull. Rien n'a ete touche.")
+        return False
+    if not chemin or not os.path.exists(chemin):
+        MAJ["etat"] = "erreur"
+        MAJ["message"] = "Le fichier telecharge a disparu."
+        return False
+    try:
+        subprocess.Popen([chemin, "--maj-silencieuse"], close_fds=True)
+        return True
+    except Exception as e:
+        MAJ["etat"] = "erreur"
+        MAJ["message"] = "Lancement de l'installeur impossible : %s" % e
+        return False
+
+
+def nettoyer_maj():
+    """Efface les exe telecharges une fois la mise a jour posee."""
+    try:
+        if not os.path.isdir(DOSSIER_MAJ):
+            return
+        for nom in os.listdir(DOSSIER_MAJ):
+            chemin = os.path.join(DOSSIER_MAJ, nom)
+            try:
+                if os.path.isfile(chemin):
+                    os.remove(chemin)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+# ==========================================================================
 #  Installation, mise a jour, demarrage
 # ==========================================================================
 
@@ -1850,6 +2189,9 @@ def creer_lanceur():
 
 
 def dialogue(titre, texte):
+    if SILENCIEUX:
+        print(titre, ":", texte)
+        return
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -1973,6 +2315,7 @@ def lancer():
     global CFG
     CFG = charger_config()
     premiere_fois = not str(CFG.get("adresse", "")).strip()
+    nettoyer_maj()      # efface l'exe telecharge par la mise a jour precedente
 
     boucle = asyncio.new_event_loop()
 
@@ -1995,11 +2338,94 @@ def lancer():
     panneau = Panneau(CFG, lambda: demande_arret.set())
 
     icone = pystray.Icon("guirlande", image_icone((139, 92, 246)), "Guirlande ambiante")
+
+    # ---- mise a jour -------------------------------------------------
+    # Tout passe par un fil separe : une requete reseau dans le fil de
+    # tkinter figerait la fenetre, et dans celui de pystray le menu.
+
+    def notifier(titre, texte):
+        try:
+            icone.notify(texte, titre)
+        except Exception:
+            print(titre, ":", texte)
+
+    def travail_maj(quoi):
+        if quoi == "installer":
+            if MAJ["etat"] != "prete":
+                publication = verifier_maj(CFG)
+                if not publication:
+                    if MAJ["etat"] == "a_jour":
+                        notifier("Guirlande ambiante", MAJ["message"])
+                    return
+                try:
+                    telecharger_maj(publication)
+                except Exception as e:
+                    MAJ["etat"] = "erreur"
+                    MAJ["message"] = "Telechargement impossible : %s" % e
+                    return
+            notifier("Guirlande ambiante",
+                     "Installation de la version %s, l'application redemarre."
+                     % MAJ["version"])
+            time.sleep(2)
+            if lancer_installeur_maj():
+                demande_arret.set()
+            return
+
+        publication = verifier_maj(CFG)
+        if not publication:
+            return
+        if CFG.get("maj_installation_auto", False):
+            travail_maj("installer")
+        else:
+            notifier("Mise a jour disponible",
+                     "Version %s. Clic droit sur l'icone pour l'installer."
+                     % publication["version"])
+
+    def declencher_maj(quoi="verifier"):
+        if MAJ["etat"] in ("verification", "telechargement"):
+            return
+        threading.Thread(target=travail_maj, args=(quoi,), daemon=True).start()
+
+    def veille_maj():
+        """Premiere verification peu apres le demarrage, puis a intervalle."""
+        attente = 30.0
+        while ETAT["en_marche"]:
+            fin = time.time() + attente
+            while ETAT["en_marche"] and time.time() < fin:
+                time.sleep(2)
+            if not ETAT["en_marche"]:
+                return
+            if FIGE and CFG.get("maj_verifier", True) \
+                    and MAJ["etat"] not in ("verification", "telechargement"):
+                travail_maj("verifier")
+            attente = max(1, int(CFG.get("maj_intervalle_heures", 6))) * 3600
+
+    panneau.declencher_maj = declencher_maj
+    threading.Thread(target=veille_maj, daemon=True).start()
+
+    def libelle_maj(*_):
+        if MAJ["etat"] == "prete":
+            return "Installer la version %s" % MAJ["version"]
+        if MAJ["etat"] == "disponible":
+            return "Mettre a jour vers la version %s" % MAJ["version"]
+        if MAJ["etat"] == "telechargement":
+            return "Telechargement en cours..."
+        if MAJ["etat"] == "verification":
+            return "Verification en cours..."
+        return "Rechercher une mise a jour"
+
     icone.menu = pystray.Menu(
         pystray.MenuItem("Ouvrir le panneau", lambda *_: demande_ouverture.set(), default=True),
         pystray.MenuItem("Pause", lambda *_: ETAT.update(pause=not ETAT["pause"]),
                          checked=lambda i: ETAT["pause"]),
         pystray.MenuItem("Reconnecter", lambda *_: ETAT.update(demande="reconnecter")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(libelle_maj,
+                         lambda *_: declencher_maj(
+                             "installer" if MAJ["etat"] in ("disponible", "prete")
+                             else "verifier"),
+                         enabled=lambda *_: MAJ["etat"] not in ("verification",
+                                                                "telechargement")),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quitter", lambda *_: demande_arret.set()),
     )
@@ -2012,6 +2438,7 @@ def lancer():
         panneau.root.withdraw()
 
     dernier = [0.0]
+    dernier_etat_maj = [MAJ["etat"]]
 
     def surveiller():
         if demande_arret.is_set():
@@ -2033,6 +2460,12 @@ def lancer():
                 icone.icon = image_icone(ETAT["couleur"])
             except Exception:
                 pass
+        if MAJ["etat"] != dernier_etat_maj[0]:
+            dernier_etat_maj[0] = MAJ["etat"]
+            try:
+                icone.update_menu()
+            except Exception:
+                pass
         panneau.root.after(150, surveiller)
 
     panneau.root.after(150, surveiller)
@@ -2040,6 +2473,14 @@ def lancer():
 
 
 def main():
+    if "--version" in sys.argv:
+        print(VERSION)
+        return
+    if "--verifier-maj" in sys.argv:
+        cfg = charger_config()
+        verifier_maj(cfg)
+        print(MAJ["message"])
+        return
     if "--icone" in sys.argv:
         ecrire_icone(os.path.join(os.path.dirname(os.path.abspath(__file__)), "icone.ico"))
         return
