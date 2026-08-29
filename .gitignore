@@ -1,0 +1,21 @@
+# Produits de compilation : l'exe se recupere dans les publications GitHub,
+# il n'a rien a faire dans l'historique du depot (34 Mo par version).
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Genere par guirlande_ambiante.py --icone
+# (icone.ico est versionne volontairement : le workflow le regenere,
+#  mais l'avoir sous la main evite d'avoir a lancer Python pour compiler)
+
+# Donnees locales
+config.json
+journal.log
+Lancer.vbs

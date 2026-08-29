@@ -1,0 +1,31 @@
+name: Verification
+
+# Garde-fou rapide sur chaque poussee : si le source ne compile meme pas,
+# inutile d'attendre six minutes de PyInstaller pour l'apprendre.
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compilation du source
+        run: python -m compileall -q guirlande_ambiante.py outils
+
+      - name: Version lisible
+        run: echo "version = $(python outils/version.py)"
+
+      - name: Coherence du tag de publication
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python outils/version.py --verifier "${GITHUB_REF_NAME}"

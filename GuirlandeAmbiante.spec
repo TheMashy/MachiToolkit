@@ -1,22 +1,41 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# Recette de compilation unique, partagee par Compiler.bat et par le
+# workflow GitHub : les deux produisent exactement le meme exe.
+#
+#     pyinstaller --noconfirm --clean GuirlandeAmbiante.spec
+#
+# Les chemins sont relatifs a ce fichier (SPECPATH), jamais absolus :
+# un chemin en dur ne compilerait que sur la machine qui l'a ecrit.
+
+import os
+
 from PyInstaller.utils.hooks import collect_all
+
+RACINE = os.path.abspath(SPECPATH)
 
 datas = []
 binaries = []
-hiddenimports = ['win32gui', 'win32process', 'win32api', 'win32event', 'winerror', 'pystray._win32', 'PIL._tkinter_finder']
-tmp_ret = collect_all('bleak')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('winrt')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('mss')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('soundcard')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = ['win32gui', 'win32process', 'win32api', 'win32event',
+                 'winerror', 'pystray._win32', 'PIL._tkinter_finder']
 
+# winrt n'existe que sur Windows et son nom de paquet a bouge selon les
+# versions de bleak : son absence ne doit pas casser la compilation.
+for paquet in ('bleak', 'winrt', 'mss', 'soundcard'):
+    try:
+        d, b, h = collect_all(paquet)
+    except Exception as e:
+        print("spec : %s ignore (%s)" % (paquet, e))
+        continue
+    datas += d
+    binaries += b
+    hiddenimports += h
+
+icone = os.path.join(RACINE, 'icone.ico')
 
 a = Analysis(
-    ['D:/Desktop/files/guirlande_ambiante.py'],
-    pathex=[],
+    [os.path.join(RACINE, 'guirlande_ambiante.py')],
+    pathex=[RACINE],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -48,5 +67,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:/Desktop/files/icone.ico'],
+    icon=([icone] if os.path.exists(icone) else None),
 )
