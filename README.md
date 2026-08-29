@@ -35,6 +35,16 @@ Windows SmartScreen affichera un avertissement au premier lancement : l'exe
 n'est pas signe, une signature de code coute quelques centaines d'euros par
 an. « Informations complementaires » puis « Executer quand meme ».
 
+### Sans publication
+
+Tant qu'aucune publication n'existe, le lien ci-dessus ne mene nulle part.
+L'exe est quand meme la : chaque poussee sur `main` en compile un.
+
+Onglet **Actions** > dernier passage de **Publication** > section
+**Artifacts** en bas de page > `GuirlandeAmbiante-<version>`. C'est un zip
+qui contient le meme exe, garde trente jours. Meme chemin pour essayer un
+build plus recent que la derniere publication.
+
 ## Mises a jour
 
 Une fois installee, l'application n'a plus besoin qu'on s'occupe d'elle.
