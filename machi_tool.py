@@ -36,7 +36,7 @@ import http.server
 import urllib.error
 import urllib.request
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -147,6 +147,10 @@ CONFIG_DEFAUT = {
     "periode_respiration": 11.0,
     "douceur": 0.06,
     "images_par_seconde": 8,
+
+    # 0 = deduite de l'ecran. Une valeur forcee sert quand la detection se
+    # trompe : ecran 4K declare a tort en 96 ppp, ou gout personnel.
+    "echelle_interface": 0.0,
 
     "son_bande": "graves",           # graves | mediums | aigus | tout
     "son_palette": "chaud_froid",    # chaud_froid | arc | regle
@@ -1072,6 +1076,99 @@ async def superviseur(cfg):
 
 
 # ==========================================================================
+#  Resolution de l'ecran
+#
+#  Une fenetre tkinter est dessinee pour du 96 points par pouce. Sur un 4K
+#  a 150 ou 200 %, Windows a deux facons de s'en sortir, et les deux sont
+#  mauvaises tant qu'on ne fait rien :
+#
+#    - processus inconscient de la resolution : Windows agrandit l'image de
+#      la fenetre. Rien n'est coupe, mais tout est flou ;
+#    - processus conscient : la fenetre est nette, mais 780 pixels restent
+#      780 pixels physiques. Sur un 4K, c'est un timbre-poste, et les
+#      caracteres deviennent illisibles.
+#
+#  On prend donc la deuxieme voie et on remet l'echelle a la main : tk
+#  scaling pour les caracteres, un facteur pour tout ce qui est exprime en
+#  pixels. Le resultat est net ET a la bonne taille.
+# ==========================================================================
+
+def chemin_icone():
+    """Le .ico a poser sur la fenetre, ecrit si besoin.
+
+    --icon de PyInstaller ne fait qu'une chose : graver l'icone dans le
+    fichier .exe. Il n'en depose aucune copie sur le disque. La fenetre,
+    elle, reclame un vrai fichier — sans quoi Tk met sa plume par defaut.
+    On embarque donc le .ico comme donnee, et on le regenere si jamais il
+    manque.
+    """
+    candidats = []
+    interne = getattr(sys, "_MEIPASS", None)     # depaquetage de l'exe
+    if interne:
+        candidats.append(os.path.join(interne, "icone.ico"))
+    candidats.append(os.path.join(DOSSIER, "icone.ico"))
+    if not FIGE:
+        candidats.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "icone.ico"))
+    for chemin in candidats:
+        if os.path.exists(chemin):
+            return chemin
+
+    depose = os.path.join(DOSSIER, "icone.ico")
+    try:
+        ecrire_icone(depose)
+        return depose
+    except Exception as e:
+        print("Icone indisponible :", e)
+        return None
+
+
+def identite_barre_taches():
+    """Sans identite propre, Windows range la fenetre sous celle de Python
+    et lui prete son icone. Une chaine a nous suffit a la detacher."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "TheMashy.MachiTool")
+    except Exception:
+        pass
+
+
+def activer_dpi():
+    """A appeler avant la premiere fenetre, sinon Windows l'ignore."""
+    if os.name != "nt":
+        return
+    import ctypes
+    # -4 = par ecran, version 2 : suit le facteur de chaque moniteur, y
+    # compris quand la fenetre est deplacee de l'un a l'autre.
+    for tentative in (
+            lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(-4)),
+            lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),
+            lambda: ctypes.windll.user32.SetProcessDPIAware()):
+        try:
+            tentative()
+            return
+        except Exception:
+            continue
+
+
+def echelle_ecran(racine, forcee=0.0):
+    """Facteur a appliquer aux tailles en pixels. 1.0 = ecran 96 ppp."""
+    try:
+        if forcee and float(forcee) > 0:
+            return max(0.75, min(4.0, float(forcee)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(1.0, min(4.0, racine.winfo_fpixels("1i") / 96.0))
+    except Exception:
+        return 1.0
+
+
+# ==========================================================================
 #  Panneau
 #
 #  Direction : la fenetre porte la lumiere de l'objet qu'elle pilote.
@@ -1138,17 +1235,26 @@ class Panneau:
         self.declencher_maj = lambda quoi="verifier": None
 
         self.root = tk.Tk()
+        self.echelle = echelle_ecran(self.root, self.cfg.get("echelle_interface", 0.0))
+        # tk scaling est le nombre de pixels par point : il fait grandir les
+        # caracteres, dont la taille est donnee en points.
+        try:
+            self.root.tk.call("tk", "scaling", self.echelle * 96.0 / 72.0)
+        except Exception:
+            pass
+
         self.root.title(NOM_APP)
-        self.root.geometry("780x700")
-        self.root.minsize(720, 640)
+        self.root.geometry("%dx%d" % (self.px(780), self.px(700)))
+        self.root.minsize(self.px(720), self.px(640))
         self.root.configure(bg=NUIT)
         self.root.protocol("WM_DELETE_WINDOW", self.cacher)
         try:
-            ico = os.path.join(DOSSIER, "icone.ico")
-            if os.path.exists(ico):
-                self.root.iconbitmap(ico)
-        except Exception:
-            pass
+            ico = chemin_icone()
+            if ico:
+                # default : vaut aussi pour les fenetres ouvertes ensuite.
+                self.root.iconbitmap(default=ico)
+        except Exception as e:
+            print("Icone de fenetre refusee :", e)
 
         familles = {f.lower() for f in tkfont.families(self.root)}
         def choisir(*noms):
@@ -1166,7 +1272,7 @@ class Panneau:
         corps = tk.Frame(self.root, bg=NUIT)
         corps.pack(fill="both", expand=True)
 
-        self.rail = tk.Frame(corps, bg=NUIT, width=152)
+        self.rail = tk.Frame(corps, bg=NUIT, width=self.px(152))
         self.rail.pack(side="left", fill="y")
         self.rail.pack_propagate(False)
         self.construire_rail()
@@ -1190,6 +1296,10 @@ class Panneau:
         self.animer()
         self.rafraichir()
 
+    def px(self, n):
+        """Convertit une mesure pensee en 96 ppp vers l'ecran reel."""
+        return max(1, int(round(n * self.echelle)))
+
     # ------------------------------------------------------------------
     #  Signature : le brin d'ampoules
     # ------------------------------------------------------------------
@@ -1199,7 +1309,7 @@ class Panneau:
         bande = tk.Frame(self.root, bg=NUIT)
         bande.pack(fill="x")
 
-        self.brin = tk.Canvas(bande, height=104, bg=NUIT, highlightthickness=0)
+        self.brin = tk.Canvas(bande, height=self.px(104), bg=NUIT, highlightthickness=0)
         self.brin.pack(fill="x")
         self.n_bulbes = 26
         self.cable = self.brin.create_line(0, 0, 0, 0, fill=FIL, width=1, smooth=True)
@@ -1226,17 +1336,19 @@ class Panneau:
         tk.Frame(self.root, bg=FIL, height=1).pack(fill="x")
 
     def placer_bulbes(self, largeur):
-        marge, creux = 30, 21
+        marge, creux = self.px(30), self.px(21)
         pas = (largeur - 2 * marge) / max(1, self.n_bulbes - 1)
         points = []
+        rayons = [self.px(19), self.px(13), self.px(8)]
+        coeur = self.px(34) / 10.0
         for i, bulbe in enumerate(self.bulbes):
             x = marge + i * pas
-            y = 47 + math.sin(i / (self.n_bulbes - 1) * math.pi) * creux
+            y = self.px(47) + math.sin(i / (self.n_bulbes - 1) * math.pi) * creux
             bulbe[2], bulbe[3] = x, y
             points += [x, y]
-            for r, h in zip((19, 13, 8), bulbe[0]):
+            for r, h in zip(rayons, bulbe[0]):
                 self.brin.coords(h, x - r, y - r, x + r, y + r)
-            self.brin.coords(bulbe[1], x - 3.4, y - 3.4, x + 3.4, y + 3.4)
+            self.brin.coords(bulbe[1], x - coeur, y - coeur, x + coeur, y + coeur)
         if len(points) >= 4:
             self.brin.coords(self.cable, *points)
 
@@ -1266,7 +1378,7 @@ class Panneau:
 
     def construire_rail(self):
         tk = self.tk
-        tk.Frame(self.rail, bg=NUIT, height=10).pack()
+        tk.Frame(self.rail, bg=NUIT, height=self.px(10)).pack()
         for cle, libelle in SECTIONS:
             if not cle:                       # intitule de groupe, non cliquable
                 self.titre(self.rail, libelle).pack(
@@ -1365,9 +1477,11 @@ class Panneau:
                              font=(self.f_mono, 8), anchor="w")
 
     def texte(self, parent, txt, couleur=BRUME, taille=9, gras=False, largeur=520):
+        # largeur est pensee en 96 ppp comme le reste : sans mise a l'echelle,
+        # les paragraphes se replieraient beaucoup trop tot sur un 4K.
         return self.tk.Label(parent, text=txt, bg=parent["bg"], fg=couleur,
                              font=(self.f_ui, taille, "bold" if gras else "normal"),
-                             anchor="w", justify="left", wraplength=largeur)
+                             anchor="w", justify="left", wraplength=self.px(largeur))
 
     def champ(self, parent, valeur, largeur=18):
         e = self.tk.Entry(parent, bg=ENCRE, fg=CRAIE, insertbackground=CRAIE,
@@ -1382,7 +1496,8 @@ class Panneau:
             parent, text="  " + texte, variable=variable, command=action,
             bg=parent["bg"], fg=CRAIE, selectcolor=ENCRE, activebackground=parent["bg"],
             activeforeground=CRAIE, relief="flat", bd=0, font=(self.f_ui, 9),
-            anchor="w", highlightthickness=0, wraplength=470, justify="left")
+            anchor="w", highlightthickness=0, wraplength=self.px(470),
+            justify="left")
 
     def radio(self, parent, texte, variable, valeur):
         return self.tk.Radiobutton(
@@ -1405,26 +1520,29 @@ class Panneau:
         self.texte(bloc, aide, BRUME, 8, largeur=460).pack(fill="x", pady=(0, 2))
 
         v = tk.DoubleVar(value=float(self.cfg.get(cle, mini)))
-        toile = tk.Canvas(bloc, height=22, bg=NUIT, highlightthickness=0,
+        toile = tk.Canvas(bloc, height=self.px(22), bg=NUIT, highlightthickness=0,
                           cursor="hand2", takefocus=1)
         toile.pack(fill="x")
-        marge, y = 11, 11
-        rail = toile.create_line(0, y, 0, y, fill=ENCRE, width=6, capstyle="round")
-        plein = toile.create_line(0, y, 0, y, fill=self.accent, width=6, capstyle="round")
+        marge, y = self.px(11), self.px(11)
+        epais = self.px(6)
+        rail = toile.create_line(0, y, 0, y, fill=ENCRE, width=epais, capstyle="round")
+        plein = toile.create_line(0, y, 0, y, fill=self.accent, width=epais,
+                                  capstyle="round")
         poignee = toile.create_oval(0, 0, 0, 0, fill=CRAIE, outline="")
 
         def peindre(*_):
-            largeur = max(60, toile.winfo_width())
+            largeur = max(self.px(60), toile.winfo_width())
             part = (v.get() - mini) / float(maxi - mini)
             x = marge + part * (largeur - 2 * marge)
+            r = self.px(7)
             toile.coords(rail, marge, y, largeur - marge, y)
             toile.coords(plein, marge, y, max(marge, x), y)
-            toile.coords(poignee, x - 7, y - 7, x + 7, y + 7)
+            toile.coords(poignee, x - r, y - r, x + r, y + r)
             toile.itemconfig(plein, fill=self.accent)
             val.configure(text=f"{int(v.get())}" if entier else f"{v.get():.2f}")
 
         def poser(evenement):
-            largeur = max(60, toile.winfo_width())
+            largeur = max(self.px(60), toile.winfo_width())
             part = (evenement.x - marge) / float(largeur - 2 * marge)
             brut = mini + max(0.0, min(1.0, part)) * (maxi - mini)
             v.set(round(brut / pas) * pas)
@@ -1438,7 +1556,8 @@ class Panneau:
         toile.bind("<Button-1>", lambda e: (toile.focus_set(), poser(e)))
         toile.bind("<B1-Motion>", poser)
         toile.bind("<Key>", flecher)
-        toile.bind("<FocusIn>", lambda e: toile.itemconfig(poignee, outline=self.accent, width=3))
+        toile.bind("<FocusIn>", lambda e: toile.itemconfig(poignee, outline=self.accent,
+                                                          width=self.px(3)))
         toile.bind("<FocusOut>", lambda e: toile.itemconfig(poignee, outline=""))
         self.reglettes.append(peindre)
         peindre()
@@ -1460,7 +1579,7 @@ class Panneau:
         source = tk.Label(haut, text="", bg=NUIT, fg=BRUME, font=(self.f_ui, 8))
         source.pack(side="right", padx=(0, 10))
 
-        toile = tk.Canvas(bloc, height=14, bg=NUIT, highlightthickness=0)
+        toile = tk.Canvas(bloc, height=self.px(14), bg=NUIT, highlightthickness=0)
         toile.pack(fill="x", pady=(3, 0))
         rail = toile.create_rectangle(0, 0, 0, 0, outline="", fill=ENCRE)
         plein = toile.create_rectangle(0, 0, 0, 0, outline="", fill=self.accent)
@@ -1468,10 +1587,11 @@ class Panneau:
                 "val": val, "source": source}
 
     def poser_jauge(self, j, valeur, pilotee):
-        largeur = max(20, j["toile"].winfo_width())
+        largeur = max(self.px(20), j["toile"].winfo_width())
         valeur = max(0.0, min(1.0, float(valeur)))
-        j["toile"].coords(j["rail"], 0, 4, largeur, 12)
-        j["toile"].coords(j["plein"], 0, 4, largeur * valeur, 12)
+        haut, bas = self.px(4), self.px(12)
+        j["toile"].coords(j["rail"], 0, haut, largeur, bas)
+        j["toile"].coords(j["plein"], 0, haut, largeur * valeur, bas)
         j["toile"].itemconfig(j["plein"], fill=self.accent if pilotee else FIL)
         j["val"].configure(text="%3d %%" % round(valeur * 100))
         j["source"].configure(text="pilotee par le son" if pilotee else "fixe",
@@ -1520,8 +1640,8 @@ class Panneau:
         dedans.pack(fill="both", expand=True)
 
         self._fond_ampoule = VELOURS
-        self.ampoule = tk.Canvas(dedans, width=96, height=112, bg=VELOURS,
-                                 highlightthickness=0)
+        self.ampoule = tk.Canvas(dedans, width=self.px(96), height=self.px(112),
+                                 bg=VELOURS, highlightthickness=0)
         self.ampoule.pack()
         self._dessiner_ampoule()
 
@@ -1568,23 +1688,29 @@ class Panneau:
         corps = teinte if vif else sourd
         arriere = hex_vers_rgb(fond)
 
+        e = self.px          # tout le dessin est pense en 96 ppp
+        cx, cy = e(48), e(46)
+
         for rayon, part in ((44, 0.10), (36, 0.16), (29, 0.26)):
-            c.create_oval(48 - rayon, 46 - rayon, 48 + rayon, 46 + rayon,
+            r = e(rayon)
+            c.create_oval(cx - r, cy - r, cx + r, cy + r,
                           outline="", fill=melange(corps, arriere, part))
-        c.create_oval(48 - 23, 46 - 23, 48 + 23, 46 + 23, outline="",
+        r = e(23)
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline="",
                       fill=melange(corps, arriere, 0.85 if vif else 0.45))
         # filament
-        c.create_line(40, 50, 44, 40, 48, 50, 52, 40, 56, 50,
+        c.create_line(e(40), e(50), e(44), e(40), cx, e(50), e(52), e(40),
+                      e(56), e(50),
                       fill=melange((255, 255, 255), corps, 0.55 if vif else 0.2),
-                      width=2, smooth=True)
+                      width=e(2), smooth=True)
         # culot
-        c.create_rectangle(39, 68, 57, 74, outline="",
+        c.create_rectangle(e(39), e(68), e(57), e(74), outline="",
                            fill=melange(corps, arriere, 0.35))
         for y in (78, 84, 90):
-            c.create_line(39, y, 57, y, fill=melange((190, 175, 205), arriere, 0.5),
-                          width=3)
-        c.create_arc(39, 92, 57, 102, start=180, extent=180, outline="",
-                     fill=melange((190, 175, 205), arriere, 0.4))
+            c.create_line(e(39), e(y), e(57), e(y),
+                          fill=melange((190, 175, 205), arriere, 0.5), width=e(3))
+        c.create_arc(e(39), e(92), e(57), e(102), start=180, extent=180,
+                     outline="", fill=melange((190, 175, 205), arriere, 0.4))
 
     def tuile_a_venir(self, parent):
         """Place tenue pour le prochain outil. Une grille a une seule tuile
@@ -1636,7 +1762,7 @@ class Panneau:
         self.separateur(f)
 
         self.titre(f, "activite recente").pack(fill="x", pady=(0, 5))
-        self.bande = tk.Canvas(f, height=26, bg=ENCRE, highlightthickness=0)
+        self.bande = tk.Canvas(f, height=self.px(26), bg=ENCRE, highlightthickness=0)
         self.bande.pack(fill="x")
         self.historique = []
         self.traits = []
@@ -1730,7 +1856,8 @@ class Panneau:
         rang.winfo_children()[-1].bind("<Button-1>", lambda e: monter())
 
         couleur = {"v": regle.get("couleur", "#FFFFFF")}
-        boite = tk.Frame(rang, bg=couleur["v"], width=22, height=22, cursor="hand2")
+        boite = tk.Frame(rang, bg=couleur["v"], width=self.px(22),
+                         height=self.px(22), cursor="hand2")
         boite.pack(side="left", padx=(0, 10))
         boite.pack_propagate(False)
 
@@ -1888,7 +2015,7 @@ class Panneau:
 
         self.separateur(f, 12, 8)
         self.titre(f, "niveaux en direct").pack(fill="x", pady=(0, 5))
-        self.vumetre = tk.Canvas(f, height=66, bg=ENCRE, highlightthickness=0)
+        self.vumetre = tk.Canvas(f, height=self.px(66), bg=ENCRE, highlightthickness=0)
         self.vumetre.pack(fill="x")
         self.barres = []
         for i in range(3):
@@ -2007,6 +2134,19 @@ class Panneau:
             "15 a 20 suffisent pour le son. Baisse si la guirlande saccade.",
             entier=True)
 
+        self.separateur(f, 14, 8)
+        self.titre(f, "affichage").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Detectee sur l'ecran au demarrage. A forcer seulement si "
+                      "l'interface sort trop petite ou trop grande — un ecran 4K "
+                      "qui se declare a tort en 96 points par pouce, par exemple. "
+                      "Le changement prend effet au prochain lancement.",
+                   BRUME, 8, largeur=490).pack(fill="x", pady=(0, 10))
+        self.var_echelle = self.reglette(
+            f, "echelle_interface", "Echelle de l'interface", 0.0, 3.0, 0.25,
+            "0 = automatique. 1.00 = ecran classique, 1.50 = 4K a 150 %%, "
+            "2.00 = 4K a 200 %%. Detectee ici : %.2f." % self.echelle)
+
+        self.separateur(f, 14, 8)
         self.var_cpu = tk.IntVar(value=1 if self.cfg.get("reaction_processeur", True) else 0)
         self.case(f, "La charge du processeur module la luminosite — mode Regles",
                   self.var_cpu).pack(fill="x")
@@ -2026,7 +2166,7 @@ class Panneau:
                  font=(self.f_titre, 17), anchor="w").pack(fill="x", pady=(4, 6))
         self.txt_maj = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
                                 font=(self.f_ui, 9), anchor="w", justify="left",
-                                wraplength=460)
+                                wraplength=self.px(460))
         self.txt_maj.pack(fill="x")
 
         barre = tk.Frame(f, bg=NUIT)
@@ -2258,6 +2398,7 @@ class Panneau:
             val = var.get()
             self.cfg[cle] = int(val) if cle in ("veille_minutes", "images_par_seconde") else round(val, 3)
         self.cfg["reaction_processeur"] = bool(self.var_cpu.get())
+        self.cfg["echelle_interface"] = round(self.var_echelle.get(), 2)
         self.cfg["mode"] = self.var_mode.get()
         source = self.var_source.get()
         self.cfg["ecran_source"] = source if source == "actif" else int(source)
@@ -2394,7 +2535,7 @@ class Panneau:
         """Un trait par mesure : environ une minute d'historique visible."""
         self.historique.append(hexa)
         largeur = max(1, self.bande.winfo_width())
-        capacite = max(20, largeur // 4)
+        capacite = max(20, largeur // self.px(4))
         del self.historique[:-capacite]
         while len(self.traits) < capacite:
             self.traits.append(self.bande.create_rectangle(
@@ -2405,7 +2546,7 @@ class Panneau:
             j = i - debut
             couleur = self.historique[j] if 0 <= j < len(self.historique) else ENCRE
             x = i * pas
-            self.bande.coords(trait, x, 0, x + pas + 1, 26)
+            self.bande.coords(trait, x, 0, x + pas + 1, self.px(26))
             self.bande.itemconfig(trait, fill=couleur)
 
     def appliquer_accent(self):
@@ -2883,6 +3024,8 @@ def ecrire_icone(chemin):
 
 def lancer():
     global CFG
+    identite_barre_taches()
+    activer_dpi()
     CFG = charger_config()
     premiere_fois = not str(CFG.get("adresse", "")).strip()
     nettoyer_maj()      # efface l'exe telecharge par la mise a jour precedente

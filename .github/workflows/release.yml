@@ -4,10 +4,16 @@ name: Publication
 # GitHub. C'est cette publication que les exemplaires deja installes
 # viennent lire pour se mettre a jour tout seuls.
 #
-# Deux facons de declencher :
-#   - pousser un tag : git tag v1.2.0 && git push origin v1.2.0
-#   - onglet Actions > Publication > Run workflow
-# Dans les deux cas le numero vient de VERSION dans le source.
+# La regle tient en une phrase : une publication nait des que VERSION
+# porte un numero encore jamais publie. Monter VERSION dans une pull
+# request suffit donc — la fusionner sur main sort la version. Pas de tag
+# a poser a la main, pas d'etape oubliee entre le code et l'exe.
+#
+# Une poussee sur main qui ne change pas VERSION ne fait qu'un build de
+# controle : l'exe part en artefact, la publication existante n'est pas
+# touchee. Poser un tag ou lancer le workflow a la main remplace en
+# revanche les fichiers d'une publication deja sortie, pour rattraper un
+# binaire rate sans changer de numero.
 
 on:
   push:
@@ -81,20 +87,38 @@ jobs:
           retention-days: 30
 
       - name: Publication GitHub
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publier
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REFERENCE: ${{ github.ref }}
+          FORCEE: ${{ inputs.publier }}
         run: |
           set -euo pipefail
-          tag="v${{ steps.version.outputs.numero }}"
+          numero="${{ steps.version.outputs.numero }}"
+          tag="v$numero"
           fichiers="dist/MachiTool.exe dist/MachiTool.exe.sha256"
+
           if gh release view "$tag" > /dev/null 2>&1; then
-            echo "Publication $tag deja presente : remplacement des fichiers."
-            gh release upload "$tag" $fichiers --clobber
+            deja=oui
           else
-            gh release create "$tag" $fichiers \
-              --title "Machi Tool ${{ steps.version.outputs.numero }}" \
-              --generate-notes
+            deja=non
           fi
-          echo "Publiee : $(gh release view "$tag" --json url --jq .url)"
+
+          # Un tag pousse ou un lancement a la main disent explicitement
+          # « sors cette version », meme si elle est deja sortie.
+          explicite=non
+          case "$REFERENCE" in refs/tags/*) explicite=oui ;; esac
+          [ "$FORCEE" = "true" ] && explicite=oui
+
+          if [ "$deja" = "non" ]; then
+            gh release create "$tag" $fichiers \
+              --title "Machi Tool $numero" \
+              --generate-notes
+            echo "Nouvelle publication : $(gh release view "$tag" --json url --jq .url)"
+          elif [ "$explicite" = "oui" ]; then
+            gh release upload "$tag" $fichiers --clobber
+            echo "Fichiers remplaces : $(gh release view "$tag" --json url --jq .url)"
+          else
+            echo "$tag est deja publiee et VERSION n'a pas bouge."
+            echo "Build de controle seulement, l'exe est en artefact."
+          fi

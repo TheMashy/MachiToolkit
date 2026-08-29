@@ -90,34 +90,46 @@ Trois cases dans l'onglet **Mises a jour** du panneau :
 Rien ne sort de la machine : la verification est une lecture, pas un envoi.
 Le numero de version installe lui-meme n'est pas transmis.
 
+## Ecrans haute resolution
+
+L'interface se met a l'echelle de l'ecran au demarrage. Sur un 4K a 150 ou
+200 %, la fenetre, les caracteres et les dessins grandissent d'autant, sans
+le flou qu'on obtient en laissant Windows agrandir l'image.
+
+Si la detection se trompe, **Reglages > Affichage > Echelle de l'interface**
+force une valeur : 1.00 pour un ecran classique, 1.50 pour un 4K a 150 %,
+2.00 pour un 4K a 200 %. Zero rend la main a la detection. Le changement
+prend effet au lancement suivant.
+
 ## Publier une nouvelle version
 
-Le workflow `.github/workflows/release.yml` compile sous Windows et joint
-l'exe a une publication GitHub. C'est cette publication que les exemplaires
-deja installes viennent lire.
+La regle tient en une phrase : **une publication nait des que `VERSION`
+porte un numero encore jamais publie.**
 
 1. Faire ses modifications.
-2. Monter `VERSION` dans `machi_tool.py` — c'est la seule source de
-   verite pour le numero de version.
-3. Commiter, puis poser le tag correspondant :
+2. Monter `VERSION` dans `machi_tool.py` — seule source de verite pour le
+   numero de version.
+3. Fusionner sur `main`.
 
-   ```bash
-   git commit -am "ce qui a change"
-   git tag v1.2.0
-   git push origin main --tags
-   ```
+C'est tout. Le workflow compile sous Windows, calcule l'empreinte SHA-256,
+cree la publication `v1.4.0` avec des notes generees a partir des commits
+et y joint `MachiTool.exe`. Compter deux minutes. Les exemplaires installes
+la proposeront a leur prochaine verification.
 
-Le workflow verifie que le tag et `VERSION` disent la meme chose, compile,
-calcule l'empreinte SHA-256 et cree la publication `v1.2.0` avec des notes
-generees a partir des commits. Compter six a dix minutes. Les exemplaires
-installes la proposeront a leur prochaine verification.
+Une poussee sur `main` qui ne change pas `VERSION` ne fait qu'un build de
+controle : l'exe part en artefact, la publication existante n'est pas
+touchee.
 
-Sans tag, l'onglet **Actions > Publication > Run workflow** fait la meme
-chose en prenant le numero directement dans le source.
+Poser un tag `v1.4.0` a la main, ou lancer **Actions > Publication > Run
+workflow**, remplace les fichiers d'une publication deja sortie — utile
+pour rattraper un binaire rate sans changer de numero. Un tag qui ne
+concorde pas avec `VERSION` est refuse, plutot que de publier un exe qui se
+croirait plus ancien que sa propre publication et se proposerait sa mise a
+jour en boucle.
 
-Se tromper de numero est sans gravite : le workflow refuse un tag qui ne
-concorde pas, plutot que de publier un exe qui se croirait plus ancien que
-sa propre publication et se proposerait sa mise a jour en boucle.
+Le nom du tag n'est pas decoratif : c'est lui que l'application compare a
+son propre `VERSION`. Il lui faut la forme `v1.4.0`. Un tag `v01` serait lu
+comme la version 1.0.0 et ignore par toute installation plus recente.
 
 ## Compiler a la main
 
