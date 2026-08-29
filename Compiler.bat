@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title Guirlande ambiante - compilation
+title Machi Tool - compilation
 cd /d "%~dp0"
 color 0D
 
@@ -10,11 +10,11 @@ echo      COMPILATION DE L'EXE
 echo   ================================================
 echo.
 echo   A faire une seule fois. Duree : 3 a 6 minutes.
-echo   Resultat : dist\GuirlandeAmbiante.exe
+echo   Resultat : dist\MachiTool.exe
 echo.
 
-if not exist "%~dp0guirlande_ambiante.py" (
-    echo   ERREUR : guirlande_ambiante.py est introuvable.
+if not exist "%~dp0machi_tool.py" (
+    echo   ERREUR : machi_tool.py est introuvable.
     echo   Les deux fichiers doivent etre dans le meme dossier.
     echo.
     pause
@@ -90,19 +90,19 @@ echo.
 
 REM ---------- 3. icone ----------
 echo   [3/4] Generation de l'icone...
-%PY% "%~dp0guirlande_ambiante.py" --icone
+%PY% "%~dp0machi_tool.py" --icone
 echo.
 
 REM ---------- 4. compilation ----------
 echo   [4/4] Compilation. Longue etape, ne ferme pas la fenetre.
 echo.
-echo         Recette : GuirlandeAmbiante.spec, la meme que celle du
+echo         Recette : MachiTool.spec, la meme que celle du
 echo         workflow GitHub. Les deux sortent donc le meme exe.
 echo.
 
-%PY% -m PyInstaller --noconfirm --clean "%~dp0GuirlandeAmbiante.spec"
+%PY% -m PyInstaller --noconfirm --clean "%~dp0MachiTool.spec"
 
-if not exist "%~dp0dist\GuirlandeAmbiante.exe" (
+if not exist "%~dp0dist\MachiTool.exe" (
     echo.
     echo   La compilation a echoue. Colle les dernieres lignes rouges
     echo   ci-dessus pour qu'on regarde ce qui manque.
@@ -116,10 +116,10 @@ echo   ================================================
 echo      TERMINE
 echo   ================================================
 echo.
-echo   Ton fichier : dist\GuirlandeAmbiante.exe
+echo   Ton fichier : dist\MachiTool.exe
 echo.
 echo   Double-clic dessus pour installer. Il se copie dans
-echo   %%LOCALAPPDATA%%\GuirlandeAmbiante, s'ajoute au demarrage
+echo   %%LOCALAPPDATA%%\MachiTool, s'ajoute au demarrage
 echo   de Windows et se lance.
 echo.
 echo   Une fois installee, l'application se met a jour toute seule :

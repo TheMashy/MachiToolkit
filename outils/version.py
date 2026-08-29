@@ -1,4 +1,4 @@
-"""Lit la version declaree dans guirlande_ambiante.py.
+"""Lit la version declaree dans machi_tool.py.
 
 VERSION dans le source est la seule source de verite. Le workflow s'en sert
 pour nommer la publication, et verifie qu'un tag pousse a la main dit bien
@@ -15,7 +15,7 @@ import re
 import sys
 
 RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SOURCE = os.path.join(RACINE, "guirlande_ambiante.py")
+SOURCE = os.path.join(RACINE, "machi_tool.py")
 
 
 def version():
@@ -33,7 +33,7 @@ def main():
         if attendue != courante:
             sys.exit(
                 "Le tag dit %s mais VERSION dit %s.\n"
-                "Corrige VERSION dans guirlande_ambiante.py, ou repose le tag."
+                "Corrige VERSION dans machi_tool.py, ou repose le tag."
                 % (attendue, courante))
         print("tag et VERSION concordent : %s" % courante)
         return

@@ -3,7 +3,7 @@
 # Recette de compilation unique, partagee par Compiler.bat et par le
 # workflow GitHub : les deux produisent exactement le meme exe.
 #
-#     pyinstaller --noconfirm --clean GuirlandeAmbiante.spec
+#     pyinstaller --noconfirm --clean MachiTool.spec
 #
 # Les chemins sont relatifs a ce fichier (SPECPATH), jamais absolus :
 # un chemin en dur ne compilerait que sur la machine qui l'a ecrit.
@@ -34,7 +34,7 @@ for paquet in ('bleak', 'winrt', 'mss', 'soundcard'):
 icone = os.path.join(RACINE, 'icone.ico')
 
 a = Analysis(
-    [os.path.join(RACINE, 'guirlande_ambiante.py')],
+    [os.path.join(RACINE, 'machi_tool.py')],
     pathex=[RACINE],
     binaries=binaries,
     datas=datas,
@@ -54,7 +54,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='GuirlandeAmbiante',
+    name='MachiTool',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

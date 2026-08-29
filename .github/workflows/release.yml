@@ -52,32 +52,32 @@ jobs:
         run: python outils/version.py --verifier "${GITHUB_REF_NAME}"
 
       - name: Icone
-        run: python guirlande_ambiante.py --icone
+        run: python machi_tool.py --icone
 
       - name: Compilation
-        run: pyinstaller --noconfirm --clean GuirlandeAmbiante.spec
+        run: pyinstaller --noconfirm --clean MachiTool.spec
 
       - name: Empreinte SHA-256
         shell: pwsh
         run: |
-          $empreinte = (Get-FileHash dist/GuirlandeAmbiante.exe -Algorithm SHA256).Hash.ToLower()
-          "$empreinte  GuirlandeAmbiante.exe" |
-            Out-File -Encoding ascii dist/GuirlandeAmbiante.exe.sha256
+          $empreinte = (Get-FileHash dist/MachiTool.exe -Algorithm SHA256).Hash.ToLower()
+          "$empreinte  MachiTool.exe" |
+            Out-File -Encoding ascii dist/MachiTool.exe.sha256
           Write-Host "SHA-256 : $empreinte"
 
       - name: Verification du binaire
         shell: pwsh
         run: |
-          $exe = Get-Item dist/GuirlandeAmbiante.exe
+          $exe = Get-Item dist/MachiTool.exe
           Write-Host ("taille : {0:N1} Mo" -f ($exe.Length / 1MB))
           if ($exe.Length -lt 8MB) { throw "exe suspect : trop petit" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: GuirlandeAmbiante-${{ steps.version.outputs.numero }}
+          name: MachiTool-${{ steps.version.outputs.numero }}
           path: |
-            dist/GuirlandeAmbiante.exe
-            dist/GuirlandeAmbiante.exe.sha256
+            dist/MachiTool.exe
+            dist/MachiTool.exe.sha256
           retention-days: 30
 
       - name: Publication GitHub
@@ -88,13 +88,13 @@ jobs:
         run: |
           set -euo pipefail
           tag="v${{ steps.version.outputs.numero }}"
-          fichiers="dist/GuirlandeAmbiante.exe dist/GuirlandeAmbiante.exe.sha256"
+          fichiers="dist/MachiTool.exe dist/MachiTool.exe.sha256"
           if gh release view "$tag" > /dev/null 2>&1; then
             echo "Publication $tag deja presente : remplacement des fichiers."
             gh release upload "$tag" $fichiers --clobber
           else
             gh release create "$tag" $fichiers \
-              --title "Guirlande ambiante ${{ steps.version.outputs.numero }}" \
+              --title "Machi Tool ${{ steps.version.outputs.numero }}" \
               --generate-notes
           fi
           echo "Publiee : $(gh release view "$tag" --json url --jq .url)"

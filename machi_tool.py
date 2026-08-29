@@ -1,5 +1,10 @@
 """
-Guirlande ambiante — eclairage procedural pilote par ce qui est a l'ecran.
+Machi Tool — boite a outils pour la workstation, logee dans la barre des
+taches de Windows.
+
+Un seul module pour l'instant, Lumiere : une guirlande Bluetooth dont la
+couleur suit ce qui se passe a l'ecran. L'accueil porte un bouton par
+module ; les suivants viendront s'y ajouter.
 
 Compile en un seul .exe portable. Cet exe fait tout :
   - lance depuis n'importe ou    -> s'installe dans %LOCALAPPDATA%, se lance
@@ -31,8 +36,16 @@ import http.server
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
-NOM_EXE = "GuirlandeAmbiante.exe"
+VERSION = "1.2.0"
+
+NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
+NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
+NOM_EXE = NOM_COURT + ".exe"
+
+# L'application s'appelait GuirlandeAmbiante jusqu'a la 1.1. Une installation
+# de cette epoque doit retrouver ses reglages sous le nouveau nom, sinon la
+# mise a jour ressemble a une perte de configuration.
+ANCIEN_NOM = "GuirlandeAmbiante"
 
 # Depot d'ou viennent les mises a jour. Une seule ligne a changer si le
 # projet demenage ou si une autre application du toolkit reprend ce module.
@@ -46,11 +59,15 @@ FIGE = getattr(sys, "frozen", False)
 # sans afficher la moindre fenetre.
 SILENCIEUX = "--maj-silencieuse" in sys.argv
 
+_LOCAL = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+
 if FIGE:
-    DOSSIER = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                           "GuirlandeAmbiante")
+    DOSSIER = os.path.join(_LOCAL, NOM_COURT)
 else:
     DOSSIER = os.path.dirname(os.path.abspath(__file__))
+
+ANCIEN_DOSSIER = os.path.join(_LOCAL, ANCIEN_NOM)
+ANCIEN_EXE = os.path.join(ANCIEN_DOSSIER, ANCIEN_NOM + ".exe")
 
 try:
     os.makedirs(DOSSIER, exist_ok=True)
@@ -126,6 +143,14 @@ CONFIG_DEFAUT = {
     "son_plancher": 0.06,
     "son_attaque": 0.55,             # montee : eleve = coup sec
     "son_chute": 0.12,               # descente : bas = trainee douce
+
+    # Ce que le son fait bouger. Ce qu'il ne pilote pas garde sa valeur
+    # fixe : saturer en permanence et ne laisser respirer que la
+    # luminosite donne une couleur franche, la ou tout piloter delave les
+    # passages calmes en blanc.
+    "son_cible": "luminosite",       # luminosite | saturation | les_deux
+    "son_saturation_fixe": 0.92,
+    "son_luminosite_fixe": 1.0,
 
     # Passerelle HTTP locale : permet a un site web de piloter la guirlande.
     # Fermee par defaut — sans jeton ni liste d'origines, n'importe quelle page
@@ -352,6 +377,11 @@ AUDIO = {
     "centroide": 0.5,
     "actif": False,
     "message": "arrete",
+    # Dernieres valeurs posees par couleur_son, pour que le panneau montre
+    # exactement ce que le son est en train de faire.
+    "niveau": 0.0,
+    "saturation": 0.0,
+    "gain": 0.0,
 }
 
 BANDES = (("graves", 30, 250), ("mediums", 250, 2000), ("aigus", 2000, 16000))
@@ -445,24 +475,56 @@ def arreter_audio():
     SON["marche"] = False
 
 
+def resaturer(rgb, saturation):
+    """Repose une couleur a la saturation voulue, teinte et valeur gardees."""
+    t, _, v = colorsys.rgb_to_hsv(*[c / 255.0 for c in rgb])
+    r, g, b = colorsys.hsv_to_rgb(t, max(0.0, min(1.0, saturation)), v)
+    return (r * 255, g * 255, b * 255)
+
+
 def couleur_son(cfg, couleur_regle):
-    """((r, v, b), gain) a partir de la derniere analyse."""
+    """((r, v, b), gain) a partir de la derniere analyse.
+
+    Le son pilote la luminosite, la saturation, ou les deux. Ce qu'il ne
+    pilote pas reste a sa valeur fixe : c'est ce qui permet de garder la
+    guirlande franchement saturee en permanence et de ne laisser respirer
+    que la luminosite.
+    """
     bande = cfg.get("son_bande", "graves")
     niveau = AUDIO.get(bande, AUDIO["tout"])
     palette = cfg.get("son_palette", "chaud_froid")
+    cible = cfg.get("son_cible", "luminosite")
+
+    plancher = float(cfg.get("son_plancher", 0.06))
+    module = plancher + (1.0 - plancher) * niveau     # 0..1, colle au son
+
+    sat_fixe = float(cfg.get("son_saturation_fixe", 0.92))
+    lum_fixe = float(cfg.get("son_luminosite_fixe", 1.0))
+    sat_pilotee = cible in ("saturation", "les_deux")
+    lum_pilotee = cible in ("luminosite", "les_deux")
+
+    # Pilotee, la saturation va de zero a la valeur fixe : celle-ci sert
+    # alors de plafond plutot que de consigne.
+    saturation = module * sat_fixe if sat_pilotee else sat_fixe
+    gain = module if lum_pilotee else lum_fixe
 
     if palette == "regle":
-        rvb = couleur_regle
+        # Sans pilotage de la saturation, la couleur de la regle est
+        # rendue telle quelle : on ne redresse que ce qui doit bouger.
+        rvb = resaturer(couleur_regle, saturation) if sat_pilotee else couleur_regle
     else:
         if palette == "arc":
             teinte = AUDIO["centroide"]
         else:                                   # chaud vers froid
             teinte = 0.02 + 0.52 * AUDIO["centroide"]
-        r, v, b = colorsys.hsv_to_rgb(teinte % 1.0, 0.92, 1.0)
+        r, v, b = colorsys.hsv_to_rgb(teinte % 1.0,
+                                      max(0.0, min(1.0, saturation)), 1.0)
         rvb = (r * 255, v * 255, b * 255)
 
-    plancher = float(cfg.get("son_plancher", 0.06))
-    return rvb, plancher + (1.0 - plancher) * niveau
+    AUDIO["niveau"] = niveau
+    AUDIO["saturation"] = saturation
+    AUDIO["gain"] = gain
+    return rvb, gain
 
 
 # ==========================================================================
@@ -865,14 +927,21 @@ ALERTE  = "#FF8A6B"   # deconnecte
 
 NUIT_RGB = hex_vers_rgb(NUIT)
 
-SECTIONS = [("etat",      "Etat"),
+# Le rail suit l'idee du toolkit : l'accueil en haut, puis les pages du
+# module ouvert. Une entree ("", "Titre") est un intitule de groupe, pas
+# une page — c'est ce qui fera la separation le jour ou un deuxieme
+# module viendra s'ajouter sous le premier.
+SECTIONS = [("accueil",   "Accueil"),
+            ("",          "Lumiere"),
+            ("etat",      "Etat"),
             ("regles",    "Regles"),
             ("ecran",     "Ecran"),
             ("son",       "Son"),
             ("reglages",  "Reglages"),
-            ("maj",       "Mises a jour"),
             ("site",      "Site web"),
-            ("appairage", "Appairage")]
+            ("appairage", "Appairage"),
+            ("",          "Application"),
+            ("maj",       "Mises a jour")]
 
 
 def melange(avant, arriere, part):
@@ -905,7 +974,7 @@ class Panneau:
         self.declencher_maj = lambda quoi="verifier": None
 
         self.root = tk.Tk()
-        self.root.title("Guirlande ambiante")
+        self.root.title(NOM_APP)
         self.root.geometry("780x700")
         self.root.minsize(720, 640)
         self.root.configure(bg=NUIT)
@@ -943,6 +1012,7 @@ class Panneau:
         self.zone = tk.Frame(corps, bg=NUIT)
         self.zone.pack(side="left", fill="both", expand=True)
 
+        self.page_accueil()
         self.page_etat()
         self.page_regles()
         self.page_ecran()
@@ -951,7 +1021,7 @@ class Panneau:
         self.page_maj()
         self.page_site()
         self.page_appairage()
-        self.aller("etat")
+        self.aller("accueil")
 
         self.animer()
         self.rafraichir()
@@ -979,7 +1049,7 @@ class Panneau:
 
         ligne = tk.Frame(self.root, bg=NUIT, padx=22)
         ligne.pack(fill="x", pady=(0, 12))
-        self.txt_titre = tk.Label(ligne, text="G U I R L A N D E", bg=NUIT, fg=CRAIE,
+        self.txt_titre = tk.Label(ligne, text="M A C H I   T O O L", bg=NUIT, fg=CRAIE,
                                   font=(self.f_titre, 19), anchor="w")
         self.txt_titre.pack(side="left")
         self.txt_trame = tk.Label(ligne, text="", bg=NUIT, fg=BRUME,
@@ -1034,6 +1104,10 @@ class Panneau:
         tk = self.tk
         tk.Frame(self.rail, bg=NUIT, height=10).pack()
         for cle, libelle in SECTIONS:
+            if not cle:                       # intitule de groupe, non cliquable
+                self.titre(self.rail, libelle).pack(
+                    fill="x", padx=17, pady=(14, 4))
+                continue
             rang = tk.Frame(self.rail, bg=NUIT, cursor="hand2")
             rang.pack(fill="x")
             barre = tk.Frame(rang, bg=NUIT, width=3)
@@ -1206,8 +1280,165 @@ class Panneau:
         peindre()
         return v
 
+    def jauge(self, parent, libelle):
+        """Barre horizontale 0..1 avec sa valeur chiffree. Renvoie de quoi
+        la repeindre : la valeur seule ne dit pas si elle bouge parce que
+        le son la pilote ou parce qu'on l'a fixee, d'ou la mention a
+        droite."""
+        tk = self.tk
+        bloc = tk.Frame(parent, bg=NUIT)
+        bloc.pack(fill="x", pady=(0, 9))
+        haut = tk.Frame(bloc, bg=NUIT)
+        haut.pack(fill="x")
+        self.texte(haut, libelle, CRAIE, 9, True).pack(side="left")
+        val = tk.Label(haut, text="", bg=NUIT, fg=BRUME, font=(self.f_mono, 9))
+        val.pack(side="right")
+        source = tk.Label(haut, text="", bg=NUIT, fg=BRUME, font=(self.f_ui, 8))
+        source.pack(side="right", padx=(0, 10))
+
+        toile = tk.Canvas(bloc, height=14, bg=NUIT, highlightthickness=0)
+        toile.pack(fill="x", pady=(3, 0))
+        rail = toile.create_rectangle(0, 0, 0, 0, outline="", fill=ENCRE)
+        plein = toile.create_rectangle(0, 0, 0, 0, outline="", fill=self.accent)
+        return {"toile": toile, "rail": rail, "plein": plein,
+                "val": val, "source": source}
+
+    def poser_jauge(self, j, valeur, pilotee):
+        largeur = max(20, j["toile"].winfo_width())
+        valeur = max(0.0, min(1.0, float(valeur)))
+        j["toile"].coords(j["rail"], 0, 4, largeur, 12)
+        j["toile"].coords(j["plein"], 0, 4, largeur * valeur, 12)
+        j["toile"].itemconfig(j["plein"], fill=self.accent if pilotee else FIL)
+        j["val"].configure(text="%3d %%" % round(valeur * 100))
+        j["source"].configure(text="pilotee par le son" if pilotee else "fixe",
+                              fg=CRAIE if pilotee else BRUME)
+
     def separateur(self, parent, haut=14, bas=14):
         self.tk.Frame(parent, bg=FIL, height=1).pack(fill="x", pady=(haut, bas))
+
+    # ------------------------------------------------------------------
+    #  Page Accueil
+    #
+    #  L'entree du toolkit : une tuile par module. Il n'y en a qu'une pour
+    #  l'instant, mais la grille est deja faite pour en aligner d'autres,
+    #  et une tuile fantome montre ou elles se poseront.
+    # ------------------------------------------------------------------
+
+    def page_accueil(self):
+        tk = self.tk
+        f = self.nouvelle_page("accueil", marge_x=30, marge_y=26)
+
+        self.texte(f, NOM_APP.upper(), CRAIE, 9).pack(fill="x")
+        tk.Label(f, text="Mes outils", bg=NUIT, fg=CRAIE,
+                 font=(self.f_titre, 24), anchor="w").pack(fill="x", pady=(2, 2))
+        self.texte(f, "De quoi veux-tu t'occuper ?", BRUME, 9).pack(fill="x")
+
+        grille = tk.Frame(f, bg=NUIT)
+        grille.pack(fill="both", expand=True, pady=(22, 0))
+        grille.grid_columnconfigure(0, weight=1, uniform="tuile")
+        grille.grid_columnconfigure(1, weight=1, uniform="tuile")
+
+        self.tuile_lumiere(grille).grid(row=0, column=0, sticky="nsew", padx=(0, 9))
+        self.tuile_a_venir(grille).grid(row=0, column=1, sticky="nsew", padx=(9, 0))
+
+        self.texte(f, "Version %s — %s" % (VERSION, DOSSIER), BRUME, 8).pack(
+            fill="x", side="bottom", pady=(18, 0))
+
+    def tuile_lumiere(self, parent):
+        """Le gros bouton du module Lumiere. L'ampoule est dessinee plutot
+        qu'importee : pas de fichier image a embarquer, et elle peut
+        s'allumer a la couleur reelle de la guirlande."""
+        tk = self.tk
+        carte = tk.Frame(parent, bg=VELOURS, cursor="hand2",
+                         highlightthickness=1, highlightbackground=VELOURS)
+
+        dedans = tk.Frame(carte, bg=VELOURS, padx=22, pady=24)
+        dedans.pack(fill="both", expand=True)
+
+        self._fond_ampoule = VELOURS
+        self.ampoule = tk.Canvas(dedans, width=96, height=112, bg=VELOURS,
+                                 highlightthickness=0)
+        self.ampoule.pack()
+        self._dessiner_ampoule()
+
+        titre = tk.Label(dedans, text="Lumiere", bg=VELOURS, fg=CRAIE,
+                         font=(self.f_titre, 18))
+        titre.pack(pady=(14, 4))
+        detail = tk.Label(
+            dedans, text="Guirlande ambiante\nLa couleur suit l'ecran, le son\n"
+                         "ou l'application active",
+            bg=VELOURS, fg=BRUME, font=(self.f_ui, 9), justify="center")
+        detail.pack()
+        self.etat_tuile = tk.Label(dedans, text="", bg=VELOURS, fg=BRUME,
+                                   font=(self.f_mono, 8))
+        self.etat_tuile.pack(pady=(12, 0))
+
+        cibles = [carte, dedans, self.ampoule, titre, detail, self.etat_tuile]
+        for w in cibles:
+            w.bind("<Button-1>", lambda e: self.aller("etat"))
+            w.bind("<Enter>", lambda e: self._survol_tuile(carte, cibles, True))
+            w.bind("<Leave>", lambda e: self._survol_tuile(carte, cibles, False))
+        return carte
+
+    def _survol_tuile(self, carte, cibles, dedans):
+        fond = ENCRE if dedans else VELOURS
+        carte.configure(bg=fond,
+                        highlightbackground=self.accent if dedans else VELOURS)
+        for w in cibles[1:]:
+            try:
+                w.configure(bg=fond)
+            except Exception:
+                pass
+        self._fond_ampoule = fond
+        self._dessiner_ampoule(fond)
+
+    def _dessiner_ampoule(self, fond=VELOURS):
+        """Verre, culot, halo. Le halo prend la couleur courante de la
+        guirlande quand elle est connectee, gris quand elle ne l'est pas."""
+        c = self.ampoule
+        c.delete("all")
+        c.configure(bg=fond)
+        vif = ETAT["connecte"] and max(ETAT["couleur"]) > 8
+        teinte = ETAT["couleur"] if vif else hex_vers_rgb(self.accent)
+        sourd = (110, 92, 132)
+        corps = teinte if vif else sourd
+        arriere = hex_vers_rgb(fond)
+
+        for rayon, part in ((44, 0.10), (36, 0.16), (29, 0.26)):
+            c.create_oval(48 - rayon, 46 - rayon, 48 + rayon, 46 + rayon,
+                          outline="", fill=melange(corps, arriere, part))
+        c.create_oval(48 - 23, 46 - 23, 48 + 23, 46 + 23, outline="",
+                      fill=melange(corps, arriere, 0.85 if vif else 0.45))
+        # filament
+        c.create_line(40, 50, 44, 40, 48, 50, 52, 40, 56, 50,
+                      fill=melange((255, 255, 255), corps, 0.55 if vif else 0.2),
+                      width=2, smooth=True)
+        # culot
+        c.create_rectangle(39, 68, 57, 74, outline="",
+                           fill=melange(corps, arriere, 0.35))
+        for y in (78, 84, 90):
+            c.create_line(39, y, 57, y, fill=melange((190, 175, 205), arriere, 0.5),
+                          width=3)
+        c.create_arc(39, 92, 57, 102, start=180, extent=180, outline="",
+                     fill=melange((190, 175, 205), arriere, 0.4))
+
+    def tuile_a_venir(self, parent):
+        """Place tenue pour le prochain outil. Une grille a une seule tuile
+        se lit comme une page ratee ; avec ce fantome elle se lit comme une
+        collection qui commence."""
+        tk = self.tk
+        carte = tk.Frame(parent, bg=NUIT, highlightthickness=1,
+                         highlightbackground=FIL)
+        dedans = tk.Frame(carte, bg=NUIT, padx=22, pady=24)
+        dedans.pack(fill="both", expand=True)
+        tk.Frame(dedans, bg=NUIT, height=34).pack()
+        tk.Label(dedans, text="+", bg=NUIT, fg=FIL,
+                 font=(self.f_titre, 40)).pack()
+        tk.Label(dedans, text="Prochain outil", bg=NUIT, fg=BRUME,
+                 font=(self.f_ui, 11)).pack(pady=(14, 4))
+        tk.Label(dedans, text="La place est prete", bg=NUIT, fg=FIL,
+                 font=(self.f_ui, 9)).pack()
+        return carte
 
     # ------------------------------------------------------------------
     #  Page Etat
@@ -1469,6 +1700,35 @@ class Panneau:
                 ("arc",         "Arc-en-ciel \u2014 toute la roue des teintes"),
                 ("regle",       "Couleur de la regle \u2014 le son ne fait que la luminosite")):
             self.radio(f, libelle, self.var_palette, cle).pack(fill="x")
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "ce que le son fait bouger").pack(fill="x", pady=(0, 4))
+        self.var_cible = tk.StringVar(value=self.cfg.get("son_cible", "luminosite"))
+        for cle, libelle in (
+                ("luminosite", "La luminosite \u2014 couleur franche en permanence, "
+                               "seul l'eclat suit la musique"),
+                ("saturation", "La saturation \u2014 eclat constant, la couleur palit "
+                               "dans les passages calmes"),
+                ("les_deux",   "Les deux \u2014 la guirlande s'eteint et se delave "
+                               "ensemble")):
+            self.radio(f, libelle, self.var_cible, cle).pack(fill="x")
+
+        self.separateur(f, 12, 6)
+        self.var_sat_fixe = self.reglette(
+            f, "son_saturation_fixe", "Saturation", 0.0, 1.0, 0.02,
+            "Valeur tenue quand le son ne pilote pas la saturation. Quand il "
+            "la pilote, elle sert de plafond. 0 = blanc, 1 = couleur pure.")
+        self.var_lum_fixe = self.reglette(
+            f, "son_luminosite_fixe", "Luminosite", 0.05, 1.0, 0.05,
+            "Valeur tenue quand le son ne pilote pas la luminosite.")
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "effet du son en direct").pack(fill="x", pady=(0, 6))
+        self.jauge_lum = self.jauge(f, "Luminosite envoyee")
+        self.jauge_sat = self.jauge(f, "Saturation envoyee")
+        self.texte(f, "Barre en couleur : le son la pilote. Barre sourde : "
+                      "elle est tenue a sa valeur fixe.", BRUME, 8,
+                   largeur=500).pack(fill="x")
 
         self.separateur(f, 12, 6)
         self.var_sens = self.reglette(f, "son_sensibilite", "Sensibilite", 0.3, 3.0, 0.1,
@@ -1793,6 +2053,9 @@ class Panneau:
         self.cfg["son_attaque"] = round(self.var_attaque.get(), 2)
         self.cfg["son_chute"] = round(self.var_chute.get(), 2)
         self.cfg["son_plancher"] = round(self.var_plancher.get(), 2)
+        self.cfg["son_cible"] = self.var_cible.get()
+        self.cfg["son_saturation_fixe"] = round(self.var_sat_fixe.get(), 2)
+        self.cfg["son_luminosite_fixe"] = round(self.var_lum_fixe.get(), 2)
         self.cfg["api_active"] = bool(self.var_api.get())
         try:
             self.cfg["api_port"] = max(1024, min(65535, int(self.champ_port.get())))
@@ -1848,6 +2111,15 @@ class Panneau:
 
         self.tracer_bande(hexa)
 
+        if self.section == "accueil":
+            # Repeindre hors de l'accueil ne servirait a rien : la tuile
+            # n'est pas a l'ecran.
+            self._dessiner_ampoule(self._fond_ampoule)
+            self.etat_tuile.configure(
+                text=("connectee \u2014 " + hexa) if ETAT["connecte"]
+                else "hors ligne",
+                fg=VIF if ETAT["connecte"] else ALERTE)
+
         self.txt_maj.configure(
             text=MAJ["message"],
             fg=VIF if MAJ["etat"] in ("disponible", "prete") else BRUME)
@@ -1855,6 +2127,17 @@ class Panneau:
         self.txt_notes.configure(text=notes[:1500] if notes else "-")
 
         self.txt_audio.configure(text="Capture " + AUDIO.get("message", "arretee"))
+
+        cible = self.cfg.get("son_cible", "luminosite")
+        en_son = self.cfg.get("mode") == "son" and AUDIO.get("actif")
+        self.poser_jauge(
+            self.jauge_lum,
+            AUDIO["gain"] if en_son else self.cfg.get("son_luminosite_fixe", 1.0),
+            cible in ("luminosite", "les_deux"))
+        self.poser_jauge(
+            self.jauge_sat,
+            AUDIO["saturation"] if en_son else self.cfg.get("son_saturation_fixe", 0.92),
+            cible in ("saturation", "les_deux"))
         self.txt_api.configure(text="Passerelle " + ETAT.get("api", "arretee"))
 
         self.txt_scan.configure(
@@ -2074,7 +2357,7 @@ def telecharger_maj(publication):
     """Ecrit le nouvel exe dans DOSSIER_MAJ. Leve en cas d'echec."""
     os.makedirs(DOSSIER_MAJ, exist_ok=True)
     cible = os.path.join(DOSSIER_MAJ,
-                         "GuirlandeAmbiante-%s.exe" % publication["version"])
+                         "%s-%s.exe" % (NOM_COURT, publication["version"]))
     partiel = cible + ".part"
 
     MAJ["etat"] = "telechargement"
@@ -2159,9 +2442,17 @@ def commande_lancement():
     return f'"{pythonw}" "{os.path.abspath(__file__)}"'
 
 
-def chemin_demarrage():
+def _dossier_demarrage():
     return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
-                        "Start Menu", "Programs", "Startup", "guirlande_ambiante.vbs")
+                        "Start Menu", "Programs", "Startup")
+
+
+def chemin_demarrage():
+    return os.path.join(_dossier_demarrage(), "machitool.vbs")
+
+
+def ancien_chemin_demarrage():
+    return os.path.join(_dossier_demarrage(), "guirlande_ambiante.vbs")
 
 
 def installer_demarrage():
@@ -2233,6 +2524,41 @@ def arreter_instances(chemin):
                 pass
 
 
+def reprendre_ancienne_installation():
+    """Recupere les reglages de GuirlandeAmbiante, nom de l'app avant la 1.2.
+
+    Sans ca, la mise a jour ouvrirait une installation vierge a cote de
+    l'ancienne : guirlande a reappairer, regles a resaisir. On copie plutot
+    que deplacer, pour qu'un retour en arriere reste possible.
+    """
+    reprise = False
+    try:
+        if os.path.isdir(ANCIEN_DOSSIER) and not os.path.exists(FICHIER_CONFIG):
+            ancien_config = os.path.join(ANCIEN_DOSSIER, "config.json")
+            if os.path.exists(ancien_config):
+                os.makedirs(DOSSIER, exist_ok=True)
+                shutil.copy2(ancien_config, FICHIER_CONFIG)
+                reprise = True
+                print("Reglages repris depuis", ANCIEN_DOSSIER)
+    except Exception as e:
+        print("Reprise des anciens reglages impossible :", e)
+
+    # L'ancienne entree de demarrage relancerait l'ancien exe en parallele.
+    try:
+        ancienne = ancien_chemin_demarrage()
+        if os.path.exists(ancienne):
+            os.remove(ancienne)
+    except Exception as e:
+        print("Ancienne entree de demarrage non retiree :", e)
+
+    try:
+        if os.path.exists(ANCIEN_EXE):
+            arreter_instances(ANCIEN_EXE)
+    except Exception:
+        pass
+    return reprise
+
+
 def installer_ou_mettre_a_jour():
     """Renvoie True si on a agi comme installeur et qu'il faut sortir."""
     moi = os.path.abspath(sys.executable)
@@ -2242,6 +2568,7 @@ def installer_ou_mettre_a_jour():
     deja = os.path.exists(CIBLE_EXE)
     try:
         os.makedirs(DOSSIER, exist_ok=True)
+        reprise = reprendre_ancienne_installation()
         arreter_instances(CIBLE_EXE)
         for essai in range(10):            # le fichier peut rester verrouille
             try:
@@ -2250,25 +2577,32 @@ def installer_ou_mettre_a_jour():
             except PermissionError:
                 time.sleep(0.6)
         else:
-            dialogue("Guirlande ambiante",
+            dialogue(NOM_APP,
                      "Impossible de remplacer la version installee.\n"
                      "Quitte l'application depuis son icone, puis relance ce fichier.")
             return True
 
         installer_demarrage()
         subprocess.Popen([CIBLE_EXE], close_fds=True)
-        dialogue("Guirlande ambiante",
-                 (f"Mise a jour vers la version {VERSION} terminee.\n\n"
-                  "Tes reglages ont ete conserves."
-                  if deja else
-                  f"Installation terminee (version {VERSION}).\n\n"
-                  f"Installee dans :\n{DOSSIER}\n\n"
-                  "L'application demarre maintenant avec Windows.\n"
-                  "Son icone est en bas a droite, pres de l'horloge."))
+        if deja:
+            texte = (f"Mise a jour vers la version {VERSION} terminee.\n\n"
+                     "Tes reglages ont ete conserves.")
+        elif reprise:
+            texte = (f"{NOM_APP} {VERSION} remplace Guirlande ambiante.\n\n"
+                     "Tes reglages ont ete repris : guirlande appairee, "
+                     "regles, preferences.\n\n"
+                     f"Nouvel emplacement :\n{DOSSIER}\n\n"
+                     "L'ancien dossier peut etre supprime a la main.")
+        else:
+            texte = (f"Installation terminee ({NOM_APP} {VERSION}).\n\n"
+                     f"Installee dans :\n{DOSSIER}\n\n"
+                     "L'application demarre maintenant avec Windows.\n"
+                     "Son icone est en bas a droite, pres de l'horloge.")
+        dialogue(NOM_APP, texte)
         return True
     except Exception as e:
         print("Installation impossible :", e)
-        dialogue("Guirlande ambiante", f"Installation impossible :\n{e}")
+        dialogue(NOM_APP, f"Installation impossible :\n{e}")
         return True
 
 
@@ -2276,7 +2610,7 @@ def deja_lance():
     """Empeche deux copies simultanees."""
     try:
         import win32event, win32api, winerror
-        _mutex = win32event.CreateMutex(None, False, "GuirlandeAmbianteMutex")
+        _mutex = win32event.CreateMutex(None, False, "MachiToolMutex")
         if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
             return True
         globals()["_mutex_garde"] = _mutex   # garde une reference vivante
@@ -2337,7 +2671,7 @@ def lancer():
     import pystray
     panneau = Panneau(CFG, lambda: demande_arret.set())
 
-    icone = pystray.Icon("guirlande", image_icone((139, 92, 246)), "Guirlande ambiante")
+    icone = pystray.Icon("machitool", image_icone((139, 92, 246)), NOM_APP)
 
     # ---- mise a jour -------------------------------------------------
     # Tout passe par un fil separe : une requete reseau dans le fil de
@@ -2355,7 +2689,7 @@ def lancer():
                 publication = verifier_maj(CFG)
                 if not publication:
                     if MAJ["etat"] == "a_jour":
-                        notifier("Guirlande ambiante", MAJ["message"])
+                        notifier(NOM_APP, MAJ["message"])
                     return
                 try:
                     telecharger_maj(publication)
@@ -2363,7 +2697,7 @@ def lancer():
                     MAJ["etat"] = "erreur"
                     MAJ["message"] = "Telechargement impossible : %s" % e
                     return
-            notifier("Guirlande ambiante",
+            notifier(NOM_APP,
                      "Installation de la version %s, l'application redemarre."
                      % MAJ["version"])
             time.sleep(2)

@@ -21,7 +21,7 @@ jobs:
           python-version: '3.12'
 
       - name: Compilation du source
-        run: python -m compileall -q guirlande_ambiante.py outils
+        run: python -m compileall -q machi_tool.py outils
 
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"
