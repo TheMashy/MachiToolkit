@@ -11,9 +11,8 @@ name: Publication
 
 on:
   push:
-    branches: [main, 'claude/**']   # build de controle, artefact seulement
-    tags: ['v*']            # build + publication
-    # (branche de travail ajoutee temporairement pour valider la compilation)
+    branches: [main]     # build de controle, artefact seulement
+    tags: ['v*']         # build + publication
   workflow_dispatch:
     inputs:
       publier:
