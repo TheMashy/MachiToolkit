@@ -1522,19 +1522,19 @@ NUIT_RGB = hex_vers_rgb(NUIT)
 # deplient : on voit d'abord de quoi il s'agit, le detail vient si on le
 # demande. Le groupe de la page ouverte se deplie tout seul.
 MENU = [
-    ("page", "accueil", "Accueil", None),
-    ("groupe", "lampe", "Lampe", [
+    ("page", "accueil", "Accueil", "\u2302", None),
+    ("groupe", "lampe", "Lampe", "\u2600", [
         ("etat",      "Etat"),
         ("ecran",     "Ecran"),
         ("son",       "Son"),
         ("appairage", "Appairage"),
     ]),
-    ("groupe", "pont", "BrainDebugger", [
+    ("groupe", "pont", "BrainDebugger", "\u25c9", [
         ("calendrier", "Calendrier"),
         ("moi",        "Moi"),
         ("passerelle", "Passerelle"),
     ]),
-    ("groupe", "app", "Application", [
+    ("groupe", "app", "Application", "\u2699", [
         ("reglages", "Reglages"),
         ("maj",      "Mises a jour"),
     ]),
@@ -1544,7 +1544,7 @@ MENU = [
 GROUPE_DE = {}
 for _e in MENU:
     if _e[0] == "groupe":
-        for _cle, _ in _e[3]:
+        for _cle, _ in _e[4]:
             GROUPE_DE[_cle] = _e[1]
 
 # Page sans entree dans le rail : on y arrive depuis le mode Regles de la
@@ -1619,6 +1619,8 @@ class Panneau:
         self.f_titre = choisir("Bahnschrift", "Segoe UI Semibold", "Segoe UI")
         self.f_ui    = choisir("Segoe UI", "Tahoma")
         self.f_mono  = choisir("Cascadia Mono", "Consolas", "Courier New")
+        # Les glyphes de symboles manquent aux polices de texte courantes.
+        self.f_icone = choisir("Segoe UI Symbol", "Segoe UI", "Tahoma")
 
         self.construire_tout()
 
@@ -1642,6 +1644,7 @@ class Panneau:
         self.zone = tk.Frame(corps, bg=NUIT)
         self.zone.pack(side="left", fill="both", expand=True)
         self.construire_bandeau()
+        self.construire_bandeau_pont()
 
         self.page_accueil()
         self.page_etat()
@@ -1787,16 +1790,19 @@ class Panneau:
         tk.Frame(self.rail, bg=NUIT, height=self.px(10)).pack()
         self.entetes = {}      # cle de groupe -> (rang, etiquette, cadre)
 
-        for genre, cle, libelle, enfants in MENU:
+        for genre, cle, libelle, icone, enfants in MENU:
             if genre == "page":
-                self.rang_page(self.rail, cle, libelle, retrait=0)
+                self.rang_page(self.rail, cle, libelle, retrait=0, icone=icone)
                 continue
 
             rang = tk.Frame(self.rail, bg=NUIT, cursor="hand2")
             rang.pack(fill="x")
-            etiq = tk.Label(rang, text="  " + libelle, bg=NUIT, fg=CRAIE,
+            marque = tk.Label(rang, text=icone, bg=NUIT, fg=CRAIE,
+                              font=(self.f_icone, 12), width=2)
+            marque.pack(side="left", padx=(self.px(8), 0))
+            etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=CRAIE,
                             anchor="w", font=(self.f_ui, 10, "bold"),
-                            padx=12, pady=9)
+                            padx=self.px(4), pady=self.px(9))
             etiq.pack(side="left", fill="x", expand=True)
             fleche = tk.Label(rang, text="\u203a", bg=NUIT, fg=BRUME,
                               font=(self.f_ui, 11), padx=10)
@@ -1806,27 +1812,32 @@ class Panneau:
             for sous_cle, sous_libelle in enfants:
                 self.rang_page(cadre, sous_cle, sous_libelle, retrait=1)
 
-            for w in (rang, etiq, fleche):
+            for w in (rang, etiq, fleche, marque):
                 w.bind("<Button-1>", lambda e, g=cle: self.basculer_groupe(g))
-                w.bind("<Enter>", lambda e, r=rang, l=etiq, f=fleche:
-                       [x.configure(bg=VELOURS) for x in (r, l, f)])
-                w.bind("<Leave>", lambda e, r=rang, l=etiq, f=fleche:
-                       [x.configure(bg=NUIT) for x in (r, l, f)])
+                w.bind("<Enter>", lambda e, r=rang, l=etiq, f=fleche, m=marque:
+                       [x.configure(bg=VELOURS) for x in (r, l, f, m)])
+                w.bind("<Leave>", lambda e, r=rang, l=etiq, f=fleche, m=marque:
+                       [x.configure(bg=NUIT) for x in (r, l, f, m)])
             self.entetes[cle] = (rang, etiq, fleche, cadre)
 
         for cle in self.entetes:
             self.poser_groupe(cle)
 
-    def rang_page(self, parent, cle, libelle, retrait=0):
+    def rang_page(self, parent, cle, libelle, retrait=0, icone=None):
         """Une ligne cliquable menant a une page."""
         tk = self.tk
         rang = tk.Frame(parent, bg=NUIT, cursor="hand2")
         rang.pack(fill="x")
         barre = tk.Frame(rang, bg=NUIT, width=self.px(3))
         barre.pack(side="left", fill="y")
+        if icone:
+            tk.Label(rang, text=icone, bg=NUIT, fg=BRUME,
+                     font=(self.f_icone, 12), width=2).pack(
+                         side="left", padx=(self.px(5), 0))
         etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=BRUME, anchor="w",
                         font=(self.f_ui, 10),
-                        padx=self.px(14 + 12 * retrait), pady=self.px(7))
+                        padx=self.px(4 if icone else 14 + 12 * retrait),
+                        pady=self.px(7))
         etiq.pack(side="left", fill="x", expand=True)
         for w in (rang, etiq):
             w.bind("<Button-1>", lambda e, c=cle: self.aller(c))
@@ -1876,8 +1887,11 @@ class Panneau:
             page.pack_forget()
         # Le bandeau ne concerne que la lampe, et doit rester au-dessus.
         self.bandeau.pack_forget()
+        self.bandeau_pont.pack_forget()
         if GROUPE_DE.get(cle) == "lampe":
             self.bandeau.pack(fill="x")
+        elif cle in ("calendrier", "moi"):
+            self.bandeau_pont.pack(fill="x")
         self.pages[cle].pack(fill="both", expand=True)
 
     def nouvelle_page(self, cle, marge_x=24, marge_y=18, defilante=False):
@@ -2103,8 +2117,34 @@ class Panneau:
         self.bande = tk.Canvas(self.bandeau, height=self.px(22), bg=ENCRE,
                                highlightthickness=0)
         self.bande.pack(fill="x", pady=(self.px(8), 0))
+
+        # Reconnecter ne concerne que la guirlande : il n'avait rien a
+        # faire dans le pied, ou il suivait jusqu'aux pages du site.
+        self.bouton(self.bandeau, "Reconnecter", self.reconnecter,
+                    compact=True).pack(anchor="w", pady=(self.px(8), 0))
         self.historique = []
         self.traits = []
+
+    def construire_bandeau_pont(self):
+        """Relever et ouvrir le site valaient pour Calendrier comme pour
+        Moi : les repeter sur chaque page en faisait quatre boutons pour
+        deux actions. Ils coiffent le groupe, comme l'etat coiffe la
+        lampe."""
+        tk = self.tk
+        self.bandeau_pont = tk.Frame(self.zone, bg=NUIT, padx=self.px(24),
+                                     pady=self.px(14))
+        barre = tk.Frame(self.bandeau_pont, bg=NUIT)
+        barre.pack(fill="x")
+        self.bouton(barre, "Relever", self.relever_pont,
+                    compact=True).pack(side="left")
+        self.bouton(barre, "Ouvrir le site", self.ouvrir_site,
+                    compact=True).pack(side="left", padx=self.px(8))
+        self.btn_lu = self.bouton(barre, "Tout marquer comme lu",
+                                  self.vider_rappels, compact=True)
+        self.txt_pont = tk.Label(self.bandeau_pont, text="", bg=NUIT, fg=BRUME,
+                                 font=(self.f_ui, 9), anchor="w",
+                                 justify="left", wraplength=self.px(520))
+        self.txt_pont.pack(fill="x", pady=(self.px(8), 0))
 
     # ------------------------------------------------------------------
     #  Page Accueil
@@ -2702,13 +2742,6 @@ class Panneau:
                       "elle affiche ce que le site lui a envoye.",
                    BRUME, 9, largeur=500).pack(fill="x")
 
-        barre = tk.Frame(f, bg=NUIT)
-        barre.pack(fill="x", pady=(14, 0))
-        self.bouton(barre, "Relever maintenant", self.relever_pont,
-                    compact=True).pack(side="left")
-        self.bouton(barre, "Ouvrir le site", self.ouvrir_site,
-                    compact=True).pack(side="left", padx=8)
-
         self.separateur(f)
         self.titre(f, "journees").pack(fill="x", pady=(0, 6))
         self.liste_jours = tk.Frame(f, bg=NUIT)
@@ -2783,19 +2816,7 @@ class Panneau:
         self.liste_rappels.pack(fill="x")
         self._signature_rappels = None
 
-        self.separateur(f)
-        barre = tk.Frame(f, bg=NUIT)
-        barre.pack(fill="x")
-        self.bouton(barre, "Relever maintenant", self.relever_pont,
-                    compact=True).pack(side="left")
-        self.bouton(barre, "Tout marquer comme lu", self.vider_rappels,
-                    compact=True).pack(side="left", padx=8)
-        self.bouton(barre, "Ouvrir le site", self.ouvrir_site,
-                    compact=True).pack(side="left")
 
-        self.separateur(f)
-        self.txt_pont = self.texte(f, "", BRUME, 9, largeur=500)
-        self.txt_pont.pack(fill="x")
 
     def peindre_moi(self):
         humeur = PONT.get("humeur") or {}
@@ -2825,9 +2846,16 @@ class Panneau:
                          font=(self.f_ui, 9), anchor="w", justify="left",
                          wraplength=self.px(460)).pack(fill="x")
 
+    def peindre_pont(self):
+        """Le bandeau du pont, commun a Calendrier et a Moi."""
         self.txt_pont.configure(
             text=PONT["message"],
             fg=ALERTE if PONT["etat"] == "erreur" else BRUME)
+        # Un bouton qui n'a rien a effacer est du bruit.
+        if PONT["rappels"]:
+            self.btn_lu.pack(side="left", padx=self.px(8))
+        else:
+            self.btn_lu.pack_forget()
 
     # ------------------------------------------------------------------
     #  Actions du pont
@@ -2867,12 +2895,12 @@ class Panneau:
 
         barre = tk.Frame(f, bg=NUIT)
         barre.pack(fill="x", pady=(14, 0))
-        self.bouton(barre, "Verifier maintenant",
-                    lambda: self.declencher_maj("verifier"),
-                    compact=True).pack(side="left")
-        self.bouton(barre, "Telecharger et installer",
-                    lambda: self.declencher_maj("installer"),
-                    compact=True).pack(side="left", padx=8)
+        # Deux boutons pour un seul geste : on verifie, puis on installe ce
+        # qu'on vient de trouver. Un seul suffit, a condition qu'il dise
+        # lequel des deux il fera.
+        self.btn_maj = self.bouton(barre, "Verifier maintenant",
+                                   self.action_maj, compact=True)
+        self.btn_maj.pack(side="left")
 
         self.separateur(f)
 
@@ -2907,6 +2935,10 @@ class Panneau:
                       "envoye. Le nouvel exe remplace l'ancien dans "
                       + DOSSIER + " et config.json n'est jamais touche.",
                    BRUME, 8, largeur=460).pack(fill="x")
+
+    def action_maj(self):
+        self.declencher_maj("installer" if MAJ["etat"] in ("disponible", "prete")
+                            else "verifier")
 
     def options_maj(self):
         self.cfg["maj_verifier"] = bool(self.var_maj_verifier.get())
@@ -3124,7 +3156,6 @@ class Panneau:
         pied = tk.Frame(self.root, bg=NUIT, padx=22, pady=12)
         pied.pack(fill="x", side="bottom")
         self.bouton(pied, "Enregistrer", self.enregistrer, principal=True).pack(side="left")
-        self.bouton(pied, "Reconnecter", self.reconnecter, compact=True).pack(side="left", padx=8)
         self.bouton(pied, "Quitter", self.quitter_tout, compact=True).pack(side="right")
         self.bouton(pied, "Reduire", self.cacher, compact=True).pack(side="right", padx=8)
 
@@ -3247,8 +3278,10 @@ class Panneau:
         self.txt_apercu_ecran.configure(text=hexa)
         if self.section == "calendrier":
             self.peindre_journal()
-        elif self.section == "moi":
+        if self.section == "moi":
             self.peindre_moi()
+        if self.section in ("calendrier", "moi"):
+            self.peindre_pont()
 
         if self.section == "accueil":
             # Repeindre hors de l'accueil ne servirait a rien : la tuile
@@ -3262,6 +3295,12 @@ class Panneau:
         self.txt_maj.configure(
             text=MAJ["message"],
             fg=VIF if MAJ["etat"] in ("disponible", "prete") else BRUME)
+        pret = MAJ["etat"] in ("disponible", "prete")
+        occupe = MAJ["etat"] in ("verification", "telechargement")
+        self.btn_maj.configure(
+            text=("Installer " + MAJ["version"]) if pret
+            else ("En cours..." if occupe else "Verifier maintenant"),
+            state="disabled" if occupe else "normal")
         notes = (MAJ.get("notes") or "").strip()
         self.txt_notes.configure(text=notes[:1500] if notes else "-")
 
