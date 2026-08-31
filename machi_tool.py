@@ -34,9 +34,10 @@ import threading
 import subprocess
 import http.server
 import urllib.error
+import urllib.parse
 import urllib.request
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -152,6 +153,10 @@ CONFIG_DEFAUT = {
     # trompe : ecran 4K declare a tort en 96 ppp, ou gout personnel.
     "echelle_interface": 0.0,
 
+    # Sans ca, la guirlande reste allumee sur sa derniere couleur quand
+    # Windows s'eteint : l'application est tuee avant d'avoir rien envoye.
+    "eteindre_en_partant": True,
+
     "son_bande": "graves",           # graves | mediums | aigus | tout
     "son_palette": "chaud_froid",    # chaud_froid | arc | regle
     "son_sensibilite": 1.0,
@@ -175,6 +180,17 @@ CONFIG_DEFAUT = {
     "api_jeton": "",
     "api_origines": ["https://braindebugger-production.up.railway.app",
                      "http://localhost:3000"],
+
+    # Pont avec BrainDebugger. Le site tourne sur Internet et l'application
+    # ecoute en local : c'est le navigateur, sur cette machine, qui fait le
+    # lien. Onglet ouvert, le site pousse directement. Onglet ferme, plus
+    # personne ne peut joindre l'application depuis l'exterieur — c'est
+    # alors elle qui va demander au site s'il a quelque chose a dire.
+    "pont_site": "https://braindebugger-production.up.railway.app",
+    "pont_releve": True,             # aller chercher les rappels en attente
+    "pont_intervalle": 10,           # minutes entre deux releves
+    "pont_cle": "",                  # cle transmise au site, s'il en veut une
+    "pont_notifie": True,            # afficher les rappels recus
 
     # Mises a jour depuis les publications GitHub du depot.
     "maj_verifier": True,             # regarder si une version plus recente existe
@@ -216,6 +232,19 @@ ETAT = {
     "ecran_sat": 0.0,         # saturation finalement envoyee
     "forcage": None,     # {"couleur", "nom", "expire"}
     "api": "arretee",
+    "rappel_neuf": False,
+}
+
+# Ce que le site a envoye. Rien n'est invente ici : tant que BrainDebugger
+# ne pousse rien, ces listes restent vides et les pages le disent.
+PONT = {
+    "etat": "inactif",        # inactif | releve | ok | erreur
+    "message": "Aucun echange avec le site pour l'instant.",
+    "vu_le": 0.0,
+    "humeur": None,           # {"valeur", "libelle", "couleur", "date"}
+    "jours": [],              # [{"date", "note", "humeur", "couleur"}]
+    "reperes": [],            # [{"date", "titre", "couleur"}]
+    "rappels": [],            # [{"id", "titre", "texte", "recu"}]
 }
 
 CFG = {}
@@ -844,7 +873,132 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             ETAT["forcage"] = None
             return self.repondre(200, {"ok": True})
 
+        # ---- BrainDebugger ----
+
+        if chemin == "/rappel":
+            titre = str(corps.get("titre") or "BrainDebugger")[:64]
+            texte = str(corps.get("texte") or "")[:220]
+            if not texte:
+                return self.repondre(400, {"erreur": "texte manquant"})
+            deposer_rappel(corps.get("id"), titre, texte)
+            return self.repondre(200, {"ok": True})
+
+        if chemin == "/humeur-du-jour":
+            PONT["humeur"] = {
+                "valeur": corps.get("valeur"),
+                "libelle": str(corps.get("libelle") or "")[:60],
+                "couleur": str(corps.get("couleur") or "")[:9],
+                "date": str(corps.get("date") or "")[:32],
+            }
+            PONT["etat"] = "ok"
+            PONT["vu_le"] = time.time()
+            PONT["message"] = "Humeur recue du site."
+            return self.repondre(200, {"ok": True})
+
+        if chemin == "/journal":
+            # Le site est maitre de ses donnees : on remplace, on ne fusionne
+            # pas. Une entree effacee la-bas doit disparaitre ici aussi.
+            jours = corps.get("jours")
+            reperes = corps.get("reperes")
+            if isinstance(jours, list):
+                PONT["jours"] = [j for j in jours if isinstance(j, dict)][:400]
+            if isinstance(reperes, list):
+                PONT["reperes"] = [r for r in reperes if isinstance(r, dict)][:400]
+            PONT["etat"] = "ok"
+            PONT["vu_le"] = time.time()
+            PONT["message"] = "Journal recu du site."
+            return self.repondre(200, {"ok": True,
+                                       "jours": len(PONT["jours"]),
+                                       "reperes": len(PONT["reperes"])})
+
         return self.repondre(404, {"erreur": "route inconnue"})
+
+
+def deposer_rappel(identifiant, titre, texte):
+    """Range un rappel et le signale. Les doublons sont ignores : le site
+    peut reemettre le meme tant qu'il n'a pas ete acquitte."""
+    identifiant = str(identifiant or (titre + texte))[:80]
+    if any(r["id"] == identifiant for r in PONT["rappels"]):
+        return False
+    PONT["rappels"].insert(0, {"id": identifiant, "titre": titre,
+                               "texte": texte, "recu": time.time()})
+    del PONT["rappels"][20:]
+    PONT["etat"] = "ok"
+    PONT["vu_le"] = time.time()
+    PONT["message"] = titre
+    ETAT["rappel_neuf"] = True     # la boucle du panneau le notifiera
+    return True
+
+
+def relever_le_site(cfg):
+    """Demande au site ce qu'il a en attente.
+
+    Necessaire parce que le site ne peut rien pousser quand aucun onglet
+    n'est ouvert : cette machine n'a pas d'adresse joignable depuis
+    Internet. C'est donc l'application qui va voir.
+
+    Contrat attendu cote site, en GET sur <pont_site>/api/machitool/attente :
+        {"rappels":  [{"id": "...", "titre": "...", "texte": "..."}],
+         "humeur":   {"valeur": 3, "libelle": "...", "couleur": "#RRGGBB"},
+         "jours":    [{"date": "2026-08-29", "note": "...", "couleur": "..."}],
+         "reperes":  [{"date": "...", "titre": "...", "couleur": "..."}]}
+    Toutes les cles sont facultatives. Tant que la route n'existe pas, le
+    404 est avale sans bruit.
+    """
+    base = str(cfg.get("pont_site", "")).strip().rstrip("/")
+    if not base:
+        return False
+    url = base + "/api/machitool/attente"
+    cle = str(cfg.get("pont_cle", "")).strip()
+    if cle:
+        url += "?cle=" + urllib.parse.quote(cle)
+
+    PONT["etat"] = "releve"
+    try:
+        requete = urllib.request.Request(url, headers={
+            "User-Agent": "MachiToolkit",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(requete, timeout=12,
+                                    context=_contexte_ssl()) as reponse:
+            donnees = json.loads(reponse.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        PONT["etat"] = "erreur"
+        PONT["message"] = ("Le site ne propose pas encore de route "
+                           "/api/machitool/attente." if e.code == 404
+                           else "Le site a repondu %s." % e.code)
+        return False
+    except Exception as e:
+        PONT["etat"] = "erreur"
+        PONT["message"] = "Site injoignable : %s" % str(e)[:60]
+        return False
+
+    if not isinstance(donnees, dict):
+        PONT["etat"] = "erreur"
+        PONT["message"] = "Reponse du site illisible."
+        return False
+
+    neufs = 0
+    for rappel in (donnees.get("rappels") or []):
+        if isinstance(rappel, dict) and rappel.get("texte"):
+            if deposer_rappel(rappel.get("id"),
+                              str(rappel.get("titre") or "BrainDebugger")[:64],
+                              str(rappel["texte"])[:220]):
+                neufs += 1
+    if isinstance(donnees.get("humeur"), dict):
+        PONT["humeur"] = donnees["humeur"]
+    if isinstance(donnees.get("jours"), list):
+        PONT["jours"] = [j for j in donnees["jours"] if isinstance(j, dict)][:400]
+    if isinstance(donnees.get("reperes"), list):
+        PONT["reperes"] = [r for r in donnees["reperes"] if isinstance(r, dict)][:400]
+
+    PONT["etat"] = "ok"
+    PONT["vu_le"] = time.time()
+    if neufs:
+        PONT["message"] = "%d rappel(s) recu(s)." % neufs
+    else:
+        PONT["message"] = "Site joint, rien de neuf."
+    return True
 
 
 def demarrer_api(cfg):
@@ -914,6 +1068,7 @@ async def une_session(cfg):
         async with BleakClient(adresse, timeout=20.0) as client:
             ETAT["connecte"] = True
             ETAT["message"] = "Connectee"
+            BLE["client"] = client
             await client.write_gatt_char(UUID_ECRITURE, TRAME_ON, response=False)
             await asyncio.sleep(0.15)
             # Luminosite materielle au maximum : la modulation se fait dans les
@@ -922,6 +1077,7 @@ async def une_session(cfg):
             await client.write_gatt_char(UUID_ECRITURE, trame_lum(15), response=False)
 
             depart = time.time()
+            echeance = time.monotonic()
             while ETAT["en_marche"] and client.is_connected and not ETAT["demande"]:
                 intervalle = 1.0 / max(1, int(cfg.get("images_par_seconde", 8)))
 
@@ -1035,10 +1191,20 @@ async def une_session(cfg):
                         ETAT["message"] = f"Ecriture perdue : {str(e)[:50]}"
                         break
 
-                await asyncio.sleep(intervalle)
+                # Dormir un intervalle plein apres le travail ajouterait la
+                # duree de ce travail a chaque tour : a 60 images par
+                # seconde la cadence reelle s'effondrerait. On vise une
+                # echeance et on ne dort que ce qui reste.
+                echeance += intervalle
+                reste = echeance - time.monotonic()
+                if reste < -intervalle:
+                    echeance = time.monotonic()   # retard franc : on repart
+                    reste = 0
+                await asyncio.sleep(max(0.0, reste))
 
     except Exception as e:
         ETAT["message"] = f"Deconnectee ({str(e)[:55]})"
+    BLE["client"] = None
     ETAT["connecte"] = False
 
 
@@ -1107,6 +1273,94 @@ async def superviseur(cfg):
 #  scaling pour les caracteres, un facteur pour tout ce qui est exprime en
 #  pixels. Le resultat est net ET a la bonne taille.
 # ==========================================================================
+
+# La boucle Bluetooth vit dans son propre fil. Pour lui faire envoyer une
+# trame depuis un autre fil — la fermeture de Windows, le bouton Quitter —
+# il faut passer par elle, d'ou cette reference.
+BLE = {"boucle": None, "client": None}
+
+
+def eteindre_guirlande(delai=2.5):
+    """Envoie la trame d'extinction et attend qu'elle parte.
+
+    Bloquant volontairement : appelee pendant l'arret de Windows, elle n'a
+    que quelques secondes avant que le processus soit tue, et rendre la
+    main trop tot laisserait la guirlande allumee.
+    """
+    boucle = BLE.get("boucle")
+    client = BLE.get("client")
+    if not boucle or not client:
+        return False
+    try:
+        if not client.is_connected:
+            return False
+    except Exception:
+        return False
+
+    async def envoyer():
+        await client.write_gatt_char(UUID_ECRITURE, trame_rgb(0, 0, 0),
+                                     response=False)
+        await client.write_gatt_char(UUID_ECRITURE, TRAME_OFF, response=False)
+
+    try:
+        travail = asyncio.run_coroutine_threadsafe(envoyer(), boucle)
+        travail.result(timeout=delai)
+        print("Guirlande eteinte.")
+        return True
+    except Exception as e:
+        print("Extinction impossible :", e)
+        return False
+
+
+def surveiller_arret_windows():
+    """Fenetre cachee qui ecoute la fermeture de session.
+
+    Windows previent les applications par WM_QUERYENDSESSION avant de les
+    tuer. Sans fenetre pour recevoir ce message, l'application disparait
+    sans un mot et la guirlande garde sa derniere couleur jusqu'a ce qu'on
+    la debranche.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import win32gui
+    except ImportError:
+        return
+
+    WM_QUERYENDSESSION = 0x0011
+    WM_ENDSESSION = 0x0016
+
+    def traiter(fenetre, message, wparam, lparam):
+        if message in (WM_QUERYENDSESSION, WM_ENDSESSION):
+            if CFG.get("eteindre_en_partant", True):
+                eteindre_guirlande()
+            # Repondre vrai a QUERYENDSESSION : on ne bloque pas l'arret.
+            return True
+        return win32gui.DefWindowProc(fenetre, message, wparam, lparam)
+
+    def fil():
+        try:
+            classe = win32gui.WNDCLASS()
+            classe.lpszClassName = "MachiToolArret"
+            classe.lpfnWndProc = traiter
+            atome = win32gui.RegisterClass(classe)
+            fenetre = win32gui.CreateWindow(
+                atome, "MachiTool", 0, 0, 0, 0, 0, 0, 0,
+                win32gui.GetModuleHandle(None), None)
+            try:
+                # Sans cela, Windows peut arreter le processus avant de
+                # poster le message aux applications sans interface.
+                import ctypes
+                ctypes.windll.user32.ShutdownBlockReasonCreate(
+                    fenetre, "Extinction de la guirlande")
+            except Exception:
+                pass
+            win32gui.PumpMessages()
+        except Exception as e:
+            print("Surveillance de l'arret impossible :", e)
+
+    threading.Thread(target=fil, daemon=True).start()
+
 
 def chemin_icone():
     """Le .ico a poser sur la fenetre, ecrit si besoin.
@@ -1207,17 +1461,35 @@ NUIT_RGB = hex_vers_rgb(NUIT)
 # module ouvert. Une entree ("", "Titre") est un intitule de groupe, pas
 # une page — c'est ce qui fera la separation le jour ou un deuxieme
 # module viendra s'ajouter sous le premier.
-SECTIONS = [("accueil",   "Accueil"),
-            ("",          "Lumiere"),
-            ("etat",      "Etat"),
-            ("regles",    "Regles"),
-            ("ecran",     "Ecran"),
-            ("son",       "Son"),
-            ("reglages",  "Reglages"),
-            ("site",      "Site web"),
-            ("appairage", "Appairage"),
-            ("",          "Application"),
-            ("maj",       "Mises a jour")]
+# Le rail portait neuf entrees a plat. Il en porte quatre, dont trois se
+# deplient : on voit d'abord de quoi il s'agit, le detail vient si on le
+# demande. Le groupe de la page ouverte se deplie tout seul.
+MENU = [
+    ("page", "accueil", "Accueil", None),
+    ("groupe", "lampe", "Lampe", [
+        ("etat",      "Etat"),
+        ("regles",    "Regles"),
+        ("ecran",     "Ecran"),
+        ("son",       "Son"),
+        ("appairage", "Appairage"),
+    ]),
+    ("groupe", "pont", "BrainDebugger", [
+        ("calendrier", "Calendrier"),
+        ("moi",        "Moi"),
+        ("passerelle", "Passerelle"),
+    ]),
+    ("groupe", "app", "Application", [
+        ("reglages", "Reglages"),
+        ("maj",      "Mises a jour"),
+    ]),
+]
+
+# Ou se range chaque page, pour deplier le bon groupe en y arrivant.
+GROUPE_DE = {}
+for _e in MENU:
+    if _e[0] == "groupe":
+        for _cle, _ in _e[3]:
+            GROUPE_DE[_cle] = _e[1]
 
 
 def melange(avant, arriere, part):
@@ -1242,7 +1514,10 @@ class Panneau:
         self.lignes = []
         self.pages = {}
         self.onglets = {}
-        self.section = "etat"
+        self.section = "accueil"
+        # Lampe deplie au demarrage : c'est le module qu'on ouvre le plus.
+        self.groupes = {"lampe": True, "pont": False, "app": False}
+        self.apercus = []      # pastilles de couleur a repeindre
         self.reglettes = []
         self.accent = ACCENT_DEPART
         self.phase = 0.0
@@ -1304,7 +1579,9 @@ class Panneau:
         self.page_son()
         self.page_reglages()
         self.page_maj()
-        self.page_site()
+        self.page_passerelle()
+        self.page_calendrier()
+        self.page_moi()
         self.page_appairage()
         self.aller("accueil")
 
@@ -1394,25 +1671,70 @@ class Panneau:
     def construire_rail(self):
         tk = self.tk
         tk.Frame(self.rail, bg=NUIT, height=self.px(10)).pack()
-        for cle, libelle in SECTIONS:
-            if not cle:                       # intitule de groupe, non cliquable
-                self.titre(self.rail, libelle).pack(
-                    fill="x", padx=17, pady=(14, 4))
+        self.entetes = {}      # cle de groupe -> (rang, etiquette, cadre)
+
+        for genre, cle, libelle, enfants in MENU:
+            if genre == "page":
+                self.rang_page(self.rail, cle, libelle, retrait=0)
                 continue
+
             rang = tk.Frame(self.rail, bg=NUIT, cursor="hand2")
             rang.pack(fill="x")
-            barre = tk.Frame(rang, bg=NUIT, width=3)
-            barre.pack(side="left", fill="y")
-            etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=BRUME, anchor="w",
-                            font=(self.f_ui, 10), padx=14, pady=9)
+            etiq = tk.Label(rang, text="  " + libelle, bg=NUIT, fg=CRAIE,
+                            anchor="w", font=(self.f_ui, 10, "bold"),
+                            padx=12, pady=9)
             etiq.pack(side="left", fill="x", expand=True)
-            for w in (rang, etiq):
-                w.bind("<Button-1>", lambda e, c=cle: self.aller(c))
-                w.bind("<Enter>", lambda e, r=rang, l=etiq, c=cle:
-                       self.survol(r, l, c, True))
-                w.bind("<Leave>", lambda e, r=rang, l=etiq, c=cle:
-                       self.survol(r, l, c, False))
-            self.onglets[cle] = (rang, barre, etiq)
+            fleche = tk.Label(rang, text="\u203a", bg=NUIT, fg=BRUME,
+                              font=(self.f_ui, 11), padx=10)
+            fleche.pack(side="right")
+
+            cadre = tk.Frame(self.rail, bg=NUIT)
+            for sous_cle, sous_libelle in enfants:
+                self.rang_page(cadre, sous_cle, sous_libelle, retrait=1)
+
+            for w in (rang, etiq, fleche):
+                w.bind("<Button-1>", lambda e, g=cle: self.basculer_groupe(g))
+                w.bind("<Enter>", lambda e, r=rang, l=etiq, f=fleche:
+                       [x.configure(bg=VELOURS) for x in (r, l, f)])
+                w.bind("<Leave>", lambda e, r=rang, l=etiq, f=fleche:
+                       [x.configure(bg=NUIT) for x in (r, l, f)])
+            self.entetes[cle] = (rang, etiq, fleche, cadre)
+
+        for cle in self.entetes:
+            self.poser_groupe(cle)
+
+    def rang_page(self, parent, cle, libelle, retrait=0):
+        """Une ligne cliquable menant a une page."""
+        tk = self.tk
+        rang = tk.Frame(parent, bg=NUIT, cursor="hand2")
+        rang.pack(fill="x")
+        barre = tk.Frame(rang, bg=NUIT, width=self.px(3))
+        barre.pack(side="left", fill="y")
+        etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=BRUME, anchor="w",
+                        font=(self.f_ui, 10),
+                        padx=self.px(14 + 12 * retrait), pady=self.px(7))
+        etiq.pack(side="left", fill="x", expand=True)
+        for w in (rang, etiq):
+            w.bind("<Button-1>", lambda e, c=cle: self.aller(c))
+            w.bind("<Enter>", lambda e, r=rang, l=etiq, c=cle:
+                   self.survol(r, l, c, True))
+            w.bind("<Leave>", lambda e, r=rang, l=etiq, c=cle:
+                   self.survol(r, l, c, False))
+        self.onglets[cle] = (rang, barre, etiq)
+        return rang
+
+    def basculer_groupe(self, cle):
+        self.groupes[cle] = not self.groupes.get(cle, False)
+        self.poser_groupe(cle)
+
+    def poser_groupe(self, cle):
+        rang, etiq, fleche, cadre = self.entetes[cle]
+        ouvert = self.groupes.get(cle, False)
+        fleche.configure(text="\u2039" if ouvert else "\u203a")
+        if ouvert:
+            cadre.pack(fill="x", after=rang)
+        else:
+            cadre.pack_forget()
 
     def survol(self, rang, etiq, cle, dedans):
         if cle == self.section:
@@ -1423,6 +1745,12 @@ class Panneau:
 
     def aller(self, cle):
         self.section = cle
+        # Arriver sur une page par un autre chemin que le rail — l'accueil,
+        # une notification — doit deplier le groupe qui la contient.
+        groupe = GROUPE_DE.get(cle)
+        if groupe and not self.groupes.get(groupe):
+            self.groupes[groupe] = True
+            self.poser_groupe(groupe)
         for c, (rang, barre, etiq) in self.onglets.items():
             actif = c == cle
             fond = VELOURS if actif else NUIT
@@ -1941,6 +2269,17 @@ class Panneau:
                    self.var_mode, "mixte").pack(fill="x")
 
         self.separateur(f, 14, 10)
+        rang_apercu = tk.Frame(f, bg=NUIT)
+        rang_apercu.pack(fill="x")
+        gauche = tk.Frame(rang_apercu, bg=NUIT)
+        gauche.pack(side="left", fill="x", expand=True)
+        self.titre(gauche, "couleur envoyee").pack(fill="x")
+        self.txt_apercu_ecran = tk.Label(gauche, text="", bg=NUIT, fg=CRAIE,
+                                         font=(self.f_mono, 11), anchor="w")
+        self.txt_apercu_ecran.pack(fill="x", pady=(4, 0))
+        self.apercu_couleur(rang_apercu, 58, NUIT).pack(side="right")
+
+        self.separateur(f, 14, 10)
         self.titre(f, "quel ecran").pack(fill="x", pady=(0, 4))
         self.var_source = tk.StringVar(value=str(self.cfg.get("ecran_source", "actif")))
         self.radio(f, "Celui de la fenetre active — suit ton attention",
@@ -2145,10 +2484,12 @@ class Panneau:
             "Minutes sans clavier ni souris avant de basculer en braise sourde.",
             entier=True)
         self.curseurs["images_par_seconde"] = self.reglette(
-            f, "images_par_seconde", "Images par seconde", 2, 30, 1,
-            "Cadence de capture et d'ecriture. Depuis que la capture passe "
-            "par une vignette, 20 a 30 tiennent sans effort en mode Ecran ; "
-            "15 a 20 suffisent pour le son. Baisse si la guirlande saccade.",
+            f, "images_par_seconde", "Images par seconde", 2, 60, 1,
+            "Cadence de capture et d'ecriture. La capture par vignette tient "
+            "60 sans effort ; c'est le controleur Bluetooth qui plafonne, "
+            "souvent vers 30. Au dela, les trames s'accumulent et la "
+            "guirlande retarde au lieu d'aller plus vite. Monte "
+            "progressivement et redescends des que ca saccade.",
             entier=True)
 
         self.separateur(f, 14, 8)
@@ -2164,9 +2505,202 @@ class Panneau:
             "2.00 = 4K a 200 %%. Detectee ici : %.2f." % self.echelle)
 
         self.separateur(f, 14, 8)
+        self.var_eteindre = tk.IntVar(
+            value=1 if self.cfg.get("eteindre_en_partant", True) else 0)
+        self.case(f, "Eteindre la guirlande en quittant et a l'arret de Windows",
+                  self.var_eteindre).pack(fill="x", pady=(0, 8))
+
         self.var_cpu = tk.IntVar(value=1 if self.cfg.get("reaction_processeur", True) else 0)
         self.case(f, "La charge du processeur module la luminosite — mode Regles",
                   self.var_cpu).pack(fill="x")
+
+    # ------------------------------------------------------------------
+    #  Apercu de la couleur — le meme objet sur l'accueil et sur Ecran
+    # ------------------------------------------------------------------
+
+    def apercu_couleur(self, parent, cote=64, fond=VELOURS):
+        """Pastille ronde qui prend la couleur reellement envoyee."""
+        toile = self.tk.Canvas(parent, width=self.px(cote), height=self.px(cote),
+                               bg=fond, highlightthickness=0)
+        self.apercus.append((toile, fond, cote))
+        return toile
+
+    def peindre_apercus(self):
+        for toile, fond, cote in self.apercus:
+            try:
+                toile.delete("all")
+                c = self.px(cote)
+                arriere = hex_vers_rgb(fond)
+                couleur = ETAT["couleur"]
+                vif = ETAT["connecte"] and max(couleur) > 6
+                corps = couleur if vif else (90, 74, 110)
+                for part, marge in ((0.16, 0), (0.30, 6), (0.60, 12)):
+                    m = self.px(marge)
+                    toile.create_oval(m, m, c - m, c - m, outline="",
+                                      fill=melange(corps, arriere, part))
+                m = self.px(19)
+                toile.create_oval(m, m, c - m, c - m, outline="",
+                                  fill=melange(corps, arriere, 0.95 if vif else 0.5))
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    #  Page Calendrier
+    # ------------------------------------------------------------------
+
+    def page_calendrier(self):
+        tk = self.tk
+        f = self.nouvelle_page("calendrier", defilante=True)
+
+        self.texte(f, "Les journees et les reperes viennent de BrainDebugger. "
+                      "L'application ne les invente pas et ne les stocke pas : "
+                      "elle affiche ce que le site lui a envoye.",
+                   BRUME, 9, largeur=500).pack(fill="x")
+
+        barre = tk.Frame(f, bg=NUIT)
+        barre.pack(fill="x", pady=(14, 0))
+        self.bouton(barre, "Relever maintenant", self.relever_pont,
+                    compact=True).pack(side="left")
+        self.bouton(barre, "Ouvrir le site", self.ouvrir_site,
+                    compact=True).pack(side="left", padx=8)
+
+        self.separateur(f)
+        self.titre(f, "journees").pack(fill="x", pady=(0, 6))
+        self.liste_jours = tk.Frame(f, bg=NUIT)
+        self.liste_jours.pack(fill="x")
+
+        self.separateur(f)
+        self.titre(f, "reperes").pack(fill="x", pady=(0, 6))
+        self.liste_reperes = tk.Frame(f, bg=NUIT)
+        self.liste_reperes.pack(fill="x")
+
+        self._signature_journal = None
+
+    def peindre_journal(self):
+        """Ne redessine que si le contenu a change : la boucle passe ici
+        deux fois par seconde."""
+        signature = (len(PONT["jours"]), len(PONT["reperes"]),
+                     PONT["vu_le"])
+        if signature == getattr(self, "_signature_journal", None):
+            return
+        self._signature_journal = signature
+        tk = self.tk
+
+        for cadre, source, cles, vide in (
+                (self.liste_jours, PONT["jours"], ("date", "note"),
+                 "Aucune journee recue. Le site n'a encore rien envoye."),
+                (self.liste_reperes, PONT["reperes"], ("date", "titre"),
+                 "Aucun repere recu.")):
+            for enfant in cadre.winfo_children():
+                enfant.destroy()
+            if not source:
+                self.texte(cadre, vide, FIL, 9).pack(fill="x")
+                continue
+            for entree in source[:40]:
+                rang = tk.Frame(cadre, bg=ENCRE)
+                rang.pack(fill="x", pady=(0, self.px(3)))
+                teinte = str(entree.get("couleur") or "").strip()
+                pastille = tk.Frame(rang, bg=teinte if teinte.startswith("#") else FIL,
+                                    width=self.px(4))
+                pastille.pack(side="left", fill="y")
+                tk.Label(rang, text=str(entree.get(cles[0], ""))[:16], bg=ENCRE,
+                         fg=BRUME, font=(self.f_mono, 9), anchor="w",
+                         padx=self.px(10), pady=self.px(7)).pack(side="left")
+                tk.Label(rang, text=str(entree.get(cles[1], ""))[:90], bg=ENCRE,
+                         fg=CRAIE, font=(self.f_ui, 9), anchor="w",
+                         justify="left").pack(side="left", fill="x", expand=True)
+
+    # ------------------------------------------------------------------
+    #  Page Moi
+    # ------------------------------------------------------------------
+
+    def page_moi(self):
+        tk = self.tk
+        f = self.nouvelle_page("moi", defilante=True)
+
+        carte = tk.Frame(f, bg=VELOURS, padx=18, pady=16)
+        carte.pack(fill="x")
+        self.titre(carte, "humeur du moment").pack(fill="x")
+        haut = tk.Frame(carte, bg=VELOURS)
+        haut.pack(fill="x", pady=(6, 0))
+        self.txt_humeur = tk.Label(haut, text="\u2014", bg=VELOURS, fg=CRAIE,
+                                   font=(self.f_titre, 20), anchor="w")
+        self.txt_humeur.pack(side="left")
+        self.apercu_humeur = self.apercu_couleur(haut, 52, VELOURS)
+        self.apercu_humeur.pack(side="right")
+        self.txt_humeur_date = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
+                                        font=(self.f_mono, 8), anchor="w")
+        self.txt_humeur_date.pack(fill="x", pady=(6, 0))
+
+        self.separateur(f)
+        self.titre(f, "rappels du site").pack(fill="x", pady=(0, 6))
+        self.liste_rappels = tk.Frame(f, bg=NUIT)
+        self.liste_rappels.pack(fill="x")
+        self._signature_rappels = None
+
+        self.separateur(f)
+        barre = tk.Frame(f, bg=NUIT)
+        barre.pack(fill="x")
+        self.bouton(barre, "Relever maintenant", self.relever_pont,
+                    compact=True).pack(side="left")
+        self.bouton(barre, "Tout marquer comme lu", self.vider_rappels,
+                    compact=True).pack(side="left", padx=8)
+        self.bouton(barre, "Ouvrir le site", self.ouvrir_site,
+                    compact=True).pack(side="left")
+
+        self.separateur(f)
+        self.txt_pont = self.texte(f, "", BRUME, 9, largeur=500)
+        self.txt_pont.pack(fill="x")
+
+    def peindre_moi(self):
+        humeur = PONT.get("humeur") or {}
+        libelle = str(humeur.get("libelle") or "").strip()
+        self.txt_humeur.configure(text=libelle or "\u2014")
+        self.txt_humeur_date.configure(
+            text=str(humeur.get("date") or "") if libelle
+            else "Le site n'a pas encore envoye d'humeur.")
+
+        signature = (len(PONT["rappels"]),
+                     PONT["rappels"][0]["id"] if PONT["rappels"] else None)
+        if signature != getattr(self, "_signature_rappels", None):
+            self._signature_rappels = signature
+            tk = self.tk
+            for enfant in self.liste_rappels.winfo_children():
+                enfant.destroy()
+            if not PONT["rappels"]:
+                self.texte(self.liste_rappels, "Aucun rappel en attente.",
+                           FIL, 9).pack(fill="x")
+            for rappel in PONT["rappels"]:
+                bloc = tk.Frame(self.liste_rappels, bg=ENCRE, padx=self.px(12),
+                                pady=self.px(9))
+                bloc.pack(fill="x", pady=(0, self.px(4)))
+                tk.Label(bloc, text=rappel["titre"], bg=ENCRE, fg=CRAIE,
+                         font=(self.f_ui, 9, "bold"), anchor="w").pack(fill="x")
+                tk.Label(bloc, text=rappel["texte"], bg=ENCRE, fg=BRUME,
+                         font=(self.f_ui, 9), anchor="w", justify="left",
+                         wraplength=self.px(460)).pack(fill="x")
+
+        self.txt_pont.configure(
+            text=PONT["message"],
+            fg=ALERTE if PONT["etat"] == "erreur" else BRUME)
+
+    # ------------------------------------------------------------------
+    #  Actions du pont
+    # ------------------------------------------------------------------
+
+    def relever_pont(self):
+        threading.Thread(target=relever_le_site, args=(self.cfg,),
+                         daemon=True).start()
+
+    def vider_rappels(self):
+        PONT["rappels"].clear()
+        self._signature_rappels = None
+
+    def ouvrir_site(self):
+        import webbrowser
+        adresse = str(self.cfg.get("pont_site", "")).strip()
+        if adresse:
+            webbrowser.open(adresse)
 
     # ------------------------------------------------------------------
     #  Page Mises a jour
@@ -2237,9 +2771,63 @@ class Panneau:
     #  Page Site web
     # ------------------------------------------------------------------
 
-    def page_site(self):
+    def page_passerelle(self):
         tk = self.tk
-        f = self.nouvelle_page("site", defilante=True)
+        f = self.nouvelle_page("passerelle", defilante=True)
+
+        self.titre(f, "pont avec braindebugger").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Le site tourne sur Internet, l'application ecoute en "
+                      "local. C'est ton navigateur, sur cette machine, qui "
+                      "fait le lien : une page du site peut appeler "
+                      "127.0.0.1 parce que les navigateurs traitent l'adresse "
+                      "locale comme sure, meme depuis une page en HTTPS.\n\n"
+                      "Mais sans onglet ouvert, plus rien ne peut joindre "
+                      "cette machine depuis Internet. Pour les rappels, c'est "
+                      "donc l'application qui va demander au site ce qu'il a "
+                      "en attente.", BRUME, 9, largeur=500).pack(fill="x")
+
+        rang = tk.Frame(f, bg=NUIT)
+        rang.pack(fill="x", pady=(12, 0))
+        self.texte(rang, "Adresse du site", CRAIE, 9, True).pack(side="left")
+        self.champ_pont = self.champ(rang, self.cfg.get("pont_site", ""), 34)
+        self.champ_pont.pack(side="right")
+
+        rang2 = tk.Frame(f, bg=NUIT)
+        rang2.pack(fill="x", pady=(8, 0))
+        self.texte(rang2, "Cle envoyee au site", CRAIE, 9, True).pack(side="left")
+        self.champ_pont_cle = self.champ(rang2, self.cfg.get("pont_cle", ""), 24)
+        self.champ_pont_cle.pack(side="right")
+        self.texte(f, "Facultative : transmise en parametre si le site veut "
+                      "verifier que la demande vient bien de toi.",
+                   BRUME, 8, largeur=500).pack(fill="x", pady=(4, 0))
+
+        self.var_pont_releve = tk.IntVar(
+            value=1 if self.cfg.get("pont_releve", True) else 0)
+        self.case(f, "Aller chercher les rappels en attente sur le site",
+                  self.var_pont_releve).pack(fill="x", pady=(10, 0))
+        self.var_pont_notifie = tk.IntVar(
+            value=1 if self.cfg.get("pont_notifie", True) else 0)
+        self.case(f, "Afficher une bulle quand un rappel arrive",
+                  self.var_pont_notifie).pack(fill="x", pady=(4, 0))
+        self.var_pont_intervalle = self.reglette(
+            f, "pont_intervalle", "Minutes entre deux releves", 1, 120, 1,
+            "Trop court fatigue le site pour rien : ces rappels ne sont pas "
+            "urgents a la minute.", entier=True)
+
+        self.separateur(f)
+        self.titre(f, "ce que le site doit exposer").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Une route GET sur /api/machitool/attente rendant du "
+                      "JSON. Toutes les cles sont facultatives :\n\n"
+                      "  rappels : [{id, titre, texte}]\n"
+                      "  humeur  : {valeur, libelle, couleur, date}\n"
+                      "  jours   : [{date, note, couleur}]\n"
+                      "  reperes : [{date, titre, couleur}]\n\n"
+                      "Tant que la route n'existe pas, le 404 est avale sans "
+                      "bruit et rien ne casse.", BRUME, 9,
+                   largeur=500).pack(fill="x")
+
+        self.separateur(f)
+        self.titre(f, "passerelle locale").pack(fill="x", pady=(0, 6))
 
         self.texte(f, "Ouvre un petit serveur sur ta machine. Un site que tu "
                       "developpes peut alors imposer une couleur, avec une date "
@@ -2416,6 +3004,12 @@ class Panneau:
             self.cfg[cle] = int(val) if cle in ("veille_minutes", "images_par_seconde") else round(val, 3)
         self.cfg["reaction_processeur"] = bool(self.var_cpu.get())
         self.cfg["echelle_interface"] = round(self.var_echelle.get(), 2)
+        self.cfg["eteindre_en_partant"] = bool(self.var_eteindre.get())
+        self.cfg["pont_site"] = self.champ_pont.get().strip().rstrip("/")
+        self.cfg["pont_cle"] = self.champ_pont_cle.get().strip()
+        self.cfg["pont_releve"] = bool(self.var_pont_releve.get())
+        self.cfg["pont_notifie"] = bool(self.var_pont_notifie.get())
+        self.cfg["pont_intervalle"] = int(self.var_pont_intervalle.get())
         self.cfg["mode"] = self.var_mode.get()
         source = self.var_source.get()
         self.cfg["ecran_source"] = source if source == "actif" else int(source)
@@ -2491,6 +3085,12 @@ class Panneau:
                  f"{self.cfg.get('images_par_seconde', 8)} images par seconde")
 
         self.tracer_bande(hexa)
+        self.peindre_apercus()
+        self.txt_apercu_ecran.configure(text=hexa)
+        if self.section == "calendrier":
+            self.peindre_journal()
+        elif self.section == "moi":
+            self.peindre_moi()
 
         if self.section == "accueil":
             # Repeindre hors de l'accueil ne servirait a rien : la tuile
@@ -3061,6 +3661,8 @@ def lancer():
     nettoyer_maj()      # efface l'exe telecharge par la mise a jour precedente
 
     boucle = asyncio.new_event_loop()
+    BLE["boucle"] = boucle
+    surveiller_arret_windows()
 
     def fil_ble():
         asyncio.set_event_loop(boucle)
@@ -3161,6 +3763,26 @@ def lancer():
     panneau.declencher_maj = declencher_maj
     threading.Thread(target=veille_maj, daemon=True).start()
 
+    def veille_pont():
+        """Va demander au site ce qu'il a en attente. Sans onglet ouvert,
+        c'est le seul chemin : rien depuis Internet ne peut joindre cette
+        machine."""
+        attente = 45.0
+        while ETAT["en_marche"]:
+            fin = time.time() + attente
+            while ETAT["en_marche"] and time.time() < fin:
+                time.sleep(2)
+            if not ETAT["en_marche"]:
+                return
+            if CFG.get("pont_releve", True):
+                try:
+                    relever_le_site(CFG)
+                except Exception as e:
+                    print("Releve du pont impossible :", e)
+            attente = max(1, int(CFG.get("pont_intervalle", 10))) * 60
+
+    threading.Thread(target=veille_pont, daemon=True).start()
+
     def libelle_maj(*_):
         if MAJ["etat"] == "prete":
             return "Installer la version %s" % MAJ["version"]
@@ -3201,6 +3823,8 @@ def lancer():
     def surveiller():
         if demande_arret.is_set():
             ETAT["en_marche"] = False
+            if CFG.get("eteindre_en_partant", True):
+                eteindre_guirlande()
             arreter_api()
             arreter_audio()
             try:
@@ -3218,6 +3842,11 @@ def lancer():
                 icone.icon = image_icone(ETAT["couleur"])
             except Exception:
                 pass
+        if ETAT.get("rappel_neuf") and PONT["rappels"]:
+            ETAT["rappel_neuf"] = False
+            if CFG.get("pont_notifie", True):
+                dernier_rappel = PONT["rappels"][0]
+                notifier(dernier_rappel["titre"], dernier_rappel["texte"])
         if MAJ["etat"] != dernier_etat_maj[0]:
             dernier_etat_maj[0] = MAJ["etat"]
             try:
