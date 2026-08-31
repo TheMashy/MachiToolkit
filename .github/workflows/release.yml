@@ -161,10 +161,17 @@ jobs:
 
           # Les pre-versions s'accumuleraient a chaque fusion : on ne garde
           # que les cinq dernieres, les stables n'etant jamais touchees.
-          gh release list --limit 100 --json tagName,isPrerelease \
+          #
+          # grep rend 1 quand il ne trouve rien, et sous pipefail cela
+          # suffisait a faire echouer l'etape alors que la publication
+          # venait de reussir. D'ou le || true, et la garde sur la ligne
+          # vide que laisse un echo d'une chaine vide.
+          anciennes="$(gh release list --limit 100 --json tagName,isPrerelease \
             --jq '.[] | select(.isPrerelease) | .tagName' \
-            | grep -- '-dev\.' | tail -n +6 \
-            | while read -r vieille; do
-                echo "Menage : suppression de $vieille"
-                gh release delete "$vieille" --yes --cleanup-tag || true
-              done
+            | grep -- '-dev\.' || true)"
+          echo "$anciennes" | tail -n +6 | while read -r vieille; do
+            [ -n "$vieille" ] || continue
+            echo "Menage : suppression de $vieille"
+            gh release delete "$vieille" --yes --cleanup-tag || true
+          done
+          echo "Etape terminee.""
