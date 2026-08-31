@@ -4,16 +4,24 @@ name: Publication
 # GitHub. C'est cette publication que les exemplaires deja installes
 # viennent lire pour se mettre a jour tout seuls.
 #
-# La regle tient en une phrase : une publication nait des que VERSION
-# porte un numero encore jamais publie. Monter VERSION dans une pull
-# request suffit donc — la fusionner sur main sort la version. Pas de tag
-# a poser a la main, pas d'etape oubliee entre le code et l'exe.
+# Chaque fusion sur main sort un exe telechargeable. Deux formes, selon
+# ce que dit VERSION :
 #
-# Une poussee sur main qui ne change pas VERSION ne fait qu'un build de
-# controle : l'exe part en artefact, la publication existante n'est pas
-# touchee. Poser un tag ou lancer le workflow a la main remplace en
-# revanche les fichiers d'une publication deja sortie, pour rattraper un
-# binaire rate sans changer de numero.
+#   VERSION porte un numero jamais publie  -> publication STABLE.
+#   VERSION n'a pas bouge                  -> PRE-VERSION 1.x.y-dev.N,
+#                                             N etant le numero du passage.
+#
+# Il n'y a donc rien a faire pour diffuser un changement : fusionner
+# suffit. Qui coche « Accepter les pre-versions » dans l'application
+# recoit chaque fusion ; qui ne la coche pas reste sur les stables.
+#
+# Le numero est grave dans le source avant la compilation : un exe de
+# developpement qui se croirait a la version stable dont il est issu se
+# proposerait sa propre mise a jour en boucle.
+#
+# Poser un tag, ou lancer le workflow a la main, remplace les fichiers
+# d'une publication deja sortie — pour rattraper un binaire rate sans
+# changer de numero.
 
 on:
   push:
@@ -47,15 +55,39 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.11.1
 
-      - name: Numero de version
-        id: version
-        shell: bash
-        run: echo "numero=$(python outils/version.py)" >> "$GITHUB_OUTPUT"
-
       - name: Coherence du tag
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: python outils/version.py --verifier "${GITHUB_REF_NAME}"
+
+      - name: Choix du numero
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REFERENCE: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          base="$(python outils/version.py)"
+
+          # Sur un tag, la version est celle du tag, point.
+          sur_tag=non
+          case "$REFERENCE" in refs/tags/*) sur_tag=oui ;; esac
+
+          if [ "$sur_tag" = "oui" ] || ! gh release view "v$base" >/dev/null 2>&1; then
+            numero="$base"
+            prerelease=false
+          else
+            # La stable existe deja : ce passage sort une pre-version.
+            numero="$(python outils/version.py --dev "${{ github.run_number }}")"
+            prerelease=true
+          fi
+
+          # Grave dans le source avant compilation.
+          python outils/version.py --poser "$numero"
+          echo "numero=$numero"         >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Cette compilation sortira en $numero (pre-version : $prerelease)"
 
       - name: Icone
         run: python machi_tool.py --icone
@@ -111,14 +143,28 @@ jobs:
           [ "$FORCEE" = "true" ] && explicite=oui
 
           if [ "$deja" = "non" ]; then
-            gh release create "$tag" $fichiers \
-              --title "Machi Tool $numero" \
-              --generate-notes
+            if [ "${{ steps.version.outputs.prerelease }}" = "true" ]; then
+              gh release create "$tag" $fichiers \
+                --title "Machi Tool $numero" --prerelease \
+                --notes "Pre-version issue de la fusion sur main. Elle n'est proposee qu'aux installations ayant coche « Accepter les pre-versions »."
+            else
+              gh release create "$tag" $fichiers \
+                --title "Machi Tool $numero" --generate-notes
+            fi
             echo "Nouvelle publication : $(gh release view "$tag" --json url --jq .url)"
           elif [ "$explicite" = "oui" ]; then
             gh release upload "$tag" $fichiers --clobber
             echo "Fichiers remplaces : $(gh release view "$tag" --json url --jq .url)"
           else
-            echo "$tag est deja publiee et VERSION n'a pas bouge."
-            echo "Build de controle seulement, l'exe est en artefact."
+            echo "$tag existe deja, rien a faire."
           fi
+
+          # Les pre-versions s'accumuleraient a chaque fusion : on ne garde
+          # que les cinq dernieres, les stables n'etant jamais touchees.
+          gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' \
+            | grep -- '-dev\.' | tail -n +6 \
+            | while read -r vieille; do
+                echo "Menage : suppression de $vieille"
+                gh release delete "$vieille" --yes --cleanup-tag || true
+              done

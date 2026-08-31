@@ -193,10 +193,13 @@ CONFIG_DEFAUT = {
     "pont_notifie": True,            # afficher les rappels recus
 
     # Mises a jour depuis les publications GitHub du depot.
+    "config_version": 2,              # sert aux migrations, voir charger_config
     "maj_verifier": True,             # regarder si une version plus recente existe
     "maj_installation_auto": False,   # poser la mise a jour sans rien demander
-    "maj_prereleases": False,         # accepter aussi les pre-versions
-    "maj_intervalle_heures": 6,       # delai entre deux verifications
+    # Chaque fusion sur main sort une pre-version : la refuser reviendrait
+    # a ne rien voir passer entre deux versions stables.
+    "maj_prereleases": True,
+    "maj_intervalle_heures": 1,       # delai entre deux verifications
 }
 
 # ==========================================================================
@@ -271,6 +274,17 @@ def charger_config():
             enregistre.get("ecran_suit_luminance") is False:
         cfg["ecran_cible"] = "rien"
     cfg.pop("ecran_suit_luminance", None)
+
+    # Version 2 : les pre-versions deviennent le canal normal, puisque
+    # chaque fusion en produit une. Une configuration ecrite avant ce
+    # changement porte un « non » qui ne repondait pas a la meme question ;
+    # on la fait passer une fois, sans y revenir ensuite.
+    if enregistre and int(enregistre.get("config_version", 1)) < 2:
+        cfg["maj_prereleases"] = True
+        cfg["maj_intervalle_heures"] = min(
+            int(cfg.get("maj_intervalle_heures", 1)), 2)
+        print("Configuration migree : les nouveaux builds seront proposes.")
+    cfg["config_version"] = 2
     return cfg
 
 
@@ -2839,7 +2853,9 @@ class Panneau:
                   self.var_maj_auto, self.options_maj).pack(fill="x", pady=(4, 0))
         self.var_maj_pre = tk.IntVar(
             value=1 if self.cfg.get("maj_prereleases", False) else 0)
-        self.case(f, "Accepter aussi les pre-versions",
+        self.case(f, "Accepter les builds de developpement — chaque fusion "
+                     "sur main en produit un, sans attendre une version "
+                     "stable. Decoche pour ne recevoir que les stables.",
                   self.var_maj_pre, self.options_maj).pack(fill="x", pady=(4, 0))
 
         self.separateur(f)
@@ -3339,6 +3355,11 @@ def version_en_tuple(texte):
     return (tuple(nombres[:3]), 0 if pre else 1, tuple(rang))
 
 
+def est_build(version):
+    """Une pre-version issue d'une fusion, par opposition a une stable."""
+    return "-dev." in str(version)
+
+
 def plus_recente(candidate, reference):
     return version_en_tuple(candidate) > version_en_tuple(reference)
 
@@ -3455,7 +3476,8 @@ def verifier_maj(cfg):
         return None
 
     MAJ["etat"] = "disponible"
-    MAJ["message"] = "Version %s disponible (installee : %s)." % (
+    MAJ["message"] = "%s %s disponible (installee : %s)." % (
+        "Nouveau build" if est_build(publication["version"]) else "Version",
         publication["version"], VERSION)
     return publication
 
@@ -3822,9 +3844,11 @@ def lancer():
         if CFG.get("maj_installation_auto", False):
             travail_maj("installer")
         else:
-            notifier("Mise a jour disponible",
-                     "Version %s. Clic droit sur l'icone pour l'installer."
-                     % publication["version"])
+            notifier(
+                "Nouveau build detecte" if est_build(publication["version"])
+                else "Mise a jour disponible",
+                "%s. Clic droit sur l'icone pour l'installer."
+                % publication["version"])
 
     verrou_maj = threading.Lock()
 
@@ -3884,10 +3908,11 @@ def lancer():
     threading.Thread(target=veille_pont, daemon=True).start()
 
     def libelle_maj(*_):
+        quoi = "le build" if est_build(MAJ["version"]) else "la version"
         if MAJ["etat"] == "prete":
-            return "Installer la version %s" % MAJ["version"]
+            return "Installer %s %s" % (quoi, MAJ["version"])
         if MAJ["etat"] == "disponible":
-            return "Mettre a jour vers la version %s" % MAJ["version"]
+            return "Passer a %s %s" % (quoi, MAJ["version"])
         if MAJ["etat"] == "telechargement":
             return "Telechargement en cours..."
         if MAJ["etat"] == "verification":
