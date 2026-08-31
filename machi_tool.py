@@ -192,6 +192,16 @@ CONFIG_DEFAUT = {
     "pont_cle": "",                  # cle transmise au site, s'il en veut une
     "pont_notifie": True,            # afficher les rappels recus
 
+    # Bascule pendant qu'on est sur le site. Deux facons de s'en rendre
+    # compte, cumulees : le titre de la fenetre active, qui ne demande rien
+    # au site, et un battement que le site peut envoyer — le seul a marcher
+    # quand l'onglet est ouvert mais qu'on regarde ailleurs.
+    "pont_presence": True,
+    "pont_presence_indice": "braindebugger",
+    "pont_presence_couleur": "#7C3AED",
+    "pont_presence_suit_humeur": True,   # prefere la couleur d'humeur recue
+    "pont_presence_grace": 20,           # secondes gardees apres la sortie
+
     # Mises a jour depuis les publications GitHub du depot.
     "config_version": 2,              # sert aux migrations, voir charger_config
     "maj_verifier": True,             # regarder si une version plus recente existe
@@ -236,6 +246,8 @@ ETAT = {
     "forcage": None,     # {"couleur", "nom", "expire"}
     "api": "arretee",
     "rappel_neuf": False,
+    "presence": None,      # battement envoye par le site
+    "presence_vu": 0.0,    # jusqu'a quand la presence reste acquise
 }
 
 # Ce que le site a envoye. Rien n'est invente ici : tant que BrainDebugger
@@ -694,6 +706,43 @@ def resaturer_vers(rgb, facteur):
     return (r * 255, g * 255, b * 255)
 
 
+def presence_du_site(cfg, contexte):
+    """La couleur a poser tant qu'on utilise BrainDebugger, ou None.
+
+    Deux sources se cumulent. Le titre de la fenetre active suffit dans le
+    cas courant — on lit le site, il est devant — et ne demande rien au
+    site. Le battement, lui, couvre le cas ou l'onglet reste ouvert
+    pendant qu'on travaille ailleurs : le titre ne dit alors plus rien.
+
+    Un delai de grace evite le clignotement quand on passe une seconde sur
+    une autre fenetre.
+    """
+    if not cfg.get("pont_presence", True):
+        return None
+
+    maintenant = time.time()
+    indice = str(cfg.get("pont_presence_indice", "")).strip().lower()
+    vu = bool(indice) and indice in (contexte or "")
+
+    battement = ETAT.get("presence")
+    if battement and maintenant >= battement.get("jusqu_a", 0):
+        battement = ETAT["presence"] = None
+    if battement:
+        vu = True
+
+    if vu:
+        grace = max(0.0, float(cfg.get("pont_presence_grace", 20)))
+        ETAT["presence_vu"] = maintenant + grace
+    elif maintenant >= ETAT.get("presence_vu", 0):
+        return None
+
+    humeur = (PONT.get("humeur") or {}).get("couleur", "")
+    if cfg.get("pont_presence_suit_humeur", True) and \
+            str(humeur).startswith("#"):
+        return hex_vers_rgb(humeur), "BrainDebugger \u00b7 humeur"
+    return hex_vers_rgb(cfg.get("pont_presence_couleur", "#7C3AED")), "BrainDebugger"
+
+
 def couleur_son(cfg, couleur_regle):
     """((r, v, b), gain) a partir de la derniere analyse.
 
@@ -888,6 +937,18 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
                                "nom": str(nom)}
             return self.repondre(200, {"ok": True, "humeur": nom,
                                        "couleur": rgb_vers_hex(rvb), "duree": duree})
+
+        if chemin == "/presence":
+            # Le site declare qu'on l'utilise. La duree est courte a
+            # dessein : un onglet ferme brutalement ne doit pas laisser la
+            # guirlande bloquee sur sa couleur.
+            duree_p = max(5.0, min(300.0, float(corps.get("duree", 60))))
+            if corps.get("actif", True):
+                ETAT["presence"] = {"jusqu_a": time.time() + duree_p}
+            else:
+                ETAT["presence"] = None
+                ETAT["presence_vu"] = 0.0
+            return self.repondre(200, {"ok": True, "duree": duree_p})
 
         if chemin == "/relacher":
             ETAT["forcage"] = None
@@ -1136,6 +1197,16 @@ async def une_session(cfg):
                     mode = "force"
                 elif forcage:
                     ETAT["forcage"] = None
+                else:
+                    # Passe devant l'ecran et le son, mais jamais devant une
+                    # couleur que le site a explicitement posee. Des que la
+                    # presence retombe, le mode normal reprend de lui-meme :
+                    # il n'y a rien a restaurer.
+                    site = presence_du_site(cfg, contexte)
+                    if site:
+                        (rc, vc, bc), nom = site
+                        mode = "site"
+                        douceur = float(cfg.get("douceur", 0.06))
 
                 if mode == "son":
                     if AUDIO["actif"]:
@@ -2994,6 +3065,44 @@ class Panneau:
             "urgents a la minute.", entier=True)
 
         self.separateur(f)
+        self.titre(f, "bascule pendant l'usage du site").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Quand tu es sur BrainDebugger, la guirlande prend sa "
+                      "couleur, et revient d'elle-meme a l'ecran ou au son "
+                      "des que tu le quittes. Rien n'est a restaurer : le "
+                      "mode normal reprend simplement la main.",
+                   BRUME, 9, largeur=500).pack(fill="x", pady=(0, 10))
+
+        self.var_presence = tk.IntVar(
+            value=1 if self.cfg.get("pont_presence", True) else 0)
+        self.case(f, "Basculer quand j'utilise le site",
+                  self.var_presence).pack(fill="x")
+        self.var_presence_humeur = tk.IntVar(
+            value=1 if self.cfg.get("pont_presence_suit_humeur", True) else 0)
+        self.case(f, "Prendre la couleur de mon humeur du jour si le site en "
+                     "a envoye une, plutot que la couleur fixe",
+                  self.var_presence_humeur).pack(fill="x", pady=(4, 0))
+
+        rang3 = tk.Frame(f, bg=NUIT)
+        rang3.pack(fill="x", pady=(10, 0))
+        self.texte(rang3, "Mot reconnu dans le titre", CRAIE, 9, True).pack(side="left")
+        self.champ_presence = self.champ(
+            rang3, self.cfg.get("pont_presence_indice", ""), 22)
+        self.champ_presence.pack(side="right")
+
+        rang4 = tk.Frame(f, bg=NUIT)
+        rang4.pack(fill="x", pady=(8, 0))
+        self.texte(rang4, "Couleur fixe", CRAIE, 9, True).pack(side="left")
+        self.champ_presence_couleur = self.champ(
+            rang4, self.cfg.get("pont_presence_couleur", "#7C3AED"), 12)
+        self.champ_presence_couleur.pack(side="right")
+
+        self.var_presence_grace = self.reglette(
+            f, "pont_presence_grace", "Delai de grace", 0, 120, 5,
+            "Secondes gardees apres avoir quitte le site. Sans ce delai, un "
+            "passage d'une seconde sur une autre fenetre ferait clignoter la "
+            "guirlande.", entier=True)
+
+        self.separateur(f)
         self.titre(f, "ce que le site doit exposer").pack(fill="x", pady=(0, 6))
         self.texte(f, "Une route GET sur /api/machitool/attente rendant du "
                       "JSON. Toutes les cles sont facultatives :\n\n"
@@ -3001,6 +3110,9 @@ class Panneau:
                       "  humeur  : {valeur, libelle, couleur, date}\n"
                       "  jours   : [{date, note, couleur}]\n"
                       "  reperes : [{date, titre, couleur}]\n\n"
+                      "Et pour signaler qu'un onglet est ouvert alors que tu "
+                      "regardes ailleurs, le site peut battre la mesure :\n"
+                      "  POST 127.0.0.1/presence {\"actif\": true, \"duree\": 60}\n\n"
                       "Tant que la route n'existe pas, le 404 est avale sans "
                       "bruit et rien ne casse.", BRUME, 9,
                    largeur=500).pack(fill="x")
@@ -3188,6 +3300,13 @@ class Panneau:
         self.cfg["pont_releve"] = bool(self.var_pont_releve.get())
         self.cfg["pont_notifie"] = bool(self.var_pont_notifie.get())
         self.cfg["pont_intervalle"] = int(self.var_pont_intervalle.get())
+        self.cfg["pont_presence"] = bool(self.var_presence.get())
+        self.cfg["pont_presence_suit_humeur"] = bool(self.var_presence_humeur.get())
+        self.cfg["pont_presence_indice"] = self.champ_presence.get().strip().lower()
+        couleur = self.champ_presence_couleur.get().strip()
+        self.cfg["pont_presence_couleur"] = (
+            couleur if couleur.startswith("#") and len(couleur) == 7 else "#7C3AED")
+        self.cfg["pont_presence_grace"] = int(self.var_presence_grace.get())
         self.cfg["mode"] = self.var_mode.get()
         source = self.var_source.get()
         self.cfg["ecran_source"] = source if source == "actif" else int(source)
