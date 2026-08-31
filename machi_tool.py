@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -950,23 +950,36 @@ def relever_le_site(cfg):
         return False
     url = base + "/api/machitool/attente"
     cle = str(cfg.get("pont_cle", "")).strip()
+    entetes = {"User-Agent": "MachiToolkit", "Accept": "application/json"}
     if cle:
+        # La cle part de trois facons a la fois : le site n'a qu'a lire
+        # celle qui l'arrange, sans qu'on ait a s'accorder d'avance.
         url += "?cle=" + urllib.parse.quote(cle)
+        entetes["Authorization"] = "Bearer " + cle
+        entetes["X-Machitool-Cle"] = cle
 
     PONT["etat"] = "releve"
     try:
-        requete = urllib.request.Request(url, headers={
-            "User-Agent": "MachiToolkit",
-            "Accept": "application/json",
-        })
+        requete = urllib.request.Request(url, headers=entetes)
         with urllib.request.urlopen(requete, timeout=12,
                                     context=_contexte_ssl()) as reponse:
             donnees = json.loads(reponse.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         PONT["etat"] = "erreur"
-        PONT["message"] = ("Le site ne propose pas encore de route "
-                           "/api/machitool/attente." if e.code == 404
-                           else "Le site a repondu %s." % e.code)
+        if e.code == 404:
+            PONT["message"] = ("Le site ne propose pas encore de route "
+                               "/api/machitool/attente.")
+        elif e.code in (401, 403):
+            PONT["message"] = (
+                "Le site demande une authentification (%s). La route existe "
+                "donc bien. Renseigne la cle dans Passerelle : elle part en "
+                "Authorization: Bearer, en X-Machitool-Cle et en ?cle=."
+                % e.code) if not cle else (
+                "Le site refuse la cle (%s). Verifie qu'il attend la meme, "
+                "et qu'il la lit dans l'un des trois emplacements envoyes."
+                % e.code)
+        else:
+            PONT["message"] = "Le site a repondu %s." % e.code
         return False
     except Exception as e:
         PONT["etat"] = "erreur"
@@ -1424,6 +1437,33 @@ def activer_dpi():
             continue
 
 
+def dpi_de_la_fenetre(racine):
+    """Points par pouce de l'ecran ou se trouve reellement la fenetre.
+
+    winfo_fpixels ne connait que l'ecran sur lequel Tk a demarre. Sur un
+    poste a deux ecrans de finesse differente — un 4K et un 1080p — il
+    renvoie donc toujours le meme chiffre, et la fenetre garde la taille du
+    premier ecran en passant sur le second. GetDpiForWindow, lui, repond
+    pour le moniteur qui porte la fenetre a cet instant.
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            poignee = racine.winfo_id()
+            # La fenetre Tk est un enfant : c'est son ancetre de plus haut
+            # niveau qui porte la resolution.
+            racine_win = ctypes.windll.user32.GetAncestor(poignee, 2)
+            ppp = ctypes.windll.user32.GetDpiForWindow(racine_win or poignee)
+            if ppp:
+                return float(ppp)
+        except Exception:
+            pass
+    try:
+        return float(racine.winfo_fpixels("1i"))
+    except Exception:
+        return 96.0
+
+
 def echelle_ecran(racine, forcee=0.0):
     """Facteur a appliquer aux tailles en pixels. 1.0 = ecran 96 ppp."""
     try:
@@ -1431,10 +1471,7 @@ def echelle_ecran(racine, forcee=0.0):
             return max(0.75, min(4.0, float(forcee)))
     except (TypeError, ValueError):
         pass
-    try:
-        return max(1.0, min(4.0, racine.winfo_fpixels("1i") / 96.0))
-    except Exception:
-        return 1.0
+    return max(1.0, min(4.0, dpi_de_la_fenetre(racine) / 96.0))
 
 
 # ==========================================================================
@@ -1523,6 +1560,9 @@ class Panneau:
         self.phase = 0.0
         # Remplace par lancer() : le panneau demande, la boucle principale agit.
         self.declencher_maj = lambda quoi="verifier": None
+        # Incremente a chaque reconstruction : les boucles differees d'une
+        # generation precedente s'arretent au lieu de se dedoubler.
+        self.generation = 0
 
         self.root = tk.Tk()
         self.echelle = echelle_ecran(self.root, self.cfg.get("echelle_interface", 0.0))
@@ -1556,6 +1596,12 @@ class Panneau:
         self.f_ui    = choisir("Segoe UI", "Tahoma")
         self.f_mono  = choisir("Cascadia Mono", "Consolas", "Courier New")
 
+        self.construire_tout()
+
+    def construire_tout(self):
+        """Tout ce qui depend de l'echelle. Rejoue tel quel quand la
+        fenetre change d'ecran."""
+        tk = self.tk
         self.construire_entete()
         self.construire_pied()
 
@@ -1583,10 +1629,52 @@ class Panneau:
         self.page_calendrier()
         self.page_moi()
         self.page_appairage()
-        self.aller("accueil")
+        self.aller(self.section if self.section in self.pages else "accueil")
 
         self.animer()
         self.rafraichir()
+
+    def refaire_interface(self, echelle):
+        """Refait l'interface a l'echelle du nouvel ecran.
+
+        tkinter fige la taille des caracteres a la creation du widget :
+        changer tk scaling ensuite ne les redessine pas. Il faut donc tout
+        rebatir. Les reglages non enregistres repartent du fichier — c'est
+        le prix, et changer d'ecran reste rare.
+        """
+        self.generation += 1
+        self.echelle = echelle
+        try:
+            self.root.tk.call("tk", "scaling", echelle * 96.0 / 72.0)
+        except Exception:
+            pass
+
+        # La position est gardee, la taille repart de la mesure de base :
+        # c'est justement elle qui doit changer d'echelle.
+        position = ""
+        try:
+            morceaux = self.root.geometry().split("+", 1)
+            if len(morceaux) > 1:
+                position = "+" + morceaux[1]
+        except Exception:
+            pass
+
+        for enfant in list(self.root.winfo_children()):
+            try:
+                enfant.destroy()
+            except Exception:
+                pass
+
+        self.lignes = []
+        self.pages = {}
+        self.onglets = {}
+        self.reglettes = []
+        self.apercus = []
+
+        self.root.minsize(self.px(720), self.px(640))
+        self.root.geometry("%dx%d%s" % (self.px(780), self.px(700), position))
+        self.construire_tout()
+        print("Interface refaite a l'echelle %.2f" % echelle)
 
     def px(self, n):
         """Convertit une mesure pensee en 96 ppp vers l'ecran reel."""
@@ -1662,7 +1750,8 @@ class Panneau:
             self.brin.itemconfig(coeur, fill=melange(teinte, NUIT_RGB,
                                                      min(1.0, 0.4 + 0.6 * force)))
         self.peindre_vumetre()
-        self.root.after(70, self.animer)
+        g = self.generation
+        self.root.after(70, lambda: g == self.generation and self.animer())
 
     # ------------------------------------------------------------------
     #  Rail de navigation
@@ -2244,7 +2333,8 @@ class Panneau:
                 self.ajouter_ligne({"nom": indice[:14].title(),
                                     "couleur": "#FFFFFF", "mots": [indice]})
                 self.aller("regles")
-        self.root.after(4000, relever)
+        g = self.generation
+        self.root.after(4000, lambda: g == self.generation and relever())
 
     # ------------------------------------------------------------------
     #  Page Ecran
@@ -3084,6 +3174,15 @@ class Panneau:
             text=f"{mode} — {ETAT['ecrans']} ecran(s) — "
                  f"{self.cfg.get('images_par_seconde', 8)} images par seconde")
 
+        # Deplacer la fenetre d'un 4K vers un 1080p doit la ramener a la
+        # taille du 1080p. Le test est une lecture de la resolution du
+        # moniteur porteur : assez peu cher pour tenir dans cette boucle.
+        if not self.cfg.get("echelle_interface", 0.0):
+            voulue = echelle_ecran(self.root, 0.0)
+            if abs(voulue - self.echelle) > 0.05:
+                self.refaire_interface(voulue)
+                return
+
         self.tracer_bande(hexa)
         self.peindre_apercus()
         self.txt_apercu_ecran.configure(text=hexa)
@@ -3147,7 +3246,8 @@ class Panneau:
             ETAT["resultat"] = ""
             self.aller("etat")
 
-        self.root.after(400, self.rafraichir)
+        g = self.generation
+        self.root.after(400, lambda: g == self.generation and self.rafraichir())
 
     def tracer_bande(self, hexa):
         """Un trait par mesure : environ une minute d'historique visible."""

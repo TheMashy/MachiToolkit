@@ -123,9 +123,14 @@ n'inventent rien et ne conservent rien : sans donnees, elles le disent.
 
 ## Ecrans haute resolution
 
-L'interface se met a l'echelle de l'ecran au demarrage. Sur un 4K a 150 ou
-200 %, la fenetre, les caracteres et les dessins grandissent d'autant, sans
-le flou qu'on obtient en laissant Windows agrandir l'image.
+L'interface se met a l'echelle de l'ecran **qui porte la fenetre**, et s'y
+refait quand on la deplace : passer d'un 4K a 150 % a un 1080p a 100 % la
+ramene a sa taille, au lieu de garder celle du premier ecran. Sans le flou
+qu'on obtient en laissant Windows agrandir l'image.
+
+Les reglages non enregistres repartent du fichier a ce moment-la : refaire
+l'interface est la seule facon de changer la taille des caracteres, que
+tkinter fige a la creation de chaque widget.
 
 Si la detection se trompe, **Reglages > Affichage > Echelle de l'interface**
 force une valeur : 1.00 pour un ecran classique, 1.50 pour un 4K a 150 %,
