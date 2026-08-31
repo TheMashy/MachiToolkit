@@ -118,6 +118,24 @@ Toutes les cles sont facultatives. Tant que cette route n'existe pas cote
 site, le 404 est avale sans bruit et rien ne casse — la page Passerelle le
 dit simplement.
 
+### Bascule pendant l'usage du site
+
+Quand BrainDebugger est devant, la guirlande prend sa couleur — celle de
+l'humeur du jour si le site en a envoye une, sinon une couleur fixe. Des
+que le site est quitte, le mode normal reprend la main : ecran, son ou
+regles. Rien n'est a restaurer, la couleur du site n'etait qu'une
+priorite temporaire.
+
+Deux facons de savoir que le site sert, cumulees. Le **titre de la fenetre
+active** suffit dans le cas courant et ne demande rien au site. Le
+**battement** couvre le cas ou l'onglet reste ouvert pendant qu'on
+travaille ailleurs :
+
+    POST 127.0.0.1:7373/presence   {"actif": true, "duree": 60}
+
+Un delai de grace, vingt secondes par defaut, evite que la guirlande
+clignote quand on passe une seconde sur une autre fenetre.
+
 Les pages **Calendrier** et **Moi** affichent ce que le site a envoye. Elles
 n'inventent rien et ne conservent rien : sans donnees, elles le disent.
 
