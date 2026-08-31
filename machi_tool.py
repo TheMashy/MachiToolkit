@@ -78,6 +78,7 @@ except Exception:
 FICHIER_CONFIG = os.path.join(DOSSIER, "config.json")
 FICHIER_JOURNAL = os.path.join(DOSSIER, "journal.log")
 CIBLE_EXE = os.path.join(DOSSIER, NOM_EXE)
+FICHIER_VERSION = os.path.join(DOSSIER, "version_installee.txt")
 
 # Sans console, sys.stdout vaut None et le moindre print() leverait une
 # exception. On redirige tout vers un fichier journal.
@@ -4193,6 +4194,55 @@ def nettoyer_maj():
 #  Installation, mise a jour, demarrage
 # ==========================================================================
 
+def version_installee():
+    """Numero de la version actuellement installee, ou '' si inconnu.
+
+    Ecrit par l'exe installe a chaque demarrage : c'est ce qui permet de
+    refuser qu'un vieux fichier telecharge s'ecrase par-dessus une version
+    plus recente."""
+    try:
+        with open(FICHIER_VERSION, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def ecrire_version_installee():
+    try:
+        with open(FICHIER_VERSION, "w", encoding="utf-8") as f:
+            f.write(VERSION)
+    except Exception:
+        pass
+
+
+def installer_raccourci():
+    """Raccourci dans le menu Demarrer, pour relancer sans chercher l'exe.
+
+    Apres avoir quitte depuis l'icone, plus besoin de retrouver le fichier :
+    'Machi Tool' se tape dans la recherche Windows. Sans pywin32/COM, on
+    laisse tomber en silence — l'entree de demarrage suffit au lancement
+    automatique."""
+    if os.name != "nt":
+        return
+    try:
+        import win32com.client
+        dossier = os.path.join(os.environ.get("APPDATA", ""), "Microsoft",
+                               "Windows", "Start Menu", "Programs")
+        os.makedirs(dossier, exist_ok=True)
+        lien = os.path.join(dossier, NOM_APP + ".lnk")
+        shell = win32com.client.Dispatch("WScript.Shell")
+        raccourci = shell.CreateShortcut(lien)
+        raccourci.TargetPath = CIBLE_EXE
+        raccourci.WorkingDirectory = DOSSIER
+        ico = os.path.join(DOSSIER, "icone.ico")
+        if os.path.exists(ico):
+            raccourci.IconLocation = ico
+        raccourci.Description = NOM_APP
+        raccourci.Save()
+    except Exception as e:
+        print("Raccourci menu Demarrer non cree :", e)
+
+
 def commande_lancement():
     """Ce qu'il faut executer pour demarrer l'application."""
     if FIGE:
@@ -4327,6 +4377,24 @@ def installer_ou_mettre_a_jour():
         return False                       # on EST l'application installee
 
     deja = os.path.exists(CIBLE_EXE)
+
+    # Un vieux fichier telecharge ne doit pas ecraser une version plus
+    # recente deja installee — le cas ou l'on relance a la main un exe garde
+    # dans les telechargements, alors que l'installation s'est mise a jour
+    # seule depuis. On lance simplement la version installee.
+    installee = version_installee()
+    if deja and installee and plus_recente(installee, VERSION):
+        try:
+            subprocess.Popen([CIBLE_EXE], close_fds=True)
+        except Exception as e:
+            print("Lancement de la version installee impossible :", e)
+        dialogue(NOM_APP,
+                 f"Une version plus recente ({installee}) est deja installee.\n"
+                 f"Ce fichier-ci est la {VERSION}. C'est la version installee "
+                 "qui demarre — ton ancien fichier telecharge peut etre "
+                 "supprime.")
+        return True
+
     try:
         os.makedirs(DOSSIER, exist_ok=True)
         reprise = reprendre_ancienne_installation()
@@ -4344,6 +4412,8 @@ def installer_ou_mettre_a_jour():
             return True
 
         installer_demarrage()
+        installer_raccourci()
+        ecrire_version_installee()
         subprocess.Popen([CIBLE_EXE], close_fds=True)
         if deja:
             texte = (f"Mise a jour vers la version {VERSION} terminee.\n\n"
@@ -4357,8 +4427,11 @@ def installer_ou_mettre_a_jour():
         else:
             texte = (f"Installation terminee ({NOM_APP} {VERSION}).\n\n"
                      f"Installee dans :\n{DOSSIER}\n\n"
-                     "L'application demarre maintenant avec Windows.\n"
-                     "Son icone est en bas a droite, pres de l'horloge.")
+                     "Elle demarre avec Windows, et se met a jour seule.\n"
+                     "Son icone est en bas a droite, pres de l'horloge.\n\n"
+                     "Pour la relancer apres l'avoir quittee : tape "
+                     "\"Machi Tool\" dans le menu Demarrer. Ton ancien "
+                     "fichier telecharge n'est plus utile.")
         dialogue(NOM_APP, texte)
         return True
     except Exception as e:
@@ -4408,6 +4481,8 @@ def ecrire_icone(chemin):
 
 def lancer():
     global CFG
+    if FIGE:
+        ecrire_version_installee()   # on est l'exe installe : on date l'install
     identite_barre_taches()
     activer_dpi()
     CFG = charger_config()
