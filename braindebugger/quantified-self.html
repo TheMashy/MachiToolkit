@@ -1,0 +1,478 @@
+<title>Quantified Self</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  /* Console de preparation : voir ce que BrainDebugger va recevoir, et en
+     tirer un rollup consolide que le site stocke une fois. Theme unique
+     assume — l'ecosysteme Machi Tool est sombre —, chaque fond peint. */
+  :root {
+    --nuit:    #140E1C;
+    --velours: #1E1530;
+    --encre:   #191024;
+    --fil:     #3B2A55;
+    --craie:   #EDE4F2;
+    --brume:   #9683AA;
+    --accent:  #B79CF5;
+    --accent-sourd: #6E5A9A;
+    --vif:     #5CE6A4;
+    --alerte:  #FF8A6B;
+
+    --display: "Barlow Semi Condensed", "Bahnschrift", "Segoe UI Semibold", sans-serif;
+    --texte:   "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --mono:    "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--nuit);
+    color: var(--craie);
+    font-family: var(--texte);
+    font-size: 14px;
+    line-height: 1.5;
+    margin: 0;
+    padding: 0 20px 80px;
+  }
+
+  .page { max-width: 1120px; margin: 0 auto; }
+
+  a { color: var(--accent); }
+
+  /* ---- en-tete ---- */
+  header { padding: 30px 0 6px; }
+  .marque {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .28em;
+    text-transform: uppercase; color: var(--brume); margin: 0;
+  }
+  h1 {
+    font-family: var(--display); font-size: clamp(30px, 5vw, 46px);
+    font-weight: 700; line-height: 1; letter-spacing: -.01em;
+    margin: 6px 0 10px; text-wrap: balance;
+  }
+  .chapo { color: var(--brume); max-width: 66ch; margin: 0; }
+
+  /* ---- barre de chargement ---- */
+  .charger {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    background: var(--velours); border: 1px solid var(--fil);
+    padding: 12px 14px; margin: 22px 0 8px;
+  }
+  .charger .etiq {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--brume); margin-right: 4px;
+  }
+  button, .bouton {
+    font-family: var(--texte); font-size: 13px; font-weight: 500;
+    color: var(--craie); background: var(--encre); border: 1px solid var(--fil);
+    padding: 7px 13px; cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  button:hover, .bouton:hover { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button.pri { background: var(--accent); border-color: var(--accent); color: #140E1C; font-weight: 600; }
+  input[type="text"], input[type="password"] {
+    font-family: var(--mono); font-size: 12px; color: var(--craie);
+    background: var(--encre); border: 1px solid var(--fil); padding: 7px 10px;
+    width: 150px;
+  }
+  input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  .zone-depot {
+    border: 1px dashed var(--fil); color: var(--brume); font-size: 12px;
+    padding: 7px 13px; cursor: pointer;
+  }
+  .zone-depot.survol { border-color: var(--accent); color: var(--craie); background: var(--encre); }
+
+  .note { font-size: 12px; color: var(--brume); margin: 6px 0 0; }
+  .note.err { color: var(--alerte); }
+
+  /* ---- tuiles KPI ---- */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+          background: var(--fil); border: 1px solid var(--fil); margin: 26px 0; }
+  .kpi { background: var(--encre); padding: 14px 16px; min-width: 0; }
+  .kpi .t { font-family: var(--mono); font-size: 10px; letter-spacing: .1em;
+            text-transform: uppercase; color: var(--brume); }
+  .kpi .v { font-family: var(--display); font-size: 30px; font-weight: 600;
+            line-height: 1.1; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .kpi .s { font-size: 11px; color: var(--brume); font-family: var(--mono);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  @media (max-width: 720px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+
+  /* ---- grille principale ---- */
+  .grille { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; align-items: start; }
+  @media (max-width: 860px) { .grille { grid-template-columns: 1fr; } }
+
+  h2 { font-family: var(--display); font-size: 22px; font-weight: 600;
+       margin: 0 0 4px; letter-spacing: .01em; }
+  .sous { color: var(--brume); font-size: 13px; margin: 0 0 14px; }
+
+  /* ---- graphe barres (minutes actives par jour) ---- */
+  .graphe { background: var(--velours); border: 1px solid var(--fil);
+            padding: 16px; margin-bottom: 22px; }
+  .barres { display: flex; align-items: flex-end; gap: 3px; height: 120px; margin-top: 10px; }
+  .barre { flex: 1; min-width: 0; display: flex; flex-direction: column;
+           justify-content: flex-end; height: 100%; cursor: default; }
+  .barre .fill { background: var(--accent); border-radius: 4px 4px 0 0; min-height: 2px;
+                 transition: background .12s; }
+  .barre:hover .fill { background: var(--vif); }
+  .axe { display: flex; justify-content: space-between; font-family: var(--mono);
+         font-size: 10px; color: var(--fil); margin-top: 6px; }
+
+  /* ---- jours ---- */
+  .jour { background: var(--velours); border: 1px solid var(--fil); padding: 13px 15px;
+          margin-bottom: 10px; }
+  .jour-tete { display: flex; justify-content: space-between; align-items: baseline;
+               gap: 10px; flex-wrap: wrap; }
+  .jour-date { font-family: var(--mono); font-size: 13px; color: var(--craie); }
+  .jour-meta { font-family: var(--mono); font-size: 11px; color: var(--brume);
+               font-variant-numeric: tabular-nums; }
+  .jour-meta b { color: var(--accent); font-weight: 500; }
+  .puces { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+  .puce { font-family: var(--mono); font-size: 10px; color: var(--brume);
+          background: var(--encre); padding: 2px 6px; }
+  .puce.som { color: var(--vif); }
+  .puce.trou { color: var(--alerte); }
+  .app-rang { margin-top: 10px; display: grid; gap: 4px; }
+  .app-ligne { display: grid; grid-template-columns: 108px 1fr auto; gap: 8px;
+               align-items: center; }
+  .app-nom { font-family: var(--mono); font-size: 11px; color: var(--craie);
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .app-piste { height: 8px; background: var(--encre); }
+  .app-fill { height: 100%; background: var(--accent-sourd); }
+  .app-val { font-family: var(--mono); font-size: 11px; color: var(--brume);
+             font-variant-numeric: tabular-nums; }
+
+  /* ---- rollup ---- */
+  .panneau { background: var(--velours); border: 1px solid var(--fil);
+             padding: 16px; margin-bottom: 22px; }
+  pre { font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+        color: var(--craie); background: var(--encre); border: 1px solid var(--fil);
+        padding: 12px; overflow-x: auto; margin: 10px 0 0; max-height: 340px; }
+  .cle { color: var(--accent); }
+  .val-n { color: var(--vif); }
+  .val-s { color: var(--craie); }
+
+  details { border: 1px solid var(--fil); background: var(--velours); margin-bottom: 14px; }
+  summary { cursor: pointer; padding: 11px 15px; font-weight: 600;
+            font-family: var(--display); font-size: 16px; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: "▸ "; color: var(--brume); }
+  details[open] summary::before { content: "▾ "; }
+  details .corps { padding: 0 15px 14px; }
+
+  .vide { color: var(--brume); font-size: 13px; padding: 30px 0; text-align: center; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="page">
+  <header>
+    <p class="marque">Machi Tool · BrainDebugger</p>
+    <h1>Quantified Self</h1>
+    <p class="chapo">Ce que le site va recevoir, avant qu'il ne le reçoive. Charge tes journées, vois d'un coup ce qu'il y a dedans, et exporte un <strong>rollup consolidé</strong> — un seul objet à jour, pour que le site n'ait plus à reparser chaque JSON.</p>
+  </header>
+
+  <div class="charger">
+    <span class="etiq">Charger</span>
+    <button type="button" id="btn-sync" class="pri">Synchro live</button>
+    <input type="password" id="jeton" placeholder="jeton local" autocomplete="off" aria-label="Jeton de la passerelle locale">
+    <label class="zone-depot" id="depot">Dépose <b>activite.jsonl</b> ou clique
+      <input type="file" id="fichier" accept=".jsonl,.json,.txt" hidden>
+    </label>
+    <button type="button" id="btn-exemple">Données d'exemple</button>
+    <button type="button" id="btn-vider">Vider</button>
+  </div>
+  <p class="note" id="note">Sur ton site BrainDebugger, « Synchro live » lit <code>127.0.0.1:7373/activite</code>. Ici, dans l'aperçu, dépose ton fichier ou charge l'exemple.</p>
+
+  <div class="kpis" id="kpis" hidden>
+    <div class="kpi"><div class="t">Journées</div><div class="v" id="k-jours">—</div><div class="s" id="k-periode"></div></div>
+    <div class="kpi"><div class="t">Sommeil moyen</div><div class="v" id="k-sommeil">—</div><div class="s">heures / nuit</div></div>
+    <div class="kpi"><div class="t">Actif moyen</div><div class="v" id="k-actif">—</div><div class="s">minutes / jour</div></div>
+    <div class="kpi"><div class="t">Contexte dominant</div><div class="v" id="k-app" style="font-size:22px">—</div><div class="s" id="k-app-s"></div></div>
+  </div>
+
+  <div id="contenu" hidden>
+    <div class="grille">
+      <div>
+        <h2>Journées</h2>
+        <p class="sous">Chaque objet est un jour, tel que l'app l'écrit dans <code>activite.jsonl</code>.</p>
+
+        <div class="graphe">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--brume)">Minutes actives par jour</div>
+          <div class="barres" id="barres"></div>
+          <div class="axe" id="axe"></div>
+        </div>
+
+        <div id="jours"></div>
+      </div>
+
+      <div>
+        <h2>Rollup consolidé</h2>
+        <p class="sous">L'objet que le site stocke <em>une fois</em> et met à jour au fil des jours, au lieu de reparser tout l'historique.</p>
+        <div class="panneau">
+          <button type="button" id="btn-rollup" class="pri">Télécharger rollup.json</button>
+          <button type="button" id="btn-copier">Copier</button>
+          <pre id="rollup"></pre>
+        </div>
+
+        <details>
+          <summary>Schéma d'un jour</summary>
+          <div class="corps">
+            <p class="sous" style="margin-top:10px">Les clés et leurs types, pour brancher l'ingestion côté site.</p>
+            <pre id="schema"></pre>
+          </div>
+        </details>
+
+        <details>
+          <summary>JSON brut chargé</summary>
+          <div class="corps"><pre id="brut"></pre></div>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <div class="vide" id="vide">Aucune donnée chargée. Charge l'exemple pour voir l'aperçu, ou dépose ton <code>activite.jsonl</code>.</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var jours = [];   // journees chargees, chacune = un digest
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---- rangement local du jeton ---- */
+  try { var j = localStorage.getItem("qs_jeton"); if (j) $("jeton").value = j; } catch (e) {}
+  $("jeton").addEventListener("change", function () {
+    try { localStorage.setItem("qs_jeton", $("jeton").value.trim()); } catch (e) {}
+  });
+
+  /* ---- utilitaires ---- */
+  function hms(s) {
+    s = Math.round(s);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h) return h + " h " + (m < 10 ? "0" : "") + m;
+    return m + " min";
+  }
+  function parseJSONL(texte) {
+    var out = [];
+    texte.split(/\r?\n/).forEach(function (l) {
+      l = l.trim(); if (!l) return;
+      try { var o = JSON.parse(l); if (o && o.date) out.push(o); } catch (e) {}
+    });
+    // Un fichier peut aussi etre un seul objet ou un tableau.
+    if (!out.length) {
+      try {
+        var v = JSON.parse(texte);
+        if (Array.isArray(v)) out = v.filter(function (o) { return o && o.date; });
+        else if (v && v.date) out = [v];
+      } catch (e) {}
+    }
+    return out;
+  }
+  function fusionner(nouveaux) {
+    // Une entree par date : la plus recente gagne.
+    var parDate = {};
+    jours.concat(nouveaux).forEach(function (o) { parDate[o.date] = o; });
+    jours = Object.keys(parDate).sort().map(function (d) { return parDate[d]; });
+    rendre();
+  }
+
+  /* ---- rollup consolide ---- */
+  function calculerRollup() {
+    if (!jours.length) return null;
+    var apps = {}, tActif = [], tSommeil = [], sommeils = [], actifs = [], bascules = [];
+    jours.forEach(function (o) {
+      var t = o.temps_par_contexte_s || {};
+      Object.keys(t).forEach(function (k) { apps[k] = (apps[k] || 0) + t[k]; });
+      if (typeof o.actif_minutes === "number") { actifs.push(o.actif_minutes); tActif.push({ date: o.date, actif_minutes: o.actif_minutes }); }
+      if (typeof o.bascules_fenetre === "number") bascules.push(o.bascules_fenetre);
+      var s = o.poste && o.poste.sommeil_h;
+      if (typeof s === "number") { sommeils.push(s); tSommeil.push({ date: o.date, sommeil_h: s }); }
+    });
+    var moy = function (a) { return a.length ? Math.round(a.reduce(function (x, y) { return x + y; }, 0) / a.length * 10) / 10 : null; };
+    var appsTri = Object.keys(apps).sort(function (a, b) { return apps[b] - apps[a]; });
+    var appsCumul = {};
+    appsTri.slice(0, 20).forEach(function (k) { appsCumul[k] = apps[k]; });
+    return {
+      genere_le: new Date().toISOString().slice(0, 19).replace("T", " "),
+      jours: jours.length,
+      periode: { de: jours[0].date, a: jours[jours.length - 1].date },
+      moyennes: { sommeil_h: moy(sommeils), actif_minutes: moy(actifs), bascules: moy(bascules) },
+      apps_cumul_s: appsCumul,
+      tendance_actif: tActif,
+      tendance_sommeil: tSommeil
+    };
+  }
+
+  /* ---- coloration JSON minimale ---- */
+  function colorer(obj) {
+    var s = JSON.stringify(obj, null, 2);
+    s = s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    s = s.replace(/"([^"]+)":/g, '<span class="cle">"$1"</span>:');
+    s = s.replace(/: (-?\d[\d.]*)/g, ': <span class="val-n">$1</span>');
+    return s;
+  }
+
+  /* ---- rendu ---- */
+  function rendre() {
+    var vide = !jours.length;
+    $("vide").hidden = !vide;
+    $("kpis").hidden = vide;
+    $("contenu").hidden = vide;
+    if (vide) return;
+
+    var roll = calculerRollup();
+    $("k-jours").textContent = roll.jours;
+    $("k-periode").textContent = roll.periode.de + " → " + roll.periode.a;
+    $("k-sommeil").textContent = roll.moyennes.sommeil_h != null ? roll.moyennes.sommeil_h : "—";
+    $("k-actif").textContent = roll.moyennes.actif_minutes != null ? Math.round(roll.moyennes.actif_minutes) : "—";
+    var top = Object.keys(roll.apps_cumul_s)[0];
+    $("k-app").textContent = top || "—";
+    $("k-app-s").textContent = top ? hms(roll.apps_cumul_s[top]) + " cumulées" : "";
+
+    // barres minutes actives
+    var max = Math.max.apply(null, jours.map(function (o) { return o.actif_minutes || 0; }), 1);
+    $("barres").innerHTML = jours.map(function (o) {
+      var h = Math.round((o.actif_minutes || 0) / max * 100);
+      return '<div class="barre" title="' + o.date + ' · ' + Math.round(o.actif_minutes || 0) +
+             ' min actives"><div class="fill" style="height:' + h + '%"></div></div>';
+    }).join("");
+    $("axe").innerHTML = "<span>" + jours[0].date.slice(5) + "</span><span>" +
+                         jours[jours.length - 1].date.slice(5) + "</span>";
+
+    // jours (recents en haut)
+    $("jours").innerHTML = jours.slice().reverse().map(carteJour).join("");
+
+    // rollup + schema + brut
+    $("rollup").innerHTML = colorer(roll);
+    $("schema").innerHTML = colorer(schemaDe(jours[jours.length - 1]));
+    $("brut").innerHTML = colorer(jours);
+  }
+
+  function carteJour(o) {
+    var poste = o.poste || {};
+    var puces = "";
+    if (poste.reveil) puces += '<span class="puce som">☀ ' + poste.reveil +
+      (poste.coucher ? " → " + poste.coucher : "") + (poste.sommeil_h ? " · " + poste.sommeil_h + " h" : "") + "</span>";
+    (o.trous || []).forEach(function (t) {
+      puces += '<span class="puce trou">trou ' + t.de + "–" + t.a + " · " + t.minutes + " min</span>";
+    });
+
+    var t = o.temps_par_contexte_s || {};
+    var tri = Object.keys(t).sort(function (a, b) { return t[b] - t[a]; });
+    var mx = tri.length ? t[tri[0]] : 1;
+    var rangs = tri.slice(0, 4).map(function (k) {
+      return '<div class="app-ligne"><span class="app-nom">' + k + '</span>' +
+        '<span class="app-piste"><span class="app-fill" style="width:' + Math.round(t[k] / mx * 100) + '%"></span></span>' +
+        '<span class="app-val">' + hms(t[k]) + '</span></div>';
+    }).join("");
+
+    return '<div class="jour"><div class="jour-tete"><span class="jour-date">' + o.date +
+      '</span><span class="jour-meta"><b>' + Math.round(o.actif_minutes || 0) + '</b> min · ' +
+      (o.bascules_fenetre || 0) + ' bascules' +
+      (o.plage ? ' · ' + (o.plage.de || "?") + "–" + (o.plage.a || "?") : "") + '</span></div>' +
+      (puces ? '<div class="puces">' + puces + '</div>' : "") +
+      '<div class="app-rang">' + rangs + '</div></div>';
+  }
+
+  function schemaDe(o) {
+    function typ(v) {
+      if (Array.isArray(v)) return v.length ? "[" + typ(v[0]) + ", …]" : "[]";
+      if (v && typeof v === "object") {
+        var r = {}; Object.keys(v).forEach(function (k) { r[k] = typ(v[k]); }); return r;
+      }
+      return typeof v === "number" ? "number" : typeof v === "boolean" ? "bool" : "string";
+    }
+    return typ(o);
+  }
+
+  /* ---- sources ---- */
+  function chargerTexte(texte, source) {
+    var n = parseJSONL(texte);
+    if (!n.length) { note("Aucune journée valide trouvée dans " + source + ".", true); return; }
+    fusionner(n);
+    note(n.length + " journée(s) chargée(s) depuis " + source + ".");
+  }
+  function note(t, err) { var e = $("note"); e.textContent = t; e.className = err ? "note err" : "note"; }
+
+  $("fichier").addEventListener("change", function (ev) {
+    var f = ev.target.files[0]; if (!f) return;
+    var r = new FileReader();
+    r.onload = function () { chargerTexte(String(r.result), f.name); };
+    r.readAsText(f);
+  });
+  var depot = $("depot");
+  ["dragover", "dragenter"].forEach(function (t) {
+    depot.addEventListener(t, function (e) { e.preventDefault(); depot.classList.add("survol"); });
+  });
+  ["dragleave", "drop"].forEach(function (t) {
+    depot.addEventListener(t, function (e) { e.preventDefault(); depot.classList.remove("survol"); });
+  });
+  depot.addEventListener("drop", function (e) {
+    var f = e.dataTransfer.files[0]; if (!f) return;
+    var r = new FileReader();
+    r.onload = function () { chargerTexte(String(r.result), f.name); };
+    r.readAsText(f);
+  });
+
+  $("btn-sync").addEventListener("click", function () {
+    note("Lecture de 127.0.0.1:7373/activite…");
+    var jeton = $("jeton").value.trim();
+    fetch("http://127.0.0.1:7373/activite", { headers: jeton ? { "X-Jeton": jeton } : {} })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (o) {
+        if (!o || !o.date) throw new Error("réponse inattendue");
+        fusionner([o]);
+        note("Journée du " + o.date + " synchronisée en direct.");
+      })
+      .catch(function (e) {
+        note("Passerelle injoignable (" + e.message + "). Depuis l'aperçu c'est normal — " +
+             "ça marche une fois la page servie par BrainDebugger, sur la même machine que l'app.", true);
+      });
+  });
+
+  $("btn-exemple").addEventListener("click", function () { fusionner(exemple()); note("Données d'exemple chargées — dépose ton activite.jsonl pour les tiennes."); });
+  $("btn-vider").addEventListener("click", function () { jours = []; rendre(); note("Vidé."); });
+
+  $("btn-rollup").addEventListener("click", function () {
+    var roll = calculerRollup(); if (!roll) return;
+    var blob = new Blob([JSON.stringify(roll, null, 2)], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "rollup.json"; a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  $("btn-copier").addEventListener("click", function () {
+    var roll = calculerRollup(); if (!roll) return;
+    navigator.clipboard && navigator.clipboard.writeText(JSON.stringify(roll, null, 2));
+    note("Rollup copié dans le presse-papiers.");
+  });
+
+  /* ---- donnees d'exemple, au vrai schema ---- */
+  function exemple() {
+    var apps = ["code", "web:discord", "web:youtube", "web:github", "web:braindebugger", "web:chatgpt", "explorer"];
+    var out = [];
+    for (var i = 9; i >= 0; i--) {
+      var d = new Date(); d.setDate(d.getDate() - i);
+      var date = d.toISOString().slice(0, 10);
+      var t = {}; var total = 0;
+      apps.forEach(function (a, k) {
+        var v = Math.round((Math.random() * (k === 0 ? 9000 : 4500)) + 400); t[a] = v; total += v;
+      });
+      var actif = Math.round(total / 60 * (0.5 + Math.random() * 0.3));
+      var som = Math.round((5.5 + Math.random() * 3.5) * 10) / 10;
+      var rev = 7 + Math.floor(Math.random() * 3), cou = 22 + Math.floor(Math.random() * 3);
+      var trous = Math.random() > 0.5 ? [{ de: "12:40", a: "13:" + (20 + i), minutes: 20 + i }] : [];
+      out.push({
+        date: date, temps_par_contexte_s: t, bascules_fenetre: Math.round(60 + Math.random() * 180),
+        actif_minutes: actif, plage: { de: "0" + rev + ":1" + i, a: cou + ":3" + i },
+        trous: trous, poste: { reveil: "0" + rev + ":15", coucher: cou + ":40", sommeil_h: som }
+      });
+    }
+    return out;
+  }
+
+  rendre();
+})();
+</script>
