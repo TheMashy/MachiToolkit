@@ -202,6 +202,13 @@ CONFIG_DEFAUT = {
     "pont_presence_suit_humeur": True,   # prefere la couleur d'humeur recue
     "pont_presence_grace": 20,           # secondes gardees apres la sortie
 
+    # Journal d'activite facon ActivityWatch : temps par app/site, bascules,
+    # plages actives. Aucun contenu, aucun clavier. Faux par defaut.
+    "collecte_active": False,
+    "collecte_titres_complets": False,   # garder le titre entier des fenetres
+    "collecte_envoi": False,             # pousser le digest au site
+    "collecte_intervalle_heures": 6,
+
     # Mises a jour depuis les publications GitHub du depot.
     "config_version": 2,              # sert aux migrations, voir charger_config
     "maj_verifier": True,             # regarder si une version plus recente existe
@@ -355,6 +362,240 @@ def secondes_inactivite():
         return (win32api.GetTickCount() - win32api.GetLastInputInfo()) / 1000.0
     except Exception:
         return 0.0
+
+
+# ==========================================================================
+#  Journal d'activite  (facon ActivityWatch)
+#
+#  Ce que fait ce module : mesurer le temps passe par application et par
+#  site, compter les bascules entre fenetres, et suivre les plages d'activite
+#  de la journee. Tout repose sur ce que l'application lit deja a chaque
+#  image pour piloter la lumiere — la fenetre au premier plan et le temps
+#  depuis la derniere frappe. Aucun hook clavier, aucune touche interceptee.
+#
+#  Ce que ce module ne fait PAS, et ne fera pas ici : lire ce qui est tape.
+#  Le texte des messages — les tiens, ceux des autres, les mots de passe —
+#  n'est jamais vu. Comme ActivityWatch, on note l'enveloppe de l'activite,
+#  pas son contenu. Le rythme d'ecriture se mesure ailleurs, dans le site
+#  lui-meme, sur les seuls champs ou c'est toi qui ecris.
+#
+#  Rien ne se collecte tant qu'on ne l'a pas demande ; rien ne quitte la
+#  machine tant que l'envoi n'est pas coche et la cle du site renseignee.
+# ==========================================================================
+
+FICHIER_ACTIVITE = os.path.join(DOSSIER, "activite.jsonl")
+
+ACTIVITE = {
+    "active": False,
+    "jour": "",
+    "contexte": "",       # categorie de la fenetre courante
+    "titre_courant": "",   # titre brut, garde seulement si l'option est cochee
+    "depuis": 0.0,
+    "temps": {},          # categorie -> secondes cumulees
+    "titres": {},         # categorie -> {titre: secondes}, si titres complets
+    "bascules": 0,
+    "actif_s": 0.0,       # secondes reellement actives (hors inactivite)
+    "premiere": "",       # premiere activite de la journee (HH:MM)
+    "derniere": "",
+    "message": "arretee",
+}
+
+MOTEUR_ACTIVITE = {"marche": False}
+
+
+def _jour_courant():
+    return time.strftime("%Y-%m-%d")
+
+
+def categorie_activite(contexte):
+    """'chrome.exe | discord - #general' -> 'web:discord', 'code.exe' -> 'code'.
+
+    On garde le programme, et pour un navigateur le premier mot du titre,
+    qui porte le site. On ne conserve donc ni le canal, ni le nom de la
+    personne, ni la video : juste ou on etait, pas avec qui.
+    """
+    contexte = (contexte or "").strip()
+    if not contexte:
+        return "inconnu"
+    proc, _, titre = contexte.partition("|")
+    proc = proc.strip().replace(".exe", "")
+    titre = titre.strip()
+    navigateurs = ("chrome", "firefox", "msedge", "brave", "opera", "vivaldi")
+    if any(n in proc for n in navigateurs) and titre:
+        mots = titre.replace(" - ", " ").replace(" | ", " ").split()
+        return "web:" + (mots[0][:24] if mots else proc)
+    return proc[:32] or "inconnu"
+
+
+def _reinit_jour():
+    ACTIVITE.update(jour=_jour_courant(), contexte="", titre_courant="",
+                    depuis=time.time(), temps={}, titres={}, bascules=0,
+                    actif_s=0.0, premiere="", derniere="")
+
+
+def activite_note(contexte, actif, titres_complets=False, maintenant=None):
+    """Verse le temps de la fenetre precedente et ouvre la nouvelle.
+
+    'actif' dit si l'utilisateur touchait clavier ou souris pendant la
+    plage : une fenetre laissee ouverte sans personne devant ne gonfle pas
+    son total, et les plages horaires ne s'etirent pas pendant les pauses.
+    """
+    if not ACTIVITE["active"]:
+        return
+    maintenant = maintenant if maintenant is not None else time.time()
+    if ACTIVITE["jour"] != _jour_courant():
+        sauver_activite()
+        _reinit_jour()
+
+    cat = categorie_activite(contexte)
+    titre = (contexte or "").partition("|")[2].strip()
+    avant = ACTIVITE["contexte"]
+    if avant:
+        ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
+        ACTIVITE["temps"][avant] = ACTIVITE["temps"].get(avant, 0.0) + ecoule
+        if actif:
+            ACTIVITE["actif_s"] += ecoule
+        if titres_complets and ACTIVITE["titre_courant"]:
+            par_titre = ACTIVITE["titres"].setdefault(avant, {})
+            t = ACTIVITE["titre_courant"][:80]
+            par_titre[t] = par_titre.get(t, 0.0) + ecoule
+    ACTIVITE["depuis"] = maintenant
+
+    if actif:
+        h = time.strftime("%H:%M")
+        if not ACTIVITE["premiere"]:
+            ACTIVITE["premiere"] = h
+        ACTIVITE["derniere"] = h
+
+    if cat != avant:
+        if avant:
+            ACTIVITE["bascules"] += 1
+        ACTIVITE["contexte"] = cat
+    ACTIVITE["titre_courant"] = titre
+
+
+def _fermer_plage(maintenant=None):
+    maintenant = maintenant if maintenant is not None else time.time()
+    if ACTIVITE["contexte"]:
+        ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
+        ACTIVITE["temps"][ACTIVITE["contexte"]] = \
+            ACTIVITE["temps"].get(ACTIVITE["contexte"], 0.0) + ecoule
+        ACTIVITE["depuis"] = maintenant
+
+
+def resume_activite():
+    """Digest de la journee. C'est lui qui part au site — jamais de contenu."""
+    _fermer_plage()
+    temps = {k: round(v) for k, v in sorted(
+        ACTIVITE["temps"].items(), key=lambda kv: -kv[1]) if v >= 1}
+    resume = {
+        "date": ACTIVITE["jour"] or _jour_courant(),
+        "temps_par_contexte_s": temps,
+        "bascules_fenetre": ACTIVITE["bascules"],
+        "actif_minutes": round(ACTIVITE["actif_s"] / 60.0, 1),
+        "plage": {"de": ACTIVITE["premiere"], "a": ACTIVITE["derniere"]},
+    }
+    if ACTIVITE["titres"]:
+        resume["titres"] = {cat: {t: round(s) for t, s in d.items()}
+                            for cat, d in ACTIVITE["titres"].items()}
+    return resume
+
+
+def _date_de_ligne(ligne):
+    try:
+        return json.loads(ligne).get("date")
+    except Exception:
+        return None
+
+
+def sauver_activite():
+    """Ecrit le digest du jour, une entree par jour, reecrite a chaque flush."""
+    try:
+        resume = resume_activite()
+        lignes = []
+        if os.path.exists(FICHIER_ACTIVITE):
+            with open(FICHIER_ACTIVITE, encoding="utf-8") as f:
+                lignes = [l for l in f if l.strip()]
+        lignes = [l for l in lignes if _date_de_ligne(l) != resume["date"]]
+        lignes.append(json.dumps(resume, ensure_ascii=False) + "\n")
+        with open(FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.writelines(lignes[-90:])        # trois mois d'historique local
+        return resume
+    except Exception as e:
+        print("Ecriture du journal d'activite impossible :", e)
+        return None
+
+
+def envoyer_activite_au_site(cfg):
+    """Pousse le digest du jour a BrainDebugger. Metriques d'enveloppe
+    seulement : temps, bascules, plage horaire. Aucun texte."""
+    base = str(cfg.get("pont_site", "")).strip().rstrip("/")
+    if not base:
+        ACTIVITE["message"] = "Aucune adresse de site."
+        return False
+    resume = sauver_activite() or resume_activite()
+    url = base + "/api/machitool/activite"
+    cle = str(cfg.get("pont_cle", "")).strip()
+    entetes = {"User-Agent": "MachiToolkit", "Content-Type": "application/json"}
+    if cle:
+        entetes["Authorization"] = "Bearer " + cle
+        entetes["X-Machitool-Cle"] = cle
+    try:
+        corps = json.dumps(resume, ensure_ascii=False).encode("utf-8")
+        requete = urllib.request.Request(url, data=corps, headers=entetes)
+        with urllib.request.urlopen(requete, timeout=15,
+                                    context=_contexte_ssl()) as reponse:
+            reponse.read()
+        ACTIVITE["message"] = "Journee envoyee au site."
+        return True
+    except urllib.error.HTTPError as e:
+        ACTIVITE["message"] = (
+            "Le site n'expose pas /api/machitool/activite." if e.code == 404
+            else "Le site demande une cle (%s)." % e.code if e.code in (401, 403)
+            else "Le site a repondu %s." % e.code)
+        return False
+    except Exception as e:
+        ACTIVITE["message"] = "Envoi impossible : %s" % str(e)[:60]
+        return False
+
+
+def _fil_activite(cfg):
+    """Echantillonne la fenetre au premier plan toutes les deux secondes.
+
+    C'est la meme lecture que pour la lumiere — GetForegroundWindow et le
+    delai depuis la derniere entree — pas une captation de plus.
+    """
+    while MOTEUR_ACTIVITE["marche"]:
+        try:
+            if ACTIVITE["active"]:
+                actif = secondes_inactivite() < 60
+                activite_note(fenetre_active(), actif,
+                              cfg.get("collecte_titres_complets", False))
+        except Exception as e:
+            print("Journal d'activite interrompu :", e)
+        fin = time.time() + 2.0
+        while MOTEUR_ACTIVITE["marche"] and time.time() < fin:
+            time.sleep(0.5)
+
+
+def demarrer_activite(cfg):
+    arreter_activite()
+    ACTIVITE["active"] = bool(cfg.get("collecte_active", False))
+    if not ACTIVITE["active"]:
+        ACTIVITE["message"] = "arretee"
+        return
+    _reinit_jour()
+    MOTEUR_ACTIVITE["marche"] = True
+    ACTIVITE["message"] = "journal en cours"
+    threading.Thread(target=_fil_activite, args=(cfg,), daemon=True).start()
+
+
+def arreter_activite():
+    if MOTEUR_ACTIVITE["marche"]:
+        sauver_activite()
+    MOTEUR_ACTIVITE["marche"] = False
+    ACTIVITE["active"] = False
+
 
 
 def couleur_cible(cfg, contexte):
@@ -1603,6 +1844,7 @@ MENU = [
     ("groupe", "pont", "BrainDebugger", "\u25c9", [
         ("calendrier", "Calendrier"),
         ("moi",        "Moi"),
+        ("activite",   "Activite"),
         ("passerelle", "Passerelle"),
     ]),
     ("groupe", "app", "Application", "\u2699", [
@@ -1727,6 +1969,7 @@ class Panneau:
         self.page_passerelle()
         self.page_calendrier()
         self.page_moi()
+        self.page_activite()
         self.page_appairage()
         self.aller(self.section if self.section in self.pages else "accueil")
 
@@ -3021,6 +3264,66 @@ class Panneau:
     #  Page Site web
     # ------------------------------------------------------------------
 
+    def page_activite(self):
+        tk = self.tk
+        f = self.nouvelle_page("activite", defilante=True)
+
+        self.titre(f, "journal d'activite").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Facon ActivityWatch : le temps passe par application "
+                      "et par site, les bascules entre fenetres, tes plages "
+                      "actives. BrainDebugger peut les relire pour situer une "
+                      "journee.", BRUME, 9, largeur=500).pack(fill="x")
+
+        carte = tk.Frame(f, bg=VELOURS, padx=self.px(14), pady=self.px(12))
+        carte.pack(fill="x", pady=(12, 0))
+        tk.Label(carte, text="\u26a0  Ce qui n'est pas collecte", bg=VELOURS,
+                 fg=CRAIE, font=(self.f_ui, 9, "bold"), anchor="w").pack(fill="x")
+        self.texte(carte, "Rien de ce que tu tapes. Ni tes messages, ni ceux "
+                          "des autres, ni tes mots de passe : ce journal note "
+                          "quelle fenetre etait devant et combien de temps, "
+                          "pas ce qui s'y ecrivait. Pour le rythme de ta "
+                          "propre ecriture, c'est le site qui le mesure, dans "
+                          "ses champs a lui.", BRUME, 9, largeur=470).pack(
+                              fill="x", pady=(4, 0))
+
+        self.separateur(f)
+        self.var_act = tk.IntVar(value=1 if self.cfg.get("collecte_active", False) else 0)
+        self.case(f, "Tenir le journal d'activite", self.var_act).pack(fill="x")
+        self.var_act_titres = tk.IntVar(
+            value=1 if self.cfg.get("collecte_titres_complets", False) else 0)
+        self.case(f, "Garder le titre complet des fenetres — plus precis, mais "
+                     "le titre peut contenir un nom de canal ou de personne",
+                  self.var_act_titres).pack(fill="x", pady=(4, 0))
+        self.var_act_envoi = tk.IntVar(
+            value=1 if self.cfg.get("collecte_envoi", False) else 0)
+        self.case(f, "Envoyer le resume a BrainDebugger — sinon il reste ici, "
+                     "dans activite.jsonl", self.var_act_envoi).pack(fill="x", pady=(4, 0))
+        self.var_act_intervalle = self.reglette(
+            f, "collecte_intervalle_heures", "Heures entre deux ecritures",
+            1, 24, 1, "Le resume est sauve, et envoye si coche, a ce rythme. "
+                      "Il l'est aussi en quittant.", entier=True)
+
+        self.separateur(f)
+        barre = tk.Frame(f, bg=NUIT)
+        barre.pack(fill="x")
+        self.bouton(barre, "Enregistrer et envoyer maintenant",
+                    self.envoyer_activite, compact=True).pack(side="left")
+        self.txt_activite = self.texte(f, "", BRUME, 9, largeur=500)
+        self.txt_activite.pack(fill="x", pady=(10, 0))
+
+        self.separateur(f)
+        self.titre(f, "ce que le site recevra").pack(fill="x", pady=(0, 6))
+        self.texte(f, "POST <site>/api/machitool/activite, un objet par jour :\n"
+                      "  date, temps_par_contexte_s, bascules_fenetre,\n"
+                      "  actif_minutes, plage : { de, a }\n\n"
+                      "Aucune cle de contenu : il n'y en a pas.", BRUME, 9,
+                   largeur=500).pack(fill="x")
+
+    def envoyer_activite(self):
+        self.enregistrer()
+        threading.Thread(target=lambda: envoyer_activite_au_site(self.cfg),
+                         daemon=True).start()
+
     def page_passerelle(self):
         tk = self.tk
         f = self.nouvelle_page("passerelle", defilante=True)
@@ -3307,6 +3610,13 @@ class Panneau:
         self.cfg["pont_presence_couleur"] = (
             couleur if couleur.startswith("#") and len(couleur) == 7 else "#7C3AED")
         self.cfg["pont_presence_grace"] = int(self.var_presence_grace.get())
+        avant_act = self.cfg.get("collecte_active")
+        self.cfg["collecte_active"] = bool(self.var_act.get())
+        self.cfg["collecte_titres_complets"] = bool(self.var_act_titres.get())
+        self.cfg["collecte_envoi"] = bool(self.var_act_envoi.get())
+        self.cfg["collecte_intervalle_heures"] = int(self.var_act_intervalle.get())
+        if self.cfg["collecte_active"] != avant_act:
+            demarrer_activite(self.cfg)
         self.cfg["mode"] = self.var_mode.get()
         source = self.var_source.get()
         self.cfg["ecran_source"] = source if source == "actif" else int(source)
@@ -3401,6 +3711,11 @@ class Panneau:
             self.peindre_moi()
         if self.section in ("calendrier", "moi"):
             self.peindre_pont()
+        if self.section == "activite":
+            self.txt_activite.configure(
+                text="Journal : " + ACTIVITE.get("message", "arrete"),
+                fg=ALERTE if "impossible" in ACTIVITE.get("message", "")
+                or "demande" in ACTIVITE.get("message", "") else BRUME)
 
         if self.section == "accueil":
             # Repeindre hors de l'accueil ne servirait a rien : la tuile
@@ -4108,6 +4423,26 @@ def lancer():
 
     threading.Thread(target=veille_pont, daemon=True).start()
 
+    demarrer_activite(CFG)
+
+    def veille_activite():
+        while ETAT["en_marche"]:
+            fin = time.time() + max(1, int(CFG.get("collecte_intervalle_heures", 6))) * 3600
+            while ETAT["en_marche"] and time.time() < fin:
+                time.sleep(5)
+            if not ETAT["en_marche"]:
+                return
+            if ACTIVITE["active"]:
+                try:
+                    if CFG.get("collecte_envoi", False):
+                        envoyer_activite_au_site(CFG)
+                    else:
+                        sauver_activite()
+                except Exception as e:
+                    print("Veille d'activite :", e)
+
+    threading.Thread(target=veille_activite, daemon=True).start()
+
     def libelle_maj(*_):
         quoi = "le build" if est_build(MAJ["version"]) else "la version"
         if MAJ["etat"] == "prete":
@@ -4151,6 +4486,7 @@ def lancer():
             ETAT["en_marche"] = False
             if CFG.get("eteindre_en_partant", True):
                 eteindre_guirlande()
+            arreter_activite()
             arreter_api()
             arreter_audio()
             try:
