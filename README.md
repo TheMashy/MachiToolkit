@@ -131,9 +131,16 @@ autres, ni tes mots de passe. Comme ActivityWatch, on note l'enveloppe de
 l'activite, pas son contenu. Le rythme de ta propre ecriture se mesure
 ailleurs, dans le site lui-meme, sur les champs ou c'est toi qui ecris.
 
+Comme l'application demarre avec Windows et recoit son ordre d'arret, elle
+note aussi ton **allumage et ton extinction du poste** — soit, en pratique,
+ton lever et ton coucher, avec la duree de sommeil deduite. Les **trous** de
+la journee (absences de plus de vingt minutes, poste allume) sont releves
+aussi.
+
 Tout est faux par defaut. Le resume part sur
 `POST <site>/api/machitool/activite`, un objet par jour :
-`temps_par_contexte_s`, `bascules_fenetre`, `actif_minutes`, `plage`.
+`temps_par_contexte_s`, `bascules_fenetre`, `actif_minutes`, `plage`,
+`trous`, et `poste : { reveil, coucher, sommeil_h }`.
 
 ### Bascule pendant l'usage du site
 

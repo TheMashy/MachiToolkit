@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -397,10 +397,74 @@ ACTIVITE = {
     "actif_s": 0.0,       # secondes reellement actives (hors inactivite)
     "premiere": "",       # premiere activite de la journee (HH:MM)
     "derniere": "",
+    "trous": [],          # absences > SEUIL_TROU pendant la journee
+    "trou_depuis": 0.0,   # debut de l'absence en cours, 0 = present
     "message": "arretee",
 }
 
 MOTEUR_ACTIVITE = {"marche": False}
+SEUIL_TROU = 20 * 60          # une absence n'est notee qu'au-dela de 20 min
+FICHIER_SESSIONS = os.path.join(DOSSIER, "sessions.jsonl")
+SESSION = {"notee": False}    # une seule entree de demarrage par lancement
+
+
+def noter_session(genre):
+    """Journalise un allumage ou une extinction du poste. C'est ce qui
+    donne le lever et le coucher : l'application demarre avec Windows et
+    recoit son ordre d'arret, donc demarrage vaut reveil, extinction vaut
+    coucher. Fichier a part, une ligne par evenement."""
+    try:
+        maintenant = time.time()
+        evenement = {"genre": genre, "quand": time.strftime("%Y-%m-%d %H:%M"),
+                     "ts": round(maintenant)}
+        lignes = []
+        if os.path.exists(FICHIER_SESSIONS):
+            with open(FICHIER_SESSIONS, encoding="utf-8") as f:
+                lignes = [l for l in f if l.strip()]
+        lignes.append(json.dumps(evenement, ensure_ascii=False) + "\n")
+        with open(FICHIER_SESSIONS, "w", encoding="utf-8") as f:
+            f.writelines(lignes[-400:])
+    except Exception as e:
+        print("Journal des sessions impossible :", e)
+
+
+def _hhmm(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def sommeil_estime():
+    """Reveil du jour, coucher de la veille, duree entre les deux.
+
+    Le reveil est le premier allumage du jour ; le coucher, la derniere
+    extinction qui le precede. Une duree hors de 2 h a 16 h n'est pas du
+    sommeil (redemarrage, coupure) : on la laisse tomber.
+    """
+    try:
+        if not os.path.exists(FICHIER_SESSIONS):
+            return None
+        evts = []
+        with open(FICHIER_SESSIONS, encoding="utf-8") as f:
+            for l in f:
+                if l.strip():
+                    evts.append(json.loads(l))
+        aujourd = time.strftime("%Y-%m-%d")
+        reveils = [e for e in evts if e.get("genre") == "demarrage"
+                   and str(e.get("quand", "")).startswith(aujourd)]
+        if not reveils:
+            return None
+        reveil = min(reveils, key=lambda e: e["ts"])
+        avant = [e for e in evts if e.get("genre") == "extinction"
+                 and e["ts"] < reveil["ts"]]
+        if not avant:
+            return {"reveil": _hhmm(reveil["ts"])}
+        coucher = max(avant, key=lambda e: e["ts"])
+        heures = round((reveil["ts"] - coucher["ts"]) / 3600.0, 1)
+        res = {"reveil": _hhmm(reveil["ts"]), "coucher": _hhmm(coucher["ts"])}
+        if 2.0 <= heures <= 16.0:
+            res["sommeil_h"] = heures
+        return res
+    except Exception:
+        return None
 
 
 def _jour_courant():
@@ -430,7 +494,8 @@ def categorie_activite(contexte):
 def _reinit_jour():
     ACTIVITE.update(jour=_jour_courant(), contexte="", titre_courant="",
                     depuis=time.time(), temps={}, titres={}, bascules=0,
-                    actif_s=0.0, premiere="", derniere="")
+                    actif_s=0.0, premiere="", derniere="", trous=[],
+                    trou_depuis=0.0)
 
 
 def activite_note(contexte, actif, titres_complets=False, maintenant=None):
@@ -461,11 +526,24 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
             par_titre[t] = par_titre.get(t, 0.0) + ecoule
     ACTIVITE["depuis"] = maintenant
 
+    # Trou : une absence prolongee pendant que le poste reste allume. Le
+    # debut est marque a la premiere mesure inactive, ferme au retour, et
+    # n'est retenu qu'au-dela du seuil.
     if actif:
+        if ACTIVITE["trou_depuis"]:
+            duree = maintenant - ACTIVITE["trou_depuis"]
+            if duree >= SEUIL_TROU:
+                ACTIVITE["trous"].append({
+                    "de": _hhmm(ACTIVITE["trou_depuis"]), "a": _hhmm(maintenant),
+                    "minutes": round(duree / 60.0)})
+                del ACTIVITE["trous"][40:]
+            ACTIVITE["trou_depuis"] = 0.0
         h = time.strftime("%H:%M")
         if not ACTIVITE["premiere"]:
             ACTIVITE["premiere"] = h
         ACTIVITE["derniere"] = h
+    elif not ACTIVITE["trou_depuis"]:
+        ACTIVITE["trou_depuis"] = maintenant
 
     if cat != avant:
         if avant:
@@ -494,7 +572,11 @@ def resume_activite():
         "bascules_fenetre": ACTIVITE["bascules"],
         "actif_minutes": round(ACTIVITE["actif_s"] / 60.0, 1),
         "plage": {"de": ACTIVITE["premiere"], "a": ACTIVITE["derniere"]},
+        "trous": list(ACTIVITE["trous"]),
     }
+    veille = sommeil_estime()
+    if veille:
+        resume["poste"] = veille
     if ACTIVITE["titres"]:
         resume["titres"] = {cat: {t: round(s) for t, s in d.items()}
                             for cat, d in ACTIVITE["titres"].items()}
@@ -1679,6 +1761,9 @@ def surveiller_arret_windows():
         if message in (WM_QUERYENDSESSION, WM_ENDSESSION):
             if CFG.get("eteindre_en_partant", True):
                 eteindre_guirlande()
+            if CFG.get("collecte_active", False):
+                noter_session("extinction")    # vaut coucher : Windows s'arrete
+                sauver_activite()
             # Repondre vrai a QUERYENDSESSION : on ne bloque pas l'arret.
             return True
         return win32gui.DefWindowProc(fenetre, message, wparam, lparam)
@@ -3271,8 +3356,11 @@ class Panneau:
         self.titre(f, "journal d'activite").pack(fill="x", pady=(0, 6))
         self.texte(f, "Facon ActivityWatch : le temps passe par application "
                       "et par site, les bascules entre fenetres, tes plages "
-                      "actives. BrainDebugger peut les relire pour situer une "
-                      "journee.", BRUME, 9, largeur=500).pack(fill="x")
+                      "actives, tes trous dans la journee, et — parce que "
+                      "l'app demarre avec Windows et recoit son ordre "
+                      "d'arret — ton lever et ton coucher. BrainDebugger peut "
+                      "les relire pour situer une journee.",
+                   BRUME, 9, largeur=500).pack(fill="x")
 
         carte = tk.Frame(f, bg=VELOURS, padx=self.px(14), pady=self.px(12))
         carte.pack(fill="x", pady=(12, 0))
@@ -3315,7 +3403,9 @@ class Panneau:
         self.titre(f, "ce que le site recevra").pack(fill="x", pady=(0, 6))
         self.texte(f, "POST <site>/api/machitool/activite, un objet par jour :\n"
                       "  date, temps_par_contexte_s, bascules_fenetre,\n"
-                      "  actif_minutes, plage : { de, a }\n\n"
+                      "  actif_minutes, plage : { de, a },\n"
+                      "  trous : [ { de, a, minutes } ],\n"
+                      "  poste : { reveil, coucher, sommeil_h }\n\n"
                       "Aucune cle de contenu : il n'y en a pas.", BRUME, 9,
                    largeur=500).pack(fill="x")
 
@@ -4424,6 +4514,9 @@ def lancer():
     threading.Thread(target=veille_pont, daemon=True).start()
 
     demarrer_activite(CFG)
+    if CFG.get("collecte_active", False) and not SESSION["notee"]:
+        SESSION["notee"] = True
+        noter_session("demarrage")     # vaut reveil : l'app demarre avec Windows
 
     def veille_activite():
         while ETAT["en_marche"]:
