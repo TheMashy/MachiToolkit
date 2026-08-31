@@ -137,6 +137,18 @@ ton lever et ton coucher, avec la duree de sommeil deduite. Les **trous** de
 la journee (absences de plus de vingt minutes, poste allume) sont releves
 aussi.
 
+Deux facons pour BrainDebugger d'avoir la journee a jour :
+
+- **Il tire** — `GET 127.0.0.1:7373/activite` (avec le jeton de la
+  passerelle locale) renvoie le digest du jour en direct. C'est le site qui
+  appelle l'application, donc rien ne depend de l'authentification du site.
+- **L'application pousse** — quand le site signale qu'on l'utilise
+  (heartbeat `/presence`), l'application lui envoie la journee a jour, au
+  plus une fois toutes les deux minutes.
+
+Sinon, l'ecriture horaire et celle de l'extinction suffisent : un JSON par
+jour s'accumule dans `activite.jsonl`, localement.
+
 Tout est faux par defaut. Le resume part sur
 `POST <site>/api/machitool/activite`, un objet par jour :
 `temps_par_contexte_s`, `bascules_fenetre`, `actif_minutes`, `plage`,

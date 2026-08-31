@@ -403,6 +403,7 @@ ACTIVITE = {
 }
 
 MOTEUR_ACTIVITE = {"marche": False}
+SYNC = {"dernier": 0.0}          # derniere synchro poussee, pour l'espacer
 SEUIL_TROU = 20 * 60          # une absence n'est notee qu'au-dela de 20 min
 FICHIER_SESSIONS = os.path.join(DOSSIER, "sessions.jsonl")
 SESSION = {"notee": False}    # une seule entree de demarrage par lancement
@@ -639,6 +640,19 @@ def envoyer_activite_au_site(cfg):
     except Exception as e:
         ACTIVITE["message"] = "Envoi impossible : %s" % str(e)[:60]
         return False
+
+
+def synchroniser_activite(cfg, minimum=120):
+    """Pousse le digest du jour au site, au plus une fois par 'minimum'
+    secondes. Appele quand on detecte qu'on utilise BrainDebugger : la
+    donnee du jour arrive a jour sans attendre l'ecriture horaire."""
+    if not (ACTIVITE["active"] and cfg.get("collecte_envoi", False)):
+        return
+    if time.time() - SYNC["dernier"] < minimum:
+        return
+    SYNC["dernier"] = time.time()
+    threading.Thread(target=lambda: envoyer_activite_au_site(cfg),
+                     daemon=True).start()
 
 
 def _fil_activite(cfg):
@@ -1223,6 +1237,15 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
                 "force": bool(forcage and time.time() < forcage["expire"]),
                 "humeurs": [r_["nom"] for r_ in CFG.get("regles", [])],
             })
+        if chemin == "/activite":
+            # Le site tire le digest du jour quand il veut, avec le jeton de
+            # la passerelle locale — pas la cle du pont. Aucune dependance a
+            # l'authentification du site : c'est lui qui appelle 127.0.0.1.
+            if not self.jeton_permis({}):
+                return self.repondre(401, {"erreur": "jeton invalide"})
+            digest = dict(resume_activite())
+            digest["journal_actif"] = ACTIVITE["active"]
+            return self.repondre(200, digest)
         return self.repondre(404, {"erreur": "route inconnue"})
 
     def do_POST(self):
@@ -1271,6 +1294,9 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             else:
                 ETAT["presence"] = None
                 ETAT["presence_vu"] = 0.0
+            # Present sur le site : bonne occasion de lui pousser la
+            # journee a jour, sans attendre l'ecriture horaire.
+            synchroniser_activite(CFG)
             return self.repondre(200, {"ok": True, "duree": duree_p})
 
         if chemin == "/relacher":
