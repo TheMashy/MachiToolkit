@@ -46,8 +46,16 @@ de prendre la main sur les lumieres.
 2. Double-cliquer.
 
 L'exe est son propre installeur : il se copie dans
-`%LOCALAPPDATA%\MachiTool`, s'ajoute au demarrage de Windows et se lance.
-Son icone apparait pres de l'horloge.
+`%LOCALAPPDATA%\MachiTool`, s'ajoute au demarrage de Windows, pose un
+raccourci dans le menu Demarrer, et se lance. Son icone apparait pres de
+l'horloge.
+
+**Pour relancer apres l'avoir quittee** : tape « Machi Tool » dans le menu
+Demarrer. Inutile de rouvrir le fichier telecharge — et surtout, ne le fais
+pas s'il est plus ancien que la version installee : l'exe refuse desormais
+de retrograder (il note sa version dans `version_installee.txt` et lance
+l'installation a jour plutot que de s'ecraser par-dessus), mais autant
+lancer directement la bonne.
 
 Si Guirlande ambiante (le nom de l'application jusqu'a la 1.1) est deja
 installee, Machi Tool reprend ses reglages au premier lancement : guirlande
