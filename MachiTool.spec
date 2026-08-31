@@ -21,7 +21,11 @@ hiddenimports = ['win32gui', 'win32process', 'win32api', 'win32event',
 
 # winrt n'existe que sur Windows et son nom de paquet a bouge selon les
 # versions de bleak : son absence ne doit pas casser la compilation.
-for paquet in ('bleak', 'winrt', 'mss', 'soundcard'):
+# cffi et son extension C portent la capture audio de soundcard ; sans
+# elles, l'import echoue dans l'exe alors qu'il passe en mode script.
+hiddenimports += ['cffi', '_cffi_backend']
+
+for paquet in ('bleak', 'winrt', 'mss', 'soundcard', 'cffi', 'numpy'):
     try:
         d, b, h = collect_all(paquet)
     except Exception as e:

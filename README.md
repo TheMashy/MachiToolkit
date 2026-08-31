@@ -139,8 +139,29 @@ prend effet au lancement suivant.
 
 ## Publier une nouvelle version
 
-La regle tient en une phrase : **une publication nait des que `VERSION`
-porte un numero encore jamais publie.**
+Chaque fusion sur `main` sort un exe telechargeable. Deux formes, selon ce
+que dit `VERSION` :
+
+| `VERSION` | Ce qui sort | Pour qui |
+|---|---|---|
+| porte un numero jamais publie | publication **stable** `v1.7.0` | tout le monde |
+| n'a pas bouge | **pre-version** `v1.6.1-dev.42` | ceux qui acceptent les builds |
+
+Il n'y a donc rien a faire pour diffuser un changement : fusionner suffit.
+L'application coche « Accepter les builds de developpement » par defaut et
+verifie toutes les heures ; elle annonce alors « Nouveau build detecte ».
+Decocher la case fait revenir aux seules stables.
+
+Le numero est grave dans le source avant compilation : un exe de
+developpement qui se croirait a la version stable dont il est issu se
+proposerait sa propre mise a jour en boucle. Le correctif est incremente
+pour la meme raison — `1.6.0-dev.7` se compare AVANT `1.6.0` et ne serait
+jamais proposee, c'est donc `1.6.1-dev.7`.
+
+Les pre-versions sont limitees aux cinq dernieres ; les stables ne sont
+jamais supprimees.
+
+Pour sortir une stable :
 
 1. Faire ses modifications.
 2. Monter `VERSION` dans `machi_tool.py` — seule source de verite pour le

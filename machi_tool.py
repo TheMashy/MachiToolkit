@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -193,10 +193,13 @@ CONFIG_DEFAUT = {
     "pont_notifie": True,            # afficher les rappels recus
 
     # Mises a jour depuis les publications GitHub du depot.
+    "config_version": 2,              # sert aux migrations, voir charger_config
     "maj_verifier": True,             # regarder si une version plus recente existe
     "maj_installation_auto": False,   # poser la mise a jour sans rien demander
-    "maj_prereleases": False,         # accepter aussi les pre-versions
-    "maj_intervalle_heures": 6,       # delai entre deux verifications
+    # Chaque fusion sur main sort une pre-version : la refuser reviendrait
+    # a ne rien voir passer entre deux versions stables.
+    "maj_prereleases": True,
+    "maj_intervalle_heures": 1,       # delai entre deux verifications
 }
 
 # ==========================================================================
@@ -271,6 +274,17 @@ def charger_config():
             enregistre.get("ecran_suit_luminance") is False:
         cfg["ecran_cible"] = "rien"
     cfg.pop("ecran_suit_luminance", None)
+
+    # Version 2 : les pre-versions deviennent le canal normal, puisque
+    # chaque fusion en produit une. Une configuration ecrite avant ce
+    # changement porte un « non » qui ne repondait pas a la meme question ;
+    # on la fait passer une fois, sans y revenir ensuite.
+    if enregistre and int(enregistre.get("config_version", 1)) < 2:
+        cfg["maj_prereleases"] = True
+        cfg["maj_intervalle_heures"] = min(
+            int(cfg.get("maj_intervalle_heures", 1)), 2)
+        print("Configuration migree : les nouveaux builds seront proposes.")
+    cfg["config_version"] = 2
     return cfg
 
 
@@ -555,8 +569,14 @@ def fil_audio(cfg):
     try:
         import numpy as np
         import soundcard as sc
-    except ImportError as e:
-        AUDIO["message"] = f"bibliotheque manquante ({e.name})"
+    except Exception as e:
+        # Pas seulement ImportError : soundcard s'appuie sur cffi, qui
+        # echoue autrement qu'en module introuvable. Et e.name vaut None
+        # des que l'erreur vient de l'interieur d'un module — le message
+        # ne disait alors rien d'exploitable.
+        AUDIO["message"] = "capture indisponible : %s: %s" % (
+            type(e).__name__, str(e)[:90])
+        print("Chargement audio impossible :", type(e).__name__, e)
         return
 
     taille = 2048                      # ~43 ms a 48 kHz, soit environ 23 mesures/s
@@ -1505,7 +1525,6 @@ MENU = [
     ("page", "accueil", "Accueil", None),
     ("groupe", "lampe", "Lampe", [
         ("etat",      "Etat"),
-        ("regles",    "Regles"),
         ("ecran",     "Ecran"),
         ("son",       "Son"),
         ("appairage", "Appairage"),
@@ -1527,6 +1546,11 @@ for _e in MENU:
     if _e[0] == "groupe":
         for _cle, _ in _e[3]:
             GROUPE_DE[_cle] = _e[1]
+
+# Page sans entree dans le rail : on y arrive depuis le mode Regles de la
+# page Ecran, ou depuis l'appairage d'une fenetre. Elle appartient quand
+# meme au module Lampe, pour que le bandeau la coiffe aussi.
+GROUPE_DE["regles"] = "lampe"
 
 
 def melange(avant, arriere, part):
@@ -1617,6 +1641,7 @@ class Panneau:
 
         self.zone = tk.Frame(corps, bg=NUIT)
         self.zone.pack(side="left", fill="both", expand=True)
+        self.construire_bandeau()
 
         self.page_accueil()
         self.page_etat()
@@ -1849,6 +1874,10 @@ class Panneau:
             barre.configure(bg=self.accent if actif else fond)
         for c, page in self.pages.items():
             page.pack_forget()
+        # Le bandeau ne concerne que la lampe, et doit rester au-dessus.
+        self.bandeau.pack_forget()
+        if GROUPE_DE.get(cle) == "lampe":
+            self.bandeau.pack(fill="x")
         self.pages[cle].pack(fill="both", expand=True)
 
     def nouvelle_page(self, cle, marge_x=24, marge_y=18, defilante=False):
@@ -2035,6 +2064,49 @@ class Panneau:
         self.tk.Frame(parent, bg=FIL, height=1).pack(fill="x", pady=(haut, bas))
 
     # ------------------------------------------------------------------
+    #  Bandeau du module Lampe
+    #
+    #  Ce que fait la guirlande a l'instant present interesse autant qu'on
+    #  regle l'ecran, le son ou l'appairage. Le laisser dans la seule page
+    #  Etat obligeait a y revenir pour verifier l'effet d'un reglage. Il
+    #  coiffe donc toutes les pages du module.
+    # ------------------------------------------------------------------
+
+    def construire_bandeau(self):
+        tk = self.tk
+        self.bandeau = tk.Frame(self.zone, bg=NUIT, padx=self.px(24),
+                                pady=self.px(14))
+
+        carte = tk.Frame(self.bandeau, bg=VELOURS, padx=self.px(16),
+                         pady=self.px(13))
+        carte.pack(fill="x")
+
+        haut = tk.Frame(carte, bg=VELOURS)
+        haut.pack(fill="x")
+        self.titre(haut, "source de la couleur").pack(side="left")
+        self.txt_mode = tk.Label(haut, text="", bg=ENCRE, fg=CRAIE,
+                                 font=(self.f_mono, 8),
+                                 padx=self.px(8), pady=self.px(2))
+        self.txt_mode.pack(side="right")
+
+        ligne = tk.Frame(carte, bg=VELOURS)
+        ligne.pack(fill="x", pady=(self.px(4), 0))
+        self.txt_regle = tk.Label(ligne, text="", bg=VELOURS, fg=CRAIE,
+                                  font=(self.f_titre, 17), anchor="w")
+        self.txt_regle.pack(side="left")
+        self.apercu_couleur(ligne, 40, VELOURS).pack(side="right")
+
+        self.txt_contexte = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
+                                     font=(self.f_mono, 8), anchor="w")
+        self.txt_contexte.pack(fill="x", pady=(self.px(4), 0))
+
+        self.bande = tk.Canvas(self.bandeau, height=self.px(22), bg=ENCRE,
+                               highlightthickness=0)
+        self.bande.pack(fill="x", pady=(self.px(8), 0))
+        self.historique = []
+        self.traits = []
+
+    # ------------------------------------------------------------------
     #  Page Accueil
     #
     #  L'entree du toolkit : une tuile par module. Il n'y en a qu'une pour
@@ -2172,18 +2244,6 @@ class Panneau:
         tk = self.tk
         f = self.nouvelle_page("etat")
 
-        carte = tk.Frame(f, bg=VELOURS, padx=18, pady=16)
-        carte.pack(fill="x")
-        self.titre(carte, "source de la couleur").pack(fill="x")
-        self.txt_regle = tk.Label(carte, text="", bg=VELOURS, fg=CRAIE,
-                                  font=(self.f_titre, 17), anchor="w")
-        self.txt_regle.pack(fill="x", pady=(4, 6))
-        self.txt_contexte = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
-                                     font=(self.f_mono, 8), anchor="w")
-        self.txt_contexte.pack(fill="x")
-
-        self.separateur(f)
-
         info = tk.Frame(f, bg=NUIT)
         info.pack(fill="x")
         self.titre(info, "guirlande").pack(fill="x")
@@ -2192,14 +2252,6 @@ class Panneau:
         self.txt_adresse.pack(fill="x", pady=(3, 0))
         self.txt_detail = self.texte(info, "", BRUME, 8)
         self.txt_detail.pack(fill="x", pady=(3, 0))
-
-        self.separateur(f)
-
-        self.titre(f, "activite recente").pack(fill="x", pady=(0, 5))
-        self.bande = tk.Canvas(f, height=self.px(26), bg=ENCRE, highlightthickness=0)
-        self.bande.pack(fill="x")
-        self.historique = []
-        self.traits = []
 
         self.separateur(f)
 
@@ -2357,6 +2409,9 @@ class Panneau:
                    self.var_mode, "ecran").pack(fill="x")
         self.radio(f, "Mixte — moitie regle, moitie ecran",
                    self.var_mode, "mixte").pack(fill="x")
+        self.bouton(f, "Modifier les regles par application",
+                    lambda: self.aller("regles"),
+                    compact=True).pack(anchor="w", pady=(8, 0))
 
         self.separateur(f, 14, 10)
         rang_apercu = tk.Frame(f, bg=NUIT)
@@ -2839,7 +2894,9 @@ class Panneau:
                   self.var_maj_auto, self.options_maj).pack(fill="x", pady=(4, 0))
         self.var_maj_pre = tk.IntVar(
             value=1 if self.cfg.get("maj_prereleases", False) else 0)
-        self.case(f, "Accepter aussi les pre-versions",
+        self.case(f, "Accepter les builds de developpement — chaque fusion "
+                     "sur main en produit un, sans attendre une version "
+                     "stable. Decoche pour ne recevoir que les stables.",
                   self.var_maj_pre, self.options_maj).pack(fill="x", pady=(4, 0))
 
         self.separateur(f)
@@ -3169,7 +3226,9 @@ class Panneau:
         self.txt_adresse.configure(
             text=self.cfg.get("adresse", "") or "aucune guirlande appairee")
         mode = {"applications": "mode Regles", "ecran": "mode Ecran",
+                "son": "mode Son",
                 "mixte": "mode Mixte"}.get(self.cfg.get("mode", "applications"), "")
+        self.txt_mode.configure(text=mode.upper())
         self.txt_detail.configure(
             text=f"{mode} — {ETAT['ecrans']} ecran(s) — "
                  f"{self.cfg.get('images_par_seconde', 8)} images par seconde")
@@ -3339,6 +3398,11 @@ def version_en_tuple(texte):
     return (tuple(nombres[:3]), 0 if pre else 1, tuple(rang))
 
 
+def est_build(version):
+    """Une pre-version issue d'une fusion, par opposition a une stable."""
+    return "-dev." in str(version)
+
+
 def plus_recente(candidate, reference):
     return version_en_tuple(candidate) > version_en_tuple(reference)
 
@@ -3455,7 +3519,8 @@ def verifier_maj(cfg):
         return None
 
     MAJ["etat"] = "disponible"
-    MAJ["message"] = "Version %s disponible (installee : %s)." % (
+    MAJ["message"] = "%s %s disponible (installee : %s)." % (
+        "Nouveau build" if est_build(publication["version"]) else "Version",
         publication["version"], VERSION)
     return publication
 
@@ -3822,9 +3887,11 @@ def lancer():
         if CFG.get("maj_installation_auto", False):
             travail_maj("installer")
         else:
-            notifier("Mise a jour disponible",
-                     "Version %s. Clic droit sur l'icone pour l'installer."
-                     % publication["version"])
+            notifier(
+                "Nouveau build detecte" if est_build(publication["version"])
+                else "Mise a jour disponible",
+                "%s. Clic droit sur l'icone pour l'installer."
+                % publication["version"])
 
     verrou_maj = threading.Lock()
 
@@ -3884,10 +3951,11 @@ def lancer():
     threading.Thread(target=veille_pont, daemon=True).start()
 
     def libelle_maj(*_):
+        quoi = "le build" if est_build(MAJ["version"]) else "la version"
         if MAJ["etat"] == "prete":
-            return "Installer la version %s" % MAJ["version"]
+            return "Installer %s %s" % (quoi, MAJ["version"])
         if MAJ["etat"] == "disponible":
-            return "Mettre a jour vers la version %s" % MAJ["version"]
+            return "Passer a %s %s" % (quoi, MAJ["version"])
         if MAJ["etat"] == "telechargement":
             return "Telechargement en cours..."
         if MAJ["etat"] == "verification":
