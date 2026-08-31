@@ -90,6 +90,37 @@ Trois cases dans l'onglet **Mises a jour** du panneau :
 Rien ne sort de la machine : la verification est une lecture, pas un envoi.
 Le numero de version installe lui-meme n'est pas transmis.
 
+## Le pont avec BrainDebugger
+
+Machi Tool sait dialoguer avec [BrainDebugger](https://braindebugger-production.up.railway.app).
+Deux chemins, parce que deux situations.
+
+**Un onglet du site est ouvert.** Le site tourne sur Internet, l'application
+ecoute sur `127.0.0.1` — et c'est le navigateur, sur cette machine, qui fait
+le lien. Une page en HTTPS peut appeler l'adresse locale : les navigateurs la
+traitent comme sure et l'exemptent du blocage de contenu mixte. Le site pose
+alors une couleur, une humeur, un rappel, sans delai.
+
+    POST /couleur          {"couleur": "#7C3AED", "duree": 30}
+    POST /humeur           {"humeur": "Musique"}
+    POST /rappel           {"id": "...", "titre": "...", "texte": "..."}
+    POST /humeur-du-jour   {"valeur": 3, "libelle": "...", "couleur": "..."}
+    POST /journal          {"jours": [...], "reperes": [...]}
+
+**Aucun onglet ouvert.** Plus rien ne peut joindre cette machine depuis
+Internet : elle est derriere un routeur, sans adresse publique. C'est donc
+l'application qui va demander, toutes les dix minutes par defaut :
+
+    GET <site>/api/machitool/attente
+    -> {"rappels": [...], "humeur": {...}, "jours": [...], "reperes": [...]}
+
+Toutes les cles sont facultatives. Tant que cette route n'existe pas cote
+site, le 404 est avale sans bruit et rien ne casse — la page Passerelle le
+dit simplement.
+
+Les pages **Calendrier** et **Moi** affichent ce que le site a envoye. Elles
+n'inventent rien et ne conservent rien : sans donnees, elles le disent.
+
 ## Ecrans haute resolution
 
 L'interface se met a l'echelle de l'ecran au demarrage. Sur un 4K a 150 ou
