@@ -118,6 +118,23 @@ Toutes les cles sont facultatives. Tant que cette route n'existe pas cote
 site, le 404 est avale sans bruit et rien ne casse — la page Passerelle le
 dit simplement.
 
+### Journal d'activite (facon ActivityWatch)
+
+Machi Tool peut tenir un journal de la journee — temps par application et
+par site, bascules entre fenetres, plages actives — et le pousser a
+BrainDebugger. C'est bati sur ce que l'application lit deja pour la
+lumiere : la fenetre au premier plan et le delai depuis la derniere
+frappe. Aucun hook clavier, aucune touche interceptee.
+
+Ce qui n'est jamais collecte : le texte tape. Ni tes messages, ni ceux des
+autres, ni tes mots de passe. Comme ActivityWatch, on note l'enveloppe de
+l'activite, pas son contenu. Le rythme de ta propre ecriture se mesure
+ailleurs, dans le site lui-meme, sur les champs ou c'est toi qui ecris.
+
+Tout est faux par defaut. Le resume part sur
+`POST <site>/api/machitool/activite`, un objet par jour :
+`temps_par_contexte_s`, `bascules_fenetre`, `actif_minutes`, `plage`.
+
 ### Bascule pendant l'usage du site
 
 Quand BrainDebugger est devant, la guirlande prend sa couleur — celle de
