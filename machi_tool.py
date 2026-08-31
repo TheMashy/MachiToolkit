@@ -36,7 +36,7 @@ import http.server
 import urllib.error
 import urllib.request
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -367,6 +367,7 @@ def _vignette_gdi(zone, colonnes, lignes):
     if garde is None or garde["taille"] != (colonnes, lignes):
         if garde is not None:
             _liberer_gdi(garde)
+        fenetre = dc_ecran = None
         try:
             fenetre = win32gui.GetDesktopWindow()
             dc_ecran = win32gui.GetWindowDC(fenetre)
@@ -380,6 +381,15 @@ def _vignette_gdi(zone, colonnes, lignes):
                      "taille": (colonnes, lignes)}
             _local.gdi = garde
         except Exception as e:
+            # Le contexte a pu etre obtenu avant l'echec. Sans cette
+            # liberation il fuit, et comme le cache reste vide la capture
+            # suivante recommence : un contexte perdu par image, jusqu'a
+            # epuisement du quota GDI du processus.
+            if dc_ecran:
+                try:
+                    win32gui.ReleaseDC(fenetre, dc_ecran)
+                except Exception:
+                    pass
             print("Capture GDI indisponible :", e)
             _local.gdi = None
             return None
@@ -460,7 +470,12 @@ def couleur_ecran(source, boost, colonnes=4):
             val_tot += val
 
         luminance = val_tot / len(pixels)
-        if poids < 0.4:                        # ecran quasi gris ou noir
+        # Le seuil porte sur la moyenne par pixel, pas sur la somme : la
+        # vignette est passee de 1296 pixels a une douzaine, et un total
+        # calibre pour l'ancienne taille condamnait un editeur sombre ou un
+        # bureau neutre au blanc chaud fige. Une moyenne ne bouge pas avec
+        # le curseur de finesse.
+        if poids / len(pixels) < 0.0003:       # ecran quasi gris ou noir
             teinte, saturation = 0.09, 0.12    # blanc chaud
         else:
             teinte = (math.atan2(sy, sx) / (2 * math.pi)) % 1.0
@@ -1586,7 +1601,9 @@ class Panneau:
         return {"toile": toile, "rail": rail, "plein": plein,
                 "val": val, "source": source}
 
-    def poser_jauge(self, j, valeur, pilotee):
+    def poser_jauge(self, j, valeur, pilotee, source="le son"):
+        """source nomme ce qui pilote : la meme jauge sert au son et a
+        l'ecran, elle ne peut pas supposer l'un ou l'autre."""
         largeur = max(self.px(20), j["toile"].winfo_width())
         valeur = max(0.0, min(1.0, float(valeur)))
         haut, bas = self.px(4), self.px(12)
@@ -1594,7 +1611,7 @@ class Panneau:
         j["toile"].coords(j["plein"], 0, haut, largeur * valeur, bas)
         j["toile"].itemconfig(j["plein"], fill=self.accent if pilotee else FIL)
         j["val"].configure(text="%3d %%" % round(valeur * 100))
-        j["source"].configure(text="pilotee par le son" if pilotee else "fixe",
+        j["source"].configure(text=("pilotee par " + source) if pilotee else "fixe",
                               fg=CRAIE if pilotee else BRUME)
 
     def separateur(self, parent, haut=14, bas=14):
@@ -2495,26 +2512,27 @@ class Panneau:
         cible_ecran = self.cfg.get("ecran_cible", "luminosite")
         en_ecran = self.cfg.get("mode") in ("ecran", "mixte")
         self.poser_jauge(self.jauge_ecran_entree,
-                         ETAT["ecran_luminance"] if en_ecran else 0.0, en_ecran)
+                         ETAT["ecran_luminance"] if en_ecran else 0.0,
+                         en_ecran, "l'ecran")
         self.poser_jauge(
             self.jauge_ecran_lum,
             ETAT["ecran_gain"] if en_ecran
             else self.cfg.get("ecran_luminosite_base", 1.0),
-            en_ecran and cible_ecran in ("luminosite", "les_deux"))
+            en_ecran and cible_ecran in ("luminosite", "les_deux"), "l'ecran")
         self.poser_jauge(
             self.jauge_ecran_sat, ETAT["ecran_sat"] if en_ecran else 0.0,
-            en_ecran and cible_ecran in ("saturation", "les_deux"))
+            en_ecran and cible_ecran in ("saturation", "les_deux"), "l'ecran")
 
         cible = self.cfg.get("son_cible", "luminosite")
         en_son = self.cfg.get("mode") == "son" and AUDIO.get("actif")
         self.poser_jauge(
             self.jauge_lum,
             AUDIO["gain"] if en_son else self.cfg.get("son_luminosite_fixe", 1.0),
-            cible in ("luminosite", "les_deux"))
+            en_son and cible in ("luminosite", "les_deux"))
         self.poser_jauge(
             self.jauge_sat,
             AUDIO["saturation"] if en_son else self.cfg.get("son_saturation_fixe", 0.92),
-            cible in ("saturation", "les_deux"))
+            en_son and cible in ("saturation", "les_deux"))
         self.txt_api.configure(text="Passerelle " + ETAT.get("api", "arretee"))
 
         self.txt_scan.configure(
@@ -2609,7 +2627,16 @@ def version_en_tuple(texte):
         nombres.append(int(chiffres) if chiffres else 0)
     while len(nombres) < 3:
         nombres.append(0)
-    return (tuple(nombres[:3]), 0 if pre else 1, pre)
+
+    # Le suffixe se compare morceau par morceau, les chiffres comme des
+    # nombres : compare comme du texte, beta.10 passerait avant beta.2.
+    rang = []
+    for morceau in (pre.split(".") if pre else []):
+        if morceau.isdigit():
+            rang.append((0, int(morceau), ""))
+        else:
+            rang.append((1, 0, morceau))
+    return (tuple(nombres[:3]), 0 if pre else 1, tuple(rang))
 
 
 def plus_recente(candidate, reference):
@@ -2640,7 +2667,10 @@ def _contexte_ssl():
 
 def _ouvrir(url, delai=20):
     requete = urllib.request.Request(url, headers={
-        "User-Agent": "MachiToolkit/" + VERSION,
+        # Sans numero de version : la page « Mises a jour » et le README
+        # promettent que rien de la machine n'est transmis, l'en-tete doit
+        # tenir cette promesse.
+        "User-Agent": "MachiToolkit",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
@@ -3094,10 +3124,26 @@ def lancer():
                      "Version %s. Clic droit sur l'icone pour l'installer."
                      % publication["version"])
 
-    def declencher_maj(quoi="verifier"):
-        if MAJ["etat"] in ("verification", "telechargement"):
+    verrou_maj = threading.Lock()
+
+    def travail_maj_exclusif(quoi):
+        """Un seul travail a la fois, quelle qu'en soit l'origine.
+
+        Le menu de l'icone, le panneau et le fil de veille peuvent
+        declencher en meme temps. Deux telechargements ecriraient le meme
+        fichier .part : chacun verrait une taille complete, et l'exe
+        entrelace serait renomme puis lance comme installeur.
+        """
+        if not verrou_maj.acquire(blocking=False):
             return
-        threading.Thread(target=travail_maj, args=(quoi,), daemon=True).start()
+        try:
+            travail_maj(quoi)
+        finally:
+            verrou_maj.release()
+
+    def declencher_maj(quoi="verifier"):
+        threading.Thread(target=travail_maj_exclusif, args=(quoi,),
+                         daemon=True).start()
 
     def veille_maj():
         """Premiere verification peu apres le demarrage, puis a intervalle."""
@@ -3108,9 +3154,8 @@ def lancer():
                 time.sleep(2)
             if not ETAT["en_marche"]:
                 return
-            if FIGE and CFG.get("maj_verifier", True) \
-                    and MAJ["etat"] not in ("verification", "telechargement"):
-                travail_maj("verifier")
+            if FIGE and CFG.get("maj_verifier", True):
+                travail_maj_exclusif("verifier")
             attente = max(1, int(CFG.get("maj_intervalle_heures", 6))) * 3600
 
     panneau.declencher_maj = declencher_maj
