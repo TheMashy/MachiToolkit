@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -404,7 +404,8 @@ ACTIVITE = {
 }
 
 MOTEUR_ACTIVITE = {"marche": False}
-SYNC = {"dernier": 0.0}          # derniere synchro poussee, pour l'espacer
+SYNC = {"dernier": 0.0, "reussi": 0.0}   # derniere synchro poussee ; dernier envoi reussi
+FICHIER_ENVOI = os.path.join(DOSSIER, "dernier_envoi.txt")  # survit au redemarrage
 SEUIL_TROU = 20 * 60          # une absence n'est notee qu'au-dela de 20 min
 FICHIER_SESSIONS = os.path.join(DOSSIER, "sessions.jsonl")
 SESSION = {"notee": False}    # une seule entree de demarrage par lancement
@@ -631,6 +632,7 @@ def envoyer_activite_au_site(cfg):
                                     context=_contexte_ssl()) as reponse:
             reponse.read()
         ACTIVITE["message"] = "Journee envoyee au site."
+        marquer_envoi_reussi()
         return True
     except urllib.error.HTTPError as e:
         ACTIVITE["message"] = (
@@ -641,6 +643,50 @@ def envoyer_activite_au_site(cfg):
     except Exception as e:
         ACTIVITE["message"] = "Envoi impossible : %s" % str(e)[:60]
         return False
+
+
+def marquer_envoi_reussi():
+    """Retient l'instant du dernier envoi reussi, en memoire et sur disque, pour
+    que « dernier envoi » survive au redemarrage."""
+    SYNC["reussi"] = time.time()
+    try:
+        with open(FICHIER_ENVOI, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M"))
+    except Exception:
+        pass
+
+
+def dernier_envoi_texte():
+    """La date du dernier envoi reussi, lisible, ou None si rien n'est encore parti."""
+    if SYNC["reussi"]:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(SYNC["reussi"]))
+    try:
+        if os.path.exists(FICHIER_ENVOI):
+            with open(FICHIER_ENVOI, encoding="utf-8") as f:
+                return f.read().strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def apercu_activite():
+    """Une preview courte de ce qui partira aujourd'hui — pas un journal, juste
+    de quoi reconnaitre sa journee. Rend (date, lignes)."""
+    r = resume_activite()
+    lignes = []
+    plage = r.get("plage") or {}
+    if plage.get("de"):
+        lignes.append("Actif de %s a %s" % (plage["de"], plage.get("a") or "…"))
+    lignes.append("%s min actives · %s bascules"
+                  % (r.get("actif_minutes", 0), r.get("bascules_fenetre", 0)))
+    tp = r.get("temps_par_contexte_s") or {}
+    for i, (contexte, secondes) in enumerate(tp.items()):
+        if i >= 3:
+            break
+        lignes.append("  %s — %d min" % (contexte, round(secondes / 60)))
+    if len(lignes) <= 1 and not (tp or plage.get("de")):
+        lignes = ["Rien encore aujourd'hui."]
+    return r.get("date", ""), "\n".join(lignes)
 
 
 def synchroniser_activite(cfg, minimum=120):
@@ -1954,10 +2000,8 @@ MENU = [
         ("appairage", "Appairage"),
     ]),
     ("groupe", "pont", "BrainDebugger", "\u25c9", [
-        ("calendrier", "Calendrier"),
-        ("moi",        "Moi"),
-        ("activite",   "Activite"),
         ("passerelle", "Passerelle"),
+        ("activite",   "Quantified Self"),
     ]),
     ("groupe", "app", "Application", "\u2699", [
         ("reglages", "Reglages"),
@@ -3380,61 +3424,43 @@ class Panneau:
         tk = self.tk
         f = self.nouvelle_page("activite", defilante=True)
 
-        self.titre(f, "journal d'activite").pack(fill="x", pady=(0, 6))
-        self.texte(f, "Facon ActivityWatch : le temps passe par application "
-                      "et par site, les bascules entre fenetres, tes plages "
-                      "actives, tes trous dans la journee, et — parce que "
-                      "l'app demarre avec Windows et recoit son ordre "
-                      "d'arret — ton lever et ton coucher. BrainDebugger peut "
-                      "les relire pour situer une journee.",
-                   BRUME, 9, largeur=500).pack(fill="x")
-
-        carte = tk.Frame(f, bg=VELOURS, padx=self.px(14), pady=self.px(12))
-        carte.pack(fill="x", pady=(12, 0))
-        tk.Label(carte, text="\u26a0  Ce qui n'est pas collecte", bg=VELOURS,
-                 fg=CRAIE, font=(self.f_ui, 9, "bold"), anchor="w").pack(fill="x")
-        self.texte(carte, "Rien de ce que tu tapes. Ni tes messages, ni ceux "
-                          "des autres, ni tes mots de passe : ce journal note "
-                          "quelle fenetre etait devant et combien de temps, "
-                          "pas ce qui s'y ecrivait. Pour le rythme de ta "
-                          "propre ecriture, c'est le site qui le mesure, dans "
-                          "ses champs a lui.", BRUME, 9, largeur=470).pack(
-                              fill="x", pady=(4, 0))
+        self.titre(f, "quantified self").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Le temps passe par application et par site, tes plages "
+                      "actives, ton lever et ton coucher — jamais ce que tu "
+                      "tapes. Envoye a BrainDebugger pour situer une journee.",
+                   BRUME, 9, largeur=460).pack(fill="x")
 
         self.separateur(f)
         self.var_act = tk.IntVar(value=1 if self.cfg.get("collecte_active", False) else 0)
-        self.case(f, "Tenir le journal d'activite", self.var_act).pack(fill="x")
-        self.var_act_titres = tk.IntVar(
-            value=1 if self.cfg.get("collecte_titres_complets", False) else 0)
-        self.case(f, "Garder le titre complet des fenetres — plus precis, mais "
-                     "le titre peut contenir un nom de canal ou de personne",
-                  self.var_act_titres).pack(fill="x", pady=(4, 0))
-        self.var_act_envoi = tk.IntVar(
-            value=1 if self.cfg.get("collecte_envoi", False) else 0)
-        self.case(f, "Envoyer le resume a BrainDebugger — sinon il reste ici, "
-                     "dans activite.jsonl", self.var_act_envoi).pack(fill="x", pady=(4, 0))
-        self.var_act_intervalle = self.reglette(
-            f, "collecte_intervalle_heures", "Heures entre deux ecritures",
-            1, 24, 1, "Le resume est sauve, et envoye si coche, a ce rythme. "
-                      "Il l'est aussi en quittant.", entier=True)
+        self.case(f, "Envoyer mon activite a BrainDebugger",
+                  self.var_act).pack(fill="x")
 
-        self.separateur(f)
+        # La preview : ce qui partira aujourd'hui, en clair, pas un journal.
+        carte = tk.Frame(f, bg=VELOURS, padx=self.px(14), pady=self.px(12))
+        carte.pack(fill="x", pady=(12, 0))
+        self.txt_apercu_titre = tk.Label(carte, text="Ce qu'il envoie",
+                 bg=VELOURS, fg=CRAIE, font=(self.f_ui, 9, "bold"), anchor="w")
+        self.txt_apercu_titre.pack(fill="x")
+        self.txt_apercu_act = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
+                 font=(self.f_mono, 9), anchor="w", justify="left")
+        self.txt_apercu_act.pack(fill="x", pady=(6, 0))
+
+        self.txt_dernier_envoi = self.texte(f, "", BRUME, 9, largeur=460)
+        self.txt_dernier_envoi.pack(fill="x", pady=(12, 0))
+
         barre = tk.Frame(f, bg=NUIT)
-        barre.pack(fill="x")
-        self.bouton(barre, "Enregistrer et envoyer maintenant",
+        barre.pack(fill="x", pady=(10, 0))
+        self.bouton(barre, "Envoyer maintenant",
                     self.envoyer_activite, compact=True).pack(side="left")
-        self.txt_activite = self.texte(f, "", BRUME, 9, largeur=500)
+        self.txt_activite = self.texte(f, "", BRUME, 9, largeur=460)
         self.txt_activite.pack(fill="x", pady=(10, 0))
 
-        self.separateur(f)
-        self.titre(f, "ce que le site recevra").pack(fill="x", pady=(0, 6))
-        self.texte(f, "POST <site>/api/machitool/activite, un objet par jour :\n"
-                      "  date, temps_par_contexte_s, bascules_fenetre,\n"
-                      "  actif_minutes, plage : { de, a },\n"
-                      "  trous : [ { de, a, minutes } ],\n"
-                      "  poste : { reveil, coucher, sommeil_h }\n\n"
-                      "Aucune cle de contenu : il n'y en a pas.", BRUME, 9,
-                   largeur=500).pack(fill="x")
+        # Reglages fins gardes vivants mais hors de vue : ils tournent avec ce
+        # qui est deja enregistre. La page reste juste l'onglet qui envoie.
+        self.var_act_titres = tk.IntVar(
+            value=1 if self.cfg.get("collecte_titres_complets", False) else 0)
+        self.var_act_intervalle = tk.IntVar(
+            value=int(self.cfg.get("collecte_intervalle_heures", 6)))
 
     def envoyer_activite(self):
         self.enregistrer()
@@ -3445,21 +3471,30 @@ class Panneau:
         tk = self.tk
         f = self.nouvelle_page("passerelle", defilante=True)
 
-        self.titre(f, "pont avec braindebugger").pack(fill="x", pady=(0, 6))
-        self.texte(f, "Le site tourne sur Internet, l'application ecoute en "
-                      "local. C'est ton navigateur, sur cette machine, qui "
-                      "fait le lien : une page du site peut appeler "
-                      "127.0.0.1 parce que les navigateurs traitent l'adresse "
-                      "locale comme sure, meme depuis une page en HTTPS.\n\n"
-                      "Mais sans onglet ouvert, plus rien ne peut joindre "
-                      "cette machine depuis Internet. Pour les rappels, c'est "
-                      "donc l'application qui va demander au site ce qu'il a "
-                      "en attente.", BRUME, 9, largeur=500).pack(fill="x")
+        self.titre(f, "passerelle").pack(fill="x", pady=(0, 8))
 
+        # L'ETAT DE LA CONNEXION, EN PREMIER. C'est la seule question qu'on se
+        # pose en ouvrant cette page : est-ce que l'app parle au site, oui ou
+        # non. Une pastille, un mot, une ligne de detail — le reste vit sans
+        # qu'on ait a le regarder.
+        etatc = tk.Frame(f, bg=VELOURS, padx=self.px(14), pady=self.px(12))
+        etatc.pack(fill="x")
+        ligne = tk.Frame(etatc, bg=VELOURS)
+        ligne.pack(fill="x")
+        self.pont_pastille = tk.Label(ligne, text="●", bg=VELOURS, fg=BRUME,
+                                      font=(self.f_ui, 13))
+        self.pont_pastille.pack(side="left")
+        self.txt_pont_etat = tk.Label(ligne, text="", bg=VELOURS, fg=CRAIE,
+                                      font=(self.f_ui, 11, "bold"), anchor="w")
+        self.txt_pont_etat.pack(side="left", padx=(8, 0))
+        self.txt_pont_detail = self.texte(etatc, "", BRUME, 9, largeur=460)
+        self.txt_pont_detail.pack(fill="x", pady=(6, 0))
+
+        # De quoi se connecter, et rien d'autre : l'adresse du site et la cle.
         rang = tk.Frame(f, bg=NUIT)
-        rang.pack(fill="x", pady=(12, 0))
+        rang.pack(fill="x", pady=(16, 0))
         self.texte(rang, "Adresse du site", CRAIE, 9, True).pack(side="left")
-        self.champ_pont = self.champ(rang, self.cfg.get("pont_site", ""), 34)
+        self.champ_pont = self.champ(rang, self.cfg.get("pont_site", ""), 30)
         self.champ_pont.pack(side="right")
 
         rang2 = tk.Frame(f, bg=NUIT)
@@ -3467,122 +3502,42 @@ class Panneau:
         self.texte(rang2, "Cle envoyee au site", CRAIE, 9, True).pack(side="left")
         self.champ_pont_cle = self.champ(rang2, self.cfg.get("pont_cle", ""), 24)
         self.champ_pont_cle.pack(side="right")
-        self.texte(f, "Facultative : transmise en parametre si le site veut "
-                      "verifier que la demande vient bien de toi.",
-                   BRUME, 8, largeur=500).pack(fill="x", pady=(4, 0))
+        self.texte(f, "La meme cle que celle creee sur le site, dans "
+                      "Reglages › La passerelle.",
+                   BRUME, 8, largeur=460).pack(fill="x", pady=(6, 0))
 
-        self.var_pont_releve = tk.IntVar(
-            value=1 if self.cfg.get("pont_releve", True) else 0)
-        self.case(f, "Aller chercher les rappels en attente sur le site",
-                  self.var_pont_releve).pack(fill="x", pady=(10, 0))
-        self.var_pont_notifie = tk.IntVar(
-            value=1 if self.cfg.get("pont_notifie", True) else 0)
-        self.case(f, "Afficher une bulle quand un rappel arrive",
-                  self.var_pont_notifie).pack(fill="x", pady=(4, 0))
-        self.var_pont_intervalle = self.reglette(
-            f, "pont_intervalle", "Minutes entre deux releves", 1, 120, 1,
-            "Trop court fatigue le site pour rien : ces rappels ne sont pas "
-            "urgents a la minute.", entier=True)
+        # ------------------------------------------------------------------
+        # TOUT LE RESTE VIT ENCORE, MAIS NE SE MONTRE PLUS.
+        #
+        # Le serveur local (127.0.0.1), la bascule pendant l'usage du site, le
+        # relevé des rappels, l'extrait JS : ces réglages continuent de tourner
+        # avec ce qui est déjà enregistré, mais ils encombraient une page dont
+        # la seule question utile est « connecté ou pas ». On garde donc leurs
+        # champs — l'enregistrement et l'extrait s'appuient dessus — dans un
+        # cadre qu'on ne pose jamais. Invisibles, vivants.
+        # ------------------------------------------------------------------
+        cache = tk.Frame(f, bg=NUIT)   # jamais .pack() : hors de l'ecran
 
-        self.separateur(f)
-        self.titre(f, "bascule pendant l'usage du site").pack(fill="x", pady=(0, 6))
-        self.texte(f, "Quand tu es sur BrainDebugger, la guirlande prend sa "
-                      "couleur, et revient d'elle-meme a l'ecran ou au son "
-                      "des que tu le quittes. Rien n'est a restaurer : le "
-                      "mode normal reprend simplement la main.",
-                   BRUME, 9, largeur=500).pack(fill="x", pady=(0, 10))
-
-        self.var_presence = tk.IntVar(
-            value=1 if self.cfg.get("pont_presence", True) else 0)
-        self.case(f, "Basculer quand j'utilise le site",
-                  self.var_presence).pack(fill="x")
+        self.var_pont_releve = tk.IntVar(value=1 if self.cfg.get("pont_releve", True) else 0)
+        self.var_pont_notifie = tk.IntVar(value=1 if self.cfg.get("pont_notifie", True) else 0)
+        self.var_pont_intervalle = tk.IntVar(value=int(self.cfg.get("pont_intervalle", 10)))
+        self.var_presence = tk.IntVar(value=1 if self.cfg.get("pont_presence", True) else 0)
         self.var_presence_humeur = tk.IntVar(
             value=1 if self.cfg.get("pont_presence_suit_humeur", True) else 0)
-        self.case(f, "Prendre la couleur de mon humeur du jour si le site en "
-                     "a envoye une, plutot que la couleur fixe",
-                  self.var_presence_humeur).pack(fill="x", pady=(4, 0))
-
-        rang3 = tk.Frame(f, bg=NUIT)
-        rang3.pack(fill="x", pady=(10, 0))
-        self.texte(rang3, "Mot reconnu dans le titre", CRAIE, 9, True).pack(side="left")
-        self.champ_presence = self.champ(
-            rang3, self.cfg.get("pont_presence_indice", ""), 22)
-        self.champ_presence.pack(side="right")
-
-        rang4 = tk.Frame(f, bg=NUIT)
-        rang4.pack(fill="x", pady=(8, 0))
-        self.texte(rang4, "Couleur fixe", CRAIE, 9, True).pack(side="left")
+        self.var_presence_grace = tk.IntVar(value=int(self.cfg.get("pont_presence_grace", 30)))
+        self.champ_presence = self.champ(cache, self.cfg.get("pont_presence_indice", ""), 22)
         self.champ_presence_couleur = self.champ(
-            rang4, self.cfg.get("pont_presence_couleur", "#7C3AED"), 12)
-        self.champ_presence_couleur.pack(side="right")
-
-        self.var_presence_grace = self.reglette(
-            f, "pont_presence_grace", "Delai de grace", 0, 120, 5,
-            "Secondes gardees apres avoir quitte le site. Sans ce delai, un "
-            "passage d'une seconde sur une autre fenetre ferait clignoter la "
-            "guirlande.", entier=True)
-
-        self.separateur(f)
-        self.titre(f, "ce que le site doit exposer").pack(fill="x", pady=(0, 6))
-        self.texte(f, "Une route GET sur /api/machitool/attente rendant du "
-                      "JSON. Toutes les cles sont facultatives :\n\n"
-                      "  rappels : [{id, titre, texte}]\n"
-                      "  humeur  : {valeur, libelle, couleur, date}\n"
-                      "  jours   : [{date, note, couleur}]\n"
-                      "  reperes : [{date, titre, couleur}]\n\n"
-                      "Et pour signaler qu'un onglet est ouvert alors que tu "
-                      "regardes ailleurs, le site peut battre la mesure :\n"
-                      "  POST 127.0.0.1/presence {\"actif\": true, \"duree\": 60}\n\n"
-                      "Tant que la route n'existe pas, le 404 est avale sans "
-                      "bruit et rien ne casse.", BRUME, 9,
-                   largeur=500).pack(fill="x")
-
-        self.separateur(f)
-        self.titre(f, "passerelle locale").pack(fill="x", pady=(0, 6))
-
-        self.texte(f, "Ouvre un petit serveur sur ta machine. Un site que tu "
-                      "developpes peut alors imposer une couleur, avec une date "
-                      "de peremption : s'il arrete d'emettre, la guirlande revient "
-                      "seule au mode normal.", BRUME, 8, largeur=500).pack(fill="x")
-
-        self.separateur(f, 12, 10)
+            cache, self.cfg.get("pont_presence_couleur", "#7C3AED"), 12)
 
         self.var_api = tk.IntVar(value=1 if self.cfg.get("api_active") else 0)
-        self.case(f, "Activer la passerelle locale", self.var_api).pack(fill="x")
-        self.txt_api = self.texte(f, "", BRUME, 8)
-        self.txt_api.pack(fill="x", pady=(4, 0))
-
-        rang = tk.Frame(f, bg=NUIT)
-        rang.pack(fill="x", pady=(12, 0))
-        self.texte(rang, "Port", CRAIE, 9, True).pack(side="left")
-        self.champ_port = self.champ(rang, str(self.cfg.get("api_port", 7373)), 7)
-        self.champ_port.pack(side="left", padx=10)
-        self.texte(rang, "Jeton", CRAIE, 9, True).pack(side="left", padx=(16, 0))
+        self.champ_port = self.champ(cache, str(self.cfg.get("api_port", 7373)), 7)
         self.champ_jeton = self.champ(
-            rang, self.cfg.get("api_jeton") or secrets.token_urlsafe(12), 20)
-        self.champ_jeton.pack(side="left", padx=10)
-        self.bouton(rang, "Copier", self.copier_jeton, compact=True).pack(side="left")
-        self.bouton(rang, "Regenerer", self.regenerer_jeton,
-                    compact=True).pack(side="left", padx=6)
-
-        self.titre(f, "sites autorises").pack(fill="x", pady=(16, 4))
-        self.texte(f, "Une origine par virgule, protocole compris. Toute autre "
-                      "page recevra une erreur.", BRUME, 8).pack(fill="x", pady=(0, 4))
-        self.champ_origines = self.champ(
-            f, ", ".join(self.cfg.get("api_origines", [])), 10)
-        self.champ_origines.pack(fill="x")
-
-        self.separateur(f, 14, 8)
-        self.titre(f, "a coller dans ton site").pack(fill="x", pady=(0, 5))
-        pied = tk.Frame(f, bg=NUIT)
-        pied.pack(fill="x", side="bottom", pady=(8, 0))
-        self.bouton(pied, "Copier le code", self.copier_code,
-                    compact=True).pack(side="left")
-
-        self.code = tk.Text(f, height=8, bg=ENCRE, fg=BRUME, relief="flat", bd=8,
+            cache, self.cfg.get("api_jeton") or secrets.token_urlsafe(12), 20)
+        self.champ_origines = self.champ(cache, ", ".join(self.cfg.get("api_origines", [])), 10)
+        self.txt_api = self.texte(cache, "", BRUME, 8)
+        self.code = tk.Text(cache, height=8, bg=ENCRE, fg=BRUME, relief="flat", bd=8,
                             font=(self.f_mono, 8), wrap="none", highlightthickness=0,
                             insertbackground=CRAIE)
-        self.code.pack(fill="both", expand=True)
         self.ecrire_extrait()
 
     def extrait_js(self):
@@ -3728,9 +3683,12 @@ class Panneau:
             couleur if couleur.startswith("#") and len(couleur) == 7 else "#7C3AED")
         self.cfg["pont_presence_grace"] = int(self.var_presence_grace.get())
         avant_act = self.cfg.get("collecte_active")
-        self.cfg["collecte_active"] = bool(self.var_act.get())
+        # Un seul interrupteur : « Envoyer mon activite » tient le journal ET
+        # l'envoie. Rien a cocher en plus, rien a oublier.
+        envoyer = bool(self.var_act.get())
+        self.cfg["collecte_active"] = envoyer
+        self.cfg["collecte_envoi"] = envoyer
         self.cfg["collecte_titres_complets"] = bool(self.var_act_titres.get())
-        self.cfg["collecte_envoi"] = bool(self.var_act_envoi.get())
         self.cfg["collecte_intervalle_heures"] = int(self.var_act_intervalle.get())
         if self.cfg["collecte_active"] != avant_act:
             demarrer_activite(self.cfg)
@@ -3782,6 +3740,28 @@ class Panneau:
         self.root.lift()
         self.root.focus_force()
 
+    def peindre_etat_pont(self):
+        """La seule question de la page Passerelle : connecte, ou pas.
+
+        On est connecte des qu'un echange recent a reussi — un releve de
+        rappels (PONT ok) ou un envoi d'activite parti sans erreur. Le detail
+        redit le dernier message du site et l'heure du dernier contact."""
+        etat = PONT.get("etat", "inactif")
+        envoi_ok = SYNC.get("reussi", 0) and (time.time() - SYNC["reussi"]) < 2 * 3600
+        if etat == "ok" or envoi_ok:
+            couleur, mot = VIF, "Connecte"
+        elif etat == "erreur":
+            couleur, mot = ALERTE, "Probleme de connexion"
+        else:
+            couleur, mot = FIL, "Pas encore connecte"
+        self.pont_pastille.configure(fg=couleur)
+        self.txt_pont_etat.configure(text=mot)
+        detail = PONT.get("message", "")
+        vu = PONT.get("vu_le", 0)
+        if vu:
+            detail += "  ·  dernier contact " + time.strftime("%H:%M", time.localtime(vu))
+        self.txt_pont_detail.configure(text=detail)
+
     # ------------------------------------------------------------------
     #  Rafraichissement
     # ------------------------------------------------------------------
@@ -3828,9 +3808,17 @@ class Panneau:
             self.peindre_moi()
         if self.section in ("calendrier", "moi"):
             self.peindre_pont()
+        if self.section == "passerelle":
+            self.peindre_etat_pont()
         if self.section == "activite":
+            _, apercu = apercu_activite()
+            self.txt_apercu_act.configure(text=apercu)
+            quand = dernier_envoi_texte()
+            self.txt_dernier_envoi.configure(
+                text=("Dernier envoi automatique : " + quand) if quand
+                else "Aucun envoi automatique pour l'instant.")
             self.txt_activite.configure(
-                text="Journal : " + ACTIVITE.get("message", "arrete"),
+                text=ACTIVITE.get("message", "arrete"),
                 fg=ALERTE if "impossible" in ACTIVITE.get("message", "")
                 or "demande" in ACTIVITE.get("message", "") else BRUME)
 
