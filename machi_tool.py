@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -3643,8 +3643,11 @@ class Panneau:
         pied = tk.Frame(self.root, bg=NUIT, padx=22, pady=12)
         pied.pack(fill="x", side="bottom")
         self.bouton(pied, "Enregistrer", self.enregistrer, principal=True).pack(side="left")
-        self.bouton(pied, "Quitter", self.quitter_tout, compact=True).pack(side="right")
-        self.bouton(pied, "Reduire", self.cacher, compact=True).pack(side="right", padx=8)
+        # Pas de « Quitter » ici : fermer ou reduire la fenetre ne fait que la
+        # cacher, et l'application continue de tourner derriere. Le seul arret
+        # franc est le clic droit « Quitter » sur l'icone de la barre des
+        # taches — un geste delibere, jamais un reflexe de fermeture.
+        self.bouton(pied, "Reduire", self.cacher, compact=True).pack(side="right")
 
     # ------------------------------------------------------------------
     #  Actions
