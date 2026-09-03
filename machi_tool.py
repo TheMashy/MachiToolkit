@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -934,27 +934,65 @@ def rampe_gamma():
     Relue au plus une fois par seconde -- elle bouge lentement. None hors Windows
     ou si le pilote la refuse.
 
-    Limite connue : on lit la rampe de l'ecran PRINCIPAL (GetDC(0)). Sur plusieurs
-    ecrans aux filtres differents, la teinte suivie est celle du principal, pas
-    forcement celle de l'ecran capture. Cas rare (un filtre couvre en general tous
-    les ecrans pareil) et sans regression : au pire, pas de compensation."""
+    POURQUOI CreateDC("DISPLAY") ET PAS SEULEMENT GetDC(0).
+
+    GetDC(0) rend un contexte d'ecran « commun » qui, tant que personne n'a
+    re-pose la rampe, renvoie souvent la rampe IDENTITE -- meme quand f.lux
+    jaunit deja l'ecran. C'est le fameux « rien ne bouge tant que je ne redemarre
+    pas f.lux » : au redemarrage f.lux rappelle SetDeviceGammaRamp, et l'espace
+    d'un instant GetDC(0) reflete enfin la vraie rampe. CreateDC("DISPLAY"), lui,
+    ouvre un contexte SUR LE PILOTE d'affichage : il rend la rampe ACTIVE, celle
+    que f.lux tient, qu'il vienne de demarrer ou qu'il tourne depuis des heures.
+    On l'essaie donc en premier, et GetDC(0) ne sert plus que de repli.
+
+    Limite connue : on lit la rampe de l'ecran PRINCIPAL. Sur plusieurs ecrans
+    aux filtres differents, la teinte suivie est celle du principal, pas forcement
+    celle de l'ecran capture. Cas rare (un filtre couvre en general tous les
+    ecrans pareil) et sans regression : au pire, pas de compensation."""
     if os.name != "nt":
         return None
     maintenant = time.time()
     # Le cache porte sur l'HORODATAGE, pas sur la presence d'une LUT : un echec
     # (rampe illisible : HDR, RDP, certains pilotes) doit lui aussi tenir une
-    # seconde, sinon on refait trois appels GDI a chaque image, en continu.
+    # seconde, sinon on refait des appels GDI a chaque image, en continu.
     if _RAMPE["ts"] and maintenant - _RAMPE["ts"] < 1.0:
         return _RAMPE["lut"]
     _RAMPE["ts"] = maintenant
     try:
         import ctypes
-        hdc = ctypes.windll.user32.GetDC(0)
-        try:
-            brut = (ctypes.c_uint16 * 256 * 3)()
-            ok = ctypes.windll.gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(brut))
-        finally:
-            ctypes.windll.user32.ReleaseDC(0, hdc)
+        gdi32 = ctypes.windll.gdi32
+        user32 = ctypes.windll.user32
+        # Handles = pointeurs : sans ces types, ctypes tronque a 32 bits en 64
+        # bits et l'appel echoue silencieusement (un HDC tronque n'est plus valide).
+        gdi32.CreateDCW.restype = ctypes.c_void_p
+        gdi32.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                    ctypes.c_wchar_p, ctypes.c_void_p]
+        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi32.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        brut = (ctypes.c_uint16 * 256 * 3)()
+        ok = 0
+
+        # 1) Le contexte du pilote d'affichage : la rampe ACTIVE de f.lux.
+        hdc = gdi32.CreateDCW("DISPLAY", None, None, None)
+        if hdc:
+            try:
+                ok = gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(brut))
+            finally:
+                gdi32.DeleteDC(hdc)
+
+        # 2) Repli : le contexte d'ecran commun, quand CreateDC est refuse.
+        if not ok:
+            hdc = user32.GetDC(None)
+            if hdc:
+                try:
+                    ok = gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(brut))
+                finally:
+                    user32.ReleaseDC(None, hdc)
+
         if not ok:
             _RAMPE["lut"] = None
             return None
