@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.9.1"
+VERSION = "1.10.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -1221,7 +1221,8 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
         elif origine and origine in autorisees:
             self.send_header("Access-Control-Allow-Origin", origine)
         self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "content-type, x-jeton")
+        self.send_header("Access-Control-Allow-Headers",
+                         "content-type, x-jeton, x-machitool-cle")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Access-Control-Max-Age", "600")
@@ -1254,7 +1255,16 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             return True
         fourni = self.headers.get("X-Jeton", "") or (corps.get("jeton", "")
                                                      if isinstance(corps, dict) else "")
-        return secrets.compare_digest(str(fourni), str(attendu))
+        if secrets.compare_digest(str(fourni), str(attendu)):
+            return True
+        # Le site tient deja la cle du pont (pont_cle cote app == passerelleCle
+        # cote site). On l'accepte ici pour qu'il puisse tirer /activite avec la
+        # cle qu'il a deja, sans nouveau secret a recopier. La liste d'origines
+        # reste le garde-fou : une page d'un autre domaine est refusee avant.
+        pont = str(CFG.get("pont_cle", "")).strip()
+        cle_site = self.headers.get("X-Machitool-Cle", "")
+        return bool(pont) and bool(cle_site) and \
+            secrets.compare_digest(str(cle_site), pont)
 
     def lire_corps(self):
         try:
@@ -4234,6 +4244,35 @@ def installer_raccourci():
         print("Raccourci menu Demarrer non cree :", e)
 
 
+def installer_protocole():
+    """Enregistre le schema d'URL machitool:// .
+
+    Sans ca, un site ne peut pas relancer l'application quand elle est eteinte :
+    un navigateur ne demarre aucun programme local, et un fetch vers 127.0.0.1
+    echoue simplement si personne n'ecoute. Avec le schema, le site ouvre
+    machitool://sync et Windows lance « CIBLE_EXE machitool://sync ». L'URL n'est
+    pas une commande reconnue par main(), donc l'app demarre normalement — ou ne
+    fait rien si elle tourne deja (le mutex la garde en un seul exemplaire), ce
+    qui suffit : le serveur local est alors la, et le site retire son digest.
+    """
+    if os.name != "nt":
+        return
+    cible = CIBLE_EXE
+    if not os.path.exists(cible):
+        return   # pas d'exe installe (mode script) : rien a lancer par le schema
+    try:
+        import winreg
+        base = r"Software\Classes\machitool"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, "URL:Machi Tool")
+            winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              base + r"\shell\open\command") as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, f'"{cible}" "%1"')
+    except Exception as e:
+        print("Enregistrement du schema machitool:// impossible :", e)
+
+
 def commande_lancement():
     """Ce qu'il faut executer pour demarrer l'application."""
     if FIGE:
@@ -4404,6 +4443,7 @@ def installer_ou_mettre_a_jour():
 
         installer_demarrage()
         installer_raccourci()
+        installer_protocole()
         ecrire_version_installee()
         subprocess.Popen([CIBLE_EXE], close_fds=True)
         if deja:
@@ -4474,6 +4514,7 @@ def lancer():
     global CFG
     if FIGE:
         ecrire_version_installee()   # on est l'exe installe : on date l'install
+        installer_protocole()        # garde machitool:// enregistre a chaque lancement
     identite_barre_taches()
     activer_dpi()
     CFG = charger_config()
