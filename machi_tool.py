@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -622,6 +622,34 @@ def sauver_activite():
     except Exception as e:
         print("Ecriture du journal d'activite impossible :", e)
         return None
+
+
+def tous_les_jours_activite():
+    """Tous les digests connus, un par jour, le jour courant en version vive.
+
+    Le site en tire un seul appel de quoi remettre a jour TOUT le quantified
+    self : chaque jour a deja son lever et son coucher sur disque, celui
+    d'aujourd'hui est recalcule a la volee pour ne pas etre en retard sur la
+    session en cours. Rendus tries par date, du plus ancien au plus recent."""
+    par_date = {}
+    if os.path.exists(FICHIER_ACTIVITE):
+        try:
+            with open(FICHIER_ACTIVITE, encoding="utf-8") as f:
+                for l in f:
+                    if not l.strip():
+                        continue
+                    try:
+                        d = json.loads(l)
+                    except Exception:
+                        continue
+                    if isinstance(d, dict) and d.get("date"):
+                        par_date[d["date"]] = d
+        except Exception as e:
+            print("Lecture du journal d'activite impossible :", e)
+    # Aujourd'hui vient de la session vive, pas de la derniere ecriture.
+    vif = resume_activite()
+    par_date[vif.get("date") or _jour_courant()] = vif
+    return [par_date[k] for k in sorted(par_date)]
 
 
 def envoyer_activite_au_site(cfg):
@@ -1386,6 +1414,13 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             # l'authentification du site : c'est lui qui appelle 127.0.0.1.
             if not (self.jeton_permis({}) or self.cle_pont_permise()):
                 return self.repondre(401, {"erreur": "jeton invalide"})
+            params = urllib.parse.parse_qs(self.path.partition("?")[2])
+            if params.get("tout", ["0"])[0] in ("1", "true", "oui"):
+                # Tout l'historique d'un coup : de quoi remettre a jour chaque
+                # jour (lever, coucher, ecran) en un seul appel.
+                return self.repondre(200, {
+                    "jours": tous_les_jours_activite(),
+                    "journal_actif": ACTIVITE["active"]})
             digest = dict(resume_activite())
             digest["journal_actif"] = ACTIVITE["active"]
             return self.repondre(200, digest)
