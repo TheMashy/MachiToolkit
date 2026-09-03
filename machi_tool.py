@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -1683,7 +1683,10 @@ async def une_session(cfg):
                 gain = None
 
                 forcage = ETAT.get("forcage")
-                if forcage and time.time() < forcage["expire"]:
+                # Un forcage manuel (couleur choisie a la main) ne peremptore pas :
+                # il tient jusqu'a ce qu'on relache. Le forcage du site, lui, a une
+                # date d'expiration et rend la main tout seul.
+                if forcage and (forcage.get("manuel") or time.time() < forcage["expire"]):
                     rc, vc, bc = forcage["couleur"]
                     nom = forcage["nom"]
                     mode = "force"
@@ -2093,18 +2096,18 @@ NUIT_RGB = hex_vers_rgb(NUIT)
 MENU = [
     ("page", "accueil", "Accueil", "\u2302", None),
     ("groupe", "lampe", "Lampe", "\u2600", [
-        ("etat",      "Etat"),
-        ("ecran",     "Ecran"),
-        ("son",       "Son"),
-        ("appairage", "Appairage"),
+        ("etat",      "Etat",      "\u25cf"),   # \u25cf
+        ("ecran",     "Ecran",     "\u25ad"),   # \u25ad
+        ("son",       "Son",       "\u266a"),   # \u266a
+        ("appairage", "Appairage", "\u21c4"),   # \u21c4
     ]),
     ("groupe", "pont", "BrainDebugger", "\u25c9", [
-        ("passerelle", "Passerelle"),
-        ("activite",   "Quantified Self"),
+        ("passerelle", "Passerelle",      "\u25c8"),   # \u25c8
+        ("activite",   "Quantified Self", "\u25a4"),   # \u25a4
     ]),
     ("groupe", "app", "Application", "\u2699", [
-        ("reglages", "Reglages"),
-        ("maj",      "Mises a jour"),
+        ("reglages", "Reglages",     "\u2630"),   # \u2630
+        ("maj",      "Mises a jour", "\u21bb"),   # \u21bb
     ]),
 ]
 
@@ -2112,8 +2115,8 @@ MENU = [
 GROUPE_DE = {}
 for _e in MENU:
     if _e[0] == "groupe":
-        for _cle, _ in _e[4]:
-            GROUPE_DE[_cle] = _e[1]
+        for _entree in _e[4]:
+            GROUPE_DE[_entree[0]] = _e[1]
 
 # Page sans entree dans le rail : on y arrive depuis le mode Regles de la
 # page Ecran, ou depuis l'appairage d'une fenetre. Elle appartient quand
@@ -2378,8 +2381,9 @@ class Panneau:
             fleche.pack(side="right")
 
             cadre = tk.Frame(self.rail, bg=NUIT)
-            for sous_cle, sous_libelle in enfants:
-                self.rang_page(cadre, sous_cle, sous_libelle, retrait=1)
+            for sous_cle, sous_libelle, sous_icone in enfants:
+                self.rang_page(cadre, sous_cle, sous_libelle, retrait=1,
+                               icone=sous_icone)
 
             for w in (rang, etiq, fleche, marque):
                 w.bind("<Button-1>", lambda e, g=cle: self.basculer_groupe(g))
@@ -2391,6 +2395,15 @@ class Panneau:
 
         for cle in self.entetes:
             self.poser_groupe(cle)
+
+        # Pastille « mise a jour disponible » sur le groupe Application : visible
+        # meme quand le groupe est replie, elle s'allume des qu'une version ou un
+        # build attend, et mene a la page Mises a jour. rafraichir la pilote.
+        rang_app = self.entetes["app"][0]
+        self.badge_maj = self.tk.Label(rang_app, text="●", bg=NUIT, fg=VIF,
+                                       font=(self.f_ui, 10), cursor="hand2")
+        self.badge_maj.bind("<Button-1>", lambda e: self.aller("maj"))
+        # non posee par defaut ; rafraichir la montre quand une maj attend
 
     def rang_page(self, parent, cle, libelle, retrait=0, icone=None):
         """Une ligne cliquable menant a une page."""
@@ -2871,8 +2884,51 @@ class Panneau:
         self.case(f, "Lancer au demarrage de Windows",
                   self.var_demarrage, self.basculer_demarrage).pack(fill="x", pady=(4, 0))
 
+        # ------- Couleur manuelle : forcer une teinte, par-dessus tout -------
+        self.separateur(f)
+        self.titre(f, "couleur manuelle").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Impose une couleur fixe, par-dessus l'ecran, le son et les "
+                      "regles. Elle tient jusqu'a ce que tu reviennes a l'automatique.",
+                   BRUME, 8, largeur=490).pack(fill="x", pady=(0, 8))
+        rang = tk.Frame(f, bg=NUIT)
+        rang.pack(fill="x")
+        self.boite_manuelle = tk.Frame(rang, bg=self.cfg.get("couleur_manuelle", "#B79CF5"),
+                                       width=self.px(26), height=self.px(26), cursor="hand2")
+        self.boite_manuelle.pack(side="left")
+        self.boite_manuelle.pack_propagate(False)
+        self.boite_manuelle.bind("<Button-1>", lambda e: self.poser_couleur_manuelle())
+        self.bouton(rang, "Choisir et forcer", self.poser_couleur_manuelle,
+                    compact=True).pack(side="left", padx=8)
+        self.bouton(rang, "Revenir a l'automatique", self.relacher_manuel,
+                    compact=True).pack(side="left")
+        self.txt_manuel = self.texte(f, "", BRUME, 8)
+        self.txt_manuel.pack(fill="x", pady=(6, 0))
+
         self.texte(f, f"Version {VERSION} — {DOSSIER}", BRUME, 8).pack(
             fill="x", side="bottom", pady=(12, 0))
+
+    def poser_couleur_manuelle(self):
+        from tkinter import colorchooser
+        depart = self.cfg.get("couleur_manuelle", "#B79CF5")
+        res = colorchooser.askcolor(color=depart, parent=self.root,
+                                    title="Couleur de la guirlande")
+        if not (res and res[1]):
+            return
+        hexa = res[1].upper()
+        self.cfg["couleur_manuelle"] = hexa
+        sauver_config(self.cfg)
+        self.boite_manuelle.configure(bg=hexa)
+        ETAT["forcage"] = {"couleur": hex_vers_rgb(hexa), "nom": "Couleur manuelle",
+                           "manuel": True, "expire": time.time() + 3650 * 86400}
+        ETAT["message"] = "Couleur manuelle " + hexa
+
+    def relacher_manuel(self):
+        f = ETAT.get("forcage")
+        # Ne relache que le forcage MANUEL : une couleur posee par le site garde
+        # sa propre expiration.
+        if f and f.get("manuel"):
+            ETAT["forcage"] = None
+        ETAT["message"] = "Retour a l'automatique"
 
     # ------------------------------------------------------------------
     #  Page Regles
@@ -3966,6 +4022,19 @@ class Panneau:
             text=("Installer " + MAJ["version"]) if pret
             else ("En cours..." if occupe else "Verifier maintenant"),
             state="disabled" if occupe else "normal")
+        # La pastille du rail s'allume des qu'une maj attend, meme groupe replie.
+        if pret and not self.badge_maj.winfo_ismapped():
+            self.badge_maj.pack(side="right", padx=(0, 2))
+        elif not pret and self.badge_maj.winfo_ismapped():
+            self.badge_maj.pack_forget()
+
+        forc = ETAT.get("forcage")
+        if forc and forc.get("manuel"):
+            self.txt_manuel.configure(
+                text="Forcee : " + rgb_vers_hex(tuple(forc["couleur"])), fg=VIF)
+        else:
+            self.txt_manuel.configure(
+                text="Automatique — l'ecran, le son ou les regles decident.", fg=BRUME)
         notes = (MAJ.get("notes") or "").strip()
         self.txt_notes.configure(text=notes[:1500] if notes else "-")
 
