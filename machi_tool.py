@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.9.1"
+VERSION = "1.11.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -116,6 +116,19 @@ CONFIG_DEFAUT = {
     "ecran_noir": 0.0,
     "ecran_blanc": 0.62,
     "ecran_gamma": 0.5,              # 0.5 = lineaire
+
+    # La guirlande suit ce que l'oeil VOIT, pas ce que la carte graphique stocke.
+    # f.lux (et les filtres qui ecrivent la rampe gamma : Redshift, SunsetScreen)
+    # jaunissent l'ecran par cette rampe du GPU, APRES le tampon d'image que la
+    # capture lit : sans compensation, l'ecran est jaune le soir et la guirlande
+    # reste blanche. On relit la rampe et on l'applique a la couleur echantillonnee.
+    # (Windows Night Light passe par un autre pipeline et n'est pas vu par cette
+    # lecture.)
+    "ecran_suit_filtre_bleu": True,
+    # Etalonnage manuel de la balance, par-dessus. Deux axes, comme un boitier
+    # photo : temperature (froid <-> chaud) et teinte (vert <-> magenta). 0 = neutre.
+    "ecran_balance_temp": 0.0,       # -1 plus froid (bleu), +1 plus chaud (ambre)
+    "ecran_balance_tint": 0.0,       # -1 plus vert, +1 plus magenta
 
     "regles": [
         {"nom": "Netflix",    "couleur": "#E50914", "mots": ["netflix"]},
@@ -877,6 +890,76 @@ def _vignette_mss(zone, colonnes, lignes):
     return list(im.getdata())
 
 
+_RAMPE = {"ts": 0.0, "lut": None}
+
+
+def rampe_gamma():
+    """Les trois tables (256 entrees, 0-255) de la rampe gamma de l'affichage.
+
+    C'est par elle que f.lux et les filtres qui ecrivent la rampe (Redshift,
+    SunsetScreen...) jaunissent l'ecran : ils n'ecrivent pas des pixels jaunes,
+    ils inflechissent la rampe du GPU, APRES le tampon d'image que la capture lit.
+    La relire permet de teinter la couleur echantillonnee comme l'oeil la voit.
+    (Windows Night Light, lui, passe par un pipeline d'affichage separe : il n'ecrit
+    pas cette rampe et n'est donc pas suivi ici.)
+
+    Relue au plus une fois par seconde -- elle bouge lentement. None hors Windows
+    ou si le pilote la refuse.
+
+    Limite connue : on lit la rampe de l'ecran PRINCIPAL (GetDC(0)). Sur plusieurs
+    ecrans aux filtres differents, la teinte suivie est celle du principal, pas
+    forcement celle de l'ecran capture. Cas rare (un filtre couvre en general tous
+    les ecrans pareil) et sans regression : au pire, pas de compensation."""
+    if os.name != "nt":
+        return None
+    maintenant = time.time()
+    # Le cache porte sur l'HORODATAGE, pas sur la presence d'une LUT : un echec
+    # (rampe illisible : HDR, RDP, certains pilotes) doit lui aussi tenir une
+    # seconde, sinon on refait trois appels GDI a chaque image, en continu.
+    if _RAMPE["ts"] and maintenant - _RAMPE["ts"] < 1.0:
+        return _RAMPE["lut"]
+    _RAMPE["ts"] = maintenant
+    try:
+        import ctypes
+        hdc = ctypes.windll.user32.GetDC(0)
+        try:
+            brut = (ctypes.c_uint16 * 256 * 3)()
+            ok = ctypes.windll.gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(brut))
+        finally:
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        if not ok:
+            _RAMPE["lut"] = None
+            return None
+        lut = tuple([brut[c][i] >> 8 for i in range(256)] for c in range(3))
+        _RAMPE["lut"] = lut
+        return lut
+    except Exception:
+        _RAMPE["lut"] = None
+        return None
+
+
+def adapter_couleur_ecran(rgb, cfg):
+    """Teinte une couleur (0-255) comme l'ecran la MONTRE : la rampe gamma des
+    filtres de nuit d'abord, puis la balance manuelle si elle est reglee."""
+    r, v, b = rgb
+    if cfg.get("ecran_suit_filtre_bleu", True):
+        lut = rampe_gamma()
+        if lut:
+            r, v, b = lut[0][r], lut[1][v], lut[2][b]
+    temp = float(cfg.get("ecran_balance_temp", 0.0) or 0.0)
+    tint = float(cfg.get("ecran_balance_tint", 0.0) or 0.0)
+    if temp or tint:
+        # Chaud monte le rouge et baisse le bleu ; magenta monte rouge et bleu et
+        # baisse le vert. Gains doux : au plus +-30 %.
+        gr = 1.0 + 0.30 * temp + 0.15 * tint
+        gv = 1.0 - 0.15 * tint
+        gb = 1.0 - 0.30 * temp + 0.15 * tint
+        r, v, b = r * gr, v * gv, b * gb
+    return (int(max(0, min(255, round(r)))),
+            int(max(0, min(255, round(v)))),
+            int(max(0, min(255, round(b)))))
+
+
 def couleur_ecran(source, boost, colonnes=4):
     """((r, v, b), luminance 0-1, numero d'ecran) ou None.
 
@@ -1221,7 +1304,8 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
         elif origine and origine in autorisees:
             self.send_header("Access-Control-Allow-Origin", origine)
         self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "content-type, x-jeton")
+        self.send_header("Access-Control-Allow-Headers",
+                         "content-type, x-jeton, x-machitool-cle")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Access-Control-Max-Age", "600")
@@ -1256,6 +1340,18 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
                                                      if isinstance(corps, dict) else "")
         return secrets.compare_digest(str(fourni), str(attendu))
 
+    def cle_pont_permise(self):
+        """La cle du pont, acceptee UNIQUEMENT pour lire /activite.
+
+        Le site tient deja cette cle (pont_cle cote app == passerelleCle cote
+        site) : il tire donc le digest sans nouveau secret a recopier. On la
+        cantonne a la lecture d'enveloppe — jamais au controle de la lumiere, qui
+        reste derriere le jeton local — et la liste d'origines reste le garde-fou."""
+        pont = str(CFG.get("pont_cle", "")).strip()
+        cle_site = self.headers.get("X-Machitool-Cle", "")
+        return bool(pont) and bool(cle_site) and \
+            secrets.compare_digest(str(cle_site), pont)
+
     def lire_corps(self):
         try:
             taille = int(self.headers.get("Content-Length", 0))
@@ -1288,7 +1384,7 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             # Le site tire le digest du jour quand il veut, avec le jeton de
             # la passerelle locale — pas la cle du pont. Aucune dependance a
             # l'authentification du site : c'est lui qui appelle 127.0.0.1.
-            if not self.jeton_permis({}):
+            if not (self.jeton_permis({}) or self.cle_pont_permise()):
                 return self.repondre(401, {"erreur": "jeton invalide"})
             digest = dict(resume_activite())
             digest["journal_actif"] = ACTIVITE["active"]
@@ -1587,7 +1683,10 @@ async def une_session(cfg):
                 gain = None
 
                 forcage = ETAT.get("forcage")
-                if forcage and time.time() < forcage["expire"]:
+                # Un forcage manuel (couleur choisie a la main) ne peremptore pas :
+                # il tient jusqu'a ce qu'on relache. Le forcage du site, lui, a une
+                # date d'expiration et rend la main tout seul.
+                if forcage and (forcage.get("manuel") or time.time() < forcage["expire"]):
                     rc, vc, bc = forcage["couleur"]
                     nom = forcage["nom"]
                     mode = "force"
@@ -1620,6 +1719,9 @@ async def une_session(cfg):
                         int(cfg.get("ecran_finesse", 4)))
                     if resultat:
                         (re, ve, be), luminance, index = resultat
+                        # Suivre ce que l'oeil voit : filtre de lumiere bleue
+                        # (rampe gamma) puis balance manuelle.
+                        (re, ve, be) = adapter_couleur_ecran((re, ve, be), cfg)
                         if mode == "mixte":
                             rc, vc, bc = (re + ra) / 2, (ve + va) / 2, (be + ba) / 2
                             nom = f"{nom} + ecran {index}"
@@ -1994,18 +2096,18 @@ NUIT_RGB = hex_vers_rgb(NUIT)
 MENU = [
     ("page", "accueil", "Accueil", "\u2302", None),
     ("groupe", "lampe", "Lampe", "\u2600", [
-        ("etat",      "Etat"),
-        ("ecran",     "Ecran"),
-        ("son",       "Son"),
-        ("appairage", "Appairage"),
+        ("etat",      "Etat",      "\u25cf"),   # \u25cf
+        ("ecran",     "Ecran",     "\u25ad"),   # \u25ad
+        ("son",       "Son",       "\u266a"),   # \u266a
+        ("appairage", "Appairage", "\u21c4"),   # \u21c4
     ]),
     ("groupe", "pont", "BrainDebugger", "\u25c9", [
-        ("passerelle", "Passerelle"),
-        ("activite",   "Quantified Self"),
+        ("passerelle", "Passerelle",      "\u25c8"),   # \u25c8
+        ("activite",   "Quantified Self", "\u25a4"),   # \u25a4
     ]),
     ("groupe", "app", "Application", "\u2699", [
-        ("reglages", "Reglages"),
-        ("maj",      "Mises a jour"),
+        ("reglages", "Reglages",     "\u2630"),   # \u2630
+        ("maj",      "Mises a jour", "\u21bb"),   # \u21bb
     ]),
 ]
 
@@ -2013,8 +2115,8 @@ MENU = [
 GROUPE_DE = {}
 for _e in MENU:
     if _e[0] == "groupe":
-        for _cle, _ in _e[4]:
-            GROUPE_DE[_cle] = _e[1]
+        for _entree in _e[4]:
+            GROUPE_DE[_entree[0]] = _e[1]
 
 # Page sans entree dans le rail : on y arrive depuis le mode Regles de la
 # page Ecran, ou depuis l'appairage d'une fenetre. Elle appartient quand
@@ -2279,8 +2381,9 @@ class Panneau:
             fleche.pack(side="right")
 
             cadre = tk.Frame(self.rail, bg=NUIT)
-            for sous_cle, sous_libelle in enfants:
-                self.rang_page(cadre, sous_cle, sous_libelle, retrait=1)
+            for sous_cle, sous_libelle, sous_icone in enfants:
+                self.rang_page(cadre, sous_cle, sous_libelle, retrait=1,
+                               icone=sous_icone)
 
             for w in (rang, etiq, fleche, marque):
                 w.bind("<Button-1>", lambda e, g=cle: self.basculer_groupe(g))
@@ -2292,6 +2395,15 @@ class Panneau:
 
         for cle in self.entetes:
             self.poser_groupe(cle)
+
+        # Pastille « mise a jour disponible » sur le groupe Application : visible
+        # meme quand le groupe est replie, elle s'allume des qu'une version ou un
+        # build attend, et mene a la page Mises a jour. rafraichir la pilote.
+        rang_app = self.entetes["app"][0]
+        self.badge_maj = self.tk.Label(rang_app, text="●", bg=NUIT, fg=VIF,
+                                       font=(self.f_ui, 10), cursor="hand2")
+        self.badge_maj.bind("<Button-1>", lambda e: self.aller("maj"))
+        # non posee par defaut ; rafraichir la montre quand une maj attend
 
     def rang_page(self, parent, cle, libelle, retrait=0, icone=None):
         """Une ligne cliquable menant a une page."""
@@ -2772,8 +2884,51 @@ class Panneau:
         self.case(f, "Lancer au demarrage de Windows",
                   self.var_demarrage, self.basculer_demarrage).pack(fill="x", pady=(4, 0))
 
+        # ------- Couleur manuelle : forcer une teinte, par-dessus tout -------
+        self.separateur(f)
+        self.titre(f, "couleur manuelle").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Impose une couleur fixe, par-dessus l'ecran, le son et les "
+                      "regles. Elle tient jusqu'a ce que tu reviennes a l'automatique.",
+                   BRUME, 8, largeur=490).pack(fill="x", pady=(0, 8))
+        rang = tk.Frame(f, bg=NUIT)
+        rang.pack(fill="x")
+        self.boite_manuelle = tk.Frame(rang, bg=self.cfg.get("couleur_manuelle", "#B79CF5"),
+                                       width=self.px(26), height=self.px(26), cursor="hand2")
+        self.boite_manuelle.pack(side="left")
+        self.boite_manuelle.pack_propagate(False)
+        self.boite_manuelle.bind("<Button-1>", lambda e: self.poser_couleur_manuelle())
+        self.bouton(rang, "Choisir et forcer", self.poser_couleur_manuelle,
+                    compact=True).pack(side="left", padx=8)
+        self.bouton(rang, "Revenir a l'automatique", self.relacher_manuel,
+                    compact=True).pack(side="left")
+        self.txt_manuel = self.texte(f, "", BRUME, 8)
+        self.txt_manuel.pack(fill="x", pady=(6, 0))
+
         self.texte(f, f"Version {VERSION} — {DOSSIER}", BRUME, 8).pack(
             fill="x", side="bottom", pady=(12, 0))
+
+    def poser_couleur_manuelle(self):
+        from tkinter import colorchooser
+        depart = self.cfg.get("couleur_manuelle", "#B79CF5")
+        res = colorchooser.askcolor(color=depart, parent=self.root,
+                                    title="Couleur de la guirlande")
+        if not (res and res[1]):
+            return
+        hexa = res[1].upper()
+        self.cfg["couleur_manuelle"] = hexa
+        sauver_config(self.cfg)
+        self.boite_manuelle.configure(bg=hexa)
+        ETAT["forcage"] = {"couleur": hex_vers_rgb(hexa), "nom": "Couleur manuelle",
+                           "manuel": True, "expire": time.time() + 3650 * 86400}
+        ETAT["message"] = "Couleur manuelle " + hexa
+
+    def relacher_manuel(self):
+        f = ETAT.get("forcage")
+        # Ne relache que le forcage MANUEL : une couleur posee par le site garde
+        # sa propre expiration.
+        if f and f.get("manuel"):
+            ETAT["forcage"] = None
+        ETAT["message"] = "Retour a l'automatique"
 
     # ------------------------------------------------------------------
     #  Page Regles
@@ -2998,6 +3153,27 @@ class Panneau:
             f, "ecran_luminosite_base", "Luminosite de base", 0.05, 1.0, 0.05,
             "Luminosite tenue quand l'ecran ne pilote pas l'eclat — quand "
             "seule la saturation le suit, ou quand il ne pilote rien.")
+
+        self.separateur(f, 14, 8)
+        self.titre(f, "balance des blancs").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Le soir, un filtre de lumiere bleue comme f.lux jaunit "
+                      "l'ecran sans que la capture le voie : la guirlande resterait "
+                      "blanche devant un ecran ambre. On relit alors la teinte "
+                      "reelle de l'affichage pour qu'elle suive. (Night Light de "
+                      "Windows passe par un autre chemin et n'est pas suivi ; regle "
+                      "la balance a la main si besoin.)", BRUME, 8,
+                   largeur=490).pack(fill="x", pady=(0, 8))
+        self.var_filtre_bleu = tk.IntVar(
+            value=1 if self.cfg.get("ecran_suit_filtre_bleu", True) else 0)
+        self.case(f, "Suivre les filtres de lumiere bleue de l'ecran",
+                  self.var_filtre_bleu).pack(fill="x")
+        self.var_balance_temp = self.reglette(
+            f, "ecran_balance_temp", "Temperature", -1.0, 1.0, 0.05,
+            "Reglage manuel par-dessus : negatif refroidit (bleu), positif "
+            "rechauffe (ambre). 0 = neutre.")
+        self.var_balance_tint = self.reglette(
+            f, "ecran_balance_tint", "Teinte", -1.0, 1.0, 0.05,
+            "Negatif vire au vert, positif au magenta. 0 = neutre.")
 
         self.separateur(f, 14, 8)
         self.titre(f, "effet de l'ecran en direct").pack(fill="x", pady=(0, 6))
@@ -3707,6 +3883,9 @@ class Panneau:
         self.cfg["ecran_gamma"] = round(self.var_ecran_gamma.get(), 2)
         self.cfg["ecran_luminance_min"] = round(self.var_ecran_plancher.get(), 2)
         self.cfg["ecran_luminosite_base"] = round(self.var_ecran_base.get(), 2)
+        self.cfg["ecran_suit_filtre_bleu"] = bool(self.var_filtre_bleu.get())
+        self.cfg["ecran_balance_temp"] = round(self.var_balance_temp.get(), 2)
+        self.cfg["ecran_balance_tint"] = round(self.var_balance_tint.get(), 2)
         self.cfg["son_bande"] = self.var_bande.get()
         self.cfg["son_palette"] = self.var_palette.get()
         self.cfg["son_sensibilite"] = round(self.var_sens.get(), 2)
@@ -3843,6 +4022,19 @@ class Panneau:
             text=("Installer " + MAJ["version"]) if pret
             else ("En cours..." if occupe else "Verifier maintenant"),
             state="disabled" if occupe else "normal")
+        # La pastille du rail s'allume des qu'une maj attend, meme groupe replie.
+        if pret and not self.badge_maj.winfo_ismapped():
+            self.badge_maj.pack(side="right", padx=(0, 2))
+        elif not pret and self.badge_maj.winfo_ismapped():
+            self.badge_maj.pack_forget()
+
+        forc = ETAT.get("forcage")
+        if forc and forc.get("manuel"):
+            self.txt_manuel.configure(
+                text="Forcee : " + rgb_vers_hex(tuple(forc["couleur"])), fg=VIF)
+        else:
+            self.txt_manuel.configure(
+                text="Automatique — l'ecran, le son ou les regles decident.", fg=BRUME)
         notes = (MAJ.get("notes") or "").strip()
         self.txt_notes.configure(text=notes[:1500] if notes else "-")
 
@@ -4234,6 +4426,35 @@ def installer_raccourci():
         print("Raccourci menu Demarrer non cree :", e)
 
 
+def installer_protocole():
+    """Enregistre le schema d'URL machitool:// .
+
+    Sans ca, un site ne peut pas relancer l'application quand elle est eteinte :
+    un navigateur ne demarre aucun programme local, et un fetch vers 127.0.0.1
+    echoue simplement si personne n'ecoute. Avec le schema, le site ouvre
+    machitool://sync et Windows lance « CIBLE_EXE machitool://sync ». L'URL n'est
+    pas une commande reconnue par main(), donc l'app demarre normalement — ou ne
+    fait rien si elle tourne deja (le mutex la garde en un seul exemplaire), ce
+    qui suffit : le serveur local est alors la, et le site retire son digest.
+    """
+    if os.name != "nt":
+        return
+    cible = CIBLE_EXE
+    if not os.path.exists(cible):
+        return   # pas d'exe installe (mode script) : rien a lancer par le schema
+    try:
+        import winreg
+        base = r"Software\Classes\machitool"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, "URL:Machi Tool")
+            winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                              base + r"\shell\open\command") as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, f'"{cible}" "%1"')
+    except Exception as e:
+        print("Enregistrement du schema machitool:// impossible :", e)
+
+
 def commande_lancement():
     """Ce qu'il faut executer pour demarrer l'application."""
     if FIGE:
@@ -4404,6 +4625,7 @@ def installer_ou_mettre_a_jour():
 
         installer_demarrage()
         installer_raccourci()
+        installer_protocole()
         ecrire_version_installee()
         subprocess.Popen([CIBLE_EXE], close_fds=True)
         if deja:
@@ -4474,6 +4696,7 @@ def lancer():
     global CFG
     if FIGE:
         ecrire_version_installee()   # on est l'exe installe : on date l'install
+        installer_protocole()        # garde machitool:// enregistre a chaque lancement
     identite_barre_taches()
     activer_dpi()
     CFG = charger_config()
