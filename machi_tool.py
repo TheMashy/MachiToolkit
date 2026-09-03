@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -1024,6 +1024,118 @@ def adapter_couleur_ecran(rgb, cfg):
     return (int(max(0, min(255, round(r)))),
             int(max(0, min(255, round(v)))),
             int(max(0, min(255, round(b)))))
+
+
+# --------------------------------------------------------------------------
+#  CE QUE MACHI TOOL VOIT DU FILTRE DE LUMIERE BLEUE.
+#
+#  De quoi rendre lisible « est-ce qu'il trouve f.lux, est-ce qu'il s'adapte,
+#  et de combien ». Trois sources, du plus sur au moins sur :
+#    - la RAMPE GAMMA (f.lux, Redshift, SunsetScreen) : la seule qu'on sait
+#      COMPENSER, parce qu'elle porte la vraie teinte de l'affichage ;
+#    - le PROCESSUS f.lux (sa fenetre cachee de classe « flux ») : s'il tourne
+#      mais que la rampe est neutre, c'est le pilote qui ne la rend pas, et il
+#      faut le DIRE plutot que laisser croire a une panne ;
+#    - Windows NIGHT LIGHT (registre) : autre pipeline, non compense — on le
+#      signale pour que la balance manuelle prenne le relais.
+# --------------------------------------------------------------------------
+
+_DIAG_FILTRE = {"ts": 0.0, "val": None}
+
+
+def _kelvin_du_blanc(r, v, b):
+    """Temperature approximative du blanc que la rampe produit. Neutre (~6500 K)
+    quand le bleu tient le rouge ; plus le bleu tombe, plus c'est chaud. Estimation
+    d'indicateur, arrondie a 50 K — pas une mesure colorimetrique."""
+    r = max(1, r)
+    bl = max(0.0, min(1.0, b / r))          # 1 = neutre, plus bas = plus chaud
+    k = 2500 + bl * 4000.0
+    return int(round(max(1900.0, min(6600.0, k)) / 50.0) * 50)
+
+
+def _flux_tourne():
+    """Vrai si f.lux tourne : il tient une fenetre cachee de classe « flux »."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        fw = ctypes.windll.user32.FindWindowW
+        fw.restype = ctypes.c_void_p
+        fw.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        return bool(fw("flux", None))
+    except Exception:
+        return False
+
+
+def _nightlight_actif():
+    """Best-effort : Windows Night Light est-il ALLUME ? Il vit dans un blob du
+    registre (CloudStore). Quand il est actif, le blob insere la paire 0x10 0x00
+    juste apres l'horodatage. Au moindre doute on rend False — mieux vaut ne rien
+    dire que mentir sur un signe."""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        chemin = (r"SOFTWARE\Microsoft\Windows\CurrentVersion\CloudStore\Store\Cache"
+                  r"\DefaultAccount\$$windows.data.bluelightreduction."
+                  r"bluelightreductionstate\Current")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, chemin) as cle:
+            data, _ = winreg.QueryValueEx(cle, "Data")
+        data = bytes(data)
+        return data[18:28].find(b"\x10\x00") != -1
+    except Exception:
+        return False
+
+
+def diag_filtre_ecran(cfg):
+    """Ce que Machi Tool detecte du filtre de lumiere bleue, pour l'afficher.
+
+    Rend un dict : suivi (option cochee), source ('filtre'|'nightlight'|None),
+    kelvin (approx), chaud_pct (de combien on rechauffe), compense (adapte-t-on
+    vraiment la LED), flux (f.lux tourne), nightlight. Cache une seconde : pas
+    d'appel registre a chaque image."""
+    maintenant = time.time()
+    if _DIAG_FILTRE["val"] is not None and maintenant - _DIAG_FILTRE["ts"] < 1.0:
+        return _DIAG_FILTRE["val"]
+    _DIAG_FILTRE["ts"] = maintenant
+    d = {"suivi": bool(cfg.get("ecran_suit_filtre_bleu", True)),
+         "source": None, "kelvin": None, "chaud_pct": 0,
+         "compense": False, "flux": False, "nightlight": False}
+    try:
+        lut = rampe_gamma()
+        if lut:
+            r = max(1, lut[0][255])
+            b = lut[2][255]
+            if b / r < 0.97:                 # le bleu est abaisse : un filtre agit
+                d["source"] = "filtre"
+                d["chaud_pct"] = int(round((1 - b / r) * 100))
+                d["kelvin"] = _kelvin_du_blanc(lut[0][255], lut[1][255], lut[2][255])
+                d["compense"] = d["suivi"]
+        d["flux"] = _flux_tourne()
+        d["nightlight"] = _nightlight_actif()
+        if d["source"] is None and d["nightlight"]:
+            d["source"] = "nightlight"
+    except Exception:
+        pass
+    _DIAG_FILTRE["val"] = d
+    return d
+
+
+def texte_filtre_ecran(d):
+    """Une phrase pour l'indicateur, et vrai si Machi Tool compense vraiment."""
+    if not d.get("suivi"):
+        return ("Suivi des filtres desactive.", False)
+    if d.get("source") == "filtre":
+        t = "Filtre ecran suivi — ≈%d K, rechauffe %d%%" % (
+            d.get("kelvin") or 0, d.get("chaud_pct") or 0)
+        return (t, bool(d.get("compense")))
+    if d.get("flux"):
+        return ("f.lux tourne, mais sa rampe est illisible sur ce pilote — "
+                "teinte non suivie (regle la balance a la main).", False)
+    if d.get("nightlight"):
+        return ("Windows Night Light actif — autre pipeline, non suivi "
+                "(regle la balance a la main).", False)
+    return ("Aucun filtre de lumiere bleue detecte.", False)
 
 
 def couleur_ecran(source, boost, colonnes=4):
@@ -3240,6 +3352,11 @@ class Panneau:
             value=1 if self.cfg.get("ecran_suit_filtre_bleu", True) else 0)
         self.case(f, "Suivre les filtres de lumiere bleue de l'ecran",
                   self.var_filtre_bleu).pack(fill="x")
+        # L'indicateur : ce que Machi Tool DETECTE, et de combien il adapte. De
+        # quoi voir tout de suite si f.lux est trouve et suivi, sans deviner.
+        self.txt_filtre = self.texte(f, "Detection du filtre en cours…",
+                                     BRUME, 8, largeur=490)
+        self.txt_filtre.pack(fill="x", pady=(4, 0))
         self.var_balance_temp = self.reglette(
             f, "ecran_balance_temp", "Temperature", -1.0, 1.0, 0.05,
             "Reglage manuel par-dessus : negatif refroidit (bleu), positif "
@@ -4126,6 +4243,14 @@ class Panneau:
         self.poser_jauge(
             self.jauge_ecran_sat, ETAT["ecran_sat"] if en_ecran else 0.0,
             en_ecran and cible_ecran in ("saturation", "les_deux"), "l'ecran")
+        # L'indicateur de filtre : detecte-t-on f.lux/Night Light, et de combien
+        # on rechauffe ? En vert quand on compense vraiment, sourd sinon.
+        if getattr(self, "txt_filtre", None):
+            try:
+                phrase, compense = texte_filtre_ecran(diag_filtre_ecran(self.cfg))
+                self.txt_filtre.configure(text=phrase, fg=(VIF if compense else BRUME))
+            except Exception:
+                pass
 
         cible = self.cfg.get("son_cible", "luminosite")
         en_son = self.cfg.get("mode") == "son" and AUDIO.get("actif")
