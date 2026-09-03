@@ -118,10 +118,12 @@ CONFIG_DEFAUT = {
     "ecran_gamma": 0.5,              # 0.5 = lineaire
 
     # La guirlande suit ce que l'oeil VOIT, pas ce que la carte graphique stocke.
-    # f.lux, Night Light et compagnie jaunissent l'ecran par la rampe gamma du
-    # GPU, APRES le tampon d'image que la capture lit : sans compensation, l'ecran
-    # est jaune le soir et la guirlande reste blanche. On relit la rampe et on
-    # l'applique a la couleur echantillonnee.
+    # f.lux (et les filtres qui ecrivent la rampe gamma : Redshift, SunsetScreen)
+    # jaunissent l'ecran par cette rampe du GPU, APRES le tampon d'image que la
+    # capture lit : sans compensation, l'ecran est jaune le soir et la guirlande
+    # reste blanche. On relit la rampe et on l'applique a la couleur echantillonnee.
+    # (Windows Night Light passe par un autre pipeline et n'est pas vu par cette
+    # lecture.)
     "ecran_suit_filtre_bleu": True,
     # Etalonnage manuel de la balance, par-dessus. Deux axes, comme un boitier
     # photo : temperature (froid <-> chaud) et teinte (vert <-> magenta). 0 = neutre.
@@ -894,17 +896,27 @@ _RAMPE = {"ts": 0.0, "lut": None}
 def rampe_gamma():
     """Les trois tables (256 entrees, 0-255) de la rampe gamma de l'affichage.
 
-    C'est par elle que f.lux, Night Light et les autres filtres de lumiere bleue
-    jaunissent l'ecran : ils n'ecrivent pas des pixels jaunes, ils inflechissent
-    la rampe du GPU, APRES le tampon d'image que la capture lit. La relire permet
-    de teinter la couleur echantillonnee comme l'oeil la voit vraiment.
+    C'est par elle que f.lux et les filtres qui ecrivent la rampe (Redshift,
+    SunsetScreen...) jaunissent l'ecran : ils n'ecrivent pas des pixels jaunes,
+    ils inflechissent la rampe du GPU, APRES le tampon d'image que la capture lit.
+    La relire permet de teinter la couleur echantillonnee comme l'oeil la voit.
+    (Windows Night Light, lui, passe par un pipeline d'affichage separe : il n'ecrit
+    pas cette rampe et n'est donc pas suivi ici.)
 
     Relue au plus une fois par seconde -- elle bouge lentement. None hors Windows
-    ou si le pilote la refuse."""
+    ou si le pilote la refuse.
+
+    Limite connue : on lit la rampe de l'ecran PRINCIPAL (GetDC(0)). Sur plusieurs
+    ecrans aux filtres differents, la teinte suivie est celle du principal, pas
+    forcement celle de l'ecran capture. Cas rare (un filtre couvre en general tous
+    les ecrans pareil) et sans regression : au pire, pas de compensation."""
     if os.name != "nt":
         return None
     maintenant = time.time()
-    if _RAMPE["lut"] is not None and maintenant - _RAMPE["ts"] < 1.0:
+    # Le cache porte sur l'HORODATAGE, pas sur la presence d'une LUT : un echec
+    # (rampe illisible : HDR, RDP, certains pilotes) doit lui aussi tenir une
+    # seconde, sinon on refait trois appels GDI a chaque image, en continu.
+    if _RAMPE["ts"] and maintenant - _RAMPE["ts"] < 1.0:
         return _RAMPE["lut"]
     _RAMPE["ts"] = maintenant
     try:
@@ -3088,10 +3100,12 @@ class Panneau:
 
         self.separateur(f, 14, 8)
         self.titre(f, "balance des blancs").pack(fill="x", pady=(0, 6))
-        self.texte(f, "Le soir, un filtre de lumiere bleue (f.lux, Night Light) "
-                      "jaunit l'ecran sans que la capture le voie : la guirlande "
-                      "resterait blanche devant un ecran ambre. On relit alors la "
-                      "teinte reelle de l'affichage pour qu'elle suive.", BRUME, 8,
+        self.texte(f, "Le soir, un filtre de lumiere bleue comme f.lux jaunit "
+                      "l'ecran sans que la capture le voie : la guirlande resterait "
+                      "blanche devant un ecran ambre. On relit alors la teinte "
+                      "reelle de l'affichage pour qu'elle suive. (Night Light de "
+                      "Windows passe par un autre chemin et n'est pas suivi ; regle "
+                      "la balance a la main si besoin.)", BRUME, 8,
                    largeur=490).pack(fill="x", pady=(0, 8))
         self.var_filtre_bleu = tk.IntVar(
             value=1 if self.cfg.get("ecran_suit_filtre_bleu", True) else 0)
