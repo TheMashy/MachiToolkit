@@ -117,6 +117,17 @@ CONFIG_DEFAUT = {
     "ecran_blanc": 0.62,
     "ecran_gamma": 0.5,              # 0.5 = lineaire
 
+    # La guirlande suit ce que l'oeil VOIT, pas ce que la carte graphique stocke.
+    # f.lux, Night Light et compagnie jaunissent l'ecran par la rampe gamma du
+    # GPU, APRES le tampon d'image que la capture lit : sans compensation, l'ecran
+    # est jaune le soir et la guirlande reste blanche. On relit la rampe et on
+    # l'applique a la couleur echantillonnee.
+    "ecran_suit_filtre_bleu": True,
+    # Etalonnage manuel de la balance, par-dessus. Deux axes, comme un boitier
+    # photo : temperature (froid <-> chaud) et teinte (vert <-> magenta). 0 = neutre.
+    "ecran_balance_temp": 0.0,       # -1 plus froid (bleu), +1 plus chaud (ambre)
+    "ecran_balance_tint": 0.0,       # -1 plus vert, +1 plus magenta
+
     "regles": [
         {"nom": "Netflix",    "couleur": "#E50914", "mots": ["netflix"]},
         {"nom": "YouTube",    "couleur": "#FF0033", "mots": ["youtube"]},
@@ -877,6 +888,66 @@ def _vignette_mss(zone, colonnes, lignes):
     return list(im.getdata())
 
 
+_RAMPE = {"ts": 0.0, "lut": None}
+
+
+def rampe_gamma():
+    """Les trois tables (256 entrees, 0-255) de la rampe gamma de l'affichage.
+
+    C'est par elle que f.lux, Night Light et les autres filtres de lumiere bleue
+    jaunissent l'ecran : ils n'ecrivent pas des pixels jaunes, ils inflechissent
+    la rampe du GPU, APRES le tampon d'image que la capture lit. La relire permet
+    de teinter la couleur echantillonnee comme l'oeil la voit vraiment.
+
+    Relue au plus une fois par seconde -- elle bouge lentement. None hors Windows
+    ou si le pilote la refuse."""
+    if os.name != "nt":
+        return None
+    maintenant = time.time()
+    if _RAMPE["lut"] is not None and maintenant - _RAMPE["ts"] < 1.0:
+        return _RAMPE["lut"]
+    _RAMPE["ts"] = maintenant
+    try:
+        import ctypes
+        hdc = ctypes.windll.user32.GetDC(0)
+        try:
+            brut = (ctypes.c_uint16 * 256 * 3)()
+            ok = ctypes.windll.gdi32.GetDeviceGammaRamp(hdc, ctypes.byref(brut))
+        finally:
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        if not ok:
+            _RAMPE["lut"] = None
+            return None
+        lut = tuple([brut[c][i] >> 8 for i in range(256)] for c in range(3))
+        _RAMPE["lut"] = lut
+        return lut
+    except Exception:
+        _RAMPE["lut"] = None
+        return None
+
+
+def adapter_couleur_ecran(rgb, cfg):
+    """Teinte une couleur (0-255) comme l'ecran la MONTRE : la rampe gamma des
+    filtres de nuit d'abord, puis la balance manuelle si elle est reglee."""
+    r, v, b = rgb
+    if cfg.get("ecran_suit_filtre_bleu", True):
+        lut = rampe_gamma()
+        if lut:
+            r, v, b = lut[0][r], lut[1][v], lut[2][b]
+    temp = float(cfg.get("ecran_balance_temp", 0.0) or 0.0)
+    tint = float(cfg.get("ecran_balance_tint", 0.0) or 0.0)
+    if temp or tint:
+        # Chaud monte le rouge et baisse le bleu ; magenta monte rouge et bleu et
+        # baisse le vert. Gains doux : au plus +-30 %.
+        gr = 1.0 + 0.30 * temp + 0.15 * tint
+        gv = 1.0 - 0.15 * tint
+        gb = 1.0 - 0.30 * temp + 0.15 * tint
+        r, v, b = r * gr, v * gv, b * gb
+    return (int(max(0, min(255, round(r)))),
+            int(max(0, min(255, round(v)))),
+            int(max(0, min(255, round(b)))))
+
+
 def couleur_ecran(source, boost, colonnes=4):
     """((r, v, b), luminance 0-1, numero d'ecran) ou None.
 
@@ -1255,12 +1326,15 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             return True
         fourni = self.headers.get("X-Jeton", "") or (corps.get("jeton", "")
                                                      if isinstance(corps, dict) else "")
-        if secrets.compare_digest(str(fourni), str(attendu)):
-            return True
-        # Le site tient deja la cle du pont (pont_cle cote app == passerelleCle
-        # cote site). On l'accepte ici pour qu'il puisse tirer /activite avec la
-        # cle qu'il a deja, sans nouveau secret a recopier. La liste d'origines
-        # reste le garde-fou : une page d'un autre domaine est refusee avant.
+        return secrets.compare_digest(str(fourni), str(attendu))
+
+    def cle_pont_permise(self):
+        """La cle du pont, acceptee UNIQUEMENT pour lire /activite.
+
+        Le site tient deja cette cle (pont_cle cote app == passerelleCle cote
+        site) : il tire donc le digest sans nouveau secret a recopier. On la
+        cantonne a la lecture d'enveloppe — jamais au controle de la lumiere, qui
+        reste derriere le jeton local — et la liste d'origines reste le garde-fou."""
         pont = str(CFG.get("pont_cle", "")).strip()
         cle_site = self.headers.get("X-Machitool-Cle", "")
         return bool(pont) and bool(cle_site) and \
@@ -1298,7 +1372,7 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             # Le site tire le digest du jour quand il veut, avec le jeton de
             # la passerelle locale — pas la cle du pont. Aucune dependance a
             # l'authentification du site : c'est lui qui appelle 127.0.0.1.
-            if not self.jeton_permis({}):
+            if not (self.jeton_permis({}) or self.cle_pont_permise()):
                 return self.repondre(401, {"erreur": "jeton invalide"})
             digest = dict(resume_activite())
             digest["journal_actif"] = ACTIVITE["active"]
@@ -1630,6 +1704,9 @@ async def une_session(cfg):
                         int(cfg.get("ecran_finesse", 4)))
                     if resultat:
                         (re, ve, be), luminance, index = resultat
+                        # Suivre ce que l'oeil voit : filtre de lumiere bleue
+                        # (rampe gamma) puis balance manuelle.
+                        (re, ve, be) = adapter_couleur_ecran((re, ve, be), cfg)
                         if mode == "mixte":
                             rc, vc, bc = (re + ra) / 2, (ve + va) / 2, (be + ba) / 2
                             nom = f"{nom} + ecran {index}"
@@ -3010,6 +3087,25 @@ class Panneau:
             "seule la saturation le suit, ou quand il ne pilote rien.")
 
         self.separateur(f, 14, 8)
+        self.titre(f, "balance des blancs").pack(fill="x", pady=(0, 6))
+        self.texte(f, "Le soir, un filtre de lumiere bleue (f.lux, Night Light) "
+                      "jaunit l'ecran sans que la capture le voie : la guirlande "
+                      "resterait blanche devant un ecran ambre. On relit alors la "
+                      "teinte reelle de l'affichage pour qu'elle suive.", BRUME, 8,
+                   largeur=490).pack(fill="x", pady=(0, 8))
+        self.var_filtre_bleu = tk.IntVar(
+            value=1 if self.cfg.get("ecran_suit_filtre_bleu", True) else 0)
+        self.case(f, "Suivre les filtres de lumiere bleue de l'ecran",
+                  self.var_filtre_bleu).pack(fill="x")
+        self.var_balance_temp = self.reglette(
+            f, "ecran_balance_temp", "Temperature", -1.0, 1.0, 0.05,
+            "Reglage manuel par-dessus : negatif refroidit (bleu), positif "
+            "rechauffe (ambre). 0 = neutre.")
+        self.var_balance_tint = self.reglette(
+            f, "ecran_balance_tint", "Teinte", -1.0, 1.0, 0.05,
+            "Negatif vire au vert, positif au magenta. 0 = neutre.")
+
+        self.separateur(f, 14, 8)
         self.titre(f, "effet de l'ecran en direct").pack(fill="x", pady=(0, 6))
         self.jauge_ecran_entree = self.jauge(f, "Luminosite lue sur l'ecran")
         self.jauge_ecran_lum = self.jauge(f, "Luminosite envoyee")
@@ -3717,6 +3813,9 @@ class Panneau:
         self.cfg["ecran_gamma"] = round(self.var_ecran_gamma.get(), 2)
         self.cfg["ecran_luminance_min"] = round(self.var_ecran_plancher.get(), 2)
         self.cfg["ecran_luminosite_base"] = round(self.var_ecran_base.get(), 2)
+        self.cfg["ecran_suit_filtre_bleu"] = bool(self.var_filtre_bleu.get())
+        self.cfg["ecran_balance_temp"] = round(self.var_balance_temp.get(), 2)
+        self.cfg["ecran_balance_tint"] = round(self.var_balance_tint.get(), 2)
         self.cfg["son_bande"] = self.var_bande.get()
         self.cfg["son_palette"] = self.var_palette.get()
         self.cfg["son_sensibilite"] = round(self.var_sens.get(), 2)
