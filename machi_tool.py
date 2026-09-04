@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -919,6 +919,42 @@ def _vignette_mss(zone, colonnes, lignes):
 
 
 _RAMPE = {"ts": 0.0, "lut": None}
+_APIS = {"gdi": None, "user": None, "pret": False}
+
+
+def _apis_ecran():
+    """Handles GDI/User32 A NOUS (WinDLL prives), avec leurs prototypes reglons
+    UNE fois. On ne touche jamais a ctypes.windll.* partage : regler les
+    prototypes de ces fonctions-la globalement pourrait deranger un autre appel
+    de l'application. Rend (gdi, user) ou (None, None) hors Windows / en echec."""
+    if _APIS["pret"]:
+        return _APIS["gdi"], _APIS["user"]
+    _APIS["pret"] = True
+    if os.name != "nt":
+        return None, None
+    try:
+        import ctypes
+        gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        user = ctypes.WinDLL("user32", use_last_error=True)
+        # Handles = pointeurs : sans ces types, ctypes tronque a 32 bits en 64
+        # bits et l'appel echoue (un HDC tronque n'est plus valide).
+        gdi.CreateDCW.restype = ctypes.c_void_p
+        gdi.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                  ctypes.c_wchar_p, ctypes.c_void_p]
+        gdi.DeleteDC.restype = ctypes.c_int
+        gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+        gdi.GetDeviceGammaRamp.restype = ctypes.c_int
+        gdi.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user.GetDC.restype = ctypes.c_void_p
+        user.GetDC.argtypes = [ctypes.c_void_p]
+        user.ReleaseDC.restype = ctypes.c_int
+        user.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user.FindWindowW.restype = ctypes.c_void_p
+        user.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        _APIS["gdi"], _APIS["user"] = gdi, user
+    except Exception:
+        _APIS["gdi"], _APIS["user"] = None, None
+    return _APIS["gdi"], _APIS["user"]
 
 
 def rampe_gamma():
@@ -960,18 +996,10 @@ def rampe_gamma():
     _RAMPE["ts"] = maintenant
     try:
         import ctypes
-        gdi32 = ctypes.windll.gdi32
-        user32 = ctypes.windll.user32
-        # Handles = pointeurs : sans ces types, ctypes tronque a 32 bits en 64
-        # bits et l'appel echoue silencieusement (un HDC tronque n'est plus valide).
-        gdi32.CreateDCW.restype = ctypes.c_void_p
-        gdi32.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
-                                    ctypes.c_wchar_p, ctypes.c_void_p]
-        gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
-        gdi32.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        user32.GetDC.restype = ctypes.c_void_p
-        user32.GetDC.argtypes = [ctypes.c_void_p]
-        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32, user32 = _apis_ecran()
+        if not gdi32 or not user32:
+            _RAMPE["lut"] = None
+            return None
 
         brut = (ctypes.c_uint16 * 256 * 3)()
         ok = 0
@@ -1055,14 +1083,11 @@ def _kelvin_du_blanc(r, v, b):
 
 def _flux_tourne():
     """Vrai si f.lux tourne : il tient une fenetre cachee de classe « flux »."""
-    if os.name != "nt":
-        return False
     try:
-        import ctypes
-        fw = ctypes.windll.user32.FindWindowW
-        fw.restype = ctypes.c_void_p
-        fw.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-        return bool(fw("flux", None))
+        _gdi, user = _apis_ecran()
+        if not user:
+            return False
+        return bool(user.FindWindowW("flux", None))
     except Exception:
         return False
 
@@ -1126,14 +1151,14 @@ def texte_filtre_ecran(d):
     if not d.get("suivi"):
         return ("Suivi des filtres desactive.", False)
     if d.get("source") == "filtre":
-        t = "Filtre ecran suivi — ≈%d K, rechauffe %d%%" % (
+        t = "Filtre ecran suivi - ~%d K, rechauffe %d%%" % (
             d.get("kelvin") or 0, d.get("chaud_pct") or 0)
         return (t, bool(d.get("compense")))
     if d.get("flux"):
-        return ("f.lux tourne, mais sa rampe est illisible sur ce pilote — "
+        return ("f.lux tourne, mais sa rampe est illisible sur ce pilote - "
                 "teinte non suivie (regle la balance a la main).", False)
     if d.get("nightlight"):
-        return ("Windows Night Light actif — autre pipeline, non suivi "
+        return ("Windows Night Light actif - autre pipeline, non suivi "
                 "(regle la balance a la main).", False)
     return ("Aucun filtre de lumiere bleue detecte.", False)
 
@@ -3354,9 +3379,15 @@ class Panneau:
                   self.var_filtre_bleu).pack(fill="x")
         # L'indicateur : ce que Machi Tool DETECTE, et de combien il adapte. De
         # quoi voir tout de suite si f.lux est trouve et suivi, sans deviner.
-        self.txt_filtre = self.texte(f, "Detection du filtre en cours…",
-                                     BRUME, 8, largeur=490)
-        self.txt_filtre.pack(fill="x", pady=(4, 0))
+        # Blinde : un pepin ici ne doit JAMAIS empecher la page (donc l'app) de
+        # se construire -- au pire, pas d'indicateur.
+        self.txt_filtre = None
+        try:
+            self.txt_filtre = self.texte(f, "Detection du filtre en cours...",
+                                         BRUME, 8, largeur=490)
+            self.txt_filtre.pack(fill="x", pady=(4, 0))
+        except Exception as e:
+            print("Indicateur de filtre indisponible :", e)
         self.var_balance_temp = self.reglette(
             f, "ecran_balance_temp", "Temperature", -1.0, 1.0, 0.05,
             "Reglage manuel par-dessus : negatif refroidit (bleu), positif "
