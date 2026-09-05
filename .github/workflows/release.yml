@@ -174,4 +174,4 @@ jobs:
             echo "Menage : suppression de $vieille"
             gh release delete "$vieille" --yes --cleanup-tag || true
           done
-          echo "Etape terminee.""
+          echo "Etape terminee."
