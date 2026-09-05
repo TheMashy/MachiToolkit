@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.15.0"
+VERSION = "1.16.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -206,6 +206,13 @@ CONFIG_DEFAUT = {
     "pont_cle": "",                  # cle transmise au site, s'il en veut une
     "pont_notifie": True,            # afficher les rappels recus
 
+    # Interrupteur maitre : BrainDebugger a-t-il le droit de piloter la
+    # guirlande ? Il couvre TOUT ce que le site peut faire a la lumiere -- la
+    # couleur qu'il force (/couleur, /humeur) et la couleur de presence. Coche
+    # par defaut. Decoche, le site n'a plus aucune prise : un forcage en cours
+    # est relache aussitot et la guirlande revient au mode normal.
+    "pont_affecte_leds": True,
+
     # Bascule pendant qu'on est sur le site. Deux facons de s'en rendre
     # compte, cumulees : le titre de la fenetre active, qui ne demande rien
     # au site, et un battement que le site peut envoyer — le seul a marcher
@@ -341,21 +348,57 @@ def rgb_vers_hex(rgb):
     return "#" + "".join(f"{max(0, min(255, int(c))):02X}" for c in rgb)
 
 
+def _nom_du_processus(pid):
+    """Le nom de l'executable d'un PID, meme quand psutil se heurte a un mur.
+
+    Beaucoup de jeux -- ceux de Steam en tete -- tournent avec un anti-triche
+    ou des droits eleves : psutil.Process(pid).name() leve alors AccessDenied,
+    et le jeu passait pour du temps 'inconnu'. On retombe sur l'API Win32
+    QueryFullProcessImageName, qui ne demande que PROCESS_QUERY_LIMITED_INFORMATION
+    et repond a travers les niveaux d'integrite -- exactement le cas d'un jeu.
+    """
+    try:
+        import psutil
+        return psutil.Process(pid).name()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        h = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            n = wintypes.DWORD(len(buf))
+            k.QueryFullProcessImageNameW.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD,
+                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return os.path.basename(buf.value)
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
 def fenetre_active():
     """'processus.exe | titre', en minuscules. Le titre d'un navigateur
     contient le nom du site, ce qui suffit a distinguer Netflix de GitHub
     sans avoir a lire la barre d'adresse."""
     try:
-        import win32gui, win32process, psutil
+        import win32gui, win32process
         hwnd = win32gui.GetForegroundWindow()
         if not hwnd:
             return ""
         titre = win32gui.GetWindowText(hwnd) or ""
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        try:
-            nom = psutil.Process(pid).name()
-        except Exception:
-            nom = ""
+        nom = _nom_du_processus(pid)
         return f"{nom} | {titre}".lower()
     except Exception:
         return ""
@@ -422,17 +465,25 @@ FICHIER_ENVOI = os.path.join(DOSSIER, "dernier_envoi.txt")  # survit au redemarr
 SEUIL_TROU = 20 * 60          # une absence n'est notee qu'au-dela de 20 min
 FICHIER_SESSIONS = os.path.join(DOSSIER, "sessions.jsonl")
 SESSION = {"notee": False}    # une seule entree de demarrage par lancement
+FICHIER_BATTEMENT = os.path.join(DOSSIER, "battement.txt")  # dernier instant vivant
+BATTEMENT = {"dernier": 0.0}  # anti-ecriture a chaque image
 
 
-def noter_session(genre):
+def noter_session(genre, quand_ts=None, extra=None):
     """Journalise un allumage ou une extinction du poste. C'est ce qui
     donne le lever et le coucher : l'application demarre avec Windows et
     recoit son ordre d'arret, donc demarrage vaut reveil, extinction vaut
-    coucher. Fichier a part, une ligne par evenement."""
+    coucher. Fichier a part, une ligne par evenement.
+
+    `quand_ts` force l'horodatage (pour poser apres coup un coucher deduit du
+    dernier battement, quand la machine s'est eteinte sans prevenir)."""
     try:
-        maintenant = time.time()
-        evenement = {"genre": genre, "quand": time.strftime("%Y-%m-%d %H:%M"),
-                     "ts": round(maintenant)}
+        ts = round(quand_ts if quand_ts is not None else time.time())
+        evenement = {"genre": genre,
+                     "quand": time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+                     "ts": ts}
+        if extra:
+            evenement.update(extra)
         lignes = []
         if os.path.exists(FICHIER_SESSIONS):
             with open(FICHIER_SESSIONS, encoding="utf-8") as f:
@@ -442,6 +493,65 @@ def noter_session(genre):
             f.writelines(lignes[-400:])
     except Exception as e:
         print("Journal des sessions impossible :", e)
+
+
+def battre():
+    """Poser l'instant present sur le disque : « l'app etait vivante jusqu'ici ».
+
+    Ecrit au plus une fois par minute. C'est le filet du coucher : quand la
+    machine s'eteint ou s'endort sans que l'app recoive son ordre d'arret (arret
+    brutal, batterie, capot rabattu), aucune extinction n'est notee et le coucher
+    manquait. Le dernier battement dit alors, a la minute pres, quand la vie s'est
+    arretee -- donc quand on s'est couche."""
+    maintenant = time.time()
+    if maintenant - BATTEMENT["dernier"] < 55:
+        return
+    BATTEMENT["dernier"] = maintenant
+    try:
+        with open(FICHIER_BATTEMENT, "w", encoding="utf-8") as f:
+            f.write(str(round(maintenant)))
+    except Exception:
+        pass
+
+
+def lire_battement():
+    try:
+        with open(FICHIER_BATTEMENT, encoding="utf-8") as f:
+            return float(f.read().strip())
+    except Exception:
+        return None
+
+
+def fermer_session_perdue():
+    """Au demarrage : reparer un coucher que personne n'a note.
+
+    Si le dernier evenement du journal est un demarrage (donc la session
+    precedente ne s'est jamais close proprement) et qu'un battement lui est
+    posterieur, la machine a vecu jusqu'a ce battement puis s'est arretee sans
+    rien dire. On pose alors une extinction A L'HEURE DU BATTEMENT -- le coucher
+    reel de cette nuit-la -- marquee `deduit` pour ne pas la confondre avec un
+    arret franc."""
+    try:
+        bat = lire_battement()
+        if not bat:
+            return
+        evts = []
+        if os.path.exists(FICHIER_SESSIONS):
+            with open(FICHIER_SESSIONS, encoding="utf-8") as f:
+                for l in f:
+                    if l.strip():
+                        evts.append(json.loads(l))
+        if not evts:
+            return
+        dernier = max(evts, key=lambda e: e.get("ts", 0))
+        # Deja clos (arret franc note), ou battement anterieur : rien a reparer.
+        if dernier.get("genre") == "extinction":
+            return
+        if bat <= dernier.get("ts", 0):
+            return
+        noter_session("extinction", quand_ts=bat, extra={"deduit": True})
+    except Exception as e:
+        print("Cloture de session perdue impossible :", e)
 
 
 def _hhmm(ts):
@@ -504,7 +614,14 @@ def categorie_activite(contexte):
     if any(n in proc for n in navigateurs) and titre:
         mots = titre.replace(" - ", " ").replace(" | ", " ").split()
         return "web:" + (mots[0][:24] if mots else proc)
-    return proc[:32] or "inconnu"
+    if proc:
+        return proc[:32]
+    # Sans nom de processus (un jeu qui refuse qu'on lise le sien), on ne jette
+    # pas ce temps dans 'inconnu' : le titre de sa fenetre le nomme encore --
+    # « bodycam » vaut mieux qu'un trou.
+    if titre:
+        return titre.split(" - ")[0].split(" | ")[0][:32]
+    return "inconnu"
 
 
 def _reinit_jour():
@@ -755,6 +872,7 @@ def _fil_activite(cfg):
                 actif = secondes_inactivite() < 60
                 activite_note(fenetre_active(), actif,
                               cfg.get("collecte_titres_complets", False))
+                battre()   # « vivant jusqu'ici » : le filet du coucher
         except Exception as e:
             print("Journal d'activite interrompu :", e)
         fin = time.time() + 2.0
@@ -1387,6 +1505,10 @@ def presence_du_site(cfg, contexte):
     Un delai de grace evite le clignotement quand on passe une seconde sur
     une autre fenetre.
     """
+    # L'interrupteur maitre coupe aussi la couleur de presence : « BrainDebugger
+    # n'affecte pas les LEDs » veut dire aucune prise, presence comprise.
+    if not cfg.get("pont_affecte_leds", True):
+        return None
     if not cfg.get("pont_presence", True):
         return None
 
@@ -1611,6 +1733,13 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
 
         duree = float(corps.get("duree", 30))
         duree = max(1.0, min(3600.0, duree))
+
+        # Interrupteur maitre : si BrainDebugger n'a pas le droit de piloter la
+        # guirlande, ses ordres de couleur sont recus poliment mais sans effet.
+        # On ne pose aucun forcage, et le site le sait par la reponse.
+        if chemin in ("/couleur", "/humeur") and not CFG.get("pont_affecte_leds", True):
+            return self.repondre(200, {"ok": False, "desactive": True,
+                                       "raison": "BrainDebugger n'affecte pas les LEDs"})
 
         if chemin == "/couleur":
             brut = corps.get("couleur")
@@ -2490,6 +2619,22 @@ class Panneau:
         """Convertit une mesure pensee en 96 ppp vers l'ecran reel."""
         return max(1, int(round(n * self.echelle)))
 
+    def interface_visible(self):
+        """La fenetre est-elle vraiment a l'ecran ?
+
+        Rangee dans la barre des taches (withdraw) ou reduite, elle n'a rien a
+        redessiner. On le demande a Tk plutot qu'a un drapeau a nous : c'est
+        l'etat reel, y compris quand Windows a retire la fenetre sous nos pieds.
+        """
+        try:
+            if not self.root.winfo_exists():
+                return False
+            if self.root.state() in ("withdrawn", "iconic"):
+                return False
+            return bool(self.root.winfo_viewable())
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     #  Signature : le brin d'ampoules
     # ------------------------------------------------------------------
@@ -2543,6 +2688,19 @@ class Panneau:
             self.brin.coords(self.cable, *points)
 
     def animer(self):
+        g = self.generation
+        # RIEN NE SE DESSINE DERRIERE UN JEU.
+        #
+        # Rangee dans la barre des taches, la fenetre n'a pas besoin de son
+        # animation. Ce n'est pas qu'une economie de processeur : Tk continuait
+        # de redessiner ses toiles pendant qu'une application plein ecran
+        # changeait la resolution de l'ecran, et demandait alors un pixmap de
+        # taille invalide. CreateDIBSection repondait « parametre incorrect »,
+        # et Tk_GetPixmap appelle Tcl_Panic -- qui tue l'application d'un coup,
+        # sans qu'aucun try/except Python ne puisse l'attraper. On ne peut donc
+        # pas rattraper cette panne : il faut ne pas la provoquer.
+        if not self.interface_visible():
+            return self.root.after(400, lambda: g == self.generation and self.animer())
         self.phase += 0.09
         couleur = ETAT["couleur"]
         vive = hex_vers_rgb(self.accent)
@@ -2560,7 +2718,6 @@ class Panneau:
             self.brin.itemconfig(coeur, fill=melange(teinte, NUIT_RGB,
                                                      min(1.0, 0.4 + 0.6 * force)))
         self.peindre_vumetre()
-        g = self.generation
         self.root.after(70, lambda: g == self.generation and self.animer())
 
     # ------------------------------------------------------------------
@@ -3903,6 +4060,16 @@ class Panneau:
                       "Reglages › La passerelle.",
                    BRUME, 8, largeur=460).pack(fill="x", pady=(6, 0))
 
+        # L'interrupteur maitre : BrainDebugger pilote-t-il la guirlande ?
+        self.var_affecte_leds = tk.IntVar(
+            value=1 if self.cfg.get("pont_affecte_leds", True) else 0)
+        self.case(f, "BrainDebugger affecte les LEDs",
+                  self.var_affecte_leds).pack(fill="x", pady=(16, 0))
+        self.texte(f, "Decoche : le site ne touche plus a la guirlande, et une "
+                      "couleur qu'il a posee revient aussitot au mode normal "
+                      "(ecran / son / regles).",
+                   BRUME, 8, largeur=460).pack(fill="x", pady=(4, 0))
+
         # ------------------------------------------------------------------
         # TOUT LE RESTE VIT ENCORE, MAIS NE SE MONTRE PLUS.
         #
@@ -4082,6 +4249,17 @@ class Panneau:
         self.cfg["pont_presence_couleur"] = (
             couleur if couleur.startswith("#") and len(couleur) == 7 else "#7C3AED")
         self.cfg["pont_presence_grace"] = int(self.var_presence_grace.get())
+        self.cfg["pont_affecte_leds"] = bool(self.var_affecte_leds.get())
+        # Coupe a l'instant : on relache le forcage POSE PAR LE SITE (jamais le
+        # forcage manuel, une couleur choisie a la main) et on oublie la
+        # presence, pour que la guirlande revienne aussitot au mode normal --
+        # sans attendre la peremption du forcage en cours.
+        if not self.cfg["pont_affecte_leds"]:
+            f_site = ETAT.get("forcage")
+            if f_site and not f_site.get("manuel"):
+                ETAT["forcage"] = None
+            ETAT["presence"] = None
+            ETAT["presence_vu"] = 0.0
         avant_act = self.cfg.get("collecte_active")
         # Un seul interrupteur : « Envoyer mon activite » tient le journal ET
         # l'envoie. Rien a cocher en plus, rien a oublier.
@@ -4170,6 +4348,11 @@ class Panneau:
     # ------------------------------------------------------------------
 
     def rafraichir(self):
+        g = self.generation
+        # Meme raison que dans animer() : cachee, la fenetre ne redessine rien.
+        # L'etat continue de vivre dans ETAT ; il se lira a la reouverture.
+        if not self.interface_visible():
+            return self.root.after(600, lambda: g == self.generation and self.rafraichir())
         r, v, b = ETAT["couleur"]
         hexa = rgb_vers_hex((r, v, b))
         accent = lisible((r, v, b)) if max(r, v, b) > 8 else ACCENT_DEPART
@@ -4307,7 +4490,6 @@ class Panneau:
             ETAT["resultat"] = ""
             self.aller("etat")
 
-        g = self.generation
         self.root.after(400, lambda: g == self.generation and self.rafraichir())
 
     def tracer_bande(self, hexa):
@@ -5060,6 +5242,10 @@ def lancer():
     demarrer_activite(CFG)
     if CFG.get("collecte_active", False) and not SESSION["notee"]:
         SESSION["notee"] = True
+        # D'abord refermer une session que la veille/l'arret brutal a laissee
+        # ouverte : le dernier battement devient le coucher manquant. Puis noter
+        # ce demarrage-ci, qui vaut reveil.
+        fermer_session_perdue()
         noter_session("demarrage")     # vaut reveil : l'app demarre avec Windows
 
     def veille_activite():
