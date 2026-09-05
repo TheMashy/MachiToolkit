@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -2619,6 +2619,22 @@ class Panneau:
         """Convertit une mesure pensee en 96 ppp vers l'ecran reel."""
         return max(1, int(round(n * self.echelle)))
 
+    def interface_visible(self):
+        """La fenetre est-elle vraiment a l'ecran ?
+
+        Rangee dans la barre des taches (withdraw) ou reduite, elle n'a rien a
+        redessiner. On le demande a Tk plutot qu'a un drapeau a nous : c'est
+        l'etat reel, y compris quand Windows a retire la fenetre sous nos pieds.
+        """
+        try:
+            if not self.root.winfo_exists():
+                return False
+            if self.root.state() in ("withdrawn", "iconic"):
+                return False
+            return bool(self.root.winfo_viewable())
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------
     #  Signature : le brin d'ampoules
     # ------------------------------------------------------------------
@@ -2672,6 +2688,19 @@ class Panneau:
             self.brin.coords(self.cable, *points)
 
     def animer(self):
+        g = self.generation
+        # RIEN NE SE DESSINE DERRIERE UN JEU.
+        #
+        # Rangee dans la barre des taches, la fenetre n'a pas besoin de son
+        # animation. Ce n'est pas qu'une economie de processeur : Tk continuait
+        # de redessiner ses toiles pendant qu'une application plein ecran
+        # changeait la resolution de l'ecran, et demandait alors un pixmap de
+        # taille invalide. CreateDIBSection repondait « parametre incorrect »,
+        # et Tk_GetPixmap appelle Tcl_Panic -- qui tue l'application d'un coup,
+        # sans qu'aucun try/except Python ne puisse l'attraper. On ne peut donc
+        # pas rattraper cette panne : il faut ne pas la provoquer.
+        if not self.interface_visible():
+            return self.root.after(400, lambda: g == self.generation and self.animer())
         self.phase += 0.09
         couleur = ETAT["couleur"]
         vive = hex_vers_rgb(self.accent)
@@ -2689,7 +2718,6 @@ class Panneau:
             self.brin.itemconfig(coeur, fill=melange(teinte, NUIT_RGB,
                                                      min(1.0, 0.4 + 0.6 * force)))
         self.peindre_vumetre()
-        g = self.generation
         self.root.after(70, lambda: g == self.generation and self.animer())
 
     # ------------------------------------------------------------------
@@ -4320,6 +4348,11 @@ class Panneau:
     # ------------------------------------------------------------------
 
     def rafraichir(self):
+        g = self.generation
+        # Meme raison que dans animer() : cachee, la fenetre ne redessine rien.
+        # L'etat continue de vivre dans ETAT ; il se lira a la reouverture.
+        if not self.interface_visible():
+            return self.root.after(600, lambda: g == self.generation and self.rafraichir())
         r, v, b = ETAT["couleur"]
         hexa = rgb_vers_hex((r, v, b))
         accent = lisible((r, v, b)) if max(r, v, b) > 8 else ACCENT_DEPART
@@ -4457,7 +4490,6 @@ class Panneau:
             ETAT["resultat"] = ""
             self.aller("etat")
 
-        g = self.generation
         self.root.after(400, lambda: g == self.generation and self.rafraichir())
 
     def tracer_bande(self, hexa):
