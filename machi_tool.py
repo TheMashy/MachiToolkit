@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -558,37 +558,131 @@ def _hhmm(ts):
     return time.strftime("%H:%M", time.localtime(ts))
 
 
-def sommeil_estime():
-    """Reveil du jour, coucher de la veille, duree entre les deux.
+def _digest_enregistre(date):
+    """Le digest d'un jour passe, tel qu'ecrit sur le disque (None sinon)."""
+    try:
+        if not os.path.exists(FICHIER_ACTIVITE):
+            return None
+        with open(FICHIER_ACTIVITE, encoding="utf-8") as f:
+            for l in f:
+                if _date_de_ligne(l) == date:
+                    return json.loads(l)
+    except Exception:
+        pass
+    return None
 
-    Le reveil est le premier allumage du jour ; le coucher, la derniere
-    extinction qui le precede. Une duree hors de 2 h a 16 h n'est pas du
-    sommeil (redemarrage, coupure) : on la laisse tomber.
+
+def _minutes(hhmm):
+    try:
+        h, m = str(hhmm).split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def _jour_avant(date):
+    t = time.strptime(date, "%Y-%m-%d")
+    return time.strftime("%Y-%m-%d", time.localtime(time.mktime(t) - 86400))
+
+
+def sommeil_estime(jour=None, plage=None, trous=None):
+    """La nuit qui OUVRE `jour` : coucher, reveil, duree.
+
+    Elle se lit dans le CLAVIER, pas dans le poste : la derniere touche du
+    soir, la premiere du matin, et entre les deux le plus long silence. Un
+    ordinateur laisse allume la nuit n'a ni extinction ni demarrage, et on y
+    dort quand meme ; un Windows qui redemarre seul a 00:30 n'est pas un lever.
+
+    Les instants viennent de `plage` (premiere et derniere minute active du
+    jour) et de `trous` (les absences de plus de vingt minutes) du jour et de
+    la veille, plus les extinctions du poste. Les demarrages ne servent que
+    quand le clavier n'a rien dit (les journaux d'avant cette version).
+
+    Deux silences separes par moins de trente minutes debout -- un verre
+    d'eau a 4 h -- sont une seule nuit. Hors de 2 h a 16 h, ce n'est pas une
+    nuit : une coupure, un week-end sans ordinateur.
     """
     try:
-        if not os.path.exists(FICHIER_SESSIONS):
-            return None
+        jour = jour or _jour_courant()
+        veille = _jour_avant(jour)
+        d_jour = {"plage": plage or {}, "trous": trous or []}
+        if plage is None:
+            if jour == ACTIVITE.get("jour"):
+                d_jour = {"plage": {"de": ACTIVITE["premiere"], "a": ACTIVITE["derniere"]},
+                          "trous": list(ACTIVITE["trous"])}
+            else:
+                d_jour = _digest_enregistre(jour) or d_jour
+        d_veille = _digest_enregistre(veille) or {}
+        # Sur un axe en minutes : 0 = minuit qui ouvre `jour`, le soir de la veille est negatif.
+        fins, debuts = [], []
+        a = _minutes((d_veille.get("plage") or {}).get("a"))
+        if a is not None:
+            fins.append(a - 1440)
+        for tr in d_veille.get("trous") or []:
+            de, ta = _minutes(tr.get("de")), _minutes(tr.get("a"))
+            if de is not None and de >= 18 * 60:
+                fins.append(de - 1440)
+                if ta is not None and ta > de:
+                    debuts.append(ta - 1440)
+        de = _minutes((d_jour.get("plage") or {}).get("de"))
+        if de is not None:
+            debuts.append(de)
+        for tr in d_jour.get("trous") or []:
+            d0, d1 = _minutes(tr.get("de")), _minutes(tr.get("a"))
+            if d0 is not None and d1 is not None and d1 > d0:
+                fins.append(d0)
+                debuts.append(d1)
+        # Le poste : ses extinctions sont des fins sures ; ses demarrages ne sont
+        # des reprises que si le clavier n'a rien dit.
         evts = []
-        with open(FICHIER_SESSIONS, encoding="utf-8") as f:
-            for l in f:
-                if l.strip():
-                    evts.append(json.loads(l))
-        aujourd = time.strftime("%Y-%m-%d")
-        reveils = [e for e in evts if e.get("genre") == "demarrage"
-                   and str(e.get("quand", "")).startswith(aujourd)]
-        if not reveils:
-            return None
-        reveil = min(reveils, key=lambda e: e["ts"])
-        avant = [e for e in evts if e.get("genre") == "extinction"
-                 and e["ts"] < reveil["ts"]]
-        if not avant:
-            return {"reveil": _hhmm(reveil["ts"])}
-        coucher = max(avant, key=lambda e: e["ts"])
-        heures = round((reveil["ts"] - coucher["ts"]) / 3600.0, 1)
-        res = {"reveil": _hhmm(reveil["ts"]), "coucher": _hhmm(coucher["ts"])}
-        if 2.0 <= heures <= 16.0:
-            res["sommeil_h"] = heures
-        return res
+        if os.path.exists(FICHIER_SESSIONS):
+            with open(FICHIER_SESSIONS, encoding="utf-8") as f:
+                for l in f:
+                    if l.strip():
+                        evts.append(json.loads(l))
+        minuit = time.mktime(time.strptime(jour, "%Y-%m-%d"))
+        clavier = bool(debuts) or bool(fins)
+        for e in evts:
+            t = (e.get("ts", 0) - minuit) / 60.0
+            if not (-12 * 60 <= t <= 16 * 60):
+                continue
+            if e.get("genre") == "extinction":
+                fins.append(t)
+            elif e.get("genre") == "demarrage" and not clavier:
+                debuts.append(t)
+        fins.sort()
+        debuts.sort()
+        # Les silences : de chaque fin a la premiere reprise qui la suit.
+        silences = []
+        for f_ in fins:
+            suiv = [d for d in debuts if d > f_]
+            if not suiv:
+                continue
+            d = suiv[0]
+            # Deux fins pour la meme reprise : on garde les deux, la plus longue
+            # nuit RECEVABLE l'emportera (une fin trop ancienne ferait un
+            # silence de trente heures, jete ensuite par la borne des seize).
+            silences.append([f_, d, d - f_])
+        fondus = []
+        for s_ in silences:
+            if fondus and 0 <= s_[0] - fondus[-1][1] < 30:
+                fondus[-1][1] = s_[1]
+                fondus[-1][2] += s_[2]
+            else:
+                fondus.append(list(s_))
+        nuits = [s_ for s_ in fondus
+                 if 0 <= s_[1] <= 16 * 60 and s_[0] >= -12 * 60 and 120 <= s_[2] <= 16 * 60]
+        if not nuits:
+            # Au moins le reveil, si le clavier ou le poste en connaissent un ce matin.
+            matin = [d for d in debuts if 0 <= d <= 16 * 60]
+            if not matin:
+                return None
+            return {"reveil": _hhmm(minuit + min(matin) * 60), "source": "clavier" if clavier else "poste"}
+        nuit = max(nuits, key=lambda s_: s_[2])
+        return {"reveil": _hhmm(minuit + nuit[1] * 60),
+                "coucher": _hhmm(minuit + nuit[0] * 60),
+                "sommeil_h": round(nuit[2] / 60.0, 1),
+                "source": "clavier" if clavier else "poste"}
     except Exception:
         return None
 
@@ -707,7 +801,7 @@ def resume_activite():
         "plage": {"de": ACTIVITE["premiere"], "a": ACTIVITE["derniere"]},
         "trous": list(ACTIVITE["trous"]),
     }
-    veille = sommeil_estime()
+    veille = sommeil_estime(ACTIVITE["jour"] or _jour_courant())
     if veille:
         resume["poste"] = veille
     if ACTIVITE["titres"]:
@@ -873,6 +967,12 @@ def _fil_activite(cfg):
                 activite_note(fenetre_active(), actif,
                               cfg.get("collecte_titres_complets", False))
                 battre()   # « vivant jusqu'ici » : le filet du coucher
+                # Le digest du jour sur le disque toutes les cinq minutes : c'est
+                # lui qui porte la derniere touche du soir, et un arret brutal
+                # ne doit pas en perdre six heures (l'envoi au site en attend six).
+                if time.time() - MOTEUR_ACTIVITE.get("sauve_le", 0) > 300:
+                    MOTEUR_ACTIVITE["sauve_le"] = time.time()
+                    sauver_activite()
         except Exception as e:
             print("Journal d'activite interrompu :", e)
         fin = time.time() + 2.0
