@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -129,6 +129,15 @@ CONFIG_DEFAUT = {
     # photo : temperature (froid <-> chaud) et teinte (vert <-> magenta). 0 = neutre.
     "ecran_balance_temp": 0.0,       # -1 plus froid (bleu), +1 plus chaud (ambre)
     "ecran_balance_tint": 0.0,       # -1 plus vert, +1 plus magenta
+    # Le blanc de la guirlande elle-meme. Une LED « blanche » n'est pas neutre :
+    # la plupart tirent au bleu (7000-8500 K). Une couleur d'ecran envoyee telle
+    # quelle y parait donc plus froide qu'a l'ecran -- meme quand f.lux est bien
+    # lu. On lui donne son point blanc, et on corrige. 6500 = neutre.
+    "led_blanc_kelvin": 7500,
+    # De combien on pousse la compensation du filtre (1 = telle quelle). Une
+    # guirlande de trente diodes vue de cote rend le chaud moins que l'ecran :
+    # 1,3 est ce qui, a l'oeil, met les deux d'accord.
+    "ecran_filtre_force": 1.3,
 
     "regles": [
         {"nom": "Netflix",    "couleur": "#E50914", "mots": ["netflix"]},
@@ -1250,14 +1259,161 @@ def rampe_gamma():
         return None
 
 
-def adapter_couleur_ecran(rgb, cfg):
-    """Teinte une couleur (0-255) comme l'ecran la MONTRE : la rampe gamma des
-    filtres de nuit d'abord, puis la balance manuelle si elle est reglee."""
-    r, v, b = rgb
+def _kelvin_rgb(k):
+    """Le blanc d'un corps noir a k kelvin, en (r, v, b) 0-1 (Tanner Helland).
+    6500 K vaut a peu pres (1, 1, 1) ; 3400 K, (1, 0.71, 0.42)."""
+    t = max(1000.0, min(40000.0, float(k))) / 100.0
+    r = 255.0 if t <= 66 else 329.698727446 * ((t - 60) ** -0.1332047592)
+    v = (99.4708025861 * math.log(t) - 161.1195681661) if t <= 66 \
+        else 288.1221695283 * ((t - 60) ** -0.0755148492)
+    b = 255.0 if t >= 66 else 0.0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
+    return tuple(max(0.0, min(255.0, x)) / 255.0 for x in (r, v, b))
+
+
+def gains_kelvin(k_ecran, k_led=6500.0, force=1.0):
+    """Les gains (r, v, b) qui, sur une guirlande dont le blanc est a k_led,
+    montrent le blanc de l'ecran a k_ecran. Jamais au-dessus de 1 : on retire du
+    bleu, on n'invente pas de rouge. `force` exagere (> 1) ou attenue (< 1)."""
+    e, l = _kelvin_rgb(k_ecran), _kelvin_rgb(k_led)
+    g = [e[i] / max(0.02, l[i]) for i in range(3)]
+    m = max(g) or 1.0
+    return tuple((x / m) ** max(0.1, float(force)) for x in g)
+
+
+_FLUX = {"ts": 0.0, "val": None}
+
+
+def _flux_reglages():
+    """Ce que f.lux dit de lui-meme dans le registre (HKCU\\Software\\Michael
+    Herf\\flux\\Preferences) : ses temperatures et sa position. Les noms exacts
+    changent d'une version a l'autre, alors on lit TOUTES les valeurs et on
+    reconnait par le nom (night/day/late, lat/long) et par la plage. Au moindre
+    doute, la valeur manque, et les defauts de f.lux (6500 le jour, 3400 la
+    nuit) prennent le relais."""
+    out = {"nuit": None, "jour": None, "tard": None, "lat": None, "lon": None}
+    if os.name != "nt":
+        return out
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Michael Herf\flux\Preferences") as cle:
+            i = 0
+            while True:
+                try:
+                    nom, val, _t = winreg.EnumValue(cle, i)
+                except OSError:
+                    break
+                i += 1
+                n = str(nom).lower()
+                try:
+                    x = float(val)
+                except Exception:
+                    continue
+                if "lat" in n and -90 <= x <= 90:
+                    out["lat"] = x
+                elif ("lon" in n or "lng" in n) and -180 <= x <= 180:
+                    out["lon"] = x
+                elif 1000 <= x <= 6600 and "bri" not in n:
+                    if "night" in n or "nuit" in n:
+                        out["nuit"] = x
+                    elif "day" in n or "jour" in n:
+                        out["jour"] = x
+                    elif "late" in n or "bed" in n:
+                        out["tard"] = x
+    except Exception:
+        pass
+    return out
+
+
+def _elevation_soleil(lat, lon, quand=None):
+    """Hauteur du soleil en degres, approximation NOAA (a un degre pres) :
+    assez pour savoir si c'est le jour, la nuit, ou entre les deux."""
+    quand = quand if quand is not None else time.time()
+    jours = quand / 86400.0 - 10957.5                 # depuis J2000
+    g = math.radians((357.529 + 0.98560028 * jours) % 360)
+    q = (280.459 + 0.98564736 * jours) % 360
+    lon_sol = math.radians((q + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g)) % 360)
+    obl = math.radians(23.439 - 0.00000036 * jours)
+    decl = math.asin(math.sin(obl) * math.sin(lon_sol))
+    ra = math.degrees(math.atan2(math.cos(obl) * math.sin(lon_sol), math.cos(lon_sol)))
+    gmst = (18.697374558 + 24.06570982441908 * jours) % 24
+    ha = math.radians((gmst * 15 + lon - ra) % 360)
+    la = math.radians(lat)
+    h = math.asin(math.sin(la) * math.sin(decl) + math.cos(la) * math.cos(decl) * math.cos(ha))
+    return math.degrees(h)
+
+
+def kelvin_attendu_flux():
+    """La temperature que f.lux DOIT tenir maintenant, d'apres ses reglages et
+    l'heure -- quand sa rampe est illisible et qu'on ne peut plus la mesurer.
+    None si f.lux ne tourne pas. Cache dix secondes."""
+    maintenant = time.time()
+    if _FLUX["val"] is not None and maintenant - _FLUX["ts"] < 10.0:
+        return _FLUX["val"]
+    _FLUX["ts"] = maintenant
+    k = None
+    try:
+        if _flux_tourne():
+            p = _flux_reglages()
+            jour = p["jour"] or 6500.0
+            nuit = p["nuit"] or 3400.0
+            tard = p["tard"]
+            heure = time.localtime().tm_hour + time.localtime().tm_min / 60.0
+            if p["lat"] is not None and p["lon"] is not None:
+                el = _elevation_soleil(p["lat"], p["lon"], maintenant)
+                # Plein jour au-dessus de 6 degres, pleine nuit sous -6 : entre les deux, la transition.
+                part = max(0.0, min(1.0, (6.0 - el) / 12.0))
+            else:
+                # Sans position : jour de 7 h a 19 h, nuit de 21 h a 6 h, une heure de transition.
+                if 7 <= heure < 19:
+                    part = 0.0
+                elif heure >= 20 or heure < 6:
+                    part = 1.0
+                elif 19 <= heure < 20:
+                    part = heure - 19
+                else:
+                    part = 1.0 - (heure - 6)
+            k = jour + (nuit - jour) * part
+            if tard and (heure >= 23 or heure < 5):
+                k = min(k, tard)
+    except Exception:
+        k = None
+    _FLUX["val"] = k
+    return k
+
+
+def kelvin_ecran(cfg):
+    """La temperature de ce que l'ecran montre, et d'ou on la tient :
+    ('rampe', K) quand la rampe gamma le dit, ('flux', K) quand f.lux tourne
+    sans rampe lisible, (None, 6500) sinon."""
     if cfg.get("ecran_suit_filtre_bleu", True):
         lut = rampe_gamma()
         if lut:
-            r, v, b = lut[0][r], lut[1][v], lut[2][b]
+            r, b = max(1, lut[0][255]), lut[2][255]
+            if b / r < 0.97:
+                return "rampe", _kelvin_du_blanc(lut[0][255], lut[1][255], lut[2][255])
+        k = kelvin_attendu_flux()
+        if k:
+            return "flux", k
+    return None, 6500.0
+
+
+def adapter_couleur_ecran(rgb, cfg):
+    """Teinte une couleur (0-255) comme l'OEIL la voit sur la guirlande.
+
+    Trois choses, dans l'ordre : le filtre de lumiere bleue (la rampe gamma
+    quand elle se lit, sinon ce que f.lux doit tenir d'apres ses reglages et
+    l'heure), le blanc de la guirlande elle-meme (une LED tire au bleu : a
+    couleur egale, elle parait plus froide que l'ecran), et la balance manuelle.
+    Tout passe par des kelvins et un seul jeu de gains, pousse par
+    `ecran_filtre_force`."""
+    r, v, b = rgb
+    source, k = kelvin_ecran(cfg)
+    k_led = float(cfg.get("led_blanc_kelvin", 7500) or 6500)
+    force = float(cfg.get("ecran_filtre_force", 1.3) or 1.0)
+    if source or abs(k_led - 6500.0) > 50:
+        gr, gv, gb = gains_kelvin(k, k_led, force if source else 1.0)
+        r, v, b = r * gr, v * gv, b * gb
     temp = float(cfg.get("ecran_balance_temp", 0.0) or 0.0)
     tint = float(cfg.get("ecran_balance_tint", 0.0) or 0.0)
     if temp or tint:
@@ -1300,14 +1456,35 @@ def _kelvin_du_blanc(r, v, b):
 
 
 def _flux_tourne():
-    """Vrai si f.lux tourne : il tient une fenetre cachee de classe « flux »."""
+    """Vrai si f.lux tourne : sa fenetre cachee de classe « flux », ou, plus
+    surement, son processus (flux.exe) -- la classe de fenetre a change d'une
+    version a l'autre, le nom du processus non. Cache cinq secondes : on ne
+    parcourt pas la liste des processus a chaque image."""
+    maintenant = time.time()
+    if _FLUX_PROC["ts"] and maintenant - _FLUX_PROC["ts"] < 5.0:
+        return _FLUX_PROC["val"]
+    _FLUX_PROC["ts"] = maintenant
+    trouve = False
     try:
         _gdi, user = _apis_ecran()
-        if not user:
-            return False
-        return bool(user.FindWindowW("flux", None))
+        if user and user.FindWindowW("flux", None):
+            trouve = True
     except Exception:
-        return False
+        pass
+    if not trouve and os.name == "nt":
+        try:
+            import psutil
+            for p in psutil.process_iter(["name"]):
+                if (p.info.get("name") or "").lower() in ("flux.exe", "flux"):
+                    trouve = True
+                    break
+        except Exception:
+            pass
+    _FLUX_PROC["val"] = trouve
+    return trouve
+
+
+_FLUX_PROC = {"ts": 0.0, "val": False}
 
 
 def _nightlight_actif():
@@ -1356,8 +1533,18 @@ def diag_filtre_ecran(cfg):
                 d["compense"] = d["suivi"]
         d["flux"] = _flux_tourne()
         d["nightlight"] = _nightlight_actif()
+        if d["source"] is None and d["flux"]:
+            k = kelvin_attendu_flux()
+            if k:
+                d["source"] = "flux"
+                d["kelvin"] = int(round(k / 50.0) * 50)
+                g = gains_kelvin(k, 6500.0)
+                d["chaud_pct"] = int(round((1 - g[2]) * 100))
+                d["compense"] = d["suivi"]
         if d["source"] is None and d["nightlight"]:
             d["source"] = "nightlight"
+        d["led_kelvin"] = int(cfg.get("led_blanc_kelvin", 7500) or 6500)
+        d["force"] = float(cfg.get("ecran_filtre_force", 1.3) or 1.0)
     except Exception:
         pass
     _DIAG_FILTRE["val"] = d
@@ -1368,12 +1555,17 @@ def texte_filtre_ecran(d):
     """Une phrase pour l'indicateur, et vrai si Machi Tool compense vraiment."""
     if not d.get("suivi"):
         return ("Suivi des filtres desactive.", False)
+    suffixe = " (x%.1f, guirlande a %d K)" % (float(d.get("force") or 1.0), int(d.get("led_kelvin") or 6500))
     if d.get("source") == "filtre":
-        t = "Filtre ecran suivi - ~%d K, rechauffe %d%%" % (
-            d.get("kelvin") or 0, d.get("chaud_pct") or 0)
+        t = "Filtre ecran suivi (rampe lue) - ~%d K, rechauffe %d%%%s" % (
+            d.get("kelvin") or 0, d.get("chaud_pct") or 0, suffixe)
+        return (t, bool(d.get("compense")))
+    if d.get("source") == "flux":
+        t = "f.lux tourne, rampe illisible : suivi d'apres ses reglages et l'heure - ~%d K, rechauffe %d%%%s" % (
+            d.get("kelvin") or 0, d.get("chaud_pct") or 0, suffixe)
         return (t, bool(d.get("compense")))
     if d.get("flux"):
-        return ("f.lux tourne, mais sa rampe est illisible sur ce pilote - "
+        return ("f.lux tourne, mais ni sa rampe ni ses reglages ne se lisent - "
                 "teinte non suivie (regle la balance a la main).", False)
     if d.get("nightlight"):
         return ("Windows Night Light actif - autre pipeline, non suivi "
@@ -3652,6 +3844,16 @@ class Panneau:
         self.var_balance_tint = self.reglette(
             f, "ecran_balance_tint", "Teinte", -1.0, 1.0, 0.05,
             "Negatif vire au vert, positif au magenta. 0 = neutre.")
+        self.var_led_kelvin = self.reglette(
+            f, "led_blanc_kelvin", "Blanc de la guirlande (K)", 4000, 9500, 250,
+            "Le blanc de tes LED elles-memes. La plupart tirent au bleu (7000-8500) : "
+            "a couleur egale elles paraissent plus froides que l'ecran, et on corrige. "
+            "6500 = neutre. Monte si la guirlande reste trop bleue le soir.", entier=True)
+        self.var_filtre_force = self.reglette(
+            f, "ecran_filtre_force", "Force de la compensation", 0.5, 2.5, 0.05,
+            "De combien on pousse le rechauffement quand un filtre agit. 1 = tel que "
+            "l'ecran ; 1,3 met en general la guirlande d'accord avec lui ; plus, "
+            "pour une guirlande vue de cote.")
 
         self.separateur(f, 14, 8)
         self.titre(f, "effet de l'ecran en direct").pack(fill="x", pady=(0, 6))
@@ -4385,6 +4587,8 @@ class Panneau:
         self.cfg["ecran_suit_filtre_bleu"] = bool(self.var_filtre_bleu.get())
         self.cfg["ecran_balance_temp"] = round(self.var_balance_temp.get(), 2)
         self.cfg["ecran_balance_tint"] = round(self.var_balance_tint.get(), 2)
+        self.cfg["led_blanc_kelvin"] = int(round(self.var_led_kelvin.get() / 250.0) * 250)
+        self.cfg["ecran_filtre_force"] = round(self.var_filtre_force.get(), 2)
         self.cfg["son_bande"] = self.var_bande.get()
         self.cfg["son_palette"] = self.var_palette.get()
         self.cfg["son_sensibilite"] = round(self.var_sens.get(), 2)
