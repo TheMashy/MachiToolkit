@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -210,6 +210,12 @@ CONFIG_DEFAUT = {
     # personne ne peut joindre l'application depuis l'exterieur — c'est
     # alors elle qui va demander au site s'il a quelque chose a dire.
     "pont_site": "https://braindebugger-production.up.railway.app",
+    # Le raccourci de demarrage se REPARE tout seul. Une entree effacee (un
+    # nettoyeur, une reinstallation de Windows, un profil recree) ne se voit
+    # pas : l'application ne se relance simplement plus jamais, et le journal
+    # s'arrete sans un mot. On retient donc le choix ici, et on repose le
+    # raccourci a chaque lancement quand il manque ou pointe ailleurs.
+    "demarrage_auto": True,
     "pont_releve": True,             # aller chercher les rappels en attente
     "pont_intervalle": 10,           # minutes entre deux releves
     "pont_cle": "",                  # cle transmise au site, s'il en veut une
@@ -662,12 +668,19 @@ def sommeil_estime(jour=None, plage=None, trous=None):
         fins.sort()
         debuts.sort()
         # Les silences : de chaque fin a la premiere reprise qui la suit.
+        # Un silence ne CONTIENT aucune activite connue : « derniere touche a
+        # 23:50, premiere a 11:00 » n'est pas une nuit de onze heures si on sait
+        # qu'il y a eu du clavier a 03:30. Sans cette regle, la plus longue
+        # l'emportait et le coucher tombait quatre heures trop tot.
+        connus = list(fins) + list(debuts)
         silences = []
         for f_ in fins:
             suiv = [d for d in debuts if d > f_]
             if not suiv:
                 continue
             d = suiv[0]
+            if any(f_ + 1 < t < d - 1 for t in connus):
+                continue
             # Deux fins pour la meme reprise : on garde les deux, la plus longue
             # nuit RECEVABLE l'emportera (une fin trop ancienne ferait un
             # silence de trente heures, jete ensuite par la borne des seize).
@@ -727,11 +740,45 @@ def categorie_activite(contexte):
     return "inconnu"
 
 
-def _reinit_jour():
-    ACTIVITE.update(jour=_jour_courant(), contexte="", titre_courant="",
+def _reinit_jour(reprendre=False):
+    """Ouvre une journee vide -- ou REPREND celle qui est deja sur le disque.
+
+    Au demarrage, une journee en cours existe presque toujours : l'application
+    vient d'etre relancee (mise a jour, redemarrage, plantage) et le disque
+    porte deja son temps d'ecran. Repartir de zero le REECRASAIT : `sauver_activite`
+    remplace la ligne du jour, donc six heures d'ecran devenaient « 0 min » a
+    chaque relance. Trois mises a jour dans la journee, et la journee etait vide.
+
+    On relit donc les compteurs et on continue de compter dessus. Au changement
+    de jour (minuit), `reprendre` reste faux : c'est bien une journee neuve.
+    """
+    jour = _jour_courant()
+    ACTIVITE.update(jour=jour, contexte="", titre_courant="",
                     depuis=time.time(), temps={}, titres={}, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
                     trou_depuis=0.0)
+    if not reprendre:
+        return
+    try:
+        d = _digest_enregistre(jour)
+        if not isinstance(d, dict):
+            return
+        temps = d.get("temps_par_contexte_s") or {}
+        ACTIVITE["temps"] = {str(k): float(v) for k, v in temps.items()
+                             if isinstance(v, (int, float)) and v > 0}
+        ACTIVITE["titres"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
+                              for k, v in (d.get("titres") or {}).items()}
+        ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
+        ACTIVITE["actif_s"] = float(d.get("actif_minutes") or 0) * 60.0
+        plage = d.get("plage") or {}
+        ACTIVITE["premiere"] = str(plage.get("de") or "")
+        ACTIVITE["derniere"] = str(plage.get("a") or "")
+        ACTIVITE["trous"] = [t for t in (d.get("trous") or []) if isinstance(t, dict)][:40]
+        if ACTIVITE["temps"]:
+            minutes = round(sum(ACTIVITE["temps"].values()) / 60)
+            print("Journee du %s reprise : %d min deja comptees." % (jour, minutes))
+    except Exception as e:
+        print("Reprise de la journee impossible :", e)
 
 
 def activite_note(contexte, actif, titres_complets=False, maintenant=None):
@@ -746,7 +793,7 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     maintenant = maintenant if maintenant is not None else time.time()
     if ACTIVITE["jour"] != _jour_courant():
         sauver_activite()
-        _reinit_jour()
+        _reinit_jour()            # minuit : une journee neuve, rien a reprendre
 
     cat = categorie_activite(contexte)
     titre = (contexte or "").partition("|")[2].strip()
@@ -989,23 +1036,58 @@ def _fil_activite(cfg):
             time.sleep(0.5)
 
 
+def fil_activite_vivant():
+    """Le fil d'echantillonnage tourne-t-il vraiment ? Ce que le chien de garde
+    interroge : un drapeau ne suffit pas, il faut que le THREAD soit la."""
+    t = MOTEUR_ACTIVITE.get("fil")
+    return bool(t and t.is_alive())
+
+
 def demarrer_activite(cfg):
     arreter_activite()
     ACTIVITE["active"] = bool(cfg.get("collecte_active", False))
     if not ACTIVITE["active"]:
         ACTIVITE["message"] = "arretee"
         return
-    _reinit_jour()
+    _reinit_jour(reprendre=True)   # une relance ne doit pas effacer la journee
     MOTEUR_ACTIVITE["marche"] = True
     ACTIVITE["message"] = "journal en cours"
-    threading.Thread(target=_fil_activite, args=(cfg,), daemon=True).start()
+    fil = threading.Thread(target=_fil_activite, args=(cfg,), daemon=True)
+    MOTEUR_ACTIVITE["fil"] = fil
+    fil.start()
 
 
 def arreter_activite():
     if MOTEUR_ACTIVITE["marche"]:
         sauver_activite()
     MOTEUR_ACTIVITE["marche"] = False
+    MOTEUR_ACTIVITE["fil"] = None
     ACTIVITE["active"] = False
+
+
+def veiller_sur_activite(cfg):
+    """LE CHIEN DE GARDE. Le journal doit tourner tant que l'application vit.
+
+    Le fil attrape ses exceptions a chaque tour, mais il n'attrape pas tout :
+    une erreur hors du try (l'import d'un module qui manque a chaud, une
+    coupure memoire) tuerait le thread en silence. La collecte s'arreterait
+    sans que rien ne le dise -- et on ne le verrait que des semaines plus tard,
+    devant un mois de journal vide.
+
+    On le relance donc, et on le NOTE : `redemarrages` se lit dans les reglages.
+    """
+    if not cfg.get("collecte_active", False) or not ACTIVITE["active"]:
+        return False
+    if fil_activite_vivant():
+        return False
+    MOTEUR_ACTIVITE["redemarrages"] = MOTEUR_ACTIVITE.get("redemarrages", 0) + 1
+    MOTEUR_ACTIVITE["marche"] = True
+    fil = threading.Thread(target=_fil_activite, args=(cfg,), daemon=True)
+    MOTEUR_ACTIVITE["fil"] = fil
+    fil.start()
+    ACTIVITE["message"] = "journal repris (%d)" % MOTEUR_ACTIVITE["redemarrages"]
+    print("Fil d'activite relance par le chien de garde.")
+    return True
 
 
 
@@ -1461,7 +1543,7 @@ def _flux_tourne():
     version a l'autre, le nom du processus non. Cache cinq secondes : on ne
     parcourt pas la liste des processus a chaque image."""
     maintenant = time.time()
-    if _FLUX_PROC["ts"] and maintenant - _FLUX_PROC["ts"] < 5.0:
+    if _FLUX_PROC["ts"] and maintenant - _FLUX_PROC["ts"] < 30.0:
         return _FLUX_PROC["val"]
     _FLUX_PROC["ts"] = maintenant
     trouve = False
@@ -2134,6 +2216,16 @@ def deposer_rappel(identifiant, titre, texte):
     return True
 
 
+def _plus_vieux_qu_un_jour(iso):
+    """Vrai si cet horodatage ISO date de plus de 24 h (ou ne se lit pas)."""
+    try:
+        t = time.mktime(time.strptime(str(iso)[:19], "%Y-%m-%dT%H:%M:%S"))
+        # strptime rend une heure locale : l'ISO du site est en UTC.
+        return (time.time() - (t - time.timezone)) > 86400
+    except Exception:
+        return False
+
+
 def relever_le_site(cfg):
     """Demande au site ce qu'il a en attente.
 
@@ -2208,6 +2300,20 @@ def relever_le_site(cfg):
         PONT["jours"] = [j for j in donnees["jours"] if isinstance(j, dict)][:400]
     if isinstance(donnees.get("reperes"), list):
         PONT["reperes"] = [r for r in donnees["reperes"] if isinstance(r, dict)][:400]
+
+    # LA DEMANDE DE SYNCHRO. Le site ne peut rien pousser vers cette machine :
+    # c'est ici, au releve, qu'on apprend qu'on la lui doit. Deux raisons de
+    # partir : quelqu'un l'a demandee depuis le site (« synchroniser », meme
+    # depuis un telephone), ou le site n'a rien recu depuis plus d'un jour alors
+    # qu'on collecte -- une passerelle muette qui se repare toute seule.
+    syn = donnees.get("synchro") if isinstance(donnees.get("synchro"), dict) else {}
+    demande = str(syn.get("demande_le") or "")
+    if demande and demande != SYNC.get("demande_vue"):
+        SYNC["demande_vue"] = demande
+        PONT["message"] = "Le site demande la journee : envoi en cours."
+        synchroniser_activite(cfg, minimum=0)
+    elif syn.get("recu_le") is None or _plus_vieux_qu_un_jour(syn.get("recu_le")):
+        synchroniser_activite(cfg, minimum=6 * 3600)
 
     PONT["etat"] = "ok"
     PONT["vu_le"] = time.time()
@@ -4523,7 +4629,16 @@ class Panneau:
         ETAT["pause"] = bool(self.var_pause.get())
 
     def basculer_demarrage(self):
-        if self.var_demarrage.get():
+        # Le choix est RETENU, pas seulement applique : c'est lui que la
+        # reparation au lancement relit. Sans ca, un raccourci efface par un
+        # tiers ne se distinguerait pas d'un raccourci retire volontairement.
+        voulu = bool(self.var_demarrage.get())
+        self.cfg["demarrage_auto"] = voulu
+        try:
+            sauver_config(self.cfg)
+        except Exception:
+            pass
+        if voulu:
             installer_demarrage()
         else:
             retirer_demarrage()
@@ -5210,6 +5325,36 @@ def retirer_demarrage():
         os.remove(p)
 
 
+def assurer_demarrage(cfg):
+    """Repose le raccourci de demarrage s'il manque ou s'il pointe ailleurs.
+
+    Sans ca, une entree effacee (nettoyeur, profil recree, mise a jour de
+    Windows) ou laissee sur un ancien chemin apres une reinstallation ne se
+    voit pas : l'application ne se relance plus au demarrage, et le journal
+    s'arrete sans un mot. On ne la repose QUE si elle etait voulue --
+    `demarrage_auto` retient le choix, la seule presence du fichier ne
+    distinguant pas « retire par l'utilisateur » de « efface par un tiers ».
+    """
+    if os.name != "nt" or not FIGE or not cfg.get("demarrage_auto", True):
+        return None
+    p = chemin_demarrage()
+    voulu = commande_lancement().replace('"', '""')
+    try:
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                if voulu in f.read():
+                    return None            # deja bon
+            raison = "raccourci de demarrage repointe"
+        else:
+            raison = "raccourci de demarrage repose"
+        if installer_demarrage():
+            print(raison.capitalize(), ":", p)
+            return raison
+    except Exception as e:
+        print("Verification du demarrage impossible :", e)
+    return None
+
+
 def creer_lanceur():
     """Pour le mode script uniquement."""
     cmd = commande_lancement().replace('"', '""')
@@ -5552,11 +5697,21 @@ def lancer():
         fermer_session_perdue()
         noter_session("demarrage")     # vaut reveil : l'app demarre avec Windows
 
+    assurer_demarrage(CFG)     # le raccourci de demarrage, repose s'il a disparu
+
     def veille_activite():
         while ETAT["en_marche"]:
             fin = time.time() + max(1, int(CFG.get("collecte_intervalle_heures", 6))) * 3600
             while ETAT["en_marche"] and time.time() < fin:
+                # Le chien de garde passe toutes les trente secondes : si le fil
+                # d'echantillonnage est mort, il repart. Une collecte arretee ne
+                # se voit pas autrement qu'a un mois de journal vide.
                 time.sleep(5)
+                if int(time.time()) % 30 < 5:
+                    try:
+                        veiller_sur_activite(CFG)
+                    except Exception as e:
+                        print("Chien de garde :", e)
             if not ETAT["en_marche"]:
                 return
             if ACTIVITE["active"]:
