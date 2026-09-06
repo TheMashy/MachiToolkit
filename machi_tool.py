@@ -37,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.19.0"
+VERSION = "1.20.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -198,7 +198,7 @@ CONFIG_DEFAUT = {
     # Passerelle HTTP locale : permet a un site web de piloter la guirlande.
     # Fermee par defaut — sans jeton ni liste d'origines, n'importe quelle page
     # ouverte dans le navigateur pourrait allumer les lumieres du salon.
-    "api_active": False,
+    "api_active": True,              # 127.0.0.1 seulement, cle exigee : le site synchronise sans attendre
     "api_port": 7373,
     "api_jeton": "",
     "api_origines": ["https://braindebugger-production.up.railway.app",
@@ -217,7 +217,7 @@ CONFIG_DEFAUT = {
     # raccourci a chaque lancement quand il manque ou pointe ailleurs.
     "demarrage_auto": True,
     "pont_releve": True,             # aller chercher les rappels en attente
-    "pont_intervalle": 10,           # minutes entre deux releves
+    "pont_intervalle": 3,            # minutes entre deux releves (une demande deposee sur le site attend au plus ca)
     "pont_cle": "",                  # cle transmise au site, s'il en veut une
     "pont_notifie": True,            # afficher les rappels recus
 
@@ -246,9 +246,9 @@ CONFIG_DEFAUT = {
     "collecte_intervalle_heures": 6,
 
     # Mises a jour depuis les publications GitHub du depot.
-    "config_version": 2,              # sert aux migrations, voir charger_config
+    "config_version": 3,              # sert aux migrations, voir charger_config
     "maj_verifier": True,             # regarder si une version plus recente existe
-    "maj_installation_auto": False,   # poser la mise a jour sans rien demander
+    "maj_installation_auto": True,    # poser la mise a jour sans rien demander
     # Chaque fusion sur main sort une pre-version : la refuser reviendrait
     # a ne rien voir passer entre deux versions stables.
     "maj_prereleases": True,
@@ -339,7 +339,21 @@ def charger_config():
         cfg["maj_intervalle_heures"] = min(
             int(cfg.get("maj_intervalle_heures", 1)), 2)
         print("Configuration migree : les nouveaux builds seront proposes.")
-    cfg["config_version"] = 2
+    # Version 3 : l'application se tient a jour SEULE. C'est ce que promet le
+    # message d'installation, et c'est la seule issue quand l'icone a disparu
+    # de la barre -- sans elle, personne ne peut cliquer « Installer ». Elle
+    # releve le site toutes les trois minutes plutot que dix (une demande de
+    # synchro deposee depuis le site attendait jusqu'a dix minutes), et tient
+    # son serveur local (127.0.0.1, cle exigee) pour que « synchroniser »
+    # depuis ce poste soit immediat. Une fois, sans y revenir ensuite.
+    if enregistre and int(enregistre.get("config_version", 1)) < 3:
+        cfg["maj_installation_auto"] = True
+        if int(cfg.get("pont_intervalle", 3) or 3) >= 10:
+            cfg["pont_intervalle"] = 3
+        cfg["api_active"] = True
+        print("Configuration migree (v3) : mise a jour automatique, releve "
+              "toutes les 3 min, serveur local allume.")
+    cfg["config_version"] = 3
     return cfg
 
 
@@ -476,6 +490,32 @@ ACTIVITE = {
 
 MOTEUR_ACTIVITE = {"marche": False}
 SYNC = {"dernier": 0.0, "reussi": 0.0}   # derniere synchro poussee ; dernier envoi reussi
+TRAY = {"icone": None, "reposer": False}  # l'icone de la barre, reposee si elle disparait
+
+# Le mot laisse par une seconde instance lancee via machitool://sync pendant
+# que la premiere tourne : le mutex la renvoie aussitot, et sans ce fichier la
+# demande du site tombait dans le vide. La premiere le lit toutes les cinq
+# secondes (voir veille_activite).
+FICHIER_DEMANDE = os.path.join(DOSSIER, "synchro_demandee")
+
+
+def deposer_demande_synchro(origine="site"):
+    try:
+        with open(FICHIER_DEMANDE, "w", encoding="utf-8") as f:
+            f.write("%s %s" % (origine, time.strftime("%Y-%m-%d %H:%M:%S")))
+    except Exception as e:
+        print("Demande de synchro non deposee :", e)
+
+
+def relever_demande_synchro():
+    """Vrai une seule fois par demande : le mot est efface en le lisant."""
+    try:
+        if not os.path.exists(FICHIER_DEMANDE):
+            return False
+        os.remove(FICHIER_DEMANDE)
+        return True
+    except Exception:
+        return False
 FICHIER_ENVOI = os.path.join(DOSSIER, "dernier_envoi.txt")  # survit au redemarrage
 SEUIL_TROU = 20 * 60          # une absence n'est notee qu'au-dela de 20 min
 FICHIER_SESSIONS = os.path.join(DOSSIER, "sessions.jsonl")
@@ -929,11 +969,16 @@ def envoyer_activite_au_site(cfg):
     resume = sauver_activite() or resume_activite()
     url = base + "/api/machitool/activite"
     cle = str(cfg.get("pont_cle", "")).strip()
-    entetes = {"User-Agent": "MachiToolkit", "Content-Type": "application/json"}
+    entetes = {"User-Agent": "MachiToolkit/" + VERSION, "Content-Type": "application/json"}
     if cle:
         entetes["Authorization"] = "Bearer " + cle
         entetes["X-Machitool-Cle"] = cle
     try:
+        # La version part avec le digest : c'est ce qui permet au site de dire
+        # « ta version ne sait pas encore lire les demandes » au lieu de
+        # « Machi Tool ne repond pas », qui ne dit rien de ce qu'il faut faire.
+        if isinstance(resume, dict):
+            resume = dict(resume, version=VERSION)
         corps = json.dumps(resume, ensure_ascii=False).encode("utf-8")
         requete = urllib.request.Request(url, data=corps, headers=entetes)
         with urllib.request.urlopen(requete, timeout=15,
@@ -2244,13 +2289,13 @@ def relever_le_site(cfg):
     base = str(cfg.get("pont_site", "")).strip().rstrip("/")
     if not base:
         return False
-    url = base + "/api/machitool/attente"
+    url = base + "/api/machitool/attente?version=" + urllib.parse.quote(VERSION)
     cle = str(cfg.get("pont_cle", "")).strip()
-    entetes = {"User-Agent": "MachiToolkit", "Accept": "application/json"}
+    entetes = {"User-Agent": "MachiToolkit/" + VERSION, "Accept": "application/json"}
     if cle:
         # La cle part de trois facons a la fois : le site n'a qu'a lire
         # celle qui l'arrange, sans qu'on ait a s'accorder d'avance.
-        url += "?cle=" + urllib.parse.quote(cle)
+        url += "&cle=" + urllib.parse.quote(cle)
         entetes["Authorization"] = "Bearer " + cle
         entetes["X-Machitool-Cle"] = cle
 
@@ -2668,8 +2713,21 @@ def surveiller_arret_windows():
 
     WM_QUERYENDSESSION = 0x0011
     WM_ENDSESSION = 0x0016
+    # Quand l'Explorateur redemarre (plantage, mise a jour, ou simplement
+    # trop lent a l'ouverture de session), Windows retire TOUTES les icones
+    # de la barre et diffuse « TaskbarCreated » : a chaque application de
+    # reposer la sienne. pystray ne l'ecoute pas ; cette fenetre-ci, si.
+    try:
+        import ctypes
+        MSG_BARRE = ctypes.windll.user32.RegisterWindowMessageW("TaskbarCreated")
+    except Exception:
+        MSG_BARRE = 0
 
     def traiter(fenetre, message, wparam, lparam):
+        if MSG_BARRE and message == MSG_BARRE:
+            TRAY["reposer"] = True
+            print("Barre des taches recreee : l'icone sera reposee.")
+            return 0
         if message in (WM_QUERYENDSESSION, WM_ENDSESSION):
             if CFG.get("eteindre_en_partant", True):
                 eteindre_guirlande()
@@ -4348,7 +4406,7 @@ class Panneau:
                   % self.cfg.get("maj_intervalle_heures", 6),
                   self.var_maj_verifier, self.options_maj).pack(fill="x")
         self.var_maj_auto = tk.IntVar(
-            value=1 if self.cfg.get("maj_installation_auto", False) else 0)
+            value=1 if self.cfg.get("maj_installation_auto", True) else 0)
         self.case(f, "Poser la mise a jour sans rien demander — l'application "
                      "se ferme et redemarre seule, les reglages sont conserves",
                   self.var_maj_auto, self.options_maj).pack(fill="x", pady=(4, 0))
@@ -4492,7 +4550,7 @@ class Panneau:
 
         self.var_pont_releve = tk.IntVar(value=1 if self.cfg.get("pont_releve", True) else 0)
         self.var_pont_notifie = tk.IntVar(value=1 if self.cfg.get("pont_notifie", True) else 0)
-        self.var_pont_intervalle = tk.IntVar(value=int(self.cfg.get("pont_intervalle", 10)))
+        self.var_pont_intervalle = tk.IntVar(value=int(self.cfg.get("pont_intervalle", 3)))
         self.var_presence = tk.IntVar(value=1 if self.cfg.get("pont_presence", True) else 0)
         self.var_presence_humeur = tk.IntVar(
             value=1 if self.cfg.get("pont_presence_suit_humeur", True) else 0)
@@ -5585,7 +5643,10 @@ def lancer():
     import pystray
     panneau = Panneau(CFG, lambda: demande_arret.set())
 
-    icone = pystray.Icon("machitool", image_icone((139, 92, 246)), NOM_APP)
+    # L'icone vit dans TRAY, pas dans une variable locale : elle peut etre
+    # REPOSEE en cours de route (voir fil_icone), et tout ce qui la touche --
+    # notifications, couleur, menu, arret -- doit trouver la nouvelle.
+    TRAY["icone"] = pystray.Icon("machitool", image_icone((139, 92, 246)), NOM_APP)
 
     # ---- mise a jour -------------------------------------------------
     # Tout passe par un fil separe : une requete reseau dans le fil de
@@ -5593,7 +5654,7 @@ def lancer():
 
     def notifier(titre, texte):
         try:
-            icone.notify(texte, titre)
+            TRAY["icone"].notify(texte, titre)
         except Exception:
             print(titre, ":", texte)
 
@@ -5622,7 +5683,7 @@ def lancer():
         publication = verifier_maj(CFG)
         if not publication:
             return
-        if CFG.get("maj_installation_auto", False):
+        if CFG.get("maj_installation_auto", True):
             travail_maj("installer")
         else:
             notifier(
@@ -5684,7 +5745,7 @@ def lancer():
                     relever_le_site(CFG)
                 except Exception as e:
                     print("Releve du pont impossible :", e)
-            attente = max(1, int(CFG.get("pont_intervalle", 10))) * 60
+            attente = max(1, int(CFG.get("pont_intervalle", 3))) * 60
 
     threading.Thread(target=veille_pont, daemon=True).start()
 
@@ -5707,6 +5768,9 @@ def lancer():
                 # d'echantillonnage est mort, il repart. Une collecte arretee ne
                 # se voit pas autrement qu'a un mois de journal vide.
                 time.sleep(5)
+                if relever_demande_synchro():
+                    print("Synchro demandee par machitool://sync : envoi.")
+                    synchroniser_activite(CFG, minimum=0)
                 if int(time.time()) % 30 < 5:
                     try:
                         veiller_sur_activite(CFG)
@@ -5737,7 +5801,8 @@ def lancer():
             return "Verification en cours..."
         return "Rechercher une mise a jour"
 
-    icone.menu = pystray.Menu(
+    def construire_menu():
+        return pystray.Menu(
         pystray.MenuItem("Ouvrir le panneau", lambda *_: demande_ouverture.set(), default=True),
         pystray.MenuItem("Pause", lambda *_: ETAT.update(pause=not ETAT["pause"]),
                          checked=lambda i: ETAT["pause"]),
@@ -5751,8 +5816,37 @@ def lancer():
                                                                 "telechargement")),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quitter", lambda *_: demande_arret.set()),
-    )
-    threading.Thread(target=icone.run, daemon=True).start()
+        )
+
+    TRAY["icone"].menu = construire_menu()
+
+    def fil_icone():
+        """L'icone, reposee tant que l'application tourne.
+
+        Deux facons de la perdre sans que rien ne s'arrete : pystray rend la
+        main SANS LEVER quand sa boucle de messages casse, et Windows retire
+        toutes les icones quand l'Explorateur redemarre (TaskbarCreated, lu
+        par la fenetre cachee). Dans les deux cas l'application tournait --
+        elle eclairait, elle collectait -- mais n'avait plus d'icone, donc plus
+        de menu, plus de « Quitter », plus de « Installer la mise a jour ».
+        Ici, le fil ne meurt jamais : il repose une icone neuve et repart.
+        """
+        premiere = True
+        while ETAT["en_marche"] and not demande_arret.is_set():
+            if not premiere:
+                time.sleep(3)
+                if not ETAT["en_marche"] or demande_arret.is_set():
+                    return
+                TRAY["icone"] = pystray.Icon("machitool", image_icone(ETAT["couleur"]), NOM_APP)
+                TRAY["icone"].menu = construire_menu()
+                print("Icone reposee dans la barre.")
+            premiere = False
+            try:
+                TRAY["icone"].run()
+            except Exception as e:
+                print("Icone de la barre tombee :", e)
+
+    threading.Thread(target=fil_icone, daemon=True).start()
 
     if premiere_fois:
         panneau.aller("appairage")
@@ -5772,18 +5866,26 @@ def lancer():
             arreter_api()
             arreter_audio()
             try:
-                icone.stop()
+                TRAY["icone"].stop()
             except Exception:
                 pass
             panneau.root.destroy()
             return
+        if TRAY.get("reposer"):
+            # La barre a ete recreee : on arrete l'icone en place, et fil_icone
+            # en repose une neuve des que run() a rendu la main.
+            TRAY["reposer"] = False
+            try:
+                TRAY["icone"].stop()
+            except Exception:
+                pass
         if demande_ouverture.is_set():
             demande_ouverture.clear()
             panneau.afficher()
         if time.time() - dernier[0] > 2.0:
             dernier[0] = time.time()
             try:
-                icone.icon = image_icone(ETAT["couleur"])
+                TRAY["icone"].icon = image_icone(ETAT["couleur"])
             except Exception:
                 pass
         if ETAT.get("rappel_neuf") and PONT["rappels"]:
@@ -5794,7 +5896,7 @@ def lancer():
         if MAJ["etat"] != dernier_etat_maj[0]:
             dernier_etat_maj[0] = MAJ["etat"]
             try:
-                icone.update_menu()
+                TRAY["icone"].update_menu()
             except Exception:
                 pass
         panneau.root.after(150, surveiller)
@@ -5825,6 +5927,14 @@ def main():
         print("Retire du demarrage.")
         return
 
+    # Le site ouvre machitool://sync pour reveiller l'application. Windows
+    # lance alors « MachiTool.exe machitool://sync » : si elle tourne deja, le
+    # mutex renvoie cette seconde copie -- on lui laisse d'abord un mot, que
+    # la premiere lit dans les cinq secondes et honore en envoyant la journee.
+    # Si elle ne tournait pas, le mot est lu par celle qui demarre.
+    lien = next((a for a in sys.argv[1:] if a.startswith("machitool://")), None)
+    if lien:
+        deposer_demande_synchro("lien")
     if FIGE:
         if installer_ou_mettre_a_jour():
             return
