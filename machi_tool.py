@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.20.2"
+VERSION = "1.20.3"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -2889,22 +2889,72 @@ def identite_barre_taches():
 
 
 def activer_dpi():
-    """A appeler avant la premiere fenetre, sinon Windows l'ignore."""
+    """A appeler avant la premiere fenetre, sinon Windows l'ignore.
+
+    ON REGARDE CE QUE WINDOWS REPOND, PAS SEULEMENT S'IL A REPONDU.
+
+    Ces trois fonctions ne LEVENT pas quand elles echouent : elles rendent
+    faux. La boucle attrapait donc l'exception qui ne venait jamais, et
+    sortait sur la premiere — meme quand celle-ci avait refuse. Le processus
+    restait alors aveugle a la finesse des ecrans, GetDpiForWindow renvoyait
+    partout celle du principal, et la fenetre gardait la taille du 4K en
+    passant sur le 1080p : trop grande, tronquee par le bas.
+
+    On lit maintenant la reponse, on passe a la suivante si elle est
+    negative, et on ecrit dans le journal ce qui a fini par prendre.
+    """
     if os.name != "nt":
         return
     import ctypes
-    # -4 = par ecran, version 2 : suit le facteur de chaque moniteur, y
-    # compris quand la fenetre est deplacee de l'un a l'autre.
-    for tentative in (
-            lambda: ctypes.windll.user32.SetProcessDpiAwarenessContext(
-                ctypes.c_void_p(-4)),
-            lambda: ctypes.windll.shcore.SetProcessDpiAwareness(2),
-            lambda: ctypes.windll.user32.SetProcessDPIAware()):
+    user32, shcore = ctypes.windll.user32, None
+    try:
+        shcore = ctypes.windll.shcore
+    except Exception:
+        pass
+
+    def par_ecran_v2():
+        # -4 = par ecran, version 2 : suit le facteur de chaque moniteur, y
+        # compris quand la fenetre est deplacee de l'un a l'autre.
+        return bool(user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)))
+
+    def par_ecran():
+        if shcore is None:
+            return False
+        # HRESULT : 0 = pose, 0x80070005 = deja pose par quelqu'un d'autre.
+        r = shcore.SetProcessDpiAwareness(2)
+        return r in (0, -2147024891)
+
+    def systeme():
+        return bool(user32.SetProcessDPIAware())
+
+    for nom, tentative in (("par ecran v2", par_ecran_v2),
+                           ("par ecran", par_ecran),
+                           ("systeme", systeme)):
         try:
-            tentative()
-            return
+            if tentative():
+                print("Finesse d'ecran : mode « %s ». %s" % (nom, _dit_la_finesse()))
+                return
         except Exception:
             continue
+    print("Finesse d'ecran : aucun mode accepte. %s" % _dit_la_finesse())
+
+
+def _dit_la_finesse():
+    """Ce que Windows dit VRAIMENT du processus, une fois les appels passes.
+
+    Sans cette relecture, un journal qui annonce « par ecran v2 » ne prouve
+    rien : c'est ce qui manquait pour voir que la fenetre restait a l'echelle
+    du 4K sur le 1080p.
+    """
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        contexte = user32.GetThreadDpiAwarenessContext()
+        niveau = user32.GetAwarenessFromDpiAwarenessContext(contexte)
+        return "Windows repond : %s." % {0: "aveugle", 1: "systeme",
+                                         2: "par ecran"}.get(niveau, "inconnu (%s)" % niveau)
+    except Exception:
+        return "Windows ne sait pas le dire (version trop ancienne)."
 
 
 def dpi_de_la_fenetre(racine):
@@ -2934,6 +2984,46 @@ def dpi_de_la_fenetre(racine):
         return 96.0
 
 
+# La fenetre, en pixels a l'echelle 1. Tout le reste s'en deduit : c'est ce
+# couple que l'echelle multiplie, et c'est donc lui qu'il faut comparer a la
+# place disponible sur l'ecran.
+FENETRE_BASE = (780, 700)
+FENETRE_MINI = (720, 640)
+
+
+def _ecran_de_la_fenetre(racine):
+    """(ecran, zone de travail) du moniteur qui porte la fenetre, en pixels.
+
+    La zone de travail exclut la barre des taches : c'est elle qui dit la
+    place reellement disponible, pas la resolution.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        poignee = user32.GetAncestor(racine.winfo_id(), 2) or racine.winfo_id()
+
+        class INFOS_MONITEUR(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        moniteur = user32.MonitorFromWindow(poignee, 2)   # 2 = le plus proche
+        if not moniteur:
+            return None
+        infos = INFOS_MONITEUR()
+        infos.cbSize = ctypes.sizeof(INFOS_MONITEUR)
+        if not user32.GetMonitorInfoW(moniteur, ctypes.byref(infos)):
+            return None
+        cadre = wintypes.RECT()
+        if not user32.GetWindowRect(poignee, ctypes.byref(cadre)):
+            cadre = None
+        return infos.rcMonitor, infos.rcWork, cadre
+    except Exception:
+        return None
+
+
 def fenetre_a_cheval(racine):
     """Vrai si la fenetre deborde du moniteur qui la porte.
 
@@ -2946,43 +3036,51 @@ def fenetre_a_cheval(racine):
     Tant qu'elle deborde, on ne touche a rien : la mesure ne veut rien dire
     tant que la fenetre n'est pas posee quelque part.
     """
-    if os.name != "nt":
+    lu = _ecran_de_la_fenetre(racine)
+    if not lu:
         return False
-    try:
-        import ctypes
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        poignee = user32.GetAncestor(racine.winfo_id(), 2) or racine.winfo_id()
-        cadre = wintypes.RECT()
-        if not user32.GetWindowRect(poignee, ctypes.byref(cadre)):
-            return False
-
-        class INFOS_MONITEUR(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-
-        moniteur = user32.MonitorFromWindow(poignee, 2)   # 2 = le plus proche
-        if not moniteur:
-            return False
-        infos = INFOS_MONITEUR()
-        infos.cbSize = ctypes.sizeof(INFOS_MONITEUR)
-        if not user32.GetMonitorInfoW(moniteur, ctypes.byref(infos)):
-            return False
-        e = infos.rcMonitor
-        return (cadre.left < e.left or cadre.top < e.top
-                or cadre.right > e.right or cadre.bottom > e.bottom)
-    except Exception:
+    e, _, cadre = lu
+    if cadre is None:
         return False
+    return (cadre.left < e.left or cadre.top < e.top
+            or cadre.right > e.right or cadre.bottom > e.bottom)
+
+
+def echelle_tenable(racine, voulue, marge=0.92):
+    """Rabaisse l'echelle jusqu'a ce que la fenetre TIENNE sur l'ecran.
+
+    LA FINESSE N'EST PAS LA PLACE, et c'est le defaut qu'on repare ici.
+    L'echelle ne se deduisait que des points par pouce : un 4K a 180 ppp donne
+    1,875, soit une fenetre de 1443 par 1295. Elle tient largement sur le 4K.
+    Sur le 1080p d'a cote, la meme fenetre est plus haute que l'ecran — on la
+    voyait deborder, tronquee par le bas, avec des caracteres enormes.
+
+    Deux moniteurs peuvent avoir la meme finesse et pas du tout la meme
+    surface. On borne donc par la zone de travail — celle qui exclut la barre
+    des taches, la seule qui dise la place vraiment disponible.
+    """
+    lu = _ecran_de_la_fenetre(racine)
+    if not lu:
+        return voulue
+    zone = lu[1]
+    largeur = max(1, zone.right - zone.left)
+    hauteur = max(1, zone.bottom - zone.top)
+    tenable = min(largeur * marge / FENETRE_BASE[0], hauteur * marge / FENETRE_BASE[1])
+    # Jamais en dessous de 1 : sous cette taille l'interface ne se lit plus, et
+    # une fenetre trop grande qu'on peut deplacer vaut mieux qu'illisible.
+    return max(1.0, min(voulue, tenable))
 
 
 def echelle_ecran(racine, forcee=0.0):
     """Facteur a appliquer aux tailles en pixels. 1.0 = ecran 96 ppp."""
     try:
         if forcee and float(forcee) > 0:
-            return max(0.75, min(4.0, float(forcee)))
+            # Meme un reglage manuel est borne : personne ne veut d'une fenetre
+            # plus grande que son ecran, et c'est reglable dans l'autre sens.
+            return echelle_tenable(racine, max(0.75, min(4.0, float(forcee))))
     except (TypeError, ValueError):
         pass
-    return max(1.0, min(4.0, dpi_de_la_fenetre(racine) / 96.0))
+    return echelle_tenable(racine, max(1.0, min(4.0, dpi_de_la_fenetre(racine) / 96.0)))
 
 
 # ==========================================================================
@@ -3093,8 +3191,8 @@ class Panneau:
             pass
 
         self.root.title(NOM_APP)
-        self.root.geometry("%dx%d" % (self.px(780), self.px(700)))
-        self.root.minsize(self.px(720), self.px(640))
+        self.root.geometry("%dx%d" % (self.px(FENETRE_BASE[0]), self.px(FENETRE_BASE[1])))
+        self.root.minsize(self.px(FENETRE_MINI[0]), self.px(FENETRE_MINI[1]))
         self.root.configure(bg=NUIT)
         self.root.protocol("WM_DELETE_WINDOW", self.cacher)
         try:
@@ -3195,8 +3293,8 @@ class Panneau:
         self.reglettes = []
         self.apercus = []
 
-        self.root.minsize(self.px(720), self.px(640))
-        self.root.geometry("%dx%d%s" % (self.px(780), self.px(700), position))
+        self.root.minsize(self.px(FENETRE_MINI[0]), self.px(FENETRE_MINI[1]))
+        self.root.geometry("%dx%d%s" % (self.px(FENETRE_BASE[0]), self.px(FENETRE_BASE[1]), position))
         self.construire_tout()
         print("Interface refaite a l'echelle %.2f" % echelle)
 

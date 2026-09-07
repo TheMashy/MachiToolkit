@@ -253,5 +253,145 @@ class Echelle(unittest.TestCase):
         self.assertEqual(self.mt.echelle_ecran(None, 0.1), 0.75, "borne basse")
 
 
+class TailleDeFenetre(unittest.TestCase):
+    """LA FINESSE N'EST PAS LA PLACE.
+
+    L'echelle ne se deduisait que des points par pouce. Un 4K a 180 ppp donne
+    1,875, soit une fenetre de 1443 par 1295 : elle tient largement sur le 4K,
+    et elle est plus haute que l'ecran 1080p d'a cote. On la voyait deborder,
+    tronquee par le bas, avec des caracteres enormes.
+
+    Deux moniteurs peuvent avoir la meme finesse et pas du tout la meme
+    surface. L'echelle se borne donc a ce que la zone de travail accepte.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    def poser_ecran(self, largeur, hauteur, barre=40):
+        """Un faux moniteur : (ecran, zone de travail, cadre de la fenetre)."""
+        class Rect:
+            def __init__(self, l, t, r, b):
+                self.left, self.top, self.right, self.bottom = l, t, r, b
+        ecran = Rect(0, 0, largeur, hauteur)
+        travail = Rect(0, 0, largeur, hauteur - barre)
+        self.mt._ecran_de_la_fenetre = lambda racine: (ecran, travail, ecran)
+
+    def test_le_1080p_ne_recoit_pas_la_taille_du_4k(self):
+        self.poser_ecran(1920, 1080)
+        tenable = self.mt.echelle_tenable(None, 1.875)
+        base_l, base_h = self.mt.FENETRE_BASE
+        self.assertLess(tenable, 1.875, "l'echelle du 4K doit etre rabaissee")
+        self.assertLessEqual(base_h * tenable, 1080 - 40,
+                             "la fenetre depasse encore la zone de travail")
+        self.assertLessEqual(base_l * tenable, 1920)
+
+    def test_le_4k_garde_son_echelle(self):
+        self.poser_ecran(3840, 2160)
+        self.assertAlmostEqual(self.mt.echelle_tenable(None, 1.875), 1.875, places=3)
+
+    def test_jamais_sous_un(self):
+        """Sous 1, l'interface ne se lit plus : une fenetre trop grande qu'on
+        peut deplacer vaut mieux qu'illisible."""
+        self.poser_ecran(800, 600)
+        self.assertEqual(self.mt.echelle_tenable(None, 1.5), 1.0)
+
+    def test_le_reglage_manuel_est_borne_lui_aussi(self):
+        self.poser_ecran(1920, 1080)
+        forcee = self.mt.echelle_ecran(None, 4.0)
+        self.assertLess(forcee, 4.0, "personne ne veut d'une fenetre plus grande que son ecran")
+
+    def test_sans_ecran_lisible_on_ne_touche_a_rien(self):
+        self.mt._ecran_de_la_fenetre = lambda racine: None
+        self.assertEqual(self.mt.echelle_tenable(None, 1.875), 1.875)
+
+
+class FinesseDEcran(unittest.TestCase):
+    """LES TROIS APPELS NE LEVENT PAS QUAND ILS ECHOUENT : ILS RENDENT FAUX.
+
+    La boucle attrapait donc une exception qui ne venait jamais et sortait sur
+    la premiere tentative, meme refusee. Le processus restait aveugle a la
+    finesse des ecrans — d'ou la fenetre qui garde la taille du 4K sur le
+    1080p.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    # Attention : les trois fonctions ne parlent pas la meme langue.
+    # SetProcessDpiAwarenessContext et SetProcessDPIAware rendent un BOOL
+    # (0 = refus), SetProcessDpiAwareness un HRESULT (0 = pose). Confondre les
+    # deux, c'est refaire le defaut a l'envers.
+    ECHEC_BOOL = 0
+    ECHEC_HRESULT = -2147024809          # E_INVALIDARG
+    DEJA_POSE = -2147024891              # E_ACCESSDENIED
+
+    def rejouer(self, reponses):
+        """Rejoue activer_dpi contre des reponses connues. Rend l'ordre des
+        appels effectivement tentes."""
+        essais = []
+
+        def faux(nom, valeur):
+            def appel(*_):
+                essais.append(nom)
+                if isinstance(valeur, Exception):
+                    raise valeur
+                return valeur
+            return appel
+
+        class FauxUser32:
+            SetProcessDpiAwarenessContext = staticmethod(faux("v2", reponses[0]))
+            SetProcessDPIAware = staticmethod(faux("systeme", reponses[2]))
+            GetThreadDpiAwarenessContext = staticmethod(lambda: 0)
+            GetAwarenessFromDpiAwarenessContext = staticmethod(lambda c: 2)
+
+        class FauxShcore:
+            SetProcessDpiAwareness = staticmethod(faux("par ecran", reponses[1]))
+
+        class FauxWindll:
+            user32 = FauxUser32
+            shcore = FauxShcore
+
+        # `windll` n'existe pas hors de Windows : on le pose le temps du cas,
+        # et on le retire ensuite pour ne rien laisser derriere.
+        import ctypes
+        avait = hasattr(ctypes, "windll")
+        garde = getattr(ctypes, "windll", None)
+        ctypes.windll = FauxWindll
+        nom_os, os.name = os.name, "nt"
+        try:
+            self.mt.activer_dpi()
+        finally:
+            if avait:
+                ctypes.windll = garde
+            else:
+                del ctypes.windll
+            os.name = nom_os
+        return essais
+
+    def test_le_premier_qui_marche_gagne(self):
+        self.assertEqual(self.rejouer([1, self.ECHEC_HRESULT, self.ECHEC_BOOL]), ["v2"])
+
+    def test_UN_REFUS_PASSE_AU_SUIVANT(self):
+        # C'est le defaut : 0 est un refus, et il etait lu comme un succes.
+        self.assertEqual(self.rejouer([self.ECHEC_BOOL, self.ECHEC_HRESULT, 1]),
+                         ["v2", "par ecran", "systeme"])
+
+    def test_zero_est_un_succes_pour_celle_qui_rend_un_hresult(self):
+        """Le piege symetrique : refaire le defaut a l'envers."""
+        self.assertEqual(self.rejouer([self.ECHEC_BOOL, 0, 1]), ["v2", "par ecran"])
+
+    def test_deja_pose_par_quelqu_un_d_autre_compte_comme_pose(self):
+        # SetProcessDpiAwareness rend E_ACCESSDENIED quand c'est deja fait.
+        self.assertEqual(self.rejouer([self.ECHEC_BOOL, self.DEJA_POSE, 1]),
+                         ["v2", "par ecran"])
+
+    def test_une_fonction_absente_ne_bloque_pas(self):
+        self.assertEqual(self.rejouer([AttributeError("trop ancien"), self.ECHEC_HRESULT, 1]),
+                         ["v2", "par ecran", "systeme"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
