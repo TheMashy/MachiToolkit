@@ -371,6 +371,15 @@ class FinesseDEcran(unittest.TestCase):
             os.name = nom_os
         return essais
 
+    def test_on_ne_repose_pas_ce_qui_est_pose(self):
+        """Windows refuse de changer d'avis une fois la finesse posee : un
+        second appel echouerait, et ferait ecrire au journal un mode qui n'est
+        pas celui en vigueur. `main` la pose avant les fenetres de
+        l'installeur, `lancer` la redemande — une seule doit compter."""
+        self.assertEqual(self.rejouer([1, self.ECHEC_HRESULT, self.ECHEC_BOOL]), ["v2"])
+        self.assertEqual(self.rejouer([1, self.ECHEC_HRESULT, self.ECHEC_BOOL]), [],
+                         "le second appel ne doit rien tenter")
+
     def test_le_premier_qui_marche_gagne(self):
         self.assertEqual(self.rejouer([1, self.ECHEC_HRESULT, self.ECHEC_BOOL]), ["v2"])
 

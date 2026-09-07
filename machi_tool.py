@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.20.3"
+VERSION = "1.20.4"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -2888,6 +2888,11 @@ def identite_barre_taches():
         pass
 
 
+# Une fois pose, Windows refuse de changer d'avis : un second appel echouerait
+# et ferait ecrire au journal un mode qui n'est pas celui en vigueur.
+DPI = {"pose": False}
+
+
 def activer_dpi():
     """A appeler avant la premiere fenetre, sinon Windows l'ignore.
 
@@ -2903,8 +2908,9 @@ def activer_dpi():
     On lit maintenant la reponse, on passe a la suivante si elle est
     negative, et on ecrit dans le journal ce qui a fini par prendre.
     """
-    if os.name != "nt":
+    if os.name != "nt" or DPI["pose"]:
         return
+    DPI["pose"] = True
     import ctypes
     user32, shcore = ctypes.windll.user32, None
     try:
@@ -6211,6 +6217,10 @@ def main():
     if "--version" in sys.argv:
         print(VERSION)
         return
+    # AVANT TOUTE FENETRE, y compris celles de l'installeur : Windows fige la
+    # finesse au premier affichage, et « Installation terminee » sur un 4K
+    # suffisait a la poser de travers pour la suite.
+    activer_dpi()
     if "--verifier-maj" in sys.argv:
         cfg = charger_config()
         verifier_maj(cfg)
