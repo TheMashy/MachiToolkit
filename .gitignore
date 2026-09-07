@@ -15,7 +15,17 @@ venv/
 # (icone.ico est versionne volontairement : le workflow le regenere,
 #  mais l'avoir sous la main evite d'avoir a lancer Python pour compiler)
 
-# Donnees locales
+# Donnees locales. En mode script, DOSSIER est le dossier du depot : tout
+# ce que l'application ecrit en tournant atterrit ici, et rien de tout ca
+# n'est une source.
 config.json
+config.json.part
 journal.log
 Lancer.vbs
+activite.jsonl
+sessions.jsonl
+battement.txt
+version_installee.txt
+synchro_demandee
+panneau_demande
+maj/
