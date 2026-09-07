@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.20.1"
+VERSION = "1.20.2"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -546,6 +546,11 @@ TRAY = {"icone": None, "reposer": False}  # l'icone de la barre, reposee si elle
 # secondes (voir veille_activite).
 FICHIER_DEMANDE = os.path.join(DOSSIER, "synchro_demandee")
 
+# Le meme mecanisme pour « montre-toi » : un exe telecharge qu'on double-clique
+# alors que l'application tourne deja se fait renvoyer par le mutex, et l'ecran
+# ne bouge pas. Il laisse donc un mot avant de partir.
+FICHIER_PANNEAU = os.path.join(DOSSIER, "panneau_demande")
+
 
 def deposer_demande_synchro(origine="site"):
     try:
@@ -553,6 +558,26 @@ def deposer_demande_synchro(origine="site"):
             f.write("%s %s" % (origine, time.strftime("%Y-%m-%d %H:%M:%S")))
     except Exception as e:
         print("Demande de synchro non deposee :", e)
+
+
+def demander_panneau():
+    try:
+        with open(FICHIER_PANNEAU, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        return True
+    except Exception as e:
+        print("Demande d'ouverture non deposee :", e)
+        return False
+
+
+def relever_demande_panneau():
+    try:
+        if not os.path.exists(FICHIER_PANNEAU):
+            return False
+        os.remove(FICHIER_PANNEAU)
+        return True
+    except Exception:
+        return False
 
 
 def relever_demande_synchro():
@@ -2909,6 +2934,47 @@ def dpi_de_la_fenetre(racine):
         return 96.0
 
 
+def fenetre_a_cheval(racine):
+    """Vrai si la fenetre deborde du moniteur qui la porte.
+
+    C'EST LA CAUSE DE LA BOUCLE. Rebatir l'interface la REDIMENSIONNE ; a
+    cheval sur un 4K et un 1080p, la nouvelle taille change le moniteur qui en
+    porte le plus, donc la reponse de GetDpiForWindow, donc l'echelle voulue —
+    et on repart. Deux fois et demie par seconde, la fenetre coincee entre les
+    deux ecrans, sautant d'un rapport a l'autre sans fin.
+
+    Tant qu'elle deborde, on ne touche a rien : la mesure ne veut rien dire
+    tant que la fenetre n'est pas posee quelque part.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        poignee = user32.GetAncestor(racine.winfo_id(), 2) or racine.winfo_id()
+        cadre = wintypes.RECT()
+        if not user32.GetWindowRect(poignee, ctypes.byref(cadre)):
+            return False
+
+        class INFOS_MONITEUR(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        moniteur = user32.MonitorFromWindow(poignee, 2)   # 2 = le plus proche
+        if not moniteur:
+            return False
+        infos = INFOS_MONITEUR()
+        infos.cbSize = ctypes.sizeof(INFOS_MONITEUR)
+        if not user32.GetMonitorInfoW(moniteur, ctypes.byref(infos)):
+            return False
+        e = infos.rcMonitor
+        return (cadre.left < e.left or cadre.top < e.top
+                or cadre.right > e.right or cadre.bottom > e.bottom)
+    except Exception:
+        return False
+
+
 def echelle_ecran(racine, forcee=0.0):
     """Facteur a appliquer aux tailles en pixels. 1.0 = ecran 96 ppp."""
     try:
@@ -3014,6 +3080,11 @@ class Panneau:
 
         self.root = tk.Tk()
         self.echelle = echelle_ecran(self.root, self.cfg.get("echelle_interface", 0.0))
+        # Ce qu'a vu `suivre_ecran` au dernier passage, et depuis combien de
+        # passages. Voir cette methode : c'est ce qui empeche la fenetre de
+        # sauter d'un rapport a l'autre pendant qu'on la traine entre deux
+        # ecrans de finesse differente.
+        self._ech_vue, self._ech_tics = None, 0
         # tk scaling est le nombre de pixels par point : il fait grandir les
         # caracteres, dont la taille est donnee en points.
         try:
@@ -4882,6 +4953,46 @@ class Panneau:
     #  Rafraichissement
     # ------------------------------------------------------------------
 
+    # Quatre passages de 400 ms : le temps de poser une fenetre qu'on deplace,
+    # et pas au-dela — au-dessus, changer d'ecran donnerait une interface qui
+    # tarde a se remettre a la bonne taille.
+    ECHELLE_TICS = 4
+
+    def suivre_ecran(self):
+        """L'echelle du moniteur qui porte la fenetre, une fois qu'elle y est.
+
+        LA BOUCLE. Rebatir l'interface la redimensionne ; a cheval sur un 4K et
+        un 1080p, la nouvelle taille change le moniteur majoritaire, donc la
+        mesure, donc l'echelle voulue — et on repart, deux fois et demie par
+        seconde. C'est le « coince entre les deux ecrans » qu'on voyait.
+
+        Deux verrous, et il faut les deux. Tant que la fenetre DEBORDE de son
+        moniteur, la mesure ne veut rien dire : on ne touche a rien. Et une
+        fois posee, on attend que la meme valeur revienne plusieurs fois de
+        suite — un deplacement a la souris traverse les deux ecrans, et
+        redessiner a chaque instant traverse ferait clignoter l'interface tout
+        le long du trajet.
+        """
+        try:
+            voulue = echelle_ecran(self.root, 0.0)
+        except Exception:
+            return False
+        if abs(voulue - self.echelle) <= 0.05 or fenetre_a_cheval(self.root):
+            self._ech_vue = None
+            self._ech_tics = 0
+            return False
+        if self._ech_vue is None or abs(voulue - self._ech_vue) > 0.05:
+            self._ech_vue = voulue
+            self._ech_tics = 1
+            return False
+        self._ech_tics += 1
+        if self._ech_tics < self.ECHELLE_TICS:
+            return False
+        self._ech_vue = None
+        self._ech_tics = 0
+        self.refaire_interface(voulue)
+        return True
+
     def rafraichir(self):
         g = self.generation
         # Meme raison que dans animer() : cachee, la fenetre ne redessine rien.
@@ -4912,13 +5023,9 @@ class Panneau:
                  f"{self.cfg.get('images_par_seconde', 8)} images par seconde")
 
         # Deplacer la fenetre d'un 4K vers un 1080p doit la ramener a la
-        # taille du 1080p. Le test est une lecture de la resolution du
-        # moniteur porteur : assez peu cher pour tenir dans cette boucle.
-        if not self.cfg.get("echelle_interface", 0.0):
-            voulue = echelle_ecran(self.root, 0.0)
-            if abs(voulue - self.echelle) > 0.05:
-                self.refaire_interface(voulue)
-                return
+        # taille du 1080p — mais seulement une fois qu'elle y est posee.
+        if not self.cfg.get("echelle_interface", 0.0) and self.suivre_ecran():
+            return
 
         self.tracer_bande(hexa)
         self.peindre_apercus()
@@ -5566,21 +5673,36 @@ def installer_ou_mettre_a_jour():
 
     deja = os.path.exists(CIBLE_EXE)
 
-    # Un vieux fichier telecharge ne doit pas ecraser une version plus
-    # recente deja installee — le cas ou l'on relance a la main un exe garde
-    # dans les telechargements, alors que l'installation s'est mise a jour
-    # seule depuis. On lance simplement la version installee.
+    """
+    UN EXE TELECHARGE EST UN LANCEUR, PAS UN INSTALLEUR PERIME.
+
+    Le fichier qu'on garde sur le bureau vieillit : l'application se met a jour
+    seule, et ce fichier-la reste a la version du jour ou on l'a telecharge.
+    Il montrait alors une boite « une version plus recente est deja installee »
+    a chaque double-clic — un reproche, pour un geste qui n'a rien de fautif —
+    et un fichier de meme version se reinstallait par-dessus lui-meme, en
+    annoncant une mise a jour qui n'en etait pas une.
+
+    La regle tient en une ligne : ce qui n'apporte rien de neuf OUVRE
+    simplement l'application installee. Le raccourci du bureau pointe donc
+    toujours vers la derniere version, quel que soit son age.
+
+    Et si elle tourne deja, le mutex renverrait cette copie sans un mot : on
+    laisse d'abord le mot qui lui demande de se montrer.
+    """
     installee = version_installee()
-    if deja and installee and plus_recente(installee, VERSION):
+    if deja and installee and not plus_recente(VERSION, installee):
+        demander_panneau()
         try:
             subprocess.Popen([CIBLE_EXE], close_fds=True)
         except Exception as e:
             print("Lancement de la version installee impossible :", e)
-        dialogue(NOM_APP,
-                 f"Une version plus recente ({installee}) est deja installee.\n"
-                 f"Ce fichier-ci est la {VERSION}. C'est la version installee "
-                 "qui demarre — ton ancien fichier telecharge peut etre "
-                 "supprime.")
+            dialogue(NOM_APP,
+                     "Impossible de demarrer la version installee.\n\n%s\n\n%s"
+                     % (CIBLE_EXE, e))
+        else:
+            print("Version installee %s ouverte (ce fichier est la %s)."
+                  % (installee, VERSION))
         return True
 
     try:
@@ -5844,11 +5966,16 @@ def lancer():
                 # Le chien de garde passe toutes les trente secondes : si le fil
                 # d'echantillonnage est mort, il repart. Une collecte arretee ne
                 # se voit pas autrement qu'a un mois de journal vide.
-                time.sleep(5)
+                # Une seconde, pas cinq : c'est le delai entre un double-clic
+                # sur l'exe et la fenetre qui parait. Cinq secondes de rien,
+                # apres un clic, se lisent comme « ca ne marche pas ».
+                time.sleep(1)
+                if relever_demande_panneau():
+                    demande_ouverture.set()
                 if relever_demande_synchro():
                     print("Synchro demandee par machitool://sync : envoi.")
                     synchroniser_activite(CFG, minimum=0)
-                if int(time.time()) % 30 < 5:
+                if int(time.time()) % 30 < 1:
                     try:
                         veiller_sur_activite(CFG)
                     except Exception as e:
