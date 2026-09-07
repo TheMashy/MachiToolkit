@@ -31,13 +31,14 @@ import shutil
 import secrets
 import colorsys
 import threading
+import traceback
 import subprocess
 import http.server
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.20.0"
+VERSION = "1.20.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -310,6 +311,21 @@ CFG = {}
 ACCENT_DEPART = "#B79CF5"   # accent au repos, avant la premiere couleur
 
 
+def entier(valeur, defaut):
+    """Un nombre lu dans un fichier ecrit par quelqu'un d'autre.
+
+    `int(cfg.get(...))` levait sur null, sur "" et sur "trois" — et ces
+    conversions sont dans le chemin de demarrage, hors de tout filet : une
+    seule valeur de travers dans config.json (une ecriture interrompue, une
+    modification a la main, un reglage venu d'une version future) tuait
+    l'application avant meme son icone, sans un mot.
+    """
+    try:
+        return int(valeur)
+    except (TypeError, ValueError):
+        return defaut
+
+
 def charger_config():
     cfg = json.loads(json.dumps(CONFIG_DEFAUT))
     enregistre = {}
@@ -317,9 +333,15 @@ def charger_config():
         try:
             with open(FICHIER_CONFIG, encoding="utf-8") as f:
                 enregistre = json.load(f)
+            if not isinstance(enregistre, dict):
+                raise ValueError("le fichier ne contient pas un objet")
             cfg.update(enregistre)
         except Exception as e:
-            print("config.json illisible :", e)
+            # On repart des valeurs par defaut plutot que de refuser de
+            # demarrer : une application qui s'ouvre avec ses reglages d'usine
+            # se repare en trois clics, une qui ne s'ouvre pas ne se repare pas.
+            enregistre = {}
+            print("config.json illisible, reglages par defaut :", e)
 
     # ecran_suit_luminance a ete remplace par ecran_cible en 1.3. Une case
     # decochee doit le rester apres la mise a jour. La question se pose sur
@@ -334,10 +356,10 @@ def charger_config():
     # chaque fusion en produit une. Une configuration ecrite avant ce
     # changement porte un « non » qui ne repondait pas a la meme question ;
     # on la fait passer une fois, sans y revenir ensuite.
-    if enregistre and int(enregistre.get("config_version", 1)) < 2:
+    if enregistre and entier(enregistre.get("config_version", 1), 1) < 2:
         cfg["maj_prereleases"] = True
         cfg["maj_intervalle_heures"] = min(
-            int(cfg.get("maj_intervalle_heures", 1)), 2)
+            entier(cfg.get("maj_intervalle_heures", 1), 1), 2)
         print("Configuration migree : les nouveaux builds seront proposes.")
     # Version 3 : l'application se tient a jour SEULE. C'est ce que promet le
     # message d'installation, et c'est la seule issue quand l'icone a disparu
@@ -346,9 +368,9 @@ def charger_config():
     # synchro deposee depuis le site attendait jusqu'a dix minutes), et tient
     # son serveur local (127.0.0.1, cle exigee) pour que « synchroniser »
     # depuis ce poste soit immediat. Une fois, sans y revenir ensuite.
-    if enregistre and int(enregistre.get("config_version", 1)) < 3:
+    if enregistre and entier(enregistre.get("config_version", 1), 1) < 3:
         cfg["maj_installation_auto"] = True
-        if int(cfg.get("pont_intervalle", 3) or 3) >= 10:
+        if entier(cfg.get("pont_intervalle", 3), 3) >= 10:
             cfg["pont_intervalle"] = 3
         cfg["api_active"] = True
         print("Configuration migree (v3) : mise a jour automatique, releve "
@@ -358,9 +380,35 @@ def charger_config():
 
 
 def sauver_config(cfg):
+    """Ecrit config.json. Renvoie faux si ca n'a pas pu se faire.
+
+    NE LEVE PLUS. Un fichier verrouille par une synchronisation cloud, un
+    dossier passe en lecture seule, un disque plein : l'ecriture echoue, et
+    elle echouait EN LEVANT. L'appel le plus precoce vient de `jeton_courant`,
+    dans le demarrage du serveur local — allume chez tout le monde depuis la
+    1.20 — donc avant meme que l'icone existe. L'application mourait sans
+    fenetre, sans icone et sans un mot : « ca plante quand je l'ouvre ».
+
+    Ne pas garder un reglage est ennuyeux ; ne pas demarrer est fatal. On ecrit
+    d'abord a cote puis on remplace, pour ne pas laisser un fichier a moitie
+    ecrit derriere une coupure — c'est ce fichier-la qu'on relit au demarrage
+    suivant.
+    """
     propre = {k: v for k, v in cfg.items() if not k.startswith("_")}
-    with open(FICHIER_CONFIG, "w", encoding="utf-8") as f:
-        json.dump(propre, f, indent=2, ensure_ascii=False)
+    provisoire = FICHIER_CONFIG + ".part"
+    try:
+        with open(provisoire, "w", encoding="utf-8") as f:
+            json.dump(propre, f, indent=2, ensure_ascii=False)
+        os.replace(provisoire, FICHIER_CONFIG)
+        return True
+    except Exception as e:
+        print("config.json non enregistre :", e)
+        try:
+            if os.path.exists(provisoire):
+                os.remove(provisoire)
+        except Exception:
+            pass
+        return False
 
 
 def hex_vers_rgb(h):
@@ -2017,9 +2065,17 @@ SERVEUR = {"http": None}
 
 
 def jeton_courant(cfg):
+    """La cle du serveur local. Tiree une fois, gardee dans la configuration.
+
+    Si l'enregistrement echoue, la cle vaut quand meme pour cette session : le
+    site en recevra une neuve au prochain demarrage, ce qui demande un nouvel
+    appairage. C'est genant. Refuser de demarrer l'etait bien plus.
+    """
     if not cfg.get("api_jeton"):
         cfg["api_jeton"] = secrets.token_urlsafe(12)
-        sauver_config(cfg)
+        if not sauver_config(cfg):
+            print("Cle du serveur local non enregistree : valable pour cette "
+                  "session seulement.")
     return cfg["api_jeton"]
 
 
@@ -2374,9 +2430,11 @@ def demarrer_api(cfg):
     if not cfg.get("api_active"):
         ETAT["api"] = "arretee"
         return
-    jeton_courant(cfg)
     try:
-        port = int(cfg.get("api_port", 7373))
+        # DANS le try, pas devant : `jeton_courant` ecrit la configuration, et
+        # une ecriture qui echoue remontait jusqu'a tuer le demarrage entier.
+        jeton_courant(cfg)
+        port = entier(cfg.get("api_port", 7373), 7373)
         serveur = http.server.ThreadingHTTPServer(("127.0.0.1", port), Passerelle)
         serveur.daemon_threads = True
         SERVEUR["http"] = serveur
@@ -5610,20 +5668,39 @@ def ecrire_icone(chemin):
     print("Icone ecrite :", chemin)
 
 
+def sans_faute(quoi, faire, *args, **kw):
+    """Fait tourner une etape de demarrage sans qu'elle puisse tout emporter.
+
+    RIEN DE CE QUI EST FACULTATIF NE DOIT EMPECHER L'ICONE DE PARAITRE. Elle
+    porte « Quitter », « Installer la mise a jour » et l'acces au panneau :
+    sans elle, une application qui tourne est une application qu'on ne peut ni
+    arreter, ni reparer, ni mettre a jour. Une guirlande qui ne s'allume pas se
+    voit et se rattrape ; un demarrage qui meurt en silence, non.
+    """
+    try:
+        return faire(*args, **kw)
+    except Exception as e:
+        print("Demarrage — %s a echoue : %s" % (quoi, e))
+        print(traceback.format_exc())
+        return None
+
+
 def lancer():
     global CFG
     if FIGE:
-        ecrire_version_installee()   # on est l'exe installe : on date l'install
-        installer_protocole()        # garde machitool:// enregistre a chaque lancement
-    identite_barre_taches()
-    activer_dpi()
-    CFG = charger_config()
+        sans_faute("marquage de version", ecrire_version_installee)
+        sans_faute("schema machitool://", installer_protocole)
+    sans_faute("identite de la barre", identite_barre_taches)
+    sans_faute("mise a l'echelle", activer_dpi)
+    CFG = sans_faute("lecture de la configuration", charger_config)
+    if CFG is None:
+        CFG = json.loads(json.dumps(CONFIG_DEFAUT))
     premiere_fois = not str(CFG.get("adresse", "")).strip()
-    nettoyer_maj()      # efface l'exe telecharge par la mise a jour precedente
+    sans_faute("nettoyage des telechargements", nettoyer_maj)
 
     boucle = asyncio.new_event_loop()
     BLE["boucle"] = boucle
-    surveiller_arret_windows()
+    sans_faute("ecoute de l'arret de Windows", surveiller_arret_windows)
 
     def fil_ble():
         asyncio.set_event_loop(boucle)
@@ -5633,9 +5710,9 @@ def lancer():
             print("Fil Bluetooth arrete :", e)
 
     threading.Thread(target=fil_ble, daemon=True).start()
-    demarrer_api(CFG)
+    sans_faute("serveur local", demarrer_api, CFG)
     if CFG.get("mode") == "son":
-        demarrer_audio(CFG)
+        sans_faute("capture du son", demarrer_audio, CFG)
 
     demande_ouverture = threading.Event()
     demande_arret = threading.Event()
@@ -5943,5 +6020,38 @@ def main():
     lancer()
 
 
+def rapporter_plantage(e):
+    """Un demarrage qui echoue ne doit pas disparaitre en silence.
+
+    Sans console, une exception non rattrapee tue le processus sans un mot :
+    l'icone ne parait jamais, rien ne s'ouvre, et il ne reste rien a montrer
+    a personne. C'est exactement ce qu'on voit de l'exterieur -- « ca plante
+    quand je l'ouvre » -- et c'est la seule chose qu'on ne peut pas
+    diagnostiquer.
+
+    On ecrit donc la trace complete dans le journal, et on la MONTRE : la
+    premiere ligne de l'erreur, et le chemin du fichier a envoyer.
+    """
+    trace = traceback.format_exc()
+    try:
+        with open(FICHIER_JOURNAL, "a", encoding="utf-8") as f:
+            f.write("\n--- PLANTAGE AU DEMARRAGE %s v%s ---\n%s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION, trace))
+    except Exception:
+        pass
+    print(trace)
+    dialogue(NOM_APP,
+             "%s %s n'a pas pu demarrer.\n\n%s : %s\n\n"
+             "Le detail est dans :\n%s\n\n"
+             "Si ca se reproduit, envoie ce fichier."
+             % (NOM_APP, VERSION, type(e).__name__, str(e)[:200], FICHIER_JOURNAL))
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as e:                 # noqa: BLE001 - dernier filet
+        rapporter_plantage(e)
+        sys.exit(1)

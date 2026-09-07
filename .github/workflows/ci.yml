@@ -23,6 +23,13 @@ jobs:
       - name: Compilation du source
         run: python -m compileall -q machi_tool.py outils
 
+      # Un plantage au demarrage est le seul defaut qu'on ne peut pas
+      # diagnostiquer : sans console, l'exception tue le processus sans
+      # fenetre, sans icone et sans une ligne. Ces cas-la tiennent la regle —
+      # rien de facultatif n'empeche l'application de s'ouvrir.
+      - name: Le demarrage survit a ce qui echoue
+        run: python outils/test_demarrage.py
+
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"
 
