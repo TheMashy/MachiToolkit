@@ -1057,8 +1057,12 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # GetLastInputInfo dit « trois secondes d'inactivite » -- la nuit n'avait
     # laisse aucune trace. Si le precedent echantillon date de plus que le
     # seuil, l'absence a commence a cet echantillon-la. Un trou deja ouvert
-    # (inactif avant la mise en veille) est garde tel quel.
-    if avant_depuis and maintenant - avant_depuis >= SEUIL_TROU and not ACTIVITE["trou_depuis"]:
+    # (inactif avant la mise en veille) est garde tel quel ; et tant que
+    # personne n'a ete vu au clavier depuis la reprise, l'absence est deja
+    # connue (veille.plage.a, trou de reprise) : un gel n'ouvre rien, sinon sa
+    # fin « couperait » la vraie nuit.
+    if (avant_depuis and maintenant - avant_depuis >= SEUIL_TROU
+            and not ACTIVITE["trou_depuis"] and not ACTIVITE.get("reprise")):
         ACTIVITE["trou_depuis"] = avant_depuis
 
     # Trou : une absence prolongee pendant que le poste reste allume. Le

@@ -402,5 +402,387 @@ class FinesseDEcran(unittest.TestCase):
                          ["v2", "par ecran", "systeme"])
 
 
+class Nuits(unittest.TestCase):
+    """LA NUIT DE QUELQU'UN QUI SE LEVE A 16 H.
+
+    Le 7 septembre : debout a minuit, PC eteint a 05:26, rallume a 16:20. Le
+    site a affiche « lever 00:00, coucher 19:47 ». Trois defauts se cumulaient :
+    la reprise apres l'allumage n'etait vue par rien (pas de trou, et les
+    demarrages du poste ignores des que le clavier avait dit UN mot) ; une nuit
+    devait finir avant 16:00 -- une borne d'heure civile, pas de duree ; et sans
+    nuit, le repli rendait la premiere minute du fichier civil comme reveil.
+
+    Ici la nuit est le plus long silence qui se termine par une reprise du
+    clavier dans la journee, 2 h a 16 h, sur trente-six heures ; le rythme de
+    la personne departage ; et sans nuit, il n'y a pas de lever du tout.
+    """
+    JOUR = "2026-09-07"
+    VEILLE = "2026-09-06"
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+        self.mt._jour_courant = lambda: self.JOUR
+        # En mode script, DOSSIER est le depot : les fichiers de donnees vont
+        # dans le dossier du cas, pas dans les sources ni dans le cas voisin.
+        for nom in ("FICHIER_ACTIVITE", "FICHIER_SESSIONS", "FICHIER_BATTEMENT",
+                    "FICHIER_MIGRATION", "FICHIER_ENVOI"):
+            setattr(self.mt, nom, os.path.join(self.dossier, os.path.basename(getattr(self.mt, nom))))
+
+    # ---- le decor ----
+    def ts(self, hhmm, jour=None):
+        import time
+        return time.mktime(time.strptime("%s %s" % (jour or self.JOUR, hhmm), "%Y-%m-%d %H:%M"))
+
+    def digest(self, date, de, a, trous=(), poste=None):
+        d = {"date": date, "plage": {"de": de, "a": a},
+             "trous": [{"de": t[0], "a": t[1],
+                        "minutes": self.mt._minutes(t[1]) - self.mt._minutes(t[0])} for t in trous],
+             "temps_par_contexte_s": {"code": 60}, "actif_minutes": 1, "bascules_fenetre": 0}
+        if poste:
+            d["poste"] = poste
+        return d
+
+    def ecrire_digests(self, digests):
+        with open(self.mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            for d in digests:
+                f.write(json.dumps(d) + "\n")
+
+    def lire_digests(self):
+        with open(self.mt.FICHIER_ACTIVITE, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def ecrire_sessions(self, evts):
+        """evts : (genre, hhmm[, jour[, extra]])."""
+        with open(self.mt.FICHIER_SESSIONS, "w", encoding="utf-8") as f:
+            for e in evts:
+                genre, hhmm = e[0], e[1]
+                jour = e[2] if len(e) > 2 else self.JOUR
+                ev = {"genre": genre, "quand": "%s %s" % (jour, hhmm), "ts": round(self.ts(hhmm, jour))}
+                if len(e) > 3:
+                    ev.update(e[3])
+                f.write(json.dumps(ev) + "\n")
+
+    def nuit(self, de, a, trous=(), veille=("00:00", "23:59"), rythme="auto"):
+        historique = [d for d in self.lire_digests() if d["date"] != self.VEILLE] \
+            if os.path.exists(self.mt.FICHIER_ACTIVITE) else []
+        self.ecrire_digests(historique + [self.digest(self.VEILLE, veille[0], veille[1])])
+        d = self.digest(self.JOUR, de, a, trous)
+        return self.mt.sommeil_estime(self.JOUR, plage=d["plage"], trous=d["trous"], rythme=rythme)
+
+    def jour_decale(self, date, c="05:26", r="16:15"):
+        """Un digest complet d'une nuit decalee -- ce qui nourrit le rythme."""
+        return self.digest(date, "00:00", "23:59", [(c, r)],
+                           poste={"coucher": c, "reveil": r, "sommeil_h": 10.8, "source": "clavier"})
+
+    def _jour_moins(self, i):
+        j = self.JOUR
+        for _ in range(i):
+            j = self.mt._jour_avant(j)
+        return j
+
+    # ---- sommeil_estime : le clavier ----
+
+    def test_lever_a_16h20_apres_coucher_a_05h26(self):
+        """LE CAS. 16:20 est apres 16:00 : l'ancienne borne jetait la nuit et
+        le repli rendait « reveil 00:00 »."""
+        n = self.nuit("00:00", "22:10", [("05:26", "16:20")])
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"], n["source"]),
+                         ("05:26", "16:20", 10.9, "clavier"))
+
+    def test_pc_allume_toute_la_nuit(self):
+        n = self.nuit("00:00", "19:47", [("05:10", "16:05")])
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"]), ("05:10", "16:05", 10.9))
+
+    def test_windows_redemarre_seul_a_03h30(self):
+        """Une extinction est une fin de plus, jamais une preuve qu'on etait
+        debout : l'ancien `connus` la contenait, et le coucher tombait a 03:30."""
+        self.ecrire_sessions([("extinction", "03:30"), ("demarrage", "03:31")])
+        n = self.nuit("08:00", "12:00", veille=("08:00", "23:30"))
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"]), ("23:30", "08:00", 8.5))
+
+    def test_journee_en_cours_sans_coucher_invente(self):
+        """Debout a 04:18, pas encore couche : rien a dire, et surtout pas
+        « reveil 00:00 » qui partait au site a l'envoi de 04:18."""
+        self.assertIsNone(self.nuit("00:00", "04:18", veille=("16:20", "23:59")))
+        self.mt.ACTIVITE.update(active=True, jour=self.JOUR, premiere="00:00", derniere="04:18", trous=[])
+        self.assertNotIn("poste", self.mt.resume_activite())
+
+    def test_le_cas_reel_du_7_septembre(self):
+        self.ecrire_sessions([("extinction", "05:26", self.JOUR, {"deduit": True}),
+                              ("demarrage", "16:20")])
+        # Tel qu'enregistre par l'ancienne version, sans trou de reprise : pas de
+        # nuit recevable, donc pas de lever -- pas 00:00.
+        self.assertIsNone(self.nuit("00:00", "19:47"))
+        # Avec le trou que la reprise ouvre desormais (R7) : la vraie nuit.
+        n = self.nuit("00:00", "19:47", [("05:26", "16:20")])
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"], n["source"]),
+                         ("05:26", "16:20", 10.9, "clavier"))
+
+    def test_deux_fins_pour_la_meme_reprise(self):
+        """Derniere touche 05:20, extinction 05:26 : deux candidats, le plus
+        long gagne, et la source reste le clavier."""
+        self.ecrire_sessions([("extinction", "05:26", self.JOUR, {"deduit": True}),
+                              ("demarrage", "16:15")])
+        n = self.nuit("00:00", "19:47", [("05:20", "16:16")], veille=("16:10", "23:59"))
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"], n["source"]),
+                         ("05:20", "16:16", 10.9, "clavier"))
+        n = self.nuit("00:00", "19:47", [("05:20", "15:31")], veille=("16:10", "23:59"))
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"]), ("05:20", "15:31", 10.2))
+
+    def test_extinction_seule_le_coucher_vient_du_poste(self):
+        self.ecrire_sessions([("extinction", "23:30", self.VEILLE)])
+        n = self.nuit("08:02", "23:41", veille=("08:00", "23:00"))
+        self.assertEqual((n["coucher"], n["reveil"], n["source"]), ("23:00", "08:02", "clavier"))
+        n = self.nuit("08:02", "23:41", veille=("08:00", "23:25"))
+        self.assertEqual(n["coucher"], "23:25")
+        # Sans derniere touche connue la veille, l'extinction est la seule fin.
+        self.ecrire_digests([])
+        d = self.digest(self.JOUR, "08:02", "23:41")
+        n = self.mt.sommeil_estime(self.JOUR, plage=d["plage"], trous=[], rythme=None)
+        self.assertEqual((n["coucher"], n["reveil"], n["source"]), ("23:30", "08:02", "poste"))
+
+    def test_un_reboot_de_mise_a_jour_ne_coupe_pas_la_nuit(self):
+        self.ecrire_sessions([("extinction", "09:00", self.JOUR, {"deduit": True}),
+                              ("demarrage", "09:01")])
+        n = self.nuit("00:00", "19:47", [("05:26", "16:15")])
+        self.assertEqual((n["coucher"], n["reveil"]), ("05:26", "16:15"))
+
+    def test_verre_d_eau_sieste_et_silence_de_vingt_heures(self):
+        n = self.nuit("00:00", "19:47", [("05:26", "09:00"), ("09:10", "16:15")])
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"]), ("05:26", "16:15", 10.7))
+        n = self.nuit("00:00", "23:00", [("05:26", "16:15"), ("18:00", "21:00")], rythme=None)
+        self.assertEqual((n["coucher"], n["reveil"]), ("05:26", "16:15"))
+        self.assertIsNone(self.nuit("23:00", "23:59", veille=("00:00", "03:00")),
+                          "vingt heures de silence, ce n'est pas une nuit")
+
+    # ---- le rythme ----
+
+    def test_le_rythme_departage(self):
+        self.ecrire_digests([self.jour_decale(j) for j in [self._jour_moins(i) for i in range(8, 1, -1)]])
+        n = self.nuit("00:00", "23:00", [("05:30", "16:00"), ("19:00", "21:30")])
+        self.assertEqual((n["coucher"], n["reveil"]), ("05:30", "16:00"), "la sieste n'est pas la nuit")
+        n = self.nuit("00:00", "23:00", [("05:30", "10:00"), ("12:00", "21:00")])
+        self.assertEqual((n["coucher"], n["reveil"]), ("05:30", "10:00"),
+                         "avec un rythme connu, l'absence de neuf heures n'est pas la nuit")
+        n = self.nuit("00:00", "23:00", [("05:30", "10:00"), ("12:00", "21:00")], rythme=None)
+        self.assertEqual((n["coucher"], n["reveil"]), ("12:00", "21:00"),
+                         "sans rythme, le plus long gagne -- documente")
+        n = self.nuit("00:00", "23:00", [("12:00", "21:00")])
+        self.assertEqual((n["coucher"], n["reveil"]), ("12:00", "21:00"), "seul candidat")
+
+    def test_rythme_connu_ignore_les_postes_sans_coucher(self):
+        mt = self.mt
+        jours = [self._jour_moins(i) for i in range(31, 0, -1)]
+        digests = []
+        for i, j in enumerate(jours[:30]):
+            if i % 3 == 2:
+                digests.append(self.digest(j, "00:00", "19:47", poste={"reveil": "00:00", "source": "clavier"}))
+            else:
+                digests.append(self.jour_decale(j, "05:%02d" % (20 + i % 7), "16:%02d" % (10 + i % 5)))
+        # Le digest du jour demande lui-meme n'entre pas.
+        digests.append(self.jour_decale(self.JOUR, "12:00", "23:00"))
+        self.ecrire_digests(digests)
+        c, l = mt._rythme_connu(self.JOUR)
+        self.assertTrue(320 <= c <= 330, c)
+        self.assertTrue(970 <= l <= 980, l)
+        self.ecrire_digests(digests[:6] + [d for d in digests[6:] if "coucher" not in (d.get("poste") or {})])
+        self.assertEqual(mt._rythme_connu(self.JOUR), (None, None), "six nuits ne font pas un rythme")
+
+    def test_mediane_horaire_sur_le_cercle(self):
+        m = self.mt._mediane_horaire
+        self.assertEqual(m([23 * 60 + 30, 30]), 0)
+        self.assertEqual(m([326, 290, 360, 1410, 310, 340, 300]), 310)
+        self.assertIsNone(m([]))
+        self.assertEqual(self.mt._ecart_circulaire(1430, 10), 20)
+
+    # ---- la reprise est un trou ----
+
+    def journal_vif(self):
+        self.mt.ACTIVITE["active"] = True
+
+    def test_trou_de_reprise(self):
+        mt = self.mt
+        self.ecrire_digests([self.digest(self.JOUR, "00:00", "05:26")])
+        self.journal_vif()
+        mt._reinit_jour(reprendre=True, maintenant=self.ts("16:15"))
+        self.assertEqual(mt.ACTIVITE["trou_depuis"], self.ts("05:26"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("16:16"))
+        self.assertEqual(mt.ACTIVITE["trous"], [{"de": "05:26", "a": "16:16", "minutes": 650}])
+        self.assertEqual(mt.ACTIVITE["trou_depuis"], 0.0)
+        self.assertFalse(mt.ACTIVITE["reprise"])
+        # Relance deux minutes apres la derniere touche : pas un trou.
+        self.ecrire_digests([self.digest(self.JOUR, "00:00", "14:58")])
+        mt._reinit_jour(reprendre=True, maintenant=self.ts("15:00"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("15:00"))
+        self.assertEqual(mt.ACTIVITE["trous"], [])
+
+    def test_pas_de_trou_artefact_a_la_relance_ni_a_minuit(self):
+        mt = self.mt
+        self.journal_vif()
+        mt._reinit_jour(reprendre=True, maintenant=self.ts("00:31"))
+        mt.activite_note("explorer.exe", False, maintenant=self.ts("00:31"))
+        mt.activite_note("explorer.exe", False, maintenant=self.ts("00:35"))
+        self.assertEqual(mt.ACTIVITE["trou_depuis"], 0.0, "personne devant : rien a ouvrir")
+        mt.activite_note("code.exe", True, maintenant=self.ts("08:00"))
+        self.assertEqual((mt.ACTIVITE["trous"], mt.ACTIVITE["premiere"]), ([], "08:00"))
+        # Minuit : actif a 23:59 la veille, inactif a 00:00:02, touche a 07:00.
+        mt._jour_courant = lambda: self.VEILLE
+        mt._reinit_jour(maintenant=self.ts("23:00", self.VEILLE))
+        mt.activite_note("code.exe", True, maintenant=self.ts("23:59", self.VEILLE))
+        mt._jour_courant = lambda: self.JOUR
+        mt.activite_note("code.exe", False, maintenant=self.ts("00:00") + 2)
+        self.assertEqual(mt.ACTIVITE["jour"], self.JOUR)
+        self.assertEqual(mt.ACTIVITE["trou_depuis"], 0.0)
+        mt.activite_note("code.exe", True, maintenant=self.ts("07:00"))
+        self.assertEqual((mt.ACTIVITE["trous"], mt.ACTIVITE["premiere"]), ([], "07:00"))
+        self.assertEqual(mt._digest_enregistre(self.VEILLE)["plage"]["a"], "23:59")
+
+    def test_un_gel_est_un_trou(self):
+        mt = self.mt
+        self.journal_vif()
+        mt._reinit_jour(maintenant=self.ts("05:25"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("05:26"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("05:27"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("16:15"))   # la machine dormait
+        self.assertEqual(mt.ACTIVITE["trous"], [{"de": "05:27", "a": "16:15", "minutes": 648}])
+        # Deja inactif avant la veille : le trou ouvert est garde.
+        mt._reinit_jour(maintenant=self.ts("04:29"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("04:30"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("04:45"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("04:59"))
+        mt.activite_note("code.exe", False, maintenant=self.ts("05:00"))
+        mt.activite_note("code.exe", True, maintenant=self.ts("16:15"))
+        self.assertEqual(mt.ACTIVITE["trous"], [{"de": "05:00", "a": "16:15", "minutes": 675}])
+
+    # ---- le journal du poste ----
+
+    def lire_sessions(self):
+        with open(self.mt.FICHIER_SESSIONS, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def test_deux_extinctions_a_trois_secondes_font_une_ligne(self):
+        t = self.ts("23:30")
+        self.mt.noter_session("extinction", quand_ts=t)
+        self.mt.noter_session("extinction", quand_ts=t + 3)
+        self.mt.noter_session("demarrage", quand_ts=t + 60)
+        self.assertEqual([e["genre"] for e in self.lire_sessions()], ["extinction", "demarrage"])
+
+    def test_le_coucher_perdu_est_note_avant_que_le_fil_ne_batte(self):
+        """La course : le fil ecrivait battement.txt a son premier tour, pendant
+        que fermer_session_perdue le lisait -- extinction a l'heure de l'allumage
+        ou pas d'extinction du tout. Le fil ne part qu'apres."""
+        mt = self.mt
+        mt._fil_activite = lambda cfg: mt.battre()      # ce que fait le vrai fil en premier
+        cfg = {"collecte_active": True, "collecte_envoi": False}
+        for _ in range(200):
+            with open(mt.FICHIER_BATTEMENT, "w") as f:
+                f.write(str(round(self.ts("05:26"))))
+            self.ecrire_sessions([("demarrage", "16:00", self.VEILLE)])
+            with open(mt.FICHIER_MIGRATION, "w") as f:
+                f.write("x")
+            mt.SESSION["notee"] = False
+            mt.BATTEMENT["dernier"] = 0.0
+            mt.ouvrir_journal_du_poste(cfg)
+            fil = mt.MOTEUR_ACTIVITE.get("fil")
+            mt.arreter_activite()
+            if fil:
+                fil.join(5)
+            evts = self.lire_sessions()
+            self.assertEqual([e["genre"] for e in evts], ["demarrage", "extinction", "demarrage"])
+            self.assertEqual(evts[1]["ts"], round(self.ts("05:26")))
+            self.assertTrue(evts[1].get("deduit"))
+
+    # ---- l'envoi ----
+
+    def capter_envois(self):
+        envois = []
+
+        class Reponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        def urlopen(requete, timeout=None, context=None):
+            envois.append(json.loads(requete.data.decode("utf-8")))
+            return Reponse()
+        self.mt.urllib.request.urlopen = urlopen
+        return envois
+
+    def test_l_envoi_porte_la_veille_et_le_jour(self):
+        mt = self.mt
+        envois = self.capter_envois()
+        cfg = {"pont_site": "http://site", "collecte_envoi": True}
+        mt.ACTIVITE.update(active=True, jour=self.JOUR, premiere="00:00", derniere="19:47",
+                           trous=[{"de": "05:26", "a": "16:20", "minutes": 654}])
+        self.assertTrue(mt.envoyer_activite_au_site(cfg))
+        self.assertEqual([d["date"] for d in envois[-1]["jours"]], [self.JOUR], "pas de veille : le jour seul")
+        self.ecrire_digests([self.digest(self.VEILLE, "16:10", "23:59", [("18:00", "21:00")])])
+        self.assertTrue(mt.envoyer_activite_au_site(cfg))
+        jours = envois[-1]["jours"]
+        self.assertEqual([d["date"] for d in jours], [self.VEILLE, self.JOUR])
+        self.assertEqual(jours[0]["plage"]["a"], "23:59", "la veille part telle qu'elle est sur le disque")
+        self.assertTrue(all(d["version"] == mt.VERSION for d in jours))
+        self.assertEqual(jours[1]["poste"]["reveil"], "16:20")
+        self.assertEqual(mt.SYNC["poste_envoye"], json.dumps(jours[1]["poste"], sort_keys=True))
+
+    def test_le_fil_renvoie_quand_le_lever_change(self):
+        mt = self.mt
+        appels = []
+        mt.fenetre_active = lambda: "code.exe"
+        mt.secondes_inactivite = lambda: 0
+        mt.synchroniser_activite = lambda cfg, minimum=120: appels.append(minimum)
+        poste = {"coucher": "05:26", "reveil": "16:16", "sommeil_h": 10.8, "source": "clavier"}
+
+        def un_tour():
+            mt.MOTEUR_ACTIVITE["marche"] = False
+            return {"date": self.JOUR, "poste": poste}
+        mt.sauver_activite = un_tour
+        mt.ACTIVITE.update(active=True, jour=self.JOUR)
+        cfg = {"collecte_envoi": True}
+        for attendu in ([120], [120, 120]):   # le poste n'est pas encore parti : envoi
+            mt.MOTEUR_ACTIVITE.update(marche=True, sauve_le=0)
+            mt._fil_activite(cfg)
+            self.assertEqual(appels, attendu)
+        mt.SYNC["poste_envoye"] = json.dumps(poste, sort_keys=True)
+        for _ in range(2):                     # deja parti : rien
+            mt.MOTEUR_ACTIVITE.update(marche=True, sauve_le=0)
+            mt._fil_activite(cfg)
+        self.assertEqual(appels, [120, 120])
+
+    def test_migration_des_postes(self):
+        mt = self.mt
+        jours = [self._jour_moins(i) for i in range(11, -1, -1)]
+        digests = []
+        for i, j in enumerate(jours):
+            if i % 3 == 2:
+                digests.append(self.digest(j, "00:00", "23:59"))
+            else:
+                digests.append(self.digest(j, "00:00", "23:59", [("05:%02d" % (20 + i), "16:%02d" % (10 + i))],
+                                           poste={"reveil": "00:00", "source": "clavier"}))
+        self.ecrire_digests(digests)
+        cfg = {"pont_site": "http://site", "collecte_envoi": True, "collecte_active": True}
+        self.assertTrue(mt.migrer_postes(cfg))
+        apres = self.lire_digests()
+        complets = [d for d in apres if "coucher" in (d.get("poste") or {})]
+        self.assertEqual(len(complets), 8)
+        self.assertEqual([d["poste"]["reveil"] for d in complets][:2], ["16:10", "16:11"])
+        self.assertFalse(any("poste" in d and "coucher" not in d["poste"] for d in apres),
+                         "plus aucun reveil sans coucher")
+        self.assertTrue(os.path.exists(mt.FICHIER_MIGRATION))
+        self.assertTrue(mt.SYNC["tout_a_pousser"])
+        envois = self.capter_envois()
+        mt.ACTIVITE.update(active=True, jour=self.JOUR)
+        self.assertTrue(mt.envoyer_activite_au_site(cfg))
+        self.assertEqual(len(envois[-1]["jours"]), 12, "tout l'historique, une fois")
+        self.assertFalse(mt.SYNC["tout_a_pousser"])
+        self.assertFalse(mt.migrer_postes(cfg), "le second lancement ne refait rien")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
