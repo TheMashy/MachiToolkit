@@ -566,10 +566,50 @@ class Nuits(unittest.TestCase):
         self.assertEqual((n["coucher"], n["reveil"]), ("05:30", "10:00"),
                          "avec un rythme connu, l'absence de neuf heures n'est pas la nuit")
         n = self.nuit("00:00", "23:00", [("05:30", "10:00"), ("12:00", "21:00")], rythme=None)
-        self.assertEqual((n["coucher"], n["reveil"]), ("12:00", "21:00"),
-                         "sans rythme, le plus long gagne -- documente")
+        self.assertEqual((n["coucher"], n["reveil"]), ("05:30", "10:00"),
+                         "sans rythme, le PREMIER gagne : meme reponse qu'avec le rythme")
+        self.assertTrue(n["incertain"], "deux reprises, aucun rythme : c'est un pari")
         n = self.nuit("00:00", "23:00", [("12:00", "21:00")])
         self.assertEqual((n["coucher"], n["reveil"]), ("12:00", "21:00"), "seul candidat")
+
+    def test_le_salarie_ne_dort_pas_au_bureau(self):
+        """LE CAS QUI CASSAIT TOUT. Fixe laisse allume : silence de 09:00 a
+        19:00, dix heures, contre une vraie nuit de 23:30 a 07:15, sept heures
+        trois quarts. La duree elisait le bureau ; le PREMIER silence est la
+        nuit. Et comme rien ne le prouve, on le dit : `incertain`."""
+        n = self.nuit("07:15", "23:30", [("09:00", "19:00")],
+                      veille=("07:20", "23:30"), rythme=None)
+        self.assertEqual((n["coucher"], n["reveil"], n["sommeil_h"]), ("23:30", "07:15", 7.8))
+        self.assertTrue(n["incertain"], "deux reprises, aucun rythme : c'est un pari")
+        # Le week-end : un seul silence recevable, rien a departager.
+        w = self.nuit("07:40", "23:59", veille=("08:00", "23:30"), rythme=None)
+        self.assertEqual((w["coucher"], w["reveil"]), ("23:30", "07:40"))
+        self.assertNotIn("incertain", w, "un seul candidat n'est pas une devinette")
+
+    def test_une_nuit_devinee_ne_nourrit_pas_le_rythme(self):
+        """Vingt jours de bureau devines contre huit week-ends surs : c'est le
+        week-end qui doit faire le rythme. Avant la marque, les vingt journees
+        de bureau entraient et le rythme confirmait le bureau."""
+        jours = [self._jour_moins(i) for i in range(30, 0, -1)]
+        digests = []
+        for i, j in enumerate(jours):
+            if i % 7 < 5:   # cinq jours ouvres : le bureau, devine
+                digests.append(self.digest(j, "07:15", "23:30", [("09:00", "19:00")],
+                                           poste={"coucher": "09:00", "reveil": "19:00",
+                                                  "sommeil_h": 10.0, "source": "clavier",
+                                                  "incertain": True}))
+            else:           # le week-end : sur
+                digests.append(self.digest(j, "07:40", "23:59", [],
+                                           poste={"coucher": "23:30", "reveil": "07:40",
+                                                  "sommeil_h": 8.2, "source": "clavier"}))
+        self.ecrire_digests(digests)
+        c, l = self.mt._rythme_connu(self.JOUR)
+        self.assertTrue(1400 <= c <= 1420, ("coucher", c))
+        self.assertTrue(455 <= l <= 465, ("lever", l))
+        # Et ce rythme-la retrouve la vraie nuit du jour ambigu.
+        n = self.nuit("07:15", "23:30", [("09:00", "19:00")], veille=("07:20", "23:30"))
+        self.assertEqual((n["coucher"], n["reveil"]), ("23:30", "07:15"))
+        self.assertNotIn("incertain", n, "tranchee par le rythme, elle est sure")
 
     def test_rythme_connu_ignore_les_postes_sans_coucher(self):
         mt = self.mt
@@ -755,6 +795,31 @@ class Nuits(unittest.TestCase):
             mt._fil_activite(cfg)
         self.assertEqual(appels, [120, 120])
 
+    def test_la_consigne_d_envoi_survit_a_une_fermeture(self):
+        """Le marqueur postes_v2 dit « c'est recalcule », pas « c'est arrive au
+        site ». En memoire seule, une fermeture avant le premier envoi reussi
+        perdait la consigne pour toujours : le recalcul ne repartait plus, et le
+        site gardait ses vieilles nuits fausses, sans rien pour le signaler."""
+        mt = self.mt
+        jours = [self._jour_moins(i) for i in range(6, -1, -1)]
+        self.ecrire_digests([self.jour_decale(j) for j in jours])
+        cfg = {"pont_site": "http://site", "collecte_envoi": True, "collecte_active": True}
+        self.assertTrue(mt.migrer_postes(cfg))
+        self.assertTrue(cfg["historique_a_pousser"], "la consigne n'est pas allee sur le disque")
+        # L'application se ferme : la memoire disparait, les reglages restent.
+        mt.SYNC["tout_a_pousser"] = False
+        relu = mt.charger_config()
+        self.assertTrue(relu.get("historique_a_pousser"), "config.json ne porte pas la consigne")
+        mt.ouvrir_journal_du_poste(dict(relu, collecte_active=False))
+        self.assertTrue(mt.SYNC["tout_a_pousser"], "au relancement, l'historique ne repart pas")
+        # Et l'envoi reussi l'efface, une fois.
+        envois = self.capter_envois()
+        mt.ACTIVITE.update(active=True, jour=self.JOUR)
+        self.assertTrue(mt.envoyer_activite_au_site(relu))
+        self.assertEqual(len(envois[-1]["jours"]), 7)
+        self.assertFalse(relu["historique_a_pousser"])
+        self.assertFalse(mt.charger_config().get("historique_a_pousser"))
+
     def test_migration_des_postes(self):
         mt = self.mt
         jours = [self._jour_moins(i) for i in range(11, -1, -1)]
@@ -770,8 +835,13 @@ class Nuits(unittest.TestCase):
         self.assertTrue(mt.migrer_postes(cfg))
         apres = self.lire_digests()
         complets = [d for d in apres if "coucher" in (d.get("poste") or {})]
-        self.assertEqual(len(complets), 8)
-        self.assertEqual([d["poste"]["reveil"] for d in complets][:2], ["16:10", "16:11"])
+        # Huit jours portent un trou de nuit, mais le PREMIER du journal n'a pas
+        # de veille : on ne sait pas ou sa periode eveillee a fini, donc on ne
+        # place pas sa nuit. Sept, et le premier jour reste vide -- c'est le
+        # prix de ne plus lire une soiree dehors comme un sommeil.
+        self.assertEqual(len(complets), 7)
+        self.assertEqual([d["poste"]["reveil"] for d in complets][:2], ["16:11", "16:13"])
+        self.assertNotIn("poste", apres[0], "le premier jour du journal n'a pas de veille")
         self.assertFalse(any("poste" in d and "coucher" not in d["poste"] for d in apres),
                          "plus aucun reveil sans coucher")
         self.assertTrue(os.path.exists(mt.FICHIER_MIGRATION))

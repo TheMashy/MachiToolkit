@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.21.0"
+VERSION = "1.21.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -768,11 +768,14 @@ def _mediane_horaire(minutes):
 def _rythme_connu(jour):
     """(coucher median, lever median) de la personne, ou (None, None).
 
-    Lu dans les nuits COMPLETES (coucher et reveil) des RYTHME_JOURS jours qui
-    precedent `jour`, sur le journal local. Un `poste` sans coucher -- le vieux
-    repli sur plage.de -- n'y entre jamais : un rythme amorce sur des 00:00
-    inventes choisirait ensuite les mauvaises nuits. En dessous de
-    RYTHME_MIN_NUITS, on n'a pas de rythme, et on le dit.
+    Lu dans les nuits SURES ET COMPLETES des RYTHME_JOURS jours qui precedent
+    `jour`, sur le journal local. Deux exclusions, meme raison : un `poste` sans
+    coucher (le vieux repli sur plage.de) et un `poste` marque `incertain` (le
+    plus long silence d'un jour ambigu, faute de rythme -- voir _choisir_nuit).
+    Les laisser entrer ferait du rythme le miroir de ses propres devinettes :
+    il confirmerait les horaires de bureau au lieu de les ecarter, et plus il y
+    aurait de jours, plus il serait faux. En dessous de RYTHME_MIN_NUITS, on n'a
+    pas de rythme, et on le dit.
     """
     try:
         if not os.path.exists(FICHIER_ACTIVITE):
@@ -792,6 +795,8 @@ def _rythme_connu(jour):
                 if not (debut <= date < jour):
                     continue
                 poste = d.get("poste") or {}
+                if poste.get("incertain"):
+                    continue
                 c, r = _minutes(poste.get("coucher")), _minutes(poste.get("reveil"))
                 if c is None or r is None:
                     continue
@@ -805,24 +810,54 @@ def _rythme_connu(jour):
 
 
 def _choisir_nuit(cands, rythme):
-    """Parmi des silences recevables [fin, reprise, duree, source], la nuit.
+    """Parmi des silences recevables [fin, reprise, duree, source] : (nuit, incertaine).
 
-    Sans rythme connu, le plus long. Avec, on ne regarde que ceux d'au moins la
-    moitie du plus long, et on prend celui dont le coucher et le lever collent
-    le mieux aux medianes de la personne : chez quelqu'un qui dort de 05:30 a
-    16:00, une absence de 12:00 a 21:00 est plus longue qu'une nuit de 05:30 a
-    10:00, mais ce n'est pas elle, la nuit. A egalite, le plus long.
+    LE PLUS LONG N'EST PAS LA NUIT, LE PREMIER L'EST. Une absence est toujours
+    plus longue qu'une nuit : qui laisse son fixe allume en partant au bureau
+    produit un silence de 09:00 a 19:00, dix heures, contre sept heures trois
+    quarts de sommeil reel. En elisant sur la duree, on prenait la journee de
+    travail pour la nuit -- vingt jours ouvres sur trente, chez un salarie.
+
+    Or la nuit qui OUVRE le jour D est, par construction, le PREMIER sommeil de
+    D : ce qui vient apres est du jour, pas de la nuit. On prend donc le silence
+    le plus TOT, et la duree ne sert plus qu'a ecarter les miettes -- en dessous
+    de la moitie du plus long, un assoupissement de deux heures et demie n'a pas
+    a evincer les huit heures qui suivent.
+
+    Le meme filtre sert AVEC LE RYTHME, ou le depart se fait sur la proximite
+    aux medianes de la personne plutot que sur l'heure : chez quelqu'un qui dort
+    de 05:30 a 16:00, une absence de 12:00 a 21:00 n'est pas sa nuit. Sur les
+    cas ou les deux regles s'appliquent, elles disent la meme chose -- ce qui
+    est le seul argument valable pour la premiere.
+
+    ET ON DIT QUAND ON A DEVINE. Sans rythme, si plusieurs silences recevables
+    ont des REPRISES DIFFERENTES, le choix est un pari : `incertaine`. Deux fins
+    pour la MEME reprise (derniere touche 05:20, extinction 05:26) sont deux
+    lectures d'une seule nuit, il n'y a rien a departager.
+
+    Cette marque n'est pas cosmetique, elle casse une BOUCLE. Une nuit devinee
+    ne nourrit pas le rythme (_rythme_connu la saute) : sans cela, la journee de
+    bureau elue faute de mieux partait dans l'historique, le rythme se calculait
+    ENSUITE dessus, et confirmait l'erreur au lieu de la corriger -- plus il y
+    avait de jours, plus c'etait faux. Le rythme se batit donc sur les seuls
+    jours sans ambiguite (un week-end, un jour ou l'on n'a pas quitte la
+    maison), et resout ensuite les jours ambigus.
+
+    Poser une heure « ou tout le monde dort » aurait ete plus simple et faux :
+    03:30 vaut pour un couche-tot et exclut quelqu'un qui se couche a 05:26 --
+    c'est-a-dire l'hypothese que ce fichier vient justement de retirer.
     """
     plus_long = max(cands, key=lambda s_: s_[2])
+    recevables = [s_ for s_ in cands if s_[2] >= RYTHME_PART * plus_long[2]]
     m_c, m_l = rythme if rythme else (None, None)
     if m_c is None or m_l is None:
-        return plus_long
-    recevables = [s_ for s_ in cands if s_[2] >= RYTHME_PART * plus_long[2]]
+        return (min(recevables, key=lambda s_: s_[0]),
+                len(set(s_[1] for s_ in recevables)) > 1)
 
     def score(s_):
         return (_ecart_circulaire(s_[1] % 1440, m_l)
                 + _ecart_circulaire(s_[0] % 1440, m_c))
-    return min(recevables, key=lambda s_: (score(s_), -s_[2]))
+    return (min(recevables, key=lambda s_: (score(s_), -s_[2])), False)
 
 
 def sommeil_estime(jour=None, plage=None, trous=None, rythme="auto"):
@@ -839,8 +874,9 @@ def sommeil_estime(jour=None, plage=None, trous=None, rythme="auto"):
 
     Quand plusieurs silences sont recevables, le rythme de la personne (ses
     medianes de coucher et de lever, voir _rythme_connu) departage ; sans
-    rythme, le plus long gagne. Sans nuit recevable : None, jamais un reveil
-    sans coucher.
+    rythme, le PREMIER gagne -- la nuit qui ouvre le jour est son premier
+    sommeil, pas son plus long silence. Sans nuit recevable : None, jamais un
+    reveil sans coucher.
 
     Le poste : une extinction est une fin de plus, elle ne « coupe » jamais un
     silence (un Windows qui redemarre seul a 00:30 n'est pas un lever, un
@@ -922,18 +958,36 @@ def sommeil_estime(jour=None, plage=None, trous=None, rythme="auto"):
                 fondus[-1][2] += s_[2]
             else:
                 fondus.append(list(s_))
+        # ON NE PLACE LA NUIT DE D QUE SI ON VOIT OU LA VEILLE S'EST ARRETEE.
+        # Sans digest de la veille, il ne reste que le silence du soir :
+        # « journee 09:00 -> 23:59, trou de 19:00 a 23:00 » sortait comme une
+        # nuit de quatre heures, couche a 19:00 -- une soiree dehors lue comme
+        # un sommeil. Rien dans le jour D ne permet de trancher. On exige donc
+        # qu'une fin existe AVANT la premiere activite connue de D : chez un
+        # couche-tard, la derniere touche de la veille est la et sa nuit de
+        # 05:26 a 16:20 passe ; sur un jour isole, rien ne passe -- « je ne
+        # sais pas » vaut mieux qu'un coucher a 19:00 dans un journal de
+        # sommeil. Aucune heure n'est posee : ce serait la norme qu'on refuse.
+        premiere = de
+        avant_le_jour = premiere is None or any(f_ <= premiere for f_, _ in fins)
         nuits = [s_ for s_ in fondus
                  if 0 <= s_[1] < 1440 and s_[0] >= FENETRE_NUIT[0]
-                 and MIN_NUIT_MIN <= s_[2] <= MAX_NUIT_MIN]
+                 and MIN_NUIT_MIN <= s_[2] <= MAX_NUIT_MIN
+                 and (avant_le_jour or s_[0] <= premiere)]
         if not nuits:
             return None
         if rythme == "auto":
             rythme = _rythme_connu(jour)
-        nuit = _choisir_nuit(nuits, rythme)
-        return {"reveil": _hhmm(minuit + nuit[1] * 60),
-                "coucher": _hhmm(minuit + nuit[0] * 60),
-                "sommeil_h": round(nuit[2] / 60.0, 1),
-                "source": "poste" if nuit[3] == "poste" else "clavier"}
+        nuit, incertaine = _choisir_nuit(nuits, rythme)
+        if nuit is None:
+            return None
+        poste = {"reveil": _hhmm(minuit + nuit[1] * 60),
+                 "coucher": _hhmm(minuit + nuit[0] * 60),
+                 "sommeil_h": round(nuit[2] / 60.0, 1),
+                 "source": "poste" if nuit[3] == "poste" else "clavier"}
+        if incertaine:
+            poste["incertain"] = True
+        return poste
     except Exception:
         return None
 
@@ -1130,6 +1184,33 @@ def _date_de_ligne(ligne):
         return None
 
 
+def _ecrire_lignes(chemin, lignes):
+    """Ecrit un fichier de lignes ENTIEREMENT OU PAS DU TOUT, comme sauver_config.
+
+    `open(chemin, "w")` tronque d'abord et ecrit ensuite : entre les deux, le
+    fichier existe et il est vide ou coupe au milieu d'une ligne. Or trois
+    choses lisent activite.jsonl pendant que le fil l'ecrit -- l'envoi au site,
+    le calcul des nuits, la migration -- et sur un tir de sept mille lectures
+    concurrentes, presque toutes tombaient sur un fichier incomplet : une
+    journee perdue, un rythme calcule sur rien, silencieusement. On ecrit a
+    cote, puis on remplace : un lecteur voit l'ancien fichier ou le nouveau,
+    jamais un entre-deux.
+    """
+    provisoire = chemin + ".part"
+    try:
+        with open(provisoire, "w", encoding="utf-8") as f:
+            f.writelines(lignes)
+        os.replace(provisoire, chemin)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(provisoire):
+                os.remove(provisoire)
+        except Exception:
+            pass
+        raise
+
+
 def sauver_activite():
     """Ecrit le digest du jour, une entree par jour, reecrite a chaque flush."""
     try:
@@ -1140,8 +1221,7 @@ def sauver_activite():
                 lignes = [l for l in f if l.strip()]
         lignes = [l for l in lignes if _date_de_ligne(l) != resume["date"]]
         lignes.append(json.dumps(resume, ensure_ascii=False) + "\n")
-        with open(FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
-            f.writelines(lignes[-90:])        # trois mois d'historique local
+        _ecrire_lignes(FICHIER_ACTIVITE, lignes[-90:])   # trois mois d'historique local
         return resume
     except Exception as e:
         print("Ecriture du journal d'activite impossible :", e)
@@ -1213,6 +1293,9 @@ def envoyer_activite_au_site(cfg):
                                     context=_contexte_ssl()) as reponse:
             reponse.read()
         ACTIVITE["message"] = "Journee envoyee au site."
+        if SYNC.get("tout_a_pousser") and cfg.get("historique_a_pousser"):
+            cfg["historique_a_pousser"] = False
+            sauver_config(cfg)
         SYNC["tout_a_pousser"] = False
         SYNC["poste_envoye"] = json.dumps(resume.get("poste"), sort_keys=True)
         marquer_envoi_reussi()
@@ -1348,9 +1431,16 @@ def migrer_postes(cfg=None):
     Les digests d'avant portaient {reveil: '00:00'} sans coucher -- le repli sur
     la premiere minute du fichier civil. Laisses tels quels, ils amorceraient le
     rythme sur des nuits inventees et resteraient en base avec un lever 00:00.
-    Deux passes : sans rythme (les nuits les plus longues), puis avec le rythme
-    que la premiere passe vient de rendre lisible. Puis tout part au site en un
-    envoi, qui purge les mesures fantomes de chaque date.
+
+    Deux passes : sans rythme, puis avec le rythme que la premiere vient de
+    rendre lisible. La seconde passe ne relit PAS les devinettes de la premiere
+    -- celles-ci sortent marquees `incertain` et _rythme_connu les saute -- donc
+    elle corrige la premiere au lieu de la confirmer. Sans cette marque, la
+    boucle etait fermee : la journee de bureau elue en passe 1 devenait le
+    rythme lu en passe 2, qui reelisait la journee de bureau.
+
+    Puis tout part au site en un envoi, qui purge les mesures fantomes de
+    chaque date.
     """
     if os.path.exists(FICHIER_MIGRATION):
         return False
@@ -1376,13 +1466,22 @@ def migrer_postes(cfg=None):
                 digests.append(d)
             lignes = [json.dumps(d, ensure_ascii=False) + "\n" for d in digests]
             if lignes:
-                with open(FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
-                    f.writelines(lignes)
+                _ecrire_lignes(FICHIER_ACTIVITE, lignes)
         with open(FICHIER_MIGRATION, "w", encoding="utf-8") as f:
             f.write(VERSION)
         print("Nuits recalculees sur %d journees." % len(lignes))
         if lignes:
-            SYNC["tout_a_pousser"] = True   # le prochain envoi porte tout l'historique
+            # LE MARQUEUR DIT « C'EST RECALCULE », PAS « C'EST ARRIVE AU SITE ».
+            # `tout_a_pousser` ne vivait qu'en memoire : le fichier postes_v2
+            # etant deja ecrit, une fermeture avant le premier envoi reussi
+            # perdait la consigne pour toujours -- le recalcul ne repartait
+            # plus, et le site gardait ses vieilles nuits fausses sans que rien
+            # ne le signale. La consigne va donc sur le disque, avec les
+            # reglages, et ne s'efface qu'a l'envoi reussi.
+            SYNC["tout_a_pousser"] = True
+            reglages = cfg if isinstance(cfg, dict) else CFG
+            reglages["historique_a_pousser"] = True
+            sauver_config(reglages)
         return True
     except Exception as e:
         print("Recalcul des nuits impossible :", e)
@@ -1411,6 +1510,10 @@ def ouvrir_journal_du_poste(cfg):
     # La migration reecrit activite.jsonl : avant le fil, qui l'ecrit aussi.
     if cfg.get("collecte_active", False):
         migrer_postes(cfg)
+    # Une migration d'un lancement precedent dont l'envoi n'a jamais abouti :
+    # la consigne a survecu sur le disque, elle repart ici.
+    if cfg.get("historique_a_pousser"):
+        SYNC["tout_a_pousser"] = True
     demarrer_activite(cfg)
     if ACTIVITE["active"]:
         synchroniser_activite(cfg, minimum=0)
