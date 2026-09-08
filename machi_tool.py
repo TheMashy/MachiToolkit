@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.20.4"
+VERSION = "1.21.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -533,11 +533,14 @@ ACTIVITE = {
     "derniere": "",
     "trous": [],          # absences > SEUIL_TROU pendant la journee
     "trou_depuis": 0.0,   # debut de l'absence en cours, 0 = present
+    "reprise": False,     # journee reprise (relance, minuit) et personne encore vu au clavier
     "message": "arretee",
 }
 
 MOTEUR_ACTIVITE = {"marche": False}
-SYNC = {"dernier": 0.0, "reussi": 0.0}   # derniere synchro poussee ; dernier envoi reussi
+SYNC = {"dernier": 0.0, "reussi": 0.0,   # derniere synchro poussee ; dernier envoi reussi
+        "poste_envoye": None,            # json du `poste` parti en dernier : on renvoie quand il change
+        "tout_a_pousser": False}         # l'historique entier au prochain envoi (migration)
 TRAY = {"icone": None, "reposer": False}  # l'icone de la barre, reposee si elle disparait
 
 # Le mot laisse par une seconde instance lancee via machitool://sync pendant
@@ -591,6 +594,15 @@ def relever_demande_synchro():
         return False
 FICHIER_ENVOI = os.path.join(DOSSIER, "dernier_envoi.txt")  # survit au redemarrage
 SEUIL_TROU = 20 * 60          # une absence n'est notee qu'au-dela de 20 min
+# La nuit, memes constantes que nuits.js sur le site : les deux cotes doivent
+# elire la meme nuit sur le meme digest, sinon « le poste dit X h, le clavier Y h ».
+MIN_NUIT_MIN = 120            # sous deux heures, une coupure, pas une nuit
+MAX_NUIT_MIN = 16 * 60        # au-dela de seize heures, un week-end sans ordinateur
+FENETRE_NUIT = (-12 * 60, 24 * 60)   # midi la veille -> minuit qui ferme le jour
+FUSION_MIN = 30               # deux silences separes par moins : un verre d'eau
+RYTHME_MIN_NUITS = 7          # en dessous, une mediane n'est pas un rythme
+RYTHME_JOURS = 90             # le rythme se lit sur les trois derniers mois
+RYTHME_PART = 0.5             # un silence deux fois plus court que le plus long n'est pas candidat
 FICHIER_SESSIONS = os.path.join(DOSSIER, "sessions.jsonl")
 SESSION = {"notee": False}    # une seule entree de demarrage par lancement
 FICHIER_BATTEMENT = os.path.join(DOSSIER, "battement.txt")  # dernier instant vivant
@@ -616,6 +628,16 @@ def noter_session(genre, quand_ts=None, extra=None):
         if os.path.exists(FICHIER_SESSIONS):
             with open(FICHIER_SESSIONS, encoding="utf-8") as f:
                 lignes = [l for l in f if l.strip()]
+        # Le meme evenement deux fois a quelques secondes (WM_QUERYENDSESSION
+        # puis WM_ENDSESSION, un double lancement) n'est qu'un evenement.
+        if lignes:
+            try:
+                precedent = json.loads(lignes[-1])
+                if (precedent.get("genre") == genre
+                        and abs(ts - float(precedent.get("ts", 0))) < 120):
+                    return
+            except Exception:
+                pass
         lignes.append(json.dumps(evenement, ensure_ascii=False) + "\n")
         with open(FICHIER_SESSIONS, "w", encoding="utf-8") as f:
             f.writelines(lignes[-400:])
@@ -713,22 +735,119 @@ def _jour_avant(date):
     return time.strftime("%Y-%m-%d", time.localtime(time.mktime(t) - 86400))
 
 
-def sommeil_estime(jour=None, plage=None, trous=None):
-    """La nuit qui OUVRE `jour` : coucher, reveil, duree.
+def _vers_l_avant(de, a):
+    """Minutes de `de` a `a` en tournant dans le sens des aiguilles, sur 24 h."""
+    return (a - de) % 1440
 
-    Elle se lit dans le CLAVIER, pas dans le poste : la derniere touche du
-    soir, la premiere du matin, et entre les deux le plus long silence. Un
-    ordinateur laisse allume la nuit n'a ni extinction ni demarrage, et on y
-    dort quand meme ; un Windows qui redemarre seul a 00:30 n'est pas un lever.
 
-    Les instants viennent de `plage` (premiere et derniere minute active du
-    jour) et de `trous` (les absences de plus de vingt minutes) du jour et de
-    la veille, plus les extinctions du poste. Les demarrages ne servent que
-    quand le clavier n'a rien dit (les journaux d'avant cette version).
+def _ecart_circulaire(a, b):
+    return min(_vers_l_avant(a, b), _vers_l_avant(b, a))
 
+
+def _mediane_horaire(minutes):
+    """La mediane d'heures-minutes SUR LE CERCLE -- port de medianeHoraire (nuits.js).
+
+    Une mediane ordinaire de 23:30 et 00:30 donne midi. On cherche le plus grand
+    vide entre deux heures consecutives, on deroule le cercle a partir de ce qui
+    le suit, et la mediane se prend la-dessus : 00:00.
+    """
+    h = sorted(x for x in minutes if x is not None)
+    if not h:
+        return None
+    trou, apres = -1, h[0]
+    for i in range(len(h)):
+        g = _vers_l_avant(h[i], h[(i + 1) % len(h)])
+        if g > trou:
+            trou, apres = g, h[(i + 1) % len(h)]
+    rel = sorted(_vers_l_avant(apres, x) for x in h)
+    n = len(rel)
+    m = rel[(n - 1) // 2] if n % 2 else (rel[n // 2 - 1] + rel[n // 2]) / 2.0
+    return (apres + m) % 1440
+
+
+def _rythme_connu(jour):
+    """(coucher median, lever median) de la personne, ou (None, None).
+
+    Lu dans les nuits COMPLETES (coucher et reveil) des RYTHME_JOURS jours qui
+    precedent `jour`, sur le journal local. Un `poste` sans coucher -- le vieux
+    repli sur plage.de -- n'y entre jamais : un rythme amorce sur des 00:00
+    inventes choisirait ensuite les mauvaises nuits. En dessous de
+    RYTHME_MIN_NUITS, on n'a pas de rythme, et on le dit.
+    """
+    try:
+        if not os.path.exists(FICHIER_ACTIVITE):
+            return (None, None)
+        midi = time.mktime(time.strptime(jour + " 12:00", "%Y-%m-%d %H:%M"))
+        debut = time.strftime("%Y-%m-%d", time.localtime(midi - RYTHME_JOURS * 86400))
+        couchers, levers = [], []
+        with open(FICHIER_ACTIVITE, encoding="utf-8") as f:
+            for l in f:
+                if not l.strip():
+                    continue
+                try:
+                    d = json.loads(l)
+                except Exception:
+                    continue
+                date = str(d.get("date") or "")
+                if not (debut <= date < jour):
+                    continue
+                poste = d.get("poste") or {}
+                c, r = _minutes(poste.get("coucher")), _minutes(poste.get("reveil"))
+                if c is None or r is None:
+                    continue
+                couchers.append(c)
+                levers.append(r)
+        if len(levers) < RYTHME_MIN_NUITS:
+            return (None, None)
+        return (_mediane_horaire(couchers), _mediane_horaire(levers))
+    except Exception:
+        return (None, None)
+
+
+def _choisir_nuit(cands, rythme):
+    """Parmi des silences recevables [fin, reprise, duree, source], la nuit.
+
+    Sans rythme connu, le plus long. Avec, on ne regarde que ceux d'au moins la
+    moitie du plus long, et on prend celui dont le coucher et le lever collent
+    le mieux aux medianes de la personne : chez quelqu'un qui dort de 05:30 a
+    16:00, une absence de 12:00 a 21:00 est plus longue qu'une nuit de 05:30 a
+    10:00, mais ce n'est pas elle, la nuit. A egalite, le plus long.
+    """
+    plus_long = max(cands, key=lambda s_: s_[2])
+    m_c, m_l = rythme if rythme else (None, None)
+    if m_c is None or m_l is None:
+        return plus_long
+    recevables = [s_ for s_ in cands if s_[2] >= RYTHME_PART * plus_long[2]]
+
+    def score(s_):
+        return (_ecart_circulaire(s_[1] % 1440, m_l)
+                + _ecart_circulaire(s_[0] % 1440, m_c))
+    return min(recevables, key=lambda s_: (score(s_), -s_[2]))
+
+
+def sommeil_estime(jour=None, plage=None, trous=None, rythme="auto"):
+    """La nuit qui se TERMINE dans `jour` : coucher, reveil, duree.
+
+    Une nuit est le plus long silence -- toutes sources confondues : derniere
+    touche, trou, extinction franche ou deduite du battement -- qui finit par
+    une reprise du clavier dans la journee civile, cherche sur trente-six
+    heures (midi la veille -> minuit qui ferme le jour). Seule la DUREE borne,
+    de 2 h a 16 h : un lever a 16:15 vaut un lever a 08:00. L'ancienne borne
+    « fin avant 16:00 » jetait une nuit sur deux chez quelqu'un qui se leve
+    l'apres-midi, et le repli sur plage.de rendait alors « reveil 00:00 » :
+    la premiere minute d'un fichier civil n'est pas un lever.
+
+    Quand plusieurs silences sont recevables, le rythme de la personne (ses
+    medianes de coucher et de lever, voir _rythme_connu) departage ; sans
+    rythme, le plus long gagne. Sans nuit recevable : None, jamais un reveil
+    sans coucher.
+
+    Le poste : une extinction est une fin de plus, elle ne « coupe » jamais un
+    silence (un Windows qui redemarre seul a 00:30 n'est pas un lever, un
+    reboot de mise a jour a 09:00 ne reveille personne). Un demarrage ne sert
+    que si le clavier n'a rien dit du tout (journaux d'avant le suivi clavier).
     Deux silences separes par moins de trente minutes debout -- un verre
-    d'eau a 4 h -- sont une seule nuit. Hors de 2 h a 16 h, ce n'est pas une
-    nuit : une coupure, un week-end sans ordinateur.
+    d'eau a 4 h -- sont une seule nuit.
     """
     try:
         jour = jour or _jour_courant()
@@ -748,7 +867,7 @@ def sommeil_estime(jour=None, plage=None, trous=None):
             fins.append(a - 1440)
         for tr in d_veille.get("trous") or []:
             de, ta = _minutes(tr.get("de")), _minutes(tr.get("a"))
-            if de is not None and de >= 18 * 60:
+            if de is not None and de >= 12 * 60:
                 fins.append(de - 1440)
                 if ta is not None and ta > de:
                     debuts.append(ta - 1440)
@@ -760,8 +879,13 @@ def sommeil_estime(jour=None, plage=None, trous=None):
             if d0 is not None and d1 is not None and d1 > d0:
                 fins.append(d0)
                 debuts.append(d1)
-        # Le poste : ses extinctions sont des fins sures ; ses demarrages ne sont
-        # des reprises que si le clavier n'a rien dit.
+        # Un silence ne CONTIENT aucune activite connue : « derniere touche a
+        # 23:50, premiere a 11:00 » n'est pas une nuit de onze heures si on sait
+        # qu'il y a eu du clavier a 03:30. Seul le CLAVIER en temoigne : une
+        # extinction ne prouve pas qu'on etait debout, elle ne coupe rien.
+        connus = list(fins) + list(debuts)
+        clavier = bool(connus)
+        fins = [(t, "clavier") for t in fins]
         evts = []
         if os.path.exists(FICHIER_SESSIONS):
             with open(FICHIER_SESSIONS, encoding="utf-8") as f:
@@ -769,55 +893,47 @@ def sommeil_estime(jour=None, plage=None, trous=None):
                     if l.strip():
                         evts.append(json.loads(l))
         minuit = time.mktime(time.strptime(jour, "%Y-%m-%d"))
-        clavier = bool(debuts) or bool(fins)
         for e in evts:
             t = (e.get("ts", 0) - minuit) / 60.0
-            if not (-12 * 60 <= t <= 16 * 60):
+            if not (FENETRE_NUIT[0] <= t < FENETRE_NUIT[1]):
                 continue
             if e.get("genre") == "extinction":
-                fins.append(t)
+                fins.append((t, "poste"))
             elif e.get("genre") == "demarrage" and not clavier:
                 debuts.append(t)
         fins.sort()
         debuts.sort()
         # Les silences : de chaque fin a la premiere reprise qui la suit.
-        # Un silence ne CONTIENT aucune activite connue : « derniere touche a
-        # 23:50, premiere a 11:00 » n'est pas une nuit de onze heures si on sait
-        # qu'il y a eu du clavier a 03:30. Sans cette regle, la plus longue
-        # l'emportait et le coucher tombait quatre heures trop tot.
-        connus = list(fins) + list(debuts)
         silences = []
-        for f_ in fins:
+        for f_, src in fins:
             suiv = [d for d in debuts if d > f_]
             if not suiv:
                 continue
             d = suiv[0]
             if any(f_ + 1 < t < d - 1 for t in connus):
                 continue
-            # Deux fins pour la meme reprise : on garde les deux, la plus longue
-            # nuit RECEVABLE l'emportera (une fin trop ancienne ferait un
-            # silence de trente heures, jete ensuite par la borne des seize).
-            silences.append([f_, d, d - f_])
+            # Deux fins pour la meme reprise (derniere touche 05:20, extinction
+            # 05:26) : on garde les deux candidats, le choix tranche.
+            silences.append([f_, d, d - f_, src])
         fondus = []
         for s_ in silences:
-            if fondus and 0 <= s_[0] - fondus[-1][1] < 30:
+            if fondus and 0 <= s_[0] - fondus[-1][1] < FUSION_MIN:
                 fondus[-1][1] = s_[1]
                 fondus[-1][2] += s_[2]
             else:
                 fondus.append(list(s_))
         nuits = [s_ for s_ in fondus
-                 if 0 <= s_[1] <= 16 * 60 and s_[0] >= -12 * 60 and 120 <= s_[2] <= 16 * 60]
+                 if 0 <= s_[1] < 1440 and s_[0] >= FENETRE_NUIT[0]
+                 and MIN_NUIT_MIN <= s_[2] <= MAX_NUIT_MIN]
         if not nuits:
-            # Au moins le reveil, si le clavier ou le poste en connaissent un ce matin.
-            matin = [d for d in debuts if 0 <= d <= 16 * 60]
-            if not matin:
-                return None
-            return {"reveil": _hhmm(minuit + min(matin) * 60), "source": "clavier" if clavier else "poste"}
-        nuit = max(nuits, key=lambda s_: s_[2])
+            return None
+        if rythme == "auto":
+            rythme = _rythme_connu(jour)
+        nuit = _choisir_nuit(nuits, rythme)
         return {"reveil": _hhmm(minuit + nuit[1] * 60),
                 "coucher": _hhmm(minuit + nuit[0] * 60),
                 "sommeil_h": round(nuit[2] / 60.0, 1),
-                "source": "clavier" if clavier else "poste"}
+                "source": "poste" if nuit[3] == "poste" else "clavier"}
     except Exception:
         return None
 
@@ -853,7 +969,7 @@ def categorie_activite(contexte):
     return "inconnu"
 
 
-def _reinit_jour(reprendre=False):
+def _reinit_jour(reprendre=False, maintenant=None):
     """Ouvre une journee vide -- ou REPREND celle qui est deja sur le disque.
 
     Au demarrage, une journee en cours existe presque toujours : l'application
@@ -864,12 +980,22 @@ def _reinit_jour(reprendre=False):
 
     On relit donc les compteurs et on continue de compter dessus. Au changement
     de jour (minuit), `reprendre` reste faux : c'est bien une journee neuve.
+
+    LA REPRISE EST UN TROU. Entre la derniere minute active sur le disque et la
+    premiere touche apres la relance, personne n'a mesure : l'application etait
+    morte. Sans ce trou, un PC eteint a 05:26 et rallume a 16:15 ne laissait
+    AUCUNE reprise au clavier, et le lever etait invisible -- le repli rendait
+    « reveil 00:00 ». On ouvre donc le trou a plage.a du disque ; le premier
+    echantillon actif le ferme, et lui seul : `reprise` empeche un echantillon
+    inactif d'ouvrir un trou artefact a l'heure de la relance ou a 00:00:02
+    (quelqu'un d'inactif a minuit dort deja, et sa nuit vient de veille.plage.a).
     """
     jour = _jour_courant()
     ACTIVITE.update(jour=jour, contexte="", titre_courant="",
-                    depuis=time.time(), temps={}, titres={}, bascules=0,
+                    depuis=maintenant if maintenant is not None else time.time(),
+                    temps={}, titres={}, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
-                    trou_depuis=0.0)
+                    trou_depuis=0.0, reprise=True)
     if not reprendre:
         return
     try:
@@ -887,6 +1013,9 @@ def _reinit_jour(reprendre=False):
         ACTIVITE["premiere"] = str(plage.get("de") or "")
         ACTIVITE["derniere"] = str(plage.get("a") or "")
         ACTIVITE["trous"] = [t for t in (d.get("trous") or []) if isinstance(t, dict)][:40]
+        a = _minutes(plage.get("a"))
+        if a is not None:
+            ACTIVITE["trou_depuis"] = time.mktime(time.strptime(jour, "%Y-%m-%d")) + a * 60
         if ACTIVITE["temps"]:
             minutes = round(sum(ACTIVITE["temps"].values()) / 60)
             print("Journee du %s reprise : %d min deja comptees." % (jour, minutes))
@@ -906,7 +1035,7 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     maintenant = maintenant if maintenant is not None else time.time()
     if ACTIVITE["jour"] != _jour_courant():
         sauver_activite()
-        _reinit_jour()            # minuit : une journee neuve, rien a reprendre
+        _reinit_jour(maintenant=maintenant)   # minuit : une journee neuve, rien a reprendre
 
     cat = categorie_activite(contexte)
     titre = (contexte or "").partition("|")[2].strip()
@@ -920,12 +1049,27 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
             par_titre = ACTIVITE["titres"].setdefault(avant, {})
             t = ACTIVITE["titre_courant"][:80]
             par_titre[t] = par_titre.get(t, 0.0) + ecoule
+    avant_depuis = ACTIVITE["depuis"]
     ACTIVITE["depuis"] = maintenant
+
+    # UN GEL EST UN TROU. Veille, hibernation, capot rabattu, processus fige :
+    # les echantillons s'arretent sans que rien ne soit note, et au reveil
+    # GetLastInputInfo dit « trois secondes d'inactivite » -- la nuit n'avait
+    # laisse aucune trace. Si le precedent echantillon date de plus que le
+    # seuil, l'absence a commence a cet echantillon-la. Un trou deja ouvert
+    # (inactif avant la mise en veille) est garde tel quel ; et tant que
+    # personne n'a ete vu au clavier depuis la reprise, l'absence est deja
+    # connue (veille.plage.a, trou de reprise) : un gel n'ouvre rien, sinon sa
+    # fin « couperait » la vraie nuit.
+    if (avant_depuis and maintenant - avant_depuis >= SEUIL_TROU
+            and not ACTIVITE["trou_depuis"] and not ACTIVITE.get("reprise")):
+        ACTIVITE["trou_depuis"] = avant_depuis
 
     # Trou : une absence prolongee pendant que le poste reste allume. Le
     # debut est marque a la premiere mesure inactive, ferme au retour, et
     # n'est retenu qu'au-dela du seuil.
     if actif:
+        ACTIVITE["reprise"] = False
         if ACTIVITE["trou_depuis"]:
             duree = maintenant - ACTIVITE["trou_depuis"]
             if duree >= SEUIL_TROU:
@@ -934,11 +1078,11 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
                     "minutes": round(duree / 60.0)})
                 del ACTIVITE["trous"][40:]
             ACTIVITE["trou_depuis"] = 0.0
-        h = time.strftime("%H:%M")
+        h = _hhmm(maintenant)
         if not ACTIVITE["premiere"]:
             ACTIVITE["premiere"] = h
         ACTIVITE["derniere"] = h
-    elif not ACTIVITE["trou_depuis"]:
+    elif not ACTIVITE["trou_depuis"] and not ACTIVITE.get("reprise"):
         ACTIVITE["trou_depuis"] = maintenant
 
     if cat != avant:
@@ -1033,13 +1177,25 @@ def tous_les_jours_activite():
 
 
 def envoyer_activite_au_site(cfg):
-    """Pousse le digest du jour a BrainDebugger. Metriques d'enveloppe
-    seulement : temps, bascules, plage horaire. Aucun texte."""
+    """Pousse la veille et le jour a BrainDebugger. Metriques d'enveloppe
+    seulement : temps, bascules, plage horaire. Aucun texte.
+
+    La veille part AVEC le jour, relue sur le disque : la nuit qui se termine
+    aujourd'hui commence par la derniere touche d'hier, et la copie d'hier sur
+    le site datait du dernier envoi de la journee -- souvent des heures avant
+    le coucher. Sur cette veille figee, le site fabriquait une nuit qui n'existait
+    pas. Apres la migration, l'historique entier part une fois (`tout_a_pousser`).
+    """
     base = str(cfg.get("pont_site", "")).strip().rstrip("/")
     if not base:
         ACTIVITE["message"] = "Aucune adresse de site."
         return False
     resume = sauver_activite() or resume_activite()
+    if SYNC.get("tout_a_pousser"):
+        jours = tous_les_jours_activite()
+    else:
+        d_veille = _digest_enregistre(_jour_avant(resume["date"]))
+        jours = [d for d in (d_veille, resume) if d]
     url = base + "/api/machitool/activite"
     cle = str(cfg.get("pont_cle", "")).strip()
     entetes = {"User-Agent": "MachiToolkit/" + VERSION, "Content-Type": "application/json"}
@@ -1050,14 +1206,15 @@ def envoyer_activite_au_site(cfg):
         # La version part avec le digest : c'est ce qui permet au site de dire
         # « ta version ne sait pas encore lire les demandes » au lieu de
         # « Machi Tool ne repond pas », qui ne dit rien de ce qu'il faut faire.
-        if isinstance(resume, dict):
-            resume = dict(resume, version=VERSION)
-        corps = json.dumps(resume, ensure_ascii=False).encode("utf-8")
+        corps = json.dumps({"jours": [dict(d, version=VERSION) for d in jours]},
+                           ensure_ascii=False).encode("utf-8")
         requete = urllib.request.Request(url, data=corps, headers=entetes)
         with urllib.request.urlopen(requete, timeout=15,
                                     context=_contexte_ssl()) as reponse:
             reponse.read()
         ACTIVITE["message"] = "Journee envoyee au site."
+        SYNC["tout_a_pousser"] = False
+        SYNC["poste_envoye"] = json.dumps(resume.get("poste"), sort_keys=True)
         marquer_envoi_reussi()
         return True
     except urllib.error.HTTPError as e:
@@ -1146,7 +1303,14 @@ def _fil_activite(cfg):
                 # ne doit pas en perdre six heures (l'envoi au site en attend six).
                 if time.time() - MOTEUR_ACTIVITE.get("sauve_le", 0) > 300:
                     MOTEUR_ACTIVITE["sauve_le"] = time.time()
-                    sauver_activite()
+                    r = sauver_activite()
+                    # Le lever vient d'etre mesure (le trou de reprise s'est ferme
+                    # sur la premiere touche) : le site doit le savoir maintenant,
+                    # pas dans six heures. On ne renvoie que si `poste` a change.
+                    if (cfg.get("collecte_envoi", False)
+                            and json.dumps((r or {}).get("poste"), sort_keys=True)
+                            != SYNC.get("poste_envoye")):
+                        synchroniser_activite(cfg, minimum=120)
         except Exception as e:
             print("Journal d'activite interrompu :", e)
         fin = time.time() + 2.0
@@ -1173,6 +1337,83 @@ def demarrer_activite(cfg):
     fil = threading.Thread(target=_fil_activite, args=(cfg,), daemon=True)
     MOTEUR_ACTIVITE["fil"] = fil
     fil.start()
+
+
+FICHIER_MIGRATION = os.path.join(DOSSIER, "postes_v2")
+
+
+def migrer_postes(cfg=None):
+    """Une fois par installation : recalculer `poste` de tout l'historique local.
+
+    Les digests d'avant portaient {reveil: '00:00'} sans coucher -- le repli sur
+    la premiere minute du fichier civil. Laisses tels quels, ils amorceraient le
+    rythme sur des nuits inventees et resteraient en base avec un lever 00:00.
+    Deux passes : sans rythme (les nuits les plus longues), puis avec le rythme
+    que la premiere passe vient de rendre lisible. Puis tout part au site en un
+    envoi, qui purge les mesures fantomes de chaque date.
+    """
+    if os.path.exists(FICHIER_MIGRATION):
+        return False
+    try:
+        lignes = []
+        if os.path.exists(FICHIER_ACTIVITE):
+            with open(FICHIER_ACTIVITE, encoding="utf-8") as f:
+                lignes = [l for l in f if l.strip()]
+        for rythme in (None, "auto"):
+            digests = []
+            for l in lignes:
+                try:
+                    d = json.loads(l)
+                except Exception:
+                    continue
+                if not isinstance(d, dict) or not d.get("date"):
+                    continue
+                poste = sommeil_estime(d["date"], plage=d.get("plage") or {},
+                                       trous=d.get("trous") or [], rythme=rythme)
+                d.pop("poste", None)
+                if poste:
+                    d["poste"] = poste
+                digests.append(d)
+            lignes = [json.dumps(d, ensure_ascii=False) + "\n" for d in digests]
+            if lignes:
+                with open(FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+                    f.writelines(lignes)
+        with open(FICHIER_MIGRATION, "w", encoding="utf-8") as f:
+            f.write(VERSION)
+        print("Nuits recalculees sur %d journees." % len(lignes))
+        if lignes:
+            SYNC["tout_a_pousser"] = True   # le prochain envoi porte tout l'historique
+        return True
+    except Exception as e:
+        print("Recalcul des nuits impossible :", e)
+        return False
+
+
+def ouvrir_journal_du_poste(cfg):
+    """Le lancement du journal, DANS CET ORDRE : le coucher perdu, ce
+    demarrage, puis seulement le fil d'echantillonnage.
+
+    Le fil ecrit battement.txt a son premier tour. Lance avant, il pouvait
+    ecraser le dernier battement de la nuit pendant que fermer_session_perdue
+    le lisait : l'extinction deduite tombait a l'heure de l'allumage (le
+    coucher devenait le lever), ou nulle part (fichier vide). Intermittent,
+    donc invisible jusqu'au jour ou une nuit manque.
+
+    Puis un premier envoi tout de suite -- la veille complete et le jour, ou
+    tout l'historique la premiere fois (migrer_postes) -- pour que le site
+    n'attende pas six heures ; le fil renverra des que le lever est mesure, et
+    veille_activite repasse deux minutes plus tard.
+    """
+    if cfg.get("collecte_active", False) and not SESSION["notee"]:
+        SESSION["notee"] = True
+        fermer_session_perdue()
+        noter_session("demarrage")     # l'app demarre avec Windows
+    # La migration reecrit activite.jsonl : avant le fil, qui l'ecrit aussi.
+    if cfg.get("collecte_active", False):
+        migrer_postes(cfg)
+    demarrer_activite(cfg)
+    if ACTIVITE["active"]:
+        synchroniser_activite(cfg, minimum=0)
 
 
 def arreter_activite():
@@ -6052,20 +6293,18 @@ def lancer():
 
     threading.Thread(target=veille_pont, daemon=True).start()
 
-    demarrer_activite(CFG)
-    if CFG.get("collecte_active", False) and not SESSION["notee"]:
-        SESSION["notee"] = True
-        # D'abord refermer une session que la veille/l'arret brutal a laissee
-        # ouverte : le dernier battement devient le coucher manquant. Puis noter
-        # ce demarrage-ci, qui vaut reveil.
-        fermer_session_perdue()
-        noter_session("demarrage")     # vaut reveil : l'app demarre avec Windows
+    sans_faute("journal du poste", ouvrir_journal_du_poste, CFG)   # coucher perdu, demarrage, PUIS le fil
 
     assurer_demarrage(CFG)     # le raccourci de demarrage, repose s'il a disparu
 
     def veille_activite():
+        # Premier tour a deux minutes : la session est posee, la premiere
+        # touche a ferme le trou de reprise, le lever du jour est mesurable.
+        # Les suivants au pas des reglages (six heures), le filet.
+        attente = 120
         while ETAT["en_marche"]:
-            fin = time.time() + max(1, int(CFG.get("collecte_intervalle_heures", 6))) * 3600
+            fin = time.time() + attente
+            attente = max(1, int(CFG.get("collecte_intervalle_heures", 6))) * 3600
             while ETAT["en_marche"] and time.time() < fin:
                 # Le chien de garde passe toutes les trente secondes : si le fil
                 # d'echantillonnage est mort, il repart. Une collecte arretee ne
