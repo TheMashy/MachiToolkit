@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.21.1"
+VERSION = "1.22.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -529,6 +529,8 @@ ACTIVITE = {
     "titres": {},         # categorie -> {titre: secondes}, si titres complets
     "bascules": 0,
     "actif_s": 0.0,       # secondes reellement actives (hors inactivite)
+    "themes": {},         # secondes par thematique de ce qu'on regardait
+    "theme_courant": None,
     "premiere": "",       # premiere activite de la journee (HH:MM)
     "derniere": "",
     "trous": [],          # absences > SEUIL_TROU pendant la journee
@@ -996,12 +998,155 @@ def _jour_courant():
     return time.strftime("%Y-%m-%d")
 
 
-def categorie_activite(contexte):
-    """'chrome.exe | discord - #general' -> 'web:discord', 'code.exe' -> 'code'.
+NAVIGATEURS = ("chrome", "chromium", "firefox", "msedge", "edge", "brave", "opera", "vivaldi")
 
-    On garde le programme, et pour un navigateur le premier mot du titre,
-    qui porte le site. On ne conserve donc ni le canal, ni le nom de la
-    personne, ni la video : juste ou on etait, pas avec qui.
+# Ce que Windows colle DERRIERE le titre de l'onglet : le nom du navigateur, et
+# chez Edge le nom du profil. Ce ne sont pas des sites.
+QUEUES_NAV = ("google chrome", "chrome", "mozilla firefox", "firefox", "microsoft edge",
+              "edge", "brave", "opera", "vivaldi", "chromium", "navigateur web")
+
+SEPARATEURS = (" - ", " \u2014 ", " \u2013 ", " | ", " \u00b7 ")
+
+# LES SITES QU'ON SAIT NOMMER. Un titre d'onglet ne dit pas ou l'on est de facon
+# reguliere : « Voices of the Void - Kerfur Acquired - YouTube » met le site a la
+# fin, « Reddit - Dive into anything » le met au debut. On cherche donc un nom
+# connu N'IMPORTE OU dans le titre avant de se rabattre sur le dernier morceau.
+SITES_CONNUS = (
+    "youtube", "reddit", "twitch", "discord", "github", "stack overflow", "stackoverflow",
+    "wikipedia", "wikipedia", "twitter", "instagram", "tiktok", "facebook", "linkedin",
+    "amazon", "leboncoin", "aliexpress", "netflix", "disney+", "prime video", "spotify",
+    "soundcloud", "bandcamp", "steam", "itch.io", "artstation", "deviantart", "pinterest",
+    "gmail", "google docs", "google drive", "google maps", "notion", "figma",
+    "chatgpt", "claude", "paypal", "wise", "coinbase", "binance", "le monde", "bfmtv",
+)
+
+def _titre_onglet(titre):
+    """Le titre de l'ONGLET AU PREMIER PLAN, sans le nom du navigateur.
+
+    Windows ne rend que le titre de la fenetre de premier plan -- mais chez un
+    navigateur, c'est exactement le titre de l'onglet actif suivi du nom du
+    programme. « Compter le temps de l'onglet qui a le focus » ne demande donc
+    aucune extension : il suffit de retirer ce qu'on a colle derriere.
+    """
+    t = " ".join(str(titre or "").split())
+    # Le compteur de notifications que Gmail et consorts collent devant.
+    while t.startswith("(") and ")" in t[:8]:
+        t = t[t.index(")") + 1:].strip()
+    for _ in range(3):                     # « … - Profil 1 - Microsoft Edge »
+        coupe = None
+        for sep in SEPARATEURS:
+            i = t.rfind(sep)
+            if i > 0 and (coupe is None or i > coupe[0]):
+                coupe = (i, len(sep))
+        if not coupe:
+            break
+        queue = t[coupe[0] + coupe[1]:].strip()
+        if queue in QUEUES_NAV or (queue.startswith("profil") or queue.startswith("profile")):
+            t = t[:coupe[0]].strip()
+        else:
+            break
+    return t
+
+
+def _site_du_titre(titre, proc):
+    """Ou l'on etait. Un nom connu s'il est la, sinon le dernier morceau du titre.
+
+    L'ancienne version prenait LE PREMIER MOT, en affirmant qu'il « porte le
+    site ». Il ne le porte pas : « Voices of the Void - Kerfur Acquired -
+    YouTube » donnait « voices », et un journal se remplissait de « my », « i »,
+    « they » -- les premiers mots de phrases de titres. Des heures de YouTube
+    comptees sous cinq noms differents, dont aucun ne voulait rien dire.
+    """
+    t = _titre_onglet(titre)
+    if not t:
+        return proc
+    for nom in SITES_CONNUS:
+        if nom in t:
+            return nom.replace(" ", "")[:24]
+    bouts = [t]
+    for sep in SEPARATEURS:
+        bouts = [x for b in bouts for x in b.split(sep)]
+    bouts = [b.strip() for b in bouts if b.strip()]
+    dernier = bouts[-1] if bouts else t
+    # ET UN SITE INCONNU NE DEVIENT PAS UNE PHRASE. « i think they are wrong
+    # about this » est un titre de page, pas un endroit : le garder ferait
+    # entrer dans le journal -- et de la, dans ce qui part au site -- le contenu
+    # meme de ce qu'on lisait. Un nom de site tient en trois mots ; au-dela, on
+    # dit « autre », ce qui est vrai et ne raconte rien.
+    if len(dernier.split()) > 3 or len(dernier) > 24:
+        return "autre"
+    return dernier[:24]
+
+
+"""LES THEMATIQUES : DE QUOI PARLE CE QU'ON REGARDE, PAS OU ON LE REGARDE.
+
+« 249 min web » ne dit rien : trois heures de documentaires et trois heures de
+doomscroll sont le meme chiffre. Le SITE ne le dit pas non plus -- YouTube porte
+aussi bien un cours de maths qu'une nuit de guerre en Ukraine.
+
+Ce sont des MOTS-CLES sur le titre de l'onglet, pas une comprehension. Un titre
+qui ne correspond a rien n'est classe nulle part, et c'est la bonne reponse :
+inventer une thematique serait pire que ne rien dire. L'ordre compte -- la
+premiere famille qui correspond gagne.
+
+ET LE TITRE NE QUITTE JAMAIS LA MACHINE. C'est ici, en local, que le theme est
+calcule ; seul le theme part au site. Le nom de la video, le canal, le pseudo
+de la personne d'en face restent sur le poste -- c'est la meme regle que pour
+`categorie_activite` depuis le debut, et l'ajout des thematiques ne la desserre
+pas d'un cran.
+"""
+THEMES_ACTIVITE = [
+    ("dev",      ("github", "stack overflow", "stackoverflow", " npm", "pypi", "documentation",
+                  "docs.", "localhost", "pull request", "commit", "python", "javascript", "api ")),
+    ("jeu",      ("gameplay", "speedrun", "let's play", "lets play", "walkthrough", "no commentary",
+                  "steam", "twitch", "minecraft", "fortnite", "valorant", "league of legends",
+                  "elden ring", "boss fight", "modded", "playthrough")),
+    ("rp",       ("roleplay", "role play", " rp ", "jdr", "dungeons", "donjons", "dnd", "d&d",
+                  "campagne", "one shot rp")),
+    ("urbex",    ("urbex", "abandoned", "abandonne", "abandonné", "exploration urbaine",
+                  "lieu abandonne", "lost place", "derelict")),
+    ("conflit",  ("war footage", "combat footage", "frontline", "ukraine", "gaza", "guerre",
+                  "drone strike", "bodycam", "conflit arme")),
+    ("actu",     ("actualite", "actualité", "info", "le monde", "bfm", "france info", "news",
+                  "reportage", "journal televise")),
+    ("musique",  ("spotify", "soundcloud", "bandcamp", "playlist", "album", " ost", "official video",
+                  "live session", "concert", "remix", "lofi")),
+    ("creation", ("artstation", "deviantart", "blender", "photoshop", "after effects", "davinci",
+                  "tutorial", "tuto", "speedpaint", "timelapse", "fl studio")),
+    ("achat",    ("amazon", "leboncoin", "aliexpress", "panier", "checkout", "commande",
+                  "livraison", "prix")),
+    ("argent",   ("paypal", "banque", "assurance", "impots", "impôts", "coinbase", "binance",
+                  "virement", "facture")),
+    ("social",   ("discord", "reddit", "instagram", "tiktok", "facebook", "twitter", "x.com",
+                  "linkedin", "snapchat", "messages")),
+    ("video",    ("youtube", "netflix", "disney+", "prime video", "twitch", "vimeo", "dailymotion",
+                  "episode", "épisode", "saison", "film complet")),
+]
+
+
+def theme_activite(contexte):
+    """La thematique de ce qu'on regarde, ou None quand rien ne correspond."""
+    contexte = (contexte or "").strip().lower()
+    if not contexte:
+        return None
+    proc, _, titre = contexte.partition("|")
+    # Le titre entier, pas seulement le site : c'est lui qui porte le sujet.
+    plein = " " + " ".join((_titre_onglet(titre) + " " + proc.strip()).split()) + " "
+    for nom, mots in THEMES_ACTIVITE:
+        for mot in mots:
+            if mot in plein:
+                return nom
+    return None
+
+
+def categorie_activite(contexte):
+    """'chrome.exe | voices of the void - youtube' -> 'web:youtube', 'code.exe' -> 'code'.
+
+    On garde le programme, et pour un navigateur LE SITE lu dans le titre de
+    l'onglet au premier plan (voir `_site_du_titre`). On ne conserve donc ni le
+    canal, ni le nom de la personne, ni le titre de la video : juste ou on
+    etait, pas avec qui. Le sujet, lui, passe par `theme_activite` -- un mot,
+    calcule ici, jamais le titre.
     """
     contexte = (contexte or "").strip()
     if not contexte:
@@ -1009,10 +1154,8 @@ def categorie_activite(contexte):
     proc, _, titre = contexte.partition("|")
     proc = proc.strip().replace(".exe", "")
     titre = titre.strip()
-    navigateurs = ("chrome", "firefox", "msedge", "brave", "opera", "vivaldi")
-    if any(n in proc for n in navigateurs) and titre:
-        mots = titre.replace(" - ", " ").replace(" | ", " ").split()
-        return "web:" + (mots[0][:24] if mots else proc)
+    if any(n in proc for n in NAVIGATEURS) and titre:
+        return "web:" + _site_du_titre(titre, proc)
     if proc:
         return proc[:32]
     # Sans nom de processus (un jeu qui refuse qu'on lise le sien), on ne jette
@@ -1047,7 +1190,7 @@ def _reinit_jour(reprendre=False, maintenant=None):
     jour = _jour_courant()
     ACTIVITE.update(jour=jour, contexte="", titre_courant="",
                     depuis=maintenant if maintenant is not None else time.time(),
-                    temps={}, titres={}, bascules=0,
+                    temps={}, titres={}, themes={}, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
                     trou_depuis=0.0, reprise=True)
     if not reprendre:
@@ -1061,6 +1204,9 @@ def _reinit_jour(reprendre=False, maintenant=None):
                              if isinstance(v, (int, float)) and v > 0}
         ACTIVITE["titres"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
                               for k, v in (d.get("titres") or {}).items()}
+        themes = d.get("temps_par_theme_s") or {}
+        ACTIVITE["themes"] = {str(k): float(v) for k, v in themes.items()
+                              if isinstance(v, (int, float)) and v > 0}
         ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
         ACTIVITE["actif_s"] = float(d.get("actif_minutes") or 0) * 60.0
         plage = d.get("plage") or {}
@@ -1094,9 +1240,17 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     cat = categorie_activite(contexte)
     titre = (contexte or "").partition("|")[2].strip()
     avant = ACTIVITE["contexte"]
+    # LE TEMPS VA AU THEME DE LA FENETRE QU'ON QUITTE, pas de celle qu'on ouvre.
+    # C'est le meme raisonnement que `avant` pour la categorie, et le confondre
+    # ferait glisser chaque minute d'un cran : les cinq heures de YouTube
+    # atterriraient sous le theme de l'onglet ouvert juste apres.
+    theme_avant = ACTIVITE.get("theme_courant")
     if avant:
         ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
         ACTIVITE["temps"][avant] = ACTIVITE["temps"].get(avant, 0.0) + ecoule
+        if theme_avant:
+            ACTIVITE.setdefault("themes", {})
+            ACTIVITE["themes"][theme_avant] = ACTIVITE["themes"].get(theme_avant, 0.0) + ecoule
         if actif:
             ACTIVITE["actif_s"] += ecoule
         if titres_complets and ACTIVITE["titre_courant"]:
@@ -1143,6 +1297,10 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
         if avant:
             ACTIVITE["bascules"] += 1
         ACTIVITE["contexte"] = cat
+    # Le theme se lit sur la MEME fenetre que la categorie, au meme instant :
+    # le temps versé plus bas doit aller au theme de ce qu'on regardait, pas de
+    # ce qu'on regardait avant.
+    ACTIVITE["theme_courant"] = theme_activite(contexte)
     ACTIVITE["titre_courant"] = titre
 
 
@@ -1152,6 +1310,16 @@ def _fermer_plage(maintenant=None):
         ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
         ACTIVITE["temps"][ACTIVITE["contexte"]] = \
             ACTIVITE["temps"].get(ACTIVITE["contexte"], 0.0) + ecoule
+        # Le meme temps, range une seconde fois par SUJET. Ce n'est pas un
+        # doublon : « 249 min web » ne dit pas si c'etait trois heures de
+        # documentaires ou trois heures de doomscroll, et le site n'a que ce
+        # chiffre-la. Un instant sans theme reconnu ne compte nulle part --
+        # les totaux des deux tables n'ont donc aucune raison d'etre egaux, et
+        # c'est voulu : ce qui n'est pas classe ne doit pas l'etre de force.
+        theme = ACTIVITE.get("theme_courant")
+        if theme:
+            ACTIVITE.setdefault("themes", {})
+            ACTIVITE["themes"][theme] = ACTIVITE["themes"].get(theme, 0.0) + ecoule
         ACTIVITE["depuis"] = maintenant
 
 
@@ -1174,6 +1342,10 @@ def resume_activite():
     if ACTIVITE["titres"]:
         resume["titres"] = {cat: {t: round(s) for t, s in d.items()}
                             for cat, d in ACTIVITE["titres"].items()}
+    themes = {k: round(v) for k, v in sorted(
+        (ACTIVITE.get("themes") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
+    if themes:
+        resume["temps_par_theme_s"] = themes
     return resume
 
 

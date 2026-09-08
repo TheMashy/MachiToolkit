@@ -402,6 +402,96 @@ class FinesseDEcran(unittest.TestCase):
                          ["v2", "par ecran", "systeme"])
 
 
+class Onglets(unittest.TestCase):
+    """CE QU'ON REGARDE : l'onglet au premier plan, et de quoi il parle.
+
+    Windows ne rend que le titre de la fenetre de premier plan -- mais chez un
+    navigateur, c'est exactement le titre de l'ONGLET ACTIF suivi du nom du
+    programme. Compter le temps par onglet ne demande donc aucune extension :
+    il suffit de decouper correctement, ce qui n'etait pas fait.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    def test_le_premier_mot_n_est_pas_le_site(self):
+        """LE DEFAUT. La regle etait « pour un navigateur, le premier mot du
+        titre, qui porte le site ». Il ne le porte pas : un titre d'onglet
+        commence par le sujet de la page. Le journal se remplissait de « my »,
+        « i », « they » -- les premiers mots de titres en anglais -- et des
+        heures de YouTube comptaient sous cinq noms dont aucun n'existait."""
+        cat = self.mt.categorie_activite
+        self.assertEqual(cat("chrome.exe | voices of the void - kerfur acquired - youtube - google chrome"),
+                         "web:youtube")
+        self.assertEqual(cat("chrome.exe | my whole life - r/confession - reddit - google chrome"),
+                         "web:reddit")
+        self.assertEqual(cat("chrome.exe | i think they are wrong - youtube - google chrome"),
+                         "web:youtube")
+        for mauvais in ("web:my", "web:i", "web:they", "web:voices"):
+            self.assertNotIn(mauvais, [cat("chrome.exe | my whole life - youtube - google chrome"),
+                                       cat("chrome.exe | i think - youtube - google chrome")])
+
+    def test_le_nom_du_navigateur_et_le_profil_tombent(self):
+        t = self.mt._titre_onglet
+        self.assertEqual(t("api keys | claude platform - profil 1 - microsoft edge"),
+                         "api keys | claude platform")
+        self.assertEqual(t("(3) boite de reception - gmail - google chrome"),
+                         "boite de reception - gmail")
+        self.assertEqual(t("un titre sans navigateur"), "un titre sans navigateur")
+
+    def test_un_site_inconnu_ne_devient_pas_une_phrase(self):
+        """La regle du produit : on garde OU on etait, jamais CE QU'ON lisait.
+        Le repli sur le dernier morceau du titre pouvait faire entrer une phrase
+        entiere dans le journal — et de la, dans ce qui part au site."""
+        cat = self.mt.categorie_activite
+        self.assertEqual(cat("chrome.exe | i think they are wrong about all of this - google chrome"),
+                         "web:autre")
+        # Un vrai nom de site, court, passe.
+        self.assertEqual(cat("chrome.exe | mon compte - impots.gouv.fr - google chrome"),
+                         "web:impots.gouv.fr")
+
+    def test_les_thematiques_se_lisent_sur_le_titre(self):
+        th = self.mt.theme_activite
+        for contexte, attendu in [
+            ("chrome.exe | urbex : hopital abandonne depuis 40 ans - youtube - google chrome", "urbex"),
+            ("chrome.exe | elden ring boss fight no commentary - youtube - google chrome", "jeu"),
+            ("chrome.exe | campagne dnd - session 4 - youtube - google chrome", "rp"),
+            ("chrome.exe | combat footage frontline - youtube - google chrome", "conflit"),
+            ("chrome.exe | (3) r/confession - reddit - google chrome", "social"),
+            ("chrome.exe | mon compte - paypal - google chrome", "argent"),
+        ]:
+            self.assertEqual(th(contexte), attendu, contexte)
+
+    def test_un_titre_qui_ne_dit_rien_n_est_classe_nulle_part(self):
+        """Inventer une thematique serait pire que ne rien dire : un theme faux
+        se lit comme une mesure, et personne n'ira le verifier."""
+        self.assertIsNone(self.mt.theme_activite("chrome.exe | une page quelconque - google chrome"))
+        self.assertIsNone(self.mt.theme_activite(""))
+
+    def test_le_temps_va_au_theme_de_la_fenetre_QU_ON_QUITTE(self):
+        """Le meme raisonnement que `avant` pour la categorie. Le confondre
+        ferait glisser chaque minute d'un cran, et les cinq heures de YouTube
+        atterriraient sous le theme de l'onglet ouvert juste apres."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        for contexte, t in [
+            ("chrome.exe | urbex : hopital abandonne - youtube - google chrome", 1000),
+            ("chrome.exe | urbex : hopital abandonne - youtube - google chrome", 1120),
+            ("code.exe | machi_tool.py", 1120),
+            ("code.exe | machi_tool.py", 1180),
+            ("chrome.exe | (3) r/confession - reddit - google chrome", 1180),
+            ("chrome.exe | (3) r/confession - reddit - google chrome", 1300),
+        ]:
+            mt.activite_note(contexte, True, maintenant=t)
+        self.assertEqual({k: round(v) for k, v in mt.ACTIVITE["temps"].items()},
+                         {"web:youtube": 120, "code": 60, "web:reddit": 120})
+        self.assertEqual({k: round(v) for k, v in mt.ACTIVITE["themes"].items()},
+                         {"urbex": 120, "social": 120},
+                         "les 60 s de code ne sont classees nulle part, et c'est juste")
+
+
 class Nuits(unittest.TestCase):
     """LA NUIT DE QUELQU'UN QUI SE LEVE A 16 H.
 
