@@ -45,7 +45,7 @@ class Demarrage(unittest.TestCase):
 
     def test_config_absente(self):
         cfg = self.mt.charger_config()
-        self.assertEqual(cfg["config_version"], 3)
+        self.assertEqual(cfg["config_version"], 4)
 
     def test_config_illisible_ne_tue_pas(self):
         """Une ecriture interrompue laisse du JSON tronque. On repart des
@@ -59,6 +59,20 @@ class Demarrage(unittest.TestCase):
         self.ecrire_config("[1, 2, 3]")
         self.assertIsInstance(self.mt.charger_config(), dict)
 
+    def test_la_migration_v4_allume_les_titres_et_le_dit(self):
+        """Elle desserre une regle que le fichier tenait depuis le debut (« on
+        garde OU on etait, jamais QUOI ») : elle doit donc s'annoncer, et rester
+        annulable. Une migration silencieuse qui ouvre une collecte serait la
+        seule chose de ce fichier qu'on n'aurait pas le droit de faire."""
+        self.ecrire_config({"config_version": 3, "collecte_titres_complets": False})
+        cfg = self.mt.charger_config()
+        self.assertTrue(cfg["collecte_titres_complets"])
+        self.assertEqual(cfg["config_version"], 4)
+        # Et une fois passee, elle ne repasse plus : quelqu'un qui decoche la
+        # case ne doit pas la retrouver cochee au lancement suivant.
+        self.ecrire_config(dict(cfg, collecte_titres_complets=False))
+        self.assertFalse(self.mt.charger_config()["collecte_titres_complets"])
+
     def test_valeurs_de_travers_dans_la_migration(self):
         """`int(cfg.get(...))` levait sur null, sur "" et sur "trois" — en
         plein chemin de demarrage, hors de tout filet."""
@@ -67,7 +81,7 @@ class Demarrage(unittest.TestCase):
                                 "pont_intervalle": mauvaise,
                                 "maj_intervalle_heures": mauvaise})
             cfg = self.mt.charger_config()
-            self.assertEqual(cfg["config_version"], 3, repr(mauvaise))
+            self.assertEqual(cfg["config_version"], 4, repr(mauvaise))
 
     def test_entier(self):
         self.assertEqual(self.mt.entier("7", 3), 7)
@@ -457,11 +471,79 @@ class Onglets(unittest.TestCase):
             ("chrome.exe | urbex : hopital abandonne depuis 40 ans - youtube - google chrome", "urbex"),
             ("chrome.exe | elden ring boss fight no commentary - youtube - google chrome", "jeu"),
             ("chrome.exe | campagne dnd - session 4 - youtube - google chrome", "rp"),
-            ("chrome.exe | combat footage frontline - youtube - google chrome", "conflit"),
-            ("chrome.exe | (3) r/confession - reddit - google chrome", "social"),
+            ("chrome.exe | combat footage frontline - youtube - google chrome", "guerre"),
+            ("chrome.exe | debat politique sur la reforme - youtube - google chrome", "politique"),
+            ("chrome.exe | storytime : ma journee - youtube - google chrome", "influenceurs"),
+            ("chrome.exe | blender tuto rigging - youtube - google chrome", "creation"),
             ("chrome.exe | mon compte - paypal - google chrome", "argent"),
         ]:
             self.assertEqual(th(contexte), attendu, contexte)
+
+    def test_le_support_n_est_pas_un_sujet(self):
+        """« video » et « social » raflaient tout ce que les familles precises
+        n'avaient pas pris : une heure d'urbex mal orthographiee finissait en
+        « video », c'est-a-dire nulle part en ayant l'air d'etre quelque part.
+        Savoir qu'on etait sur YouTube ne dit rien de plus que la premiere barre
+        de l'ecran, qui l'affiche deja."""
+        th = self.mt.theme_activite
+        self.assertIsNone(th("chrome.exe | voices of the void - kerfur - youtube - google chrome"))
+        self.assertIsNone(th("chrome.exe | (3) r/confession - reddit - google chrome"))
+        self.assertNotIn("video", [n for n, _ in self.mt.THEMES_ACTIVITE])
+        self.assertNotIn("social", [n for n, _ in self.mt.THEMES_ACTIVITE])
+
+    def test_ce_qui_est_consulte_sur_internet_compte_a_part(self):
+        """Une heure de « creation » passee DANS Blender et une heure passee a
+        regarder un tuto de Blender ne sont pas la meme heure : l'une est du
+        travail, l'autre de la consultation. Melangees, « de quoi parle ce que je
+        regarde » n'a plus de reponse."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        # Les ecarts restent sous 180 s : au-dela, un echantillon manquant veut
+        # dire que personne ne mesurait, et le versement est plafonne — c'est
+        # voulu, et une fixture qui l'ignore mesure le plafond, pas la regle.
+        for contexte, t in [
+            ("blender.exe | projet.blend", 1000),
+            ("blender.exe | projet.blend", 1150),          # 150 s de creation, hors web
+            ("chrome.exe | blender tuto rigging - youtube - google chrome", 1150),
+            ("chrome.exe | blender tuto rigging - youtube - google chrome", 1270),  # 120 s, web
+        ]:
+            mt.activite_note(contexte, True, maintenant=t)
+        self.assertEqual(round(mt.ACTIVITE["themes"]["creation"]), 270, "tout confondu")
+        self.assertEqual(round(mt.ACTIVITE["themes_web"]["creation"]), 120, "sur internet seulement")
+
+    def test_le_titre_derriere_le_theme_rend_la_mesure_refutable(self):
+        """Un camembert qui dit « 40 min de guerre » laisse seul devant le
+        chiffre. Le titre le rend VERIFIABLE, donc refutable : on doit pouvoir
+        regarder la liste et dire « ca, ce n'etait pas de la guerre ». Sans elle,
+        une table de mots-cles devient une autorite qu'on ne peut pas contredire."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        vu = "chrome.exe | combat footage frontline - youtube - google chrome"
+        mt.activite_note(vu, True, titres_complets=True, maintenant=1000.0)
+        mt.activite_note(vu, True, titres_complets=True, maintenant=1150.0)
+        mt.activite_note("code.exe | machi_tool.py", True, titres_complets=True, maintenant=1150.0)
+        r = mt.resume_activite()
+        self.assertEqual(r["titres_par_theme"]["guerre"], {"combat footage frontline - youtube": 150})
+        # Sans le reglage, rien n'est garde : c'est le sens du reglage.
+        mt._reinit_jour(maintenant=2000.0)
+        mt.ACTIVITE["active"] = True
+        mt.activite_note(vu, True, maintenant=2000.0)
+        mt.activite_note(vu, True, maintenant=2150.0)
+        self.assertNotIn("titres_par_theme", mt.resume_activite())
+
+    def test_un_titre_vu_trois_secondes_ne_compte_pas(self):
+        """Cent onglets ouverts trois secondes ne disent rien de ce qu'on a
+        regarde, et les envoyer ferait grossir chaque journee sans rien
+        apprendre a personne."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        vu = "chrome.exe | urbex : un lieu abandonne - youtube - google chrome"
+        mt.activite_note(vu, True, titres_complets=True, maintenant=1000.0)
+        mt.activite_note(vu, True, titres_complets=True, maintenant=1010.0)   # 10 s
+        self.assertNotIn("titres_par_theme", mt.resume_activite())
 
     def test_un_titre_qui_ne_dit_rien_n_est_classe_nulle_part(self):
         """Inventer une thematique serait pire que ne rien dire : un theme faux
@@ -488,8 +570,10 @@ class Onglets(unittest.TestCase):
         self.assertEqual({k: round(v) for k, v in mt.ACTIVITE["temps"].items()},
                          {"web:youtube": 120, "code": 60, "web:reddit": 120})
         self.assertEqual({k: round(v) for k, v in mt.ACTIVITE["themes"].items()},
-                         {"urbex": 120, "social": 120},
-                         "les 60 s de code ne sont classees nulle part, et c'est juste")
+                         {"urbex": 120},
+                         "ni les 60 s de code ni les 120 s de reddit ne sont classees : "
+                         "« social » est un SUPPORT, pas un sujet — la premiere barre de "
+                         "l'ecran dit deja qu'on etait sur reddit")
 
 
 class Nuits(unittest.TestCase):

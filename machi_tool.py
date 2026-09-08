@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.22.0"
+VERSION = "1.23.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -242,12 +242,12 @@ CONFIG_DEFAUT = {
     # Journal d'activite facon ActivityWatch : temps par app/site, bascules,
     # plages actives. Aucun contenu, aucun clavier. Faux par defaut.
     "collecte_active": False,
-    "collecte_titres_complets": False,   # garder le titre entier des fenetres
+    "collecte_titres_complets": True,    # garder le titre des onglets (voir migration v4)
     "collecte_envoi": False,             # pousser le digest au site
     "collecte_intervalle_heures": 6,
 
     # Mises a jour depuis les publications GitHub du depot.
-    "config_version": 3,              # sert aux migrations, voir charger_config
+    "config_version": 4,              # sert aux migrations, voir charger_config
     "maj_verifier": True,             # regarder si une version plus recente existe
     "maj_installation_auto": True,    # poser la mise a jour sans rien demander
     # Chaque fusion sur main sort une pre-version : la refuser reviendrait
@@ -375,7 +375,26 @@ def charger_config():
         cfg["api_active"] = True
         print("Configuration migree (v3) : mise a jour automatique, releve "
               "toutes les 3 min, serveur local allume.")
-    cfg["config_version"] = 3
+    # Version 4 : LE TITRE DES ONGLETS EST GARDE, ET C'EST UN CHOIX ASSUME.
+    #
+    # Jusqu'ici ce reglage etait eteint par defaut, et la regle du fichier etait
+    # « on garde OU on etait, jamais QUOI » : le site ne recevait que « youtube,
+    # 249 min ». Depuis que chaque instant est aussi range par SUJET, ce silence
+    # coute plus qu'il ne protege — un camembert qui annonce « 40 min de guerre »
+    # sans pouvoir montrer sur quoi il se fonde est une autorite qu'on ne peut
+    # pas contredire, et une table de mots-cles se trompe forcement quelque part.
+    #
+    # Ce qui part au site, desormais : les DIX titres les plus longs par sujet,
+    # au-dela de trente secondes chacun. Ce qui ne part toujours pas : l'adresse
+    # visitee, le contenu de la page, ce qui est tape au clavier. Et la case
+    # reste dans les reglages — c'est le sens d'un reglage qu'on puisse le
+    # rendre a zero.
+    if enregistre and entier(enregistre.get("config_version", 1), 1) < 4:
+        cfg["collecte_titres_complets"] = True
+        print("Configuration migree (v4) : les titres d'onglets sont gardes, "
+              "pour que les sujets soient verifiables. Reglages > Site web pour "
+              "revenir en arriere.")
+    cfg["config_version"] = 4
     return cfg
 
 
@@ -529,8 +548,11 @@ ACTIVITE = {
     "titres": {},         # categorie -> {titre: secondes}, si titres complets
     "bascules": 0,
     "actif_s": 0.0,       # secondes reellement actives (hors inactivite)
-    "themes": {},         # secondes par thematique de ce qu'on regardait
+    "themes": {},         # secondes par thematique, tout confondu
+    "themes_web": {},     # secondes par thematique, NAVIGATEUR seulement
+    "titres_theme": {},   # thematique -> {titre: secondes}, si titres complets
     "theme_courant": None,
+    "web_courant": False,
     "premiere": "",       # premiere activite de la journee (HH:MM)
     "derniere": "",
     "trous": [],          # absences > SEUIL_TROU pendant la journee
@@ -1089,6 +1111,13 @@ qui ne correspond a rien n'est classe nulle part, et c'est la bonne reponse :
 inventer une thematique serait pire que ne rien dire. L'ordre compte -- la
 premiere famille qui correspond gagne.
 
+LE SUPPORT N'EST PAS UN SUJET, et « video » / « social » ont ete retires pour
+ca. Savoir qu'on etait sur YouTube ne dit rien de plus que la premiere barre de
+l'ecran, qui l'affiche deja ; et places en fin de liste, ces deux-la raflaient
+tout ce que les familles precises n'avaient pas pris — une heure d'urbex mal
+orthographiee finissait en « video », c'est-a-dire nulle part, en ayant l'air
+d'etre quelque part. Ce qui n'est pas classe doit se voir comme non classe.
+
 ET LE TITRE NE QUITTE JAMAIS LA MACHINE. C'est ici, en local, que le theme est
 calcule ; seul le theme part au site. Le nom de la video, le canal, le pseudo
 de la personne d'en face restent sur le poste -- c'est la meme regle que pour
@@ -1096,31 +1125,60 @@ de la personne d'en face restent sur le poste -- c'est la meme regle que pour
 pas d'un cran.
 """
 THEMES_ACTIVITE = [
-    ("dev",      ("github", "stack overflow", "stackoverflow", " npm", "pypi", "documentation",
-                  "docs.", "localhost", "pull request", "commit", "python", "javascript", "api ")),
-    ("jeu",      ("gameplay", "speedrun", "let's play", "lets play", "walkthrough", "no commentary",
-                  "steam", "twitch", "minecraft", "fortnite", "valorant", "league of legends",
-                  "elden ring", "boss fight", "modded", "playthrough")),
-    ("rp",       ("roleplay", "role play", " rp ", "jdr", "dungeons", "donjons", "dnd", "d&d",
-                  "campagne", "one shot rp")),
-    ("urbex",    ("urbex", "abandoned", "abandonne", "abandonné", "exploration urbaine",
-                  "lieu abandonne", "lost place", "derelict")),
-    ("conflit",  ("war footage", "combat footage", "frontline", "ukraine", "gaza", "guerre",
-                  "drone strike", "bodycam", "conflit arme")),
-    ("actu",     ("actualite", "actualité", "info", "le monde", "bfm", "france info", "news",
-                  "reportage", "journal televise")),
-    ("musique",  ("spotify", "soundcloud", "bandcamp", "playlist", "album", " ost", "official video",
-                  "live session", "concert", "remix", "lofi")),
-    ("creation", ("artstation", "deviantart", "blender", "photoshop", "after effects", "davinci",
-                  "tutorial", "tuto", "speedpaint", "timelapse", "fl studio")),
-    ("achat",    ("amazon", "leboncoin", "aliexpress", "panier", "checkout", "commande",
-                  "livraison", "prix")),
-    ("argent",   ("paypal", "banque", "assurance", "impots", "impôts", "coinbase", "binance",
-                  "virement", "facture")),
-    ("social",   ("discord", "reddit", "instagram", "tiktok", "facebook", "twitter", "x.com",
-                  "linkedin", "snapchat", "messages")),
-    ("video",    ("youtube", "netflix", "disney+", "prime video", "twitch", "vimeo", "dailymotion",
-                  "episode", "épisode", "saison", "film complet")),
+    # -- ce qu'on REGARDE, du plus precis au plus large -------------------
+    ("guerre",       ("war footage", "combat footage", "frontline", "front line", "ukraine",
+                      "gaza", "guerre", "drone strike", "bodycam", "conflit arme", "russie",
+                      "soldat", "militaire", "artillerie", "tranchee", "kherson", "bakhmut")),
+    ("politique",    ("politique", "election", "élection", "assemblee nationale", "senat",
+                      "gouvernement", "ministre", "president", "président", "macron", "melenchon",
+                      "rn ", "sondage", "debat politique", "reforme", "greve", "grève",
+                      "manifestation", "syndicat", "loi ", "parlement")),
+    ("influenceurs", ("vlog", "storytime", "story time", "drama", "clash", "react", "reaction",
+                      "podcast", "interview", "streamer", "influenceur", "influenceuse",
+                      "tiktokeur", "youtubeur", "youtubeuse", "unboxing", "grwm", "q&a",
+                      "ma journee", "ma journée", "je teste", "j ai teste")),
+    ("urbex",        ("urbex", "abandoned", "abandonne", "abandonné", "exploration urbaine",
+                      "lieu abandonne", "lost place", "derelict", "friche", "souterrain")),
+    ("rp",           ("roleplay", "role play", " rp ", "jdr", "dungeons", "donjons", "dnd", "d&d",
+                      "campagne rp", "one shot rp", "murder party")),
+    ("jeu",          ("gameplay", "speedrun", "let's play", "lets play", "walkthrough",
+                      "no commentary", "steam", "minecraft", "fortnite", "valorant",
+                      "league of legends", "elden ring", "boss fight", "modded", "playthrough",
+                      "soluce", "tier list", "patch note", "esport", "e-sport")),
+    ("creation",     ("artstation", "deviantart", "blender", "photoshop", "after effects",
+                      "davinci", "tutorial", "tuto", "speedpaint", "timelapse", "fl studio",
+                      "substance", "zbrush", "rigging", "sculpt", "concept art", "making of",
+                      "breakdown vfx", "montage video")),
+    ("musique",      ("spotify", "soundcloud", "bandcamp", "playlist", "album", " ost",
+                      "official video", "live session", "concert", "remix", "lofi", "clip",
+                      "audio hq", "full album")),
+    ("science",      ("documentaire", "espace", "nasa", "astronomie", "physique", "biologie",
+                      "neuroscience", "cerveau", "histoire de", "archeologie", "vulgarisation",
+                      "conference", "conférence", "these", "étude")),
+    ("sante",        ("psy ", "psychologue", "psychiatre", "therapie", "thérapie", "tdah", "adhd",
+                      "autisme", "anxiete", "anxiété", "depression", "dépression", "burn out",
+                      "sommeil", "symptome", "symptôme", "medecin", "médecin", "diagnostic")),
+    ("sport",        ("match", "ligue 1", "premier league", "nba", "ufc", "mma", "formule 1",
+                      "f1 ", "tennis", "roland garros", "tour de france", "musculation",
+                      "entrainement", "entraînement", "workout", "course a pied")),
+    ("cuisine",      ("recette", "cuisine", "patisserie", "pâtisserie", "restaurant", "chef ",
+                      "marmiton", "batch cooking", "vegan")),
+    ("humour",       ("humour", "sketch", "stand up", "stand-up", "parodie", "meme", "memes",
+                      "best of", "fail", "compilation drole", "compilation drôle")),
+    ("voyage",       ("voyage", "roadtrip", "road trip", "randonnee", "randonnée", "itineraire",
+                      "billet d avion", "airbnb", "booking", "guide de voyage")),
+    ("adulte",       ("porn", "pornhub", "xvideos", "xhamster", "onlyfans", "nsfw", "hentai",
+                      "camgirl", "escort")),
+    ("actu",         ("actualite", "actualité", "le monde", "bfm", "france info", "franceinfo",
+                      "news", "reportage", "journal televise", "20 minutes", "mediapart",
+                      "liberation", "le figaro")),
+    ("achat",        ("amazon", "leboncoin", "aliexpress", "panier", "checkout", "commande",
+                      "livraison", "vinted", "cdiscount", "fnac")),
+    ("argent",       ("paypal", "banque", "assurance", "impots", "impôts", "coinbase", "binance",
+                      "virement", "facture", "mutuelle", "caf ", "pole emploi", "pôle emploi")),
+    ("dev",          ("github", "stack overflow", "stackoverflow", " npm", "pypi", "documentation",
+                      "docs.", "localhost", "pull request", "commit", "python", "javascript",
+                      "api ", "typescript", "docker", "regex")),
 ]
 
 
@@ -1190,7 +1248,8 @@ def _reinit_jour(reprendre=False, maintenant=None):
     jour = _jour_courant()
     ACTIVITE.update(jour=jour, contexte="", titre_courant="",
                     depuis=maintenant if maintenant is not None else time.time(),
-                    temps={}, titres={}, themes={}, bascules=0,
+                    temps={}, titres={}, themes={}, themes_web={},
+                    titres_theme={}, theme_courant=None, web_courant=False, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
                     trou_depuis=0.0, reprise=True)
     if not reprendre:
@@ -1207,6 +1266,11 @@ def _reinit_jour(reprendre=False, maintenant=None):
         themes = d.get("temps_par_theme_s") or {}
         ACTIVITE["themes"] = {str(k): float(v) for k, v in themes.items()
                               if isinstance(v, (int, float)) and v > 0}
+        web = d.get("temps_par_theme_web_s") or {}
+        ACTIVITE["themes_web"] = {str(k): float(v) for k, v in web.items()
+                                  if isinstance(v, (int, float)) and v > 0}
+        ACTIVITE["titres_theme"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
+                                    for k, v in (d.get("titres_par_theme") or {}).items()}
         ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
         ACTIVITE["actif_s"] = float(d.get("actif_minutes") or 0) * 60.0
         plage = d.get("plage") or {}
@@ -1245,12 +1309,31 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # ferait glisser chaque minute d'un cran : les cinq heures de YouTube
     # atterriraient sous le theme de l'onglet ouvert juste apres.
     theme_avant = ACTIVITE.get("theme_courant")
+    web_avant = ACTIVITE.get("web_courant", False)
     if avant:
         ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
         ACTIVITE["temps"][avant] = ACTIVITE["temps"].get(avant, 0.0) + ecoule
         if theme_avant:
             ACTIVITE.setdefault("themes", {})
             ACTIVITE["themes"][theme_avant] = ACTIVITE["themes"].get(theme_avant, 0.0) + ecoule
+            # CE QU'ON CONSULTE SUR INTERNET, COMPTE A PART. Une heure de
+            # « creation » passee dans Blender et une heure passee a regarder un
+            # tuto de Blender ne sont pas la meme heure : l'une est du travail,
+            # l'autre de la consultation. Melangees, la question « de quoi parle
+            # ce que je regarde » n'a plus de reponse.
+            if web_avant:
+                ACTIVITE.setdefault("themes_web", {})
+                ACTIVITE["themes_web"][theme_avant] = ACTIVITE["themes_web"].get(theme_avant, 0.0) + ecoule
+            # LE TITRE DERRIERE LE THEME, quand la personne l'a demande. Un
+            # camembert de themes dit « 40 min de guerre » et laisse seul devant
+            # le chiffre : c'est le TITRE qui rend la mesure verifiable, et
+            # verifiable veut dire refutable — on doit pouvoir regarder la liste
+            # et dire « ca, ce n'etait pas de la guerre ». Sans elle, une table
+            # de mots-cles devient une autorite qu'on ne peut pas contredire.
+            if titres_complets and ACTIVITE["titre_courant"]:
+                par = ACTIVITE.setdefault("titres_theme", {}).setdefault(theme_avant, {})
+                t = _titre_onglet(ACTIVITE["titre_courant"])[:120] or ACTIVITE["titre_courant"][:120]
+                par[t] = par.get(t, 0.0) + ecoule
         if actif:
             ACTIVITE["actif_s"] += ecoule
         if titres_complets and ACTIVITE["titre_courant"]:
@@ -1301,6 +1384,7 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # le temps versé plus bas doit aller au theme de ce qu'on regardait, pas de
     # ce qu'on regardait avant.
     ACTIVITE["theme_courant"] = theme_activite(contexte)
+    ACTIVITE["web_courant"] = cat.startswith("web:")
     ACTIVITE["titre_courant"] = titre
 
 
@@ -1346,6 +1430,21 @@ def resume_activite():
         (ACTIVITE.get("themes") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
     if themes:
         resume["temps_par_theme_s"] = themes
+    web = {k: round(v) for k, v in sorted(
+        (ACTIVITE.get("themes_web") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
+    if web:
+        resume["temps_par_theme_web_s"] = web
+    # Les titres : les DIX plus longs par theme, jamais toute la liste. Cent
+    # onglets ouverts trois secondes ne disent rien de ce qu'on a regarde, et
+    # les envoyer ferait grossir chaque journee sans rien apprendre a personne.
+    titres = {}
+    for theme, d in (ACTIVITE.get("titres_theme") or {}).items():
+        gardes = sorted(d.items(), key=lambda kv: -kv[1])[:10]
+        gardes = [(t, round(sec)) for t, sec in gardes if sec >= 30]
+        if gardes:
+            titres[theme] = dict(gardes)
+    if titres:
+        resume["titres_par_theme"] = titres
     return resume
 
 
