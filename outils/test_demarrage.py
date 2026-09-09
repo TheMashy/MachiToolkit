@@ -773,6 +773,107 @@ class SousCategories(unittest.TestCase):
         self.assertEqual(titres, {"carte du front en ukraine - youtube": 420})
 
 
+class MiseAJourQuiDisparait(unittest.TestCase):
+    """ELLE S'EST ETEINTE TOUTE SEULE, SANS RIEN AFFICHER.
+
+    Le fil de la mise a jour posait l'installeur puis tuait l'application, deux
+    secondes apres une bulle de notification. Au demarrage de Windows cette
+    bulle n'arrive nulle part -- l'assistant de concentration l'avale a
+    l'ouverture de session -- et quelqu'un qui cliquait l'icone a cet instant
+    voyait sa fenetre s'ouvrir PUIS le processus mourir dessous. De l'exterieur
+    c'est un plantage. L'application faisait exactement ce qu'on lui avait
+    demande, sans que rien ne le dise.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+        # `charger_module` deplace LOCALAPPDATA, mais hors de Windows le dossier
+        # de l'application retombe sur le depot : une config laissee par un
+        # essai precedent ferait passer un premier demarrage pour une reprise.
+        # On repart donc d'un dossier vide, explicitement.
+        self.mt.DOSSIER = self.dossier
+        self.mt.FICHIER_CONFIG = os.path.join(self.dossier, "config.json")
+        self.mt.FICHIER_JOURNAL = os.path.join(self.dossier, "journal.log")
+        self.mt.MAJ.update(etat="repos", differee=False, version="9.9.9")
+
+    def test_rien_a_poser_ne_pose_rien(self):
+        self.assertFalse(self.mt.poser_la_maj(False))
+        self.assertFalse(self.mt.MAJ["differee"])
+
+    def test_la_fenetre_ouverte_retient_la_pose(self):
+        """Le coeur du correctif : on ne tue pas l'application sous les doigts
+        de quelqu'un qui vient de l'ouvrir."""
+        mt = self.mt
+        mt.MAJ["etat"] = "a_poser"
+        self.assertFalse(mt.poser_la_maj(True))
+        self.assertTrue(mt.MAJ["differee"], "et le panneau doit pouvoir le dire")
+        self.assertEqual(mt.MAJ["etat"], "a_poser", "la pose attend, elle n'est pas annulee")
+
+    def test_la_fenetre_fermee_laisse_partir_la_pose(self):
+        mt = self.mt
+        mt.MAJ["etat"] = "a_poser"
+        self.assertTrue(mt.poser_la_maj(False))
+        self.assertFalse(mt.MAJ["differee"])
+
+    def test_refermer_la_fenetre_libere_la_pose(self):
+        """La sequence complete : elle attend, puis elle part."""
+        mt = self.mt
+        mt.MAJ["etat"] = "a_poser"
+        self.assertFalse(mt.poser_la_maj(True))
+        self.assertFalse(mt.poser_la_maj(True))
+        self.assertTrue(mt.poser_la_maj(False))
+
+    def test_un_installeur_qui_ne_part_pas_ne_fait_pas_quitter(self):
+        """En mode script -- et chaque fois que le fichier telecharge a disparu
+        -- l'installeur ne part pas. L'application ne doit alors surtout pas
+        s'arreter : elle resterait fermee, sans rien pour la relancer. Et
+        l'etat bascule en « erreur », sinon la boucle de surveillance
+        reessaierait toutes les cent cinquante millisecondes."""
+        mt = self.mt
+        mt.MAJ.update(etat="a_poser", fichier="")
+        self.assertFalse(mt.lancer_installeur_maj())
+        self.assertEqual(mt.MAJ["etat"], "erreur")
+        self.assertFalse(mt.poser_la_maj(False), "l'etat a change : plus rien a poser")
+
+    def test_un_arret_laisse_une_trace_datee(self):
+        """Un redemarrage pour mise a jour et un plantage laissaient la meme
+        trace : aucune. Vu de l'exterieur les deux se ressemblent."""
+        mt = self.mt
+        mt.journaliser_arret("mise a jour vers 9.9.9")
+        with open(mt.FICHIER_JOURNAL, encoding="utf-8") as f:
+            journal = f.read()
+        self.assertIn("ARRET", journal)
+        self.assertIn("mise a jour vers 9.9.9", journal)
+        self.assertIn(mt.VERSION, journal)
+
+    def test_au_retour_l_application_dit_qu_elle_a_ete_mise_a_jour(self):
+        """Sans ca, rien au redemarrage ne distingue « je viens de me mettre a
+        jour » de « je viens de planter »."""
+        mt = self.mt
+        cfg = mt.charger_config()
+        self.assertEqual(cfg["derniere_version"], mt.VERSION)
+        mt.sauver_config(cfg)
+        # On rejoue un demarrage venant d'une version d'avant.
+        with open(mt.FICHIER_CONFIG, encoding="utf-8") as f:
+            enregistre = json.load(f)
+        enregistre["derniere_version"] = "1.0.0"
+        with open(mt.FICHIER_CONFIG, "w", encoding="utf-8") as f:
+            json.dump(enregistre, f)
+        mt.MAJ.update(etat="repos", message="Aucune verification depuis le demarrage.")
+        mt.charger_config()
+        self.assertEqual(mt.MAJ["etat"], "a_jour")
+        self.assertIn("1.0.0", mt.MAJ["message"])
+        self.assertIn(mt.VERSION, mt.MAJ["message"])
+
+    def test_un_premier_demarrage_n_annonce_aucune_mise_a_jour(self):
+        mt = self.mt
+        mt.MAJ.update(etat="repos", message="Aucune verification depuis le demarrage.")
+        mt.charger_config()
+        self.assertEqual(mt.MAJ["etat"], "repos",
+                         "il n'y a pas eu de version d'avant : il n'y a rien a annoncer")
+
+
 class Nuits(unittest.TestCase):
     """LA NUIT DE QUELQU'UN QUI SE LEVE A 16 H.
 

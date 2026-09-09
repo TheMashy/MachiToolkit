@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.24.1"
+VERSION = "1.24.2"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -248,6 +248,9 @@ CONFIG_DEFAUT = {
 
     # Mises a jour depuis les publications GitHub du depot.
     "config_version": 4,              # sert aux migrations, voir charger_config
+    "derniere_version": "",           # la version du dernier demarrage : dit au
+                                      # retour qu'une mise a jour est passee, et
+                                      # qu'il ne s'agissait pas d'un plantage
     "maj_verifier": True,             # regarder si une version plus recente existe
     "maj_installation_auto": True,    # poser la mise a jour sans rien demander
     # Chaque fusion sur main sort une pre-version : la refuser reviendrait
@@ -395,6 +398,20 @@ def charger_config():
               "pour que les sujets soient verifiables. Reglages > Site web pour "
               "revenir en arriere.")
     cfg["config_version"] = 4
+    """
+    ET ON SE SOUVIENT DE LA VERSION QU'ON ETAIT LA FOIS D'AVANT.
+
+    L'application se met a jour seule : elle disparait, se remplace, revient.
+    Vue de l'exterieur, cette disparition ressemble a un plantage -- et rien,
+    au retour, ne disait qu'il ne s'en etait pas produit un. Une ligne suffit a
+    lever le doute, et elle se lit au premier coup d'oeil sur le panneau.
+    """
+    vue = str(enregistre.get("derniere_version", "") or "")
+    cfg["derniere_version"] = VERSION
+    if vue and vue != VERSION:
+        MAJ["etat"] = "a_jour"
+        MAJ["message"] = "Mise a jour posee : %s vers %s." % (vue, VERSION)
+        print("Mise a jour posee : %s vers %s." % (vue, VERSION))
     return cfg
 
 
@@ -5610,6 +5627,12 @@ class Panneau:
                    BRUME, 8, largeur=460).pack(fill="x")
 
     def action_maj(self):
+        if MAJ["etat"] == "a_poser":
+            # Rien a declencher : la pose attend deja. On referme la fenetre, et
+            # la boucle de surveillance s'en charge au prochain tour -- un seul
+            # chemin vers l'installeur, pas deux qui pourraient partir ensemble.
+            self.cacher()
+            return
         self.declencher_maj("installer" if MAJ["etat"] in ("disponible", "prete")
                             else "verifier")
 
@@ -6113,19 +6136,38 @@ class Panneau:
                 else "hors ligne",
                 fg=VIF if ETAT["connecte"] else ALERTE)
 
+        """
+        ET LE PANNEAU DIT CE QUI VA SE PASSER, PARCE QUE C'EST LUI QU'ON REGARDE.
+
+        Une pose de mise a jour tue l'application. Tant que ca ne se disait que
+        dans une bulle de notification -- avalee par l'assistant de
+        concentration a l'ouverture de session -- la fenetre disparaissait sans
+        un mot, et ca se rapportait comme un plantage. Le message est ici
+        maintenant, a l'endroit ou quelqu'un vient justement de cliquer.
+        """
+        a_poser = MAJ["etat"] == "a_poser"
+        if a_poser and MAJ.get("differee"):
+            texte_maj = ("Version %s prete. Elle se pose des que tu fermes "
+                         "cette fenetre, et l'application revient seule."
+                         % MAJ["version"])
+        elif a_poser:
+            texte_maj = "Pose de la version %s..." % MAJ["version"]
+        else:
+            texte_maj = MAJ["message"]
         self.txt_maj.configure(
-            text=MAJ["message"],
-            fg=VIF if MAJ["etat"] in ("disponible", "prete") else BRUME)
+            text=texte_maj,
+            fg=VIF if MAJ["etat"] in ("disponible", "prete", "a_poser") else BRUME)
         pret = MAJ["etat"] in ("disponible", "prete")
         occupe = MAJ["etat"] in ("verification", "telechargement")
         self.btn_maj.configure(
-            text=("Installer " + MAJ["version"]) if pret
-            else ("En cours..." if occupe else "Verifier maintenant"),
+            text=("Poser maintenant" if a_poser
+                  else ("Installer " + MAJ["version"]) if pret
+                  else ("En cours..." if occupe else "Verifier maintenant")),
             state="disabled" if occupe else "normal")
         # La pastille du rail s'allume des qu'une maj attend, meme groupe replie.
-        if pret and not self.badge_maj.winfo_ismapped():
+        if (pret or a_poser) and not self.badge_maj.winfo_ismapped():
             self.badge_maj.pack(side="right", padx=(0, 2))
-        elif not pret and self.badge_maj.winfo_ismapped():
+        elif not (pret or a_poser) and self.badge_maj.winfo_ismapped():
             self.badge_maj.pack_forget()
 
         forc = ETAT.get("forcage")
@@ -6236,7 +6278,12 @@ PAGE_PUBLICATIONS = "https://github.com/" + DEPOT_GITHUB + "/releases"
 DOSSIER_MAJ = os.path.join(DOSSIER, "maj")
 
 MAJ = {
-    # repos | verification | a_jour | disponible | telechargement | prete | erreur
+    # repos | verification | a_jour | disponible | telechargement | prete |
+    # a_poser | erreur
+    #
+    # « a_poser » : la version est telechargee ET la decision de l'installer est
+    # prise. L'installation elle-meme TUE cette instance, et c'est pour ca
+    # qu'elle ne se fait plus ici : voir `differer_la_pose`.
     "etat": "repos",
     "message": "Aucune verification depuis le demarrage.",
     "version": "",
@@ -6247,6 +6294,10 @@ MAJ = {
     "progression": 0.0,
     "fichier": "",
     "verifie_le": 0.0,
+    # L'heure a laquelle la pose a ete demandee, et si elle attend que la
+    # fenetre se referme. Le panneau les lit pour dire ce qui va se passer.
+    "demande_le": 0.0,
+    "differee": False,
 }
 
 
@@ -6925,12 +6976,25 @@ def lancer():
                     MAJ["etat"] = "erreur"
                     MAJ["message"] = "Telechargement impossible : %s" % e
                     return
-            notifier(NOM_APP,
-                     "Installation de la version %s, l'application redemarre."
-                     % MAJ["version"])
-            time.sleep(2)
-            if lancer_installeur_maj():
-                demande_arret.set()
+            """
+            ON NE QUITTE PLUS D'ICI, ET C'EST TOUT LE CORRECTIF.
+
+            Ce fil posait l'installeur puis tuait l'application, deux secondes
+            apres une bulle de notification. Au demarrage de Windows, cette
+            bulle n'arrive nulle part -- l'assistant de concentration l'avale a
+            l'ouverture de session -- et quelqu'un qui cliquait l'icone a cet
+            instant precis voyait sa fenetre s'ouvrir PUIS le processus mourir
+            dessous. De l'exterieur, c'est un plantage, et c'est ce qui a ete
+            rapporte. L'application faisait exactement ce qu'on lui avait
+            demande, sans que rien ne le dise.
+
+            La pose est donc DEMANDEE ici, et executee par la boucle de
+            surveillance -- la seule qui sache si une fenetre est ouverte
+            devant quelqu'un.
+            """
+            MAJ["etat"] = "a_poser"
+            MAJ["demande_le"] = time.time()
+            MAJ["message"] = ("Version %s prete a etre posee." % MAJ["version"])
             return
 
         publication = verifier_maj(CFG)
@@ -7071,7 +7135,9 @@ def lancer():
                          enabled=lambda *_: MAJ["etat"] not in ("verification",
                                                                 "telechargement")),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Quitter", lambda *_: demande_arret.set()),
+        pystray.MenuItem("Quitter",
+                         lambda *_: (journaliser_arret("quitte depuis la barre"),
+                                     demande_arret.set())),
         )
 
     TRAY["icone"].menu = construire_menu()
@@ -7138,6 +7204,34 @@ def lancer():
         if demande_ouverture.is_set():
             demande_ouverture.clear()
             panneau.afficher()
+        """
+        LA POSE D'UNE MISE A JOUR ATTEND QUE LA FENETRE SOIT REFERMEE.
+
+        Poser une version tue cette instance : la fenetre se ferme, le
+        processus meurt, et l'exe telecharge relance l'application quelques
+        secondes plus tard. C'est correct quand personne ne regarde ; c'est
+        indiscernable d'un plantage quand quelqu'un vient d'ouvrir le panneau.
+
+        La regle est donc simple : tant que la fenetre est VISIBLE, on ne pose
+        rien, et le panneau dit ce qui attend. Des qu'elle est refermee -- ou
+        tout de suite si elle ne l'etait pas -- la pose part, apres avoir ecrit
+        dans le journal POURQUOI l'application s'arrete. Sans cette ligne, un
+        redemarrage pour mise a jour et un plantage laissent la meme trace :
+        aucune.
+        """
+        if poser_la_maj(panneau.interface_visible()):
+            if lancer_installeur_maj():
+                # La trace APRES le depart de l'installeur, pas avant : un
+                # « ARRET » ecrit pour un arret qui n'a pas eu lieu rendrait le
+                # journal moins fiable que pas de journal du tout.
+                journaliser_arret("mise a jour vers %s" % MAJ["version"])
+                demande_arret.set()
+            else:
+                # L'installeur n'est pas parti : on ne quitte surtout pas, et le
+                # message d'erreur pose par `lancer_installeur_maj` reste a
+                # l'ecran. Il a aussi bascule l'etat en « erreur », donc on ne
+                # reessaie pas toutes les cent cinquante millisecondes.
+                MAJ["differee"] = False
         if time.time() - dernier[0] > 2.0:
             dernier[0] = time.time()
             try:
@@ -7201,6 +7295,43 @@ def main():
         if deja_lance():
             return
     lancer()
+
+
+def poser_la_maj(fenetre_visible):
+    """Faut-il poser la mise a jour maintenant ? Et sinon, le dire.
+
+    POSER UNE VERSION TUE CETTE INSTANCE. La fenetre se ferme, le processus
+    meurt, et l'exe telecharge relance l'application quelques secondes plus
+    tard. C'est correct quand personne ne regarde ; c'est indiscernable d'un
+    plantage quand quelqu'un vient d'ouvrir le panneau -- et c'est exactement ce
+    qui a ete rapporte : « la fenetre s'est ouverte puis l'app s'est eteinte
+    toute seule, sans rien afficher ».
+
+    Tant que la fenetre est VISIBLE, on ne pose donc rien, et `differee` dit au
+    panneau d'expliquer ce qui attend. Une fenetre reduite ou rangee dans la
+    barre ne compte pas comme visible : personne ne la regarde.
+    """
+    if MAJ["etat"] != "a_poser":
+        MAJ["differee"] = False
+        return False
+    MAJ["differee"] = bool(fenetre_visible)
+    return not fenetre_visible
+
+
+def journaliser_arret(pourquoi):
+    """Pourquoi l'application s'arrete, ecrit avant qu'elle ne le fasse.
+
+    Un redemarrage pour mise a jour et un plantage laissaient la meme trace :
+    aucune. Vu de l'exterieur les deux se ressemblent -- la fenetre disparait
+    -- et sans cette ligne il n'y a rien pour les departager le lendemain.
+    """
+    try:
+        with open(FICHIER_JOURNAL, "a", encoding="utf-8") as f:
+            f.write("--- ARRET %s v%s : %s ---\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION, pourquoi))
+    except Exception:
+        pass
+    print("Arret :", pourquoi)
 
 
 def rapporter_plantage(e):
