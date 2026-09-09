@@ -35,11 +35,12 @@ import threading
 import traceback
 import subprocess
 import http.server
+import concurrent.futures
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.24.3"
+VERSION = "1.24.4"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -87,6 +88,16 @@ FICHIER_VERSION = os.path.join(DOSSIER, "version_installee.txt")
 _JOURNAL = None
 try:
     if sys.stdout is None or not hasattr(sys.stdout, "write"):
+        # LA SEULE PLACE POSSIBLE POUR FAIRE TOURNER CE FICHIER : ICI.
+        # faulthandler garde CE descripteur pour la vie du processus (plus
+        # bas) ; le renommer ensuite enverrait la pile d'un plantage natif --
+        # la seule chose qui puisse le nommer -- dans un fichier orphelin.
+        # Une capture qui echouait en boucle y ecrivait 4 Mo par heure.
+        try:
+            if os.path.getsize(FICHIER_JOURNAL) > 2_000_000:
+                os.replace(FICHIER_JOURNAL, FICHIER_JOURNAL + ".1")
+        except OSError:
+            pass
         _JOURNAL = open(FICHIER_JOURNAL, "a", encoding="utf-8", buffering=1)
         sys.stdout = sys.stderr = _JOURNAL
         print(f"\n--- demarrage {time.strftime('%Y-%m-%d %H:%M:%S')} v{VERSION} ---")
@@ -360,6 +371,10 @@ ETAT = {
     # une guirlande qui tombe aussitot connectee clignote toutes les dix
     # secondes, et martele la pile Bluetooth pour rien.
     "echecs_ble": 0,
+    # Etat de la capture d'ecran. Sans lui, une capture qui echoue n'a nulle
+    # part ou se dire : le panneau montrait « Connectee » -- le message du
+    # Bluetooth -- pendant que l'ecran n'etait plus lu du tout.
+    "ecran": {"echecs": 0, "suspendue": False, "reprise": 0.0, "depuis": 0.0},
     "rappel_neuf": False,
     "presence": None,      # battement envoye par le site
     "presence_vu": 0.0,    # jusqu'a quand la presence reste acquise
@@ -2258,6 +2273,69 @@ def couleur_cible(cfg, contexte):
 
 _local = threading.local()
 
+# Un seul fil pour la capture. La boucle de la guirlande attend chaque image
+# avant de demander la suivante : le pool par defaut n'accelere donc rien, il
+# multiplie seulement les contextes de peripherique -- les caches de capture
+# sont thread-local, un jeu par fil, et personne ne les rend jamais.
+EXECUTEUR_CAPTURE = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="capture")
+
+
+def objets_gdi():
+    """(objets GDI, objets USER) du processus, ou (-1, -1) hors Windows.
+
+    Le plafond par defaut est de 10 000 de chaque. C'est la seule mesure qui
+    tranche entre « le bureau a disparu » et « le processus n'a plus un seul
+    handle » : les libelles d'erreur, eux, mentent (pywin32 rend NULL sans
+    poser d'erreur, et mss affiche un code perime que ctypes a restaure).
+    """
+    try:
+        import ctypes
+        # Prototypes poses ICI, sur des WinDLL a nous : ctypes passerait sinon
+        # le pseudo-handle du processus (-1) sur 32 bits, et la mesure serait
+        # fausse sur un Windows 64 bits -- c'est-a-dire partout. Meme raison
+        # que dans `_apis_ecran` : on ne regle jamais les prototypes du
+        # `ctypes.windll.*` partage, un autre appel de l'application s'en sert.
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.GetCurrentProcess.argtypes = []
+        u32.GetGuiResources.restype = ctypes.c_uint
+        u32.GetGuiResources.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        moi = k32.GetCurrentProcess()
+        return int(u32.GetGuiResources(moi, 0)), int(u32.GetGuiResources(moi, 1))
+    except Exception:
+        return -1, -1
+
+
+_CAPTURE_DIT = set()
+
+
+def signaler_capture(quoi, e):
+    """Une ligne par panne, pas une par image.
+
+    UN ENSEMBLE, ET PAS LA DERNIERE PHRASE : dans le journal reel, DEUX
+    phrases alternaient -- le chemin GDI echouait, puis le repli mss
+    echouait a son tour, image apres image. Se souvenir seulement de la
+    precedente ne deduplique donc rien du tout : chacune differe toujours de
+    celle d'avant, et les deux repartent huit fois par seconde.
+
+    L'ensemble se vide au retablissement (voir `echec_capture`) : une panne
+    qui revient plus tard se redit, elle ne se tait pas pour la vie du
+    processus.
+
+    Et le compte d'objets du processus part avec. C'est la seule mesure qui
+    tranche entre « le bureau a disparu » et « il n'y a plus un handle » --
+    les libelles d'erreur, eux, mentent.
+    """
+    ligne = "%s : %s" % (quoi, e)
+    if ligne in _CAPTURE_DIT:
+        return
+    _CAPTURE_DIT.add(ligne)
+    g, u = objets_gdi()
+    print("%s | objets du processus : GDI %s, USER %s (plafond 10000)"
+          % (ligne, g, u))
+
 
 def _capteur():
     import mss
@@ -2309,30 +2387,25 @@ def _vignette_gdi(zone, colonnes, lignes):
     if garde is None or garde["taille"] != (colonnes, lignes):
         if garde is not None:
             _liberer_gdi(garde)
-        fenetre = dc_ecran = None
+        # La garde se remplit AU FUR ET A MESURE : ce qui a ete obtenu avant
+        # l'echec doit pouvoir etre rendu. L'ancienne version ne rattrapait
+        # que le contexte d'ecran ; un echec plus tardif -- le bitmap qui ne
+        # s'alloue plus -- laissait le contexte memoire derriere lui, un par
+        # image, jusqu'a epuisement du quota du processus.
+        neuf = {"taille": (colonnes, lignes)}
         try:
-            fenetre = win32gui.GetDesktopWindow()
-            dc_ecran = win32gui.GetWindowDC(fenetre)
-            source = win32ui.CreateDCFromHandle(dc_ecran)
-            memoire = source.CreateCompatibleDC()
-            image = win32ui.CreateBitmap()
+            neuf["fenetre"] = win32gui.GetDesktopWindow()
+            neuf["dc"] = win32gui.GetWindowDC(neuf["fenetre"])
+            neuf["source"] = source = win32ui.CreateDCFromHandle(neuf["dc"])
+            neuf["memoire"] = memoire = source.CreateCompatibleDC()
+            neuf["image"] = image = win32ui.CreateBitmap()
             image.CreateCompatibleBitmap(source, colonnes, lignes)
             memoire.SelectObject(image)
-            garde = {"fenetre": fenetre, "dc": dc_ecran, "source": source,
-                     "memoire": memoire, "image": image,
-                     "taille": (colonnes, lignes)}
+            garde = neuf
             _local.gdi = garde
         except Exception as e:
-            # Le contexte a pu etre obtenu avant l'echec. Sans cette
-            # liberation il fuit, et comme le cache reste vide la capture
-            # suivante recommence : un contexte perdu par image, jusqu'a
-            # epuisement du quota GDI du processus.
-            if dc_ecran:
-                try:
-                    win32gui.ReleaseDC(fenetre, dc_ecran)
-                except Exception:
-                    pass
-            print("Capture GDI indisponible :", e)
+            _liberer_gdi(neuf)
+            signaler_capture("Capture GDI indisponible", e)
             _local.gdi = None
             return None
 
@@ -2349,7 +2422,7 @@ def _vignette_gdi(zone, colonnes, lignes):
     except Exception as e:
         # Un changement de resolution ou une session verrouillee invalide
         # les contextes : on les jette, la prochaine image les refera.
-        print("Capture GDI perdue :", e)
+        signaler_capture("Capture GDI perdue", e)
         _liberer_gdi(garde)
         _local.gdi = None
         return None
@@ -2360,13 +2433,44 @@ def _vignette_gdi(zone, colonnes, lignes):
 
 
 def _liberer_gdi(garde):
+    """Rend les TROIS ressources de la garde, et dans cet ordre-la.
+
+    LE BITMAP N'ETAIT RENDU PAR PERSONNE. On rendait le contexte memoire et
+    le contexte d'ecran, jamais l'objet bitmap. Chaque garde refaite en
+    laissait donc un derriere elle -- huit par seconde quand la capture rate
+    en boucle. Le quota de 10 000 objets GDI du processus se vide en vingt
+    minutes, et ensuite plus AUCUN contexte ne s'obtient nulle part : tkinter
+    compris, qui ne verifie pas ses retours GDI, ouvre alors une fenetre
+    qu'il ne peut pas peindre et meurt dessus. C'est la panne rapportee, et
+    la pile C du journal la nomme -- violation d'acces dans mainloop.
+
+    CE QUI RESTE UNE HYPOTHESE, ET QU'ON NE PEUT PAS VERIFIER D'ICI : que le
+    ramasse-miettes de pywin32 ne rende pas ce handle tout seul. S'il le
+    rendait deja, ce DeleteObject-ci porterait sur un handle deja libere et
+    se contenterait d'echouer. Le risque est donc dissymetrique -- ne rien
+    faire tue l'application, en faire trop ne coute qu'un appel refuse -- et
+    c'est ce qui tranche. Le compteur d'objets pose dans le journal dira
+    lequel des deux mondes est le vrai.
+
+    L'ordre : un bitmap encore selectionne dans un contexte ne se detruit
+    pas, donc apres DeleteDC. La garde peut etre incomplete (echec en cours
+    de construction), d'ou les .get.
+    """
+    if not garde:
+        return
     try:
         garde["memoire"].DeleteDC()
     except Exception:
         pass
     try:
         import win32gui
-        win32gui.ReleaseDC(garde["fenetre"], garde["dc"])
+        win32gui.DeleteObject(garde["image"].GetHandle())
+    except Exception:
+        pass
+    try:
+        import win32gui
+        if garde.get("dc"):
+            win32gui.ReleaseDC(garde["fenetre"], garde["dc"])
     except Exception:
         pass
 
@@ -2854,8 +2958,63 @@ def couleur_ecran(source, boost, colonnes=4):
         r, v, b = colorsys.hsv_to_rgb(teinte, saturation, 1.0)
         return (int(r * 255), int(v * 255), int(b * 255)), luminance, index
     except Exception as e:
-        print("Capture ecran impossible :", e)
+        signaler_capture("Capture ecran impossible", e)
         return None
+
+
+# Trois images d'affilee avant de suspendre : aucune des causes reelles ne se
+# resout entre deux images. La premiere attente, courte, sert de rattrapage si
+# on s'est trompe ; le plafond vaut celui du Bluetooth, pour que la couleur
+# revienne dans la minute qui suit un deverrouillage.
+ECHECS_ECRAN = 3
+ATTENTE_ECRAN = [5.0, 15.0, 60.0]
+
+
+def echec_capture(rate):
+    """UNE CAPTURE QUI ECHOUE ECHOUE POUR UN MOMENT, PAS POUR UNE IMAGE.
+
+    Session verrouillee, bureau securise, changement de resolution, quota
+    graphique epuise : rien de tout cela ne se repare en un huitieme de
+    seconde. Sans compteur, la meme operation impossible etait retentee huit
+    fois par seconde pendant des heures -- ce qui remplissait le journal et,
+    surtout, entretenait la fuite qui vidait le quota du processus.
+
+    On ne renonce JAMAIS, comme pour la guirlande : une session verrouillee
+    se deverrouille, un ecran en veille se rallume.
+    """
+    e = ETAT["ecran"]
+    if not rate:
+        # Le cas de loin le plus frequent : tout va bien, et il ne doit rien
+        # couter. Sans ce retour, on reconstruisait ce dictionnaire huit fois
+        # par seconde pour n'y rien changer.
+        #
+        # ET L'ENSEMBLE DES PHRASES DEJA DITES COMPTE DANS « rien a faire ».
+        # Une capture peut echouer par le chemin GDI puis reussir par le repli
+        # mss : la phrase est alors dite sans qu'aucun echec ne soit compte.
+        # Sortir sans vider l'ensemble condamnait cette panne-la au silence
+        # pour la vie du processus, alors qu'elle doit se redire si elle revient.
+        if not e["echecs"] and not e["suspendue"] and not _CAPTURE_DIT:
+            return
+        if e["suspendue"]:
+            print("Capture ecran retablie apres %d s et %d essais rates."
+                  % (time.monotonic() - e["depuis"], e["echecs"]))
+        ETAT["ecran"] = {"echecs": 0, "suspendue": False,
+                         "reprise": 0.0, "depuis": 0.0}
+        _CAPTURE_DIT.clear()
+        return
+    e["echecs"] += 1
+    if e["echecs"] < ECHECS_ECRAN:
+        return
+    if not e["suspendue"]:
+        e["suspendue"] = True
+        e["depuis"] = time.monotonic()
+    rang = min(e["echecs"] - ECHECS_ECRAN, len(ATTENTE_ECRAN) - 1)
+    e["reprise"] = time.monotonic() + ATTENTE_ECRAN[rang]
+
+
+def capture_autorisee():
+    return not ETAT["ecran"]["suspendue"] or \
+        time.monotonic() >= ETAT["ecran"]["reprise"]
 
 
 # ==========================================================================
@@ -3611,12 +3770,16 @@ async def une_session(cfg):
                     else:
                         nom = "Son indisponible"
 
-                if mode in ("ecran", "mixte"):
+                if mode in ("ecran", "mixte") and capture_autorisee():
                     resultat = await boucle.run_in_executor(
-                        None, couleur_ecran,
+                        EXECUTEUR_CAPTURE, couleur_ecran,
                         cfg.get("ecran_source", "actif"),
                         float(cfg.get("ecran_saturation", 1.5)),
                         int(cfg.get("ecran_finesse", 4)))
+                    # La degradation existe deja : quand resultat vaut None,
+                    # la couleur de regle et le gain processeur reprennent la
+                    # main plus bas. Il suffit donc de cesser d'appeler.
+                    echec_capture(resultat is None)
                     if resultat:
                         (re, ve, be), luminance, index = resultat
                         # Suivre ce que l'oeil voit : filtre de lumiere bleue
@@ -5216,6 +5379,8 @@ class Panneau:
                    self.var_mode, "ecran").pack(fill="x")
         self.radio(f, "Mixte — moitie regle, moitie ecran",
                    self.var_mode, "mixte").pack(fill="x")
+        self.txt_etat_ecran = self.texte(f, "", BRUME, 8, largeur=490)
+        self.txt_etat_ecran.pack(fill="x", pady=(4, 0))
         self.bouton(f, "Modifier les regles par application",
                     lambda: self.aller("regles"),
                     compact=True).pack(anchor="w", pady=(8, 0))
@@ -6245,6 +6410,17 @@ class Panneau:
                 text=ACTIVITE.get("message", "arrete"),
                 fg=ALERTE if "impossible" in ACTIVITE.get("message", "")
                 or "demande" in ACTIVITE.get("message", "") else BRUME)
+
+        if self.section == "ecran":
+            # Sans cette phrase, le mode Ecran suspendu est indiscernable
+            # d'un mode Ecran qui marche : le panneau affichait le message du
+            # Bluetooth, « Connectee », pendant que l'ecran n'etait plus lu.
+            suspendue = ETAT["ecran"]["suspendue"]
+            self.txt_etat_ecran.configure(
+                text=("La capture est en pause : Windows ne rend plus l'image "
+                      "de l'ecran. La guirlande suit tes regles en attendant, "
+                      "et la couleur reviendra toute seule.") if suspendue else "",
+                fg=ALERTE if suspendue else BRUME)
 
         if self.section == "accueil":
             # Repeindre hors de l'accueil ne servirait a rien : la tuile
@@ -7306,6 +7482,9 @@ def lancer():
             arreter_activite()
             arreter_api()
             arreter_audio()
+            # Un StretchBlt en vol retarderait la fermeture : l'interpreteur
+            # joint les fils de ce pool en sortant.
+            EXECUTEUR_CAPTURE.shutdown(wait=False)
             try:
                 TRAY["icone"].stop()
             except Exception:

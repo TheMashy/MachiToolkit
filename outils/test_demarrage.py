@@ -15,10 +15,13 @@ ni reparee, ni mise a jour.
     python outils/test_demarrage.py
 """
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1361,6 +1364,346 @@ class Nuits(unittest.TestCase):
         self.assertEqual(len(envois[-1]["jours"]), 12, "tout l'historique, une fois")
         self.assertFalse(mt.SYNC["tout_a_pousser"])
         self.assertFalse(mt.migrer_postes(cfg), "le second lancement ne refait rien")
+
+
+class AtelierGDI:
+    """UN WINDOWS DE LABORATOIRE QUI COMPTE SES HANDLES.
+
+    Une fuite de handles GDI ne se mesure pas sous Linux : ni win32gui, ni
+    win32ui, ni quota de 10 000 objets. Ce qui se mesure, en revanche, c'est
+    la seule chose qui compte ici -- que chaque objet CREE soit RENDU. On pose
+    donc de faux modules win32 qui distribuent des numeros et les reprennent,
+    et on regarde le registre a la fin. Un objet encore inscrit est un handle
+    perdu ; sous Windows, c'est un de moins sur les 10 000 du processus.
+
+    Ce que ce banc NE prouve PAS, et qu'aucun test ne prouvera d'ici :
+      - que DeleteObject rende vraiment le handle cote Windows ;
+      - que Tk meure sur un pixmap nul. Ces deux-la se verifient sur la
+        machine de l'utilisateur, par le compteur pose dans le journal.
+    """
+
+    def __init__(self, casse_a=None):
+        self.vivants = {}          # numero -> ce que c'est
+        self.suivant = 100
+        self.casse_a = casse_a     # nom de l'appel qui doit echouer
+        self.faits = []
+
+    def naitre(self, quoi):
+        self.suivant += 1
+        self.vivants[self.suivant] = quoi
+        return self.suivant
+
+    def mourir(self, numero):
+        self.vivants.pop(numero, None)
+
+    def etape(self, nom):
+        self.faits.append(nom)
+        if nom == self.casse_a:
+            raise RuntimeError("Could not create DC.")
+
+    # ---- les faux modules ----
+
+    def poser(self, sys_modules):
+        atelier = self
+
+        class FauxBitmap:
+            def __init__(self):
+                self.numero = 0
+
+            def CreateCompatibleBitmap(self, dc, c, l):
+                atelier.etape("CreateCompatibleBitmap")
+                self.taille = (c, l)
+                self.numero = atelier.naitre("bitmap")
+
+            def GetHandle(self):
+                return self.numero
+
+            def GetBitmapBits(self, _):
+                atelier.etape("GetBitmapBits")
+                c, l = self.taille
+                return bytes([30, 20, 10, 0] * (c * l))
+
+        class FauxDC:
+            def __init__(self, numero, propre):
+                self.numero, self.propre = numero, propre
+
+            def CreateCompatibleDC(self):
+                atelier.etape("CreateCompatibleDC")
+                return FauxDC(atelier.naitre("dc memoire"), True)
+
+            def DeleteDC(self):
+                atelier.mourir(self.numero)
+
+            def SelectObject(self, _):
+                atelier.etape("SelectObject")
+
+            def SetStretchBltMode(self, _):
+                pass
+
+            def StretchBlt(self, *_):
+                atelier.etape("StretchBlt")
+
+        class FauxWin32gui:
+            @staticmethod
+            def GetDesktopWindow():
+                return 1
+
+            @staticmethod
+            def GetWindowDC(_):
+                atelier.etape("GetWindowDC")
+                return atelier.naitre("dc ecran")
+
+            @staticmethod
+            def ReleaseDC(_, numero):
+                atelier.mourir(numero)
+
+            @staticmethod
+            def DeleteObject(numero):
+                atelier.mourir(numero)
+
+        class FauxWin32ui:
+            @staticmethod
+            def CreateDCFromHandle(numero):
+                atelier.etape("CreateDCFromHandle")
+                # Enveloppe le MEME handle que dc_ecran : rien de neuf.
+                return FauxDC(numero, False)
+
+            @staticmethod
+            def CreateBitmap():
+                return FauxBitmap()
+
+        class FauxWin32con:
+            SRCCOPY = 0x00CC0020
+            HALFTONE = 4
+            COLORONCOLOR = 3
+
+        sys_modules["win32gui"] = FauxWin32gui
+        sys_modules["win32ui"] = FauxWin32ui
+        sys_modules["win32con"] = FauxWin32con
+
+
+ZONE = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+
+
+class FuiteDeHandles(unittest.TestCase):
+    """LE BITMAP DE LA VIGNETTE N'ETAIT DETRUIT PAR PERSONNE.
+
+    pywin32 cree le CBitmap sans drapeau de destruction et n'appelle jamais
+    ::DeleteObject : le ramasse-miettes ne rend pas le handle. _liberer_gdi
+    rendait le contexte memoire et le contexte d'ecran, et laissait le bitmap.
+    Une garde refaite par image -- ce que fait le chemin « Capture GDI perdue »
+    -- perdait donc un objet par image, huit fois par seconde.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+        self.faux = []
+
+    def tearDown(self):
+        for nom in ("win32gui", "win32ui", "win32con"):
+            sys.modules.pop(nom, None)
+
+    def atelier(self, casse_a=None):
+        a = AtelierGDI(casse_a)
+        a.poser(sys.modules)
+        return a
+
+    def test_un_cycle_complet_ne_laisse_aucun_handle(self):
+        a = self.atelier()
+        pixels = self.mt._vignette_gdi(ZONE, 4, 2)
+        self.assertEqual(len(pixels), 8)
+        self.assertEqual(pixels[0], (10, 20, 30), "BGRA relu a l'endroit")
+        self.assertEqual(len(a.vivants), 3, "un dc d'ecran, un dc memoire, un bitmap")
+        self.mt._liberer_gdi(self.mt._local.gdi)
+        self.assertEqual(a.vivants, {}, "tout doit etre rendu, le bitmap compris")
+
+    def test_le_bitmap_est_detruit_et_pas_seulement_les_contextes(self):
+        """Le cas exact du plantage : les deux contextes etaient rendus, le
+        bitmap non. Un seul objet oublie suffit -- c'est huit par seconde."""
+        a = self.atelier()
+        self.mt._vignette_gdi(ZONE, 4, 2)
+        self.mt._liberer_gdi(self.mt._local.gdi)
+        self.assertNotIn("bitmap", a.vivants.values())
+
+    def test_mille_contextes_perdus_ne_coutent_pas_un_handle(self):
+        """LE REGIME QUI A VIDE LE QUOTA. Session verrouillee ou changement de
+        resolution : StretchBlt echoue, la garde est jetee, la suivante la
+        refait. Mille images, c'est deux minutes a huit par seconde -- et
+        c'etait mille handles perdus, soit un dixieme du quota du processus."""
+        a = self.atelier(casse_a="StretchBlt")
+        for _ in range(1000):
+            self.assertIsNone(self.mt._vignette_gdi(ZONE, 4, 2))
+        self.assertEqual(a.vivants, {},
+                         "mille pertes de contexte, zero handle en fuite")
+
+    def test_un_echec_en_cours_de_construction_ne_laisse_rien(self):
+        """L'ancienne version ne rattrapait QUE le contexte d'ecran. Quand
+        l'echec arrivait plus tard -- le bitmap qui ne s'alloue plus, ce qui
+        est exactement ce qui arrive a court de handles -- le contexte memoire
+        restait derriere, un par image."""
+        for etape in ("CreateCompatibleDC", "CreateCompatibleBitmap",
+                      "SelectObject"):
+            with self.subTest(etape=etape):
+                self.mt._local.gdi = None
+                a = self.atelier(casse_a=etape)
+                self.assertIsNone(self.mt._vignette_gdi(ZONE, 4, 2))
+                self.assertEqual(a.vivants, {}, "echec en %s" % etape)
+
+    def test_le_cas_du_journal_ne_laisse_rien_a_rendre(self):
+        """« Could not create DC. » : GetWindowDC a rendu NULL sans poser
+        d'erreur, donc rien n'avait ete acquis. Ce chemin-la ne fuit pas -- il
+        crie. C'est ce que le journal de l'utilisateur montrait, et c'est
+        pourquoi la fuite etait DEJA finie quand il l'a envoye."""
+        a = self.atelier(casse_a="CreateDCFromHandle")
+        self.assertIsNone(self.mt._vignette_gdi(ZONE, 4, 2))
+        self.assertEqual(a.vivants, {})
+
+    def test_changer_la_finesse_rend_l_ancienne_garde(self):
+        """Le curseur « Finesse » change la taille de la vignette, donc jette
+        la garde. Rare, mais c'est le meme chemin."""
+        a = self.atelier()
+        self.mt._vignette_gdi(ZONE, 4, 2)
+        self.mt._vignette_gdi(ZONE, 8, 4)
+        self.assertEqual(len(a.vivants), 3, "une seule garde a la fois")
+
+
+class CoupeCircuitEcran(unittest.TestCase):
+    """RIEN NE COMPTAIT LES ECHECS DE CAPTURE.
+
+    La guirlande espace ses reconnexions depuis 1.24.3 ; l'ecran, lui,
+    retentait a la cadence video, indefiniment. Huit fois par seconde, des
+    heures durant : c'est ce qui transforme un incident borne -- un ecran
+    verrouille -- en epuisement du quota graphique du processus.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    def test_trois_rates_suspendent_la_capture(self):
+        mt = self.mt
+        self.assertTrue(mt.capture_autorisee())
+        for _ in range(2):
+            mt.echec_capture(True)
+            self.assertTrue(mt.capture_autorisee(),
+                            "un rate isole ne coupe rien : un changement de "
+                            "resolution dure une image")
+        mt.echec_capture(True)
+        self.assertFalse(mt.capture_autorisee())
+
+    def test_l_attente_grandit_puis_plafonne_a_une_minute(self):
+        mt = self.mt
+        attentes = []
+        for _ in range(6):
+            mt.echec_capture(True)
+            if mt.ETAT["ecran"]["suspendue"]:
+                attentes.append(round(mt.ETAT["ecran"]["reprise"]
+                                      - time.monotonic()))
+        self.assertEqual(attentes, [5, 15, 60, 60],
+                         "cinq secondes de rattrapage, puis quinze, puis une "
+                         "minute -- le meme plafond que la guirlande")
+
+    def test_une_capture_qui_marche_remet_tout_a_zero(self):
+        mt = self.mt
+        for _ in range(5):
+            mt.echec_capture(True)
+        self.assertFalse(mt.capture_autorisee())
+        mt.echec_capture(False)
+        self.assertTrue(mt.capture_autorisee())
+        self.assertEqual(mt.ETAT["ecran"]["echecs"], 0)
+
+    def test_on_ne_renonce_jamais_a_l_ecran(self):
+        """Une session verrouillee se deverrouille, un ecran en veille se
+        rallume : on suspend, on n'abandonne pas. Apres l'attente, la
+        capture repart d'elle-meme."""
+        mt = self.mt
+        for _ in range(50):
+            mt.echec_capture(True)
+        self.assertFalse(mt.capture_autorisee())
+        mt.ETAT["ecran"]["reprise"] = time.monotonic() - 0.001
+        self.assertTrue(mt.capture_autorisee())
+        self.assertLessEqual(max(mt.ATTENTE_ECRAN), 60.0)
+
+    def test_le_journal_ne_repete_pas_la_meme_panne(self):
+        """DES CENTAINES DE FOIS DEUX PHRASES IDENTIQUES. C'est ce que
+        l'utilisateur a envoye : 16 lignes par seconde, 4 Mo par heure, et
+        pas un mot de plus qu'a la premiere. Une panne, une ligne."""
+        mt = self.mt
+        sortie = io.StringIO()
+        vrai, sys.stdout = sys.stdout, sortie
+        try:
+            for _ in range(500):
+                mt.signaler_capture("Capture GDI indisponible",
+                                    "Could not create DC.")
+            mt.signaler_capture("Capture ecran impossible", "GetWindowDC")
+        finally:
+            sys.stdout = vrai
+        lignes = [l for l in sortie.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len(lignes), 2, "une ligne par panne, pas par image")
+        self.assertIn("objets du processus", lignes[0],
+                      "le compteur, seule mesure qui tranche entre « plus de "
+                      "handles » et « plus de bureau »")
+
+    def test_DEUX_phrases_qui_alternent_se_taisent_aussi(self):
+        """C'est la forme EXACTE du journal recu, et le piege du correctif.
+
+        Le chemin GDI echoue, le repli mss echoue derriere lui : deux phrases
+        differentes, image apres image. Ne retenir que la DERNIERE dite ne
+        deduplique alors rien du tout -- chacune differe toujours de celle
+        d'avant -- et les deux repartent huit fois par seconde. C'est ce que
+        montre le journal de l'utilisateur, et un correctif qui ne tient pas
+        ce cas-la ne corrige rien de ce qu'on a vu."""
+        mt = self.mt
+        sortie = io.StringIO()
+        vrai, sys.stdout = sys.stdout, sortie
+        try:
+            for _ in range(300):
+                mt.signaler_capture("Capture GDI indisponible", "Could not create DC.")
+                mt.signaler_capture("Capture ecran impossible", "GetWindowDC")
+        finally:
+            sys.stdout = vrai
+        lignes = [l for l in sortie.getvalue().splitlines() if l.strip()]
+        self.assertEqual(len(lignes), 2,
+                         "600 appels, deux pannes, deux lignes")
+
+    def test_une_panne_qui_revient_se_redit(self):
+        """Sinon un deuxieme episode, des jours plus tard, serait muet."""
+        mt = self.mt
+        sortie = io.StringIO()
+        vrai, sys.stdout = sys.stdout, sortie
+        try:
+            mt.signaler_capture("Capture GDI perdue", "x")
+            mt.echec_capture(False)
+            mt.signaler_capture("Capture GDI perdue", "x")
+        finally:
+            sys.stdout = vrai
+        self.assertEqual(len(sortie.getvalue().splitlines()), 2)
+
+    def test_le_compteur_d_objets_ne_leve_pas_hors_windows(self):
+        """Il est appele depuis un chemin d'erreur : s'il levait, il
+        remplacerait la panne a diagnostiquer par la sienne."""
+        self.assertEqual(self.mt.objets_gdi(), (-1, -1))
+
+
+class UnSeulFilDeCapture(unittest.TestCase):
+    """Les caches de capture sont thread-local. Sur le pool par defaut ils se
+    dupliquent par fil -- le journal de l'utilisateur en montre quatre -- et
+    personne ne les rend jamais. La boucle attend chaque image avant de
+    demander la suivante : un fil suffit."""
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    def test_l_executeur_de_capture_n_a_qu_un_fil(self):
+        self.assertEqual(self.mt.EXECUTEUR_CAPTURE._max_workers, 1)
+
+    def test_le_meme_fil_sert_toujours(self):
+        fils = {self.mt.EXECUTEUR_CAPTURE.submit(
+            threading.current_thread).result().name for _ in range(200)}
+        self.assertEqual(len(fils), 1, "un seul jeu de contextes GDI")
+
 
 
 if __name__ == "__main__":
