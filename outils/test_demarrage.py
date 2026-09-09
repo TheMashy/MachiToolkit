@@ -824,6 +824,43 @@ class MiseAJourQuiDisparait(unittest.TestCase):
         self.assertFalse(mt.poser_la_maj(True))
         self.assertTrue(mt.poser_la_maj(False))
 
+    def test_une_guirlande_qui_retombe_aussitot_espace_ses_tentatives(self):
+        """UNE GUIRLANDE QUI CLIGNOTE, C'EST UNE SESSION QUI NE TIENT PAS.
+
+        Dix secondes fixes entre deux tentatives : une guirlande qui tombe
+        aussitot connectee se rallume et s'eteint toutes les dix secondes, sans
+        fin. C'est ce qu'on voit — elle clignote — et c'est aussi ce qui
+        martele la pile Bluetooth de Windows.
+        """
+        mt = self.mt
+        mt.ETAT["echecs_ble"] = 0
+        attentes = [mt.attente_apres_session(0.4) for _ in range(5)]
+        self.assertEqual(attentes, [10.0, 25.0, 60.0, 60.0, 60.0],
+                         "dix secondes pour le premier echec — un simple rate ne "
+                         "doit pas coûter une minute — puis vingt-cinq, puis une "
+                         "minute, et ça s'y tient")
+        self.assertEqual(mt.ETAT["echecs_ble"], 3, "le compteur est borne")
+
+    def test_une_session_qui_tient_remet_le_compteur_a_zero(self):
+        """Le cas normal ne paie rien : ce sont les echecs consecutifs qui
+        s'espacent, pas les sessions qui se terminent normalement."""
+        mt = self.mt
+        mt.ETAT["echecs_ble"] = 0
+        for _ in range(3):
+            mt.attente_apres_session(0.4)
+        self.assertGreater(mt.ETAT["echecs_ble"], 0)
+        self.assertEqual(mt.attente_apres_session(mt.SESSION_TENUE + 1), 10.0)
+        self.assertEqual(mt.ETAT["echecs_ble"], 0)
+
+    def test_on_ne_renonce_jamais_a_la_guirlande(self):
+        """Une guirlande eteinte parce qu'elle etait hors de portee doit
+        revenir quand elle rentre : l'attente plafonne, elle ne s'arrete pas."""
+        mt = self.mt
+        mt.ETAT["echecs_ble"] = 0
+        for _ in range(50):
+            self.assertLessEqual(mt.attente_apres_session(0.1), 60.0)
+        self.assertLessEqual(max(mt.ATTENTE_BLE), 60.0)
+
     def test_un_installeur_qui_ne_part_pas_ne_fait_pas_quitter(self):
         """En mode script -- et chaque fois que le fichier telecharge a disparu
         -- l'installeur ne part pas. L'application ne doit alors surtout pas

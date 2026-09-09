@@ -24,6 +24,7 @@ Modes de couleur :
 import asyncio
 import sys
 import os
+import atexit
 import json
 import time
 import math
@@ -38,7 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.24.2"
+VERSION = "1.24.3"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -83,13 +84,76 @@ FICHIER_VERSION = os.path.join(DOSSIER, "version_installee.txt")
 
 # Sans console, sys.stdout vaut None et le moindre print() leverait une
 # exception. On redirige tout vers un fichier journal.
+_JOURNAL = None
 try:
     if sys.stdout is None or not hasattr(sys.stdout, "write"):
-        _j = open(FICHIER_JOURNAL, "a", encoding="utf-8", buffering=1)
-        sys.stdout = sys.stderr = _j
+        _JOURNAL = open(FICHIER_JOURNAL, "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = _JOURNAL
         print(f"\n--- demarrage {time.strftime('%Y-%m-%d %H:%M:%S')} v{VERSION} ---")
 except Exception:
     pass
+
+"""
+TROIS FILETS POUR QU'UNE DISPARITION S'EXPLIQUE.
+
+L'application peut s'arreter de trois facons, et deux d'entre elles ne
+laissaient AUCUNE trace -- ce qui rend « ca a plante » impossible a
+diagnostiquer, et impossible a distinguer d'un redemarrage voulu.
+
+  1. UNE EXCEPTION DANS UN FIL. Elle ne tue pas le processus : elle tue le fil,
+     en silence. Le pilote de la guirlande s'arrete alors sur sa derniere
+     couleur, la fenetre continue de repondre, et rien nulle part ne dit qu'un
+     morceau de l'application est mort. `threading.excepthook` l'ecrit.
+
+  2. UN PLANTAGE NATIF. win32, PIL, la pile Bluetooth : une faute de segment
+     dans une extension C tue le processus instantanement, sans exception
+     Python, sans boite de dialogue, sans un mot. C'est exactement ce qu'on
+     voit de l'exterieur -- la fenetre disparait. `faulthandler` ecrit la pile
+     C au moment de la faute, et c'est la seule chose qui puisse la nommer.
+
+  3. UN ARRET PROPRE. `atexit` pose une derniere ligne. Son ABSENCE est alors
+     une information : le journal se termine sans elle exactement quand le
+     processus a ete tue de l'exterieur.
+"""
+try:
+    import faulthandler
+    faulthandler.enable(file=_JOURNAL or sys.stderr, all_threads=True)
+except Exception:
+    pass
+
+
+def _fil_a_saute(args):
+    try:
+        print("--- FIL MORT %s : %s dans %s ---"
+              % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                 getattr(args.exc_type, "__name__", args.exc_type),
+                 getattr(args.thread, "name", "?")))
+        traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+    except Exception:
+        pass
+
+
+try:
+    threading.excepthook = _fil_a_saute
+except Exception:
+    pass
+
+
+def _derniere_ligne():
+    try:
+        print("--- fin %s v%s ---" % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION))
+    except Exception:
+        pass
+
+
+# Seulement quand le journal existe : sa raison d'etre est qu'une derniere
+# ligne MANQUE quand le processus a ete tue, et sans journal il n'y a rien
+# ou la lire. En mode script, elle ne ferait que salir la console.
+if _JOURNAL:
+    try:
+        atexit.register(_derniere_ligne)
+    except Exception:
+        pass
 
 # ==========================================================================
 #  Reglages par defaut
@@ -292,6 +356,10 @@ ETAT = {
     "ecran_sat": 0.0,         # saturation finalement envoyee
     "forcage": None,     # {"couleur", "nom", "expire"}
     "api": "arretee",
+    # Echecs de connexion Bluetooth d'affilee. Sert a espacer les tentatives :
+    # une guirlande qui tombe aussitot connectee clignote toutes les dix
+    # secondes, et martele la pile Bluetooth pour rien.
+    "echecs_ble": 0,
     "rappel_neuf": False,
     "presence": None,      # battement envoye par le site
     "presence_vu": 0.0,    # jusqu'a quand la presence reste acquise
@@ -3638,6 +3706,17 @@ async def une_session(cfg):
 
     except Exception as e:
         ETAT["message"] = f"Deconnectee ({str(e)[:55]})"
+        """
+        ET ON L'ECRIT DANS LE JOURNAL, pas seulement dans le panneau.
+
+        Ce message ne vivait que dans `ETAT`, c'est-a-dire dans une fenetre
+        qu'il faut avoir ouverte au bon moment pour le lire. Une guirlande qui
+        se deconnecte et se reconnecte toutes les dix secondes CLIGNOTE, et
+        c'est tout ce qu'on en voyait -- aucune trace, nulle part, de ce qui la
+        faisait tomber.
+        """
+        print("Session Bluetooth tombee : %s : %s"
+              % (type(e).__name__, str(e)[:160]))
     BLE["client"] = None
     ETAT["connecte"] = False
 
@@ -3679,8 +3758,24 @@ async def superviseur(cfg):
             ETAT["demande"] = None
 
         elif str(cfg.get("adresse", "")).strip():
+            """
+            UNE ATTENTE QUI GRANDIT QUAND LA SESSION NE TIENT PAS.
+
+            Dix secondes fixes entre deux tentatives : une guirlande qui tombe
+            aussitot connectee se rallume et s'eteint toutes les dix secondes,
+            sans fin. C'est ce qu'on voit -- elle clignote -- et c'est aussi ce
+            qui martele la pile Bluetooth de Windows, la ou les plantages sans
+            exception Python se produisent.
+
+            Une session qui a TENU remet le compteur a zero : le cas normal ne
+            paie rien. Ce sont les echecs consecutifs qui s'espacent, jusqu'a
+            une minute. On ne renonce jamais -- une guirlande eteinte parce
+            qu'elle etait hors de portee doit revenir quand elle rentre.
+            """
+            debut = time.monotonic()
             await une_session(cfg)
-            for _ in range(100):
+            attente = attente_apres_session(time.monotonic() - debut)
+            for _ in range(int(attente * 10)):
                 if not ETAT["en_marche"] or ETAT["demande"]:
                     break
                 await asyncio.sleep(0.1)
@@ -3712,6 +3807,30 @@ async def superviseur(cfg):
 # trame depuis un autre fil — la fermeture de Windows, le bouton Quitter —
 # il faut passer par elle, d'ou cette reference.
 BLE = {"boucle": None, "client": None}
+
+# Une session qui a dure au moins ca a « tenu » : ce n'est pas un echec de
+# connexion, c'est une session normale qui s'est terminee.
+SESSION_TENUE = 20.0
+# L'attente avant la tentative suivante, par nombre d'echecs consecutifs.
+ATTENTE_BLE = [10.0, 10.0, 25.0, 60.0]
+
+
+def attente_apres_session(tenue):
+    """Combien attendre avant de retenter, d'apres la duree de la session.
+
+    Une session qui a TENU remet le compteur a zero : le cas normal ne paie
+    rien. Ce sont les echecs consecutifs qui s'espacent, jusqu'a une minute.
+    On ne renonce jamais -- une guirlande eteinte parce qu'elle etait hors de
+    portee doit revenir quand elle rentre.
+    """
+    if tenue >= SESSION_TENUE:
+        ETAT["echecs_ble"] = 0
+    else:
+        ETAT["echecs_ble"] = min(ETAT.get("echecs_ble", 0) + 1, len(ATTENTE_BLE) - 1)
+        if ETAT["echecs_ble"] >= 2:
+            ETAT["message"] = ("Guirlande injoignable, nouvelle tentative dans %d s"
+                               % int(ATTENTE_BLE[ETAT["echecs_ble"]]))
+    return ATTENTE_BLE[ETAT.get("echecs_ble", 0)]
 
 
 def eteindre_guirlande(delai=2.5):
