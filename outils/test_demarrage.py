@@ -594,7 +594,7 @@ class SousCategories(unittest.TestCase):
             ("guerre", "chrome.exe | carte du front en ukraine - youtube - google chrome", "ukraine"),
             ("guerre", "chrome.exe | la situation a gaza - le monde - firefox", "proche-orient"),
             ("guerre", "chrome.exe | documentaire seconde guerre mondiale - youtube", "archives"),
-            ("jeu", "chrome.exe | elden ring playthrough part 4 - youtube - google chrome", "solo"),
+            ("jeu", "chrome.exe | elden ring : la fin du jeu - youtube - google chrome", "solo"),
             ("jeu", "chrome.exe | valorant ranked highlights - twitch - google chrome", "competitif"),
             ("creation", "blender.exe | scene.blend", "3d"),
             ("dev", "chrome.exe | typeerror python traceback - stack overflow - firefox", "erreur"),
@@ -685,6 +685,68 @@ class SousCategories(unittest.TestCase):
         mt._reinit_jour(maintenant=2000.0)
         self.assertEqual(mt.ACTIVITE["sous_themes_web"], {})
         self.assertIsNone(mt.ACTIVITE["sous_courant"])
+
+    def test_un_sigle_de_trois_lettres_ne_se_cherche_pas_en_sous_chaine(self):
+        """QUATRE MAUVAIS CLASSEMENTS, TROUVES EN RELISANT LA TABLE.
+
+        « donbass » et « coinbase » contiennent « nba », « commande » contient
+        « mma », « osteo » commence par « ost » : la guerre, l'argent et la
+        sante partaient dans le sport et la musique. Trois lettres suffisent a
+        un sigle et ne suffisent jamais a une recherche en sous-chaine.
+        """
+        th = self.mt.theme_activite
+        for contexte, attendu in [
+            ("chrome.exe | avancee dans le donbass - youtube - google chrome", "guerre"),
+            ("chrome.exe | coinbase - mon portefeuille - google chrome", "argent"),
+            ("chrome.exe | suivi de ma commande - amazon - google chrome", "achat"),
+            ("chrome.exe | rendez vous osteo chez le kine - google chrome", "sante"),
+        ]:
+            self.assertEqual(th(contexte), attendu, contexte)
+        # Et les vrais sigles passent toujours.
+        self.assertEqual(th("chrome.exe | resume nba lakers - youtube"), "sport")
+        self.assertEqual(th("chrome.exe | ufc 300 : le combat - youtube"), "sport")
+
+    def test_un_mot_clef_n_attrape_pas_du_francais_ordinaire(self):
+        """« meme » nu attrapait « même » ecrit sans accent — omnipresent dans
+        les titres francais. La sous-categorie aurait double de taille pour
+        rien, et « humour » aurait eu l'air d'etre partout."""
+        st = self.mt.sous_theme_activite
+        self.assertIsNone(st("humour", "chrome.exe | je ne sais meme pas quoi dire - youtube"))
+        self.assertEqual(st("humour", "chrome.exe | best of memes 2026 - youtube"), "meme")
+
+    def test_une_sous_categorie_ne_reprend_pas_les_mots_de_son_theme(self):
+        """Une sous-categorie faite des mots qui declenchent son theme est un
+        SUPPORT deguise en sujet : presque tout le theme y tomberait, et elle ne
+        dirait rien de plus que lui. C'etait le cas de « actu/france »."""
+        for theme, mots_theme in self.mt.THEMES_ACTIVITE:
+            declencheurs = set(mots_theme)
+            for nom, mots in self.mt.SOUS_THEMES.get(theme, ()):
+                communs = declencheurs & set(mots)
+                # Partager quelques mots est normal et utile : « ukraine »
+                # declenche « guerre » ET la precise. Ce qui ne l'est pas, c'est
+                # de n'etre fait QUE de mots du theme : la sous-categorie
+                # ramasse alors ce que le theme ramasse deja et ne dit rien de
+                # plus que lui — un SUPPORT deguise en sujet. C'etait
+                # « actu/france », fait des journaux qui declenchent « actu »,
+                # et trois autres. La regle : au moins la moitie de ses mots
+                # doivent etre a elle. Et depuis qu'une sous-categorie implique
+                # son theme, lui retirer un mot partage ne perd rien : le theme
+                # se declenche toujours dessus.
+                propres = len(mots) - len(communs)
+                self.assertGreaterEqual(propres, len(mots) / 2,
+                                        "%s/%s n'a que %d mots a elle sur %d : %s viennent du theme"
+                                        % (theme, nom, propres, len(mots), sorted(communs)))
+
+    def test_un_nom_de_sous_categorie_n_est_pas_un_mot_clef_d_une_soeur(self):
+        """« endurance » etait un mot-clef de sport/moteur ET le nom de
+        sport/endurance, qui vient apres : « sport d'endurance » tombait dans
+        « moteur »."""
+        for theme, sous in self.mt.SOUS_THEMES.items():
+            noms = {n for n, _ in sous}
+            for nom, mots in sous:
+                for m in mots:
+                    self.assertNotIn(m.strip(), noms - {nom},
+                                     "%s/%s : « %s » est le nom d'une soeur" % (theme, nom, m))
 
     def test_le_titre_envoye_est_celui_de_l_onglet(self):
         """Il partait brut, avec « - Profil 1 - Microsoft Edge » colle derriere :

@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.24.0"
+VERSION = "1.24.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -1151,7 +1151,8 @@ THEMES_ACTIVITE = [
                       "davinci", "tutorial", "tuto", "speedpaint", "timelapse", "fl studio",
                       "substance", "zbrush", "rigging", "sculpt", "concept art", "making of",
                       "breakdown vfx", "montage video")),
-    ("musique",      ("spotify", "soundcloud", "bandcamp", "playlist", "album", " ost",
+    # « ost » avec un espace devant attrapait « osteo » : il en faut un derriere.
+    ("musique",      ("spotify", "soundcloud", "bandcamp", "playlist", "album", " ost ",
                       "official video", "live session", "concert", "remix", "lofi", "clip",
                       "audio hq", "full album")),
     ("science",      ("documentaire", "espace", "nasa", "astronomie", "physique", "biologie",
@@ -1160,12 +1161,18 @@ THEMES_ACTIVITE = [
     ("sante",        ("psy ", "psychologue", "psychiatre", "therapie", "thérapie", "tdah", "adhd",
                       "autisme", "anxiete", "anxiété", "depression", "dépression", "burn out",
                       "sommeil", "symptome", "symptôme", "medecin", "médecin", "diagnostic")),
-    ("sport",        ("match", "ligue 1", "premier league", "nba", "ufc", "mma", "formule 1",
+    # « nba » et « mma » sont cherches ENTOURES D'ESPACES : en sous-chaine, ils
+    # rangeaient « do-nba-ss » et « co-nba-se » et « co-mma-nde » dans le sport.
+    # Trois lettres suffisent a un sigle et ne suffisent jamais a une recherche
+    # en sous-chaine — c'est vrai de tous les sigles de ce tableau.
+    ("sport",        ("match", "ligue 1", "premier league", " nba ", "ufc", " mma ", "formule 1",
                       "f1 ", "tennis", "roland garros", "tour de france", "musculation",
                       "entrainement", "entraînement", "workout", "course a pied")),
     ("cuisine",      ("recette", "cuisine", "patisserie", "pâtisserie", "restaurant", "chef ",
                       "marmiton", "batch cooking", "vegan")),
-    ("humour",       ("humour", "sketch", "stand up", "stand-up", "parodie", "meme", "memes",
+    # « meme » nu attrapait « même » ecrit sans accent, omnipresent dans les
+    # titres francais : tout ce qui portait le mot devenait de l'humour.
+    ("humour",       ("humour", "sketch", "stand up", "stand-up", "parodie", "memes",
                       "best of", "fail", "compilation drole", "compilation drôle")),
     ("voyage",       ("voyage", "roadtrip", "road trip", "randonnee", "randonnée", "itineraire",
                       "billet d avion", "airbnb", "booking", "guide de voyage")),
@@ -1184,18 +1191,36 @@ THEMES_ACTIVITE = [
 ]
 
 
+def _plein(contexte):
+    """Le titre de l'onglet et le programme, en une chaine bordee d'espaces."""
+    proc, _, titre = (contexte or "").strip().lower().partition("|")
+    return " " + " ".join((_titre_onglet(titre) + " " + proc.strip()).split()) + " "
+
+
 def theme_activite(contexte):
     """La thematique de ce qu'on regarde, ou None quand rien ne correspond."""
-    contexte = (contexte or "").strip().lower()
-    if not contexte:
+    if not (contexte or "").strip():
         return None
-    proc, _, titre = contexte.partition("|")
-    # Le titre entier, pas seulement le site : c'est lui qui porte le sujet.
-    plein = " " + " ".join((_titre_onglet(titre) + " " + proc.strip()).split()) + " "
+    plein = _plein(contexte)
     for nom, mots in THEMES_ACTIVITE:
         for mot in mots:
             if mot in plein:
                 return nom
+    # UNE SOUS-CATEGORIE RECONNUE IMPLIQUE SON THEME.
+    #
+    # Les deux tables sont ecrites separement, et la seconde connait des mots
+    # que la premiere ignore : « donbass » est de la guerre, « exoplanete » de
+    # la science, « urssaf » de l'argent -- mais le theme ne se declenchait pas,
+    # donc la sous-categorie n'etait jamais consultee et le titre finissait non
+    # classe. Onze sous-categories etaient ainsi inatteignables toutes seules.
+    #
+    # On repasse dans l'ordre des THEMES pour garder leur priorite : ce second
+    # tour ne change pas qui gagne, il rattrape ce que personne ne prenait.
+    for nom, _ in THEMES_ACTIVITE:
+        for _, mots in SOUS_THEMES.get(nom, ()):
+            for mot in mots:
+                if mot in plein:
+                    return nom
     return None
 
 
@@ -1261,8 +1286,8 @@ SOUS_THEMES = {
                          "mise au point", "reponse a", "réponse à", "je m explique")),
         ("react",       ("react", "reaction", "réaction", "je regarde", "on regarde", "tier list",
                          "je note", "je teste")),
-        ("recit",       ("storytime", "story time", "vlog", "ma journee", "ma journée",
-                         "mon histoire", "je raconte", "grwm", "routine")),
+        ("recit",       ("mon histoire", "je raconte", "mon quotidien", "ma semaine",
+                         "une journee avec", "ce qui m est arrive", "get ready", "routine")),
         ("entretien",   ("podcast", "interview", "entretien", "invite", "invité", "q&a",
                          "questions reponses")),
         ("marque",      ("unboxing", "haul", "code promo", "sponsorise", "sponsorisé",
@@ -1289,14 +1314,17 @@ SOUS_THEMES = {
                          "grandeur nature", "gn ")),
     ),
     "jeu": (
-        ("competitif",  ("ranked", "classe", "esport", "e-sport", "tournoi", "ligue", "scrim",
+        # « classe » et « ligue » nus attrapaient du francais ordinaire.
+        ("competitif",  ("ranked", "classement", "esport", "e-sport", "tournoi", "scrim",
                          "valorant", "league of legends", "counter", "rocket league", "montee elo")),
-        ("solo",        ("playthrough", "walkthrough", "let's play", "lets play", "no commentary",
-                         "elden ring", "boss fight", "fin du jeu", "soluce", "100%")),
+        ("solo",        ("fin du jeu", "100%", "sans mourir", "sans degats", "sans dégâts",
+                         "premiere partie", "première partie", "nouvelle partie", "difficulte max",
+                         "run complete")),
         ("bac-a-sable", ("minecraft", "modded", "moddé", "terraria", "factorio", "survie",
                          "base building", "seed ", "farm ")),
-        ("actualite",   ("patch note", "trailer", "bande annonce", "sortie", "annonce",
-                         "gameplay reveal", "roadmap", "mise a jour du jeu")),
+        # « sortie » et « annonce » nus : trop de francais ordinaire.
+        ("actualite",   ("patch note", "trailer", "bande annonce", "gameplay reveal",
+                         "roadmap", "mise a jour du jeu", "date de sortie")),
         ("retro",       ("retro", "rétro", "speedrun", "any%", "nes ", "snes", "ps1", "n64",
                          "emulateur", "émulateur", "abandonware")),
     ),
@@ -1315,7 +1343,10 @@ SOUS_THEMES = {
     "musique": (
         ("live",        ("live session", "concert", "en direct", "boiler room", "tiny desk",
                          "unplugged", "festival", "set live")),
-        ("album",       ("full album", "album complet", " ost", "bande originale", "soundtrack",
+        # « ost » demande ses deux espaces ici aussi : sans le second il attrapait
+        # « osteo », et depuis que la sous-categorie implique son theme, ca
+        # rangeait un rendez-vous chez le kine dans la musique.
+        ("album",       ("full album", "album complet", " ost ", "bande originale", "soundtrack",
                          "deluxe", "ep ", "lp ")),
         ("playlist",    ("playlist", "mix ", "lofi", "radio", "compilation", "ambient",
                          "pour travailler", "pour dormir")),
@@ -1349,11 +1380,16 @@ SOUS_THEMES = {
                          "arreter de", "arrêter de", "addiction")),
     ),
     "sport": (
-        ("football",    ("ligue 1", "premier league", "liga", "champions league", "coupe du monde",
-                         "psg", "om ", "ballon d or", "mercato", "football")),
+        # Un seul sport collectif laissait le basket, le rugby et le handball
+        # dehors : « resume nba » tombait dans « sport » sans plus de precision.
+        ("collectif",   ("liga", "champions league", "coupe du monde", "psg", "ballon d or",
+                         "mercato", "football", "basket", "rugby", "handball", "volley",
+                         "top 14", "euroligue")),
         ("combat",      ("ufc", "mma", "boxe", "judo", "lutte", "kickboxing", "grappling",
                          "combat ", "ko ")),
-        ("moteur",      ("formule 1", "f1 ", "motogp", "rallye", "wrc", "endurance", "le mans",
+        # « endurance » est le NOM de la sous-categorie suivante : le garder ici
+        # faisait tomber « sport d'endurance » dans « moteur », qui vient avant.
+        ("moteur",      ("formule 1", "f1 ", "motogp", "rallye", "wrc", "24h du mans", "le mans",
                          "grand prix", "qualifications")),
         ("endurance",   ("marathon", "course a pied", "trail", "triathlon", "cyclisme",
                          "tour de france", "natation", "chrono")),
@@ -1373,9 +1409,12 @@ SOUS_THEMES = {
     "humour": (
         ("sketch",      ("sketch", "stand up", "stand-up", "one man show", "spectacle",
                          "improvisation", "parodie", "sketch comique")),
-        ("meme",        ("meme", "memes", "shitpost", "cursed", "brainrot", "copypasta")),
-        ("fail",        ("fail", "compilation drole", "compilation drôle", "moments genants",
-                         "moments gênants", "best of", "bloopers", "rate", "raté")),
+        # « meme » nu attrapait « même » ecrit sans accent, omnipresent dans les
+        # titres francais : la sous-categorie aurait double de taille pour rien.
+        ("meme",        ("memes", "shitpost", "cursed", "brainrot", "copypasta", "meme drole")),
+        # « rate » attrapait « pirate », « separate ».
+        ("fail",        ("moments genants", "moments gênants", "bloopers", "ca tourne mal",
+                         "ça tourne mal", "loupe la marche", "gag", "malaise")),
     ),
     "voyage": (
         ("preparation", ("billet d avion", "airbnb", "booking", "itineraire", "itinéraire",
@@ -1395,8 +1434,11 @@ SOUS_THEMES = {
                          "moyen orient", "correspondant", "a l etranger")),
         ("economie",    ("inflation", "chomage", "chômage", "bourse", "croissance", "pouvoir d achat",
                          "budget de l etat", "dette", "entreprise", "licenciement")),
-        ("france",      ("france info", "franceinfo", "bfm", "le monde", "mediapart", "liberation",
-                         "le figaro", "20 minutes", "journal televise", "20h")),
+        # PAS DE « actu/france ». Ses mots-clefs seraient exactement ceux qui
+        # declenchent le theme « actu » : presque tout ce qui entre dans actu
+        # sans avoir matche faits-divers en ressortirait, quel que soit le sujet
+        # lu. Une sous-categorie qui reprend les mots de son theme est un
+        # SUPPORT deguise en sujet, et elle ne dit rien de plus que le theme.
     ),
     "achat": (
         ("commande",    ("panier", "checkout", "commande", "livraison", "suivi de colis",
@@ -1413,8 +1455,8 @@ SOUS_THEMES = {
                          "avis d imposition", "prelevement", "prélèvement")),
         ("crypto",      ("coinbase", "binance", "bitcoin", "ethereum", "crypto", "wallet",
                          "blockchain", "staking")),
-        ("charges",     ("facture", "mutuelle", "assurance", "loyer", "abonnement", "edf",
-                         "resiliation", "résiliation", "caf ", "pole emploi", "pôle emploi")),
+        ("charges",     ("loyer", "abonnement", "edf", "engie", "resiliation", "résiliation",
+                         "prelevement automatique", "echeance", "échéance", "relance de paiement")),
     ),
     "dev": (
         ("erreur",      ("stack overflow", "stackoverflow", "error", "erreur", "traceback",
@@ -1441,13 +1483,9 @@ def sous_theme_activite(theme, contexte):
     pour que la barre soit pleine.
     """
     sous = SOUS_THEMES.get(theme or "")
-    if not sous:
+    if not sous or not (contexte or "").strip():
         return None
-    contexte = (contexte or "").strip().lower()
-    if not contexte:
-        return None
-    proc, _, titre = contexte.partition("|")
-    plein = " " + " ".join((_titre_onglet(titre) + " " + proc.strip()).split()) + " "
+    plein = _plein(contexte)
     for nom, mots in sous:
         for mot in mots:
             if mot in plein:
