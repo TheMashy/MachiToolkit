@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.23.0"
+VERSION = "1.24.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -551,7 +551,9 @@ ACTIVITE = {
     "themes": {},         # secondes par thematique, tout confondu
     "themes_web": {},     # secondes par thematique, NAVIGATEUR seulement
     "titres_theme": {},   # thematique -> {titre: secondes}, si titres complets
+    "sous_themes_web": {},  # thematique -> {sous-categorie: secondes}, NAVIGATEUR seulement
     "theme_courant": None,
+    "sous_courant": None,
     "web_courant": False,
     "premiere": "",       # premiere activite de la journee (HH:MM)
     "derniere": "",
@@ -1197,6 +1199,262 @@ def theme_activite(contexte):
     return None
 
 
+"""LES SOUS-CATEGORIES : DANS UN SUJET, DE QUOI IL S'AGIT.
+
+« 40 min de guerre » est deja plus utile que « 249 min web ». Mais la guerre
+en Ukraine suivie sur des cartes et une nuit de bodycams ne sont pas la meme
+soiree, et le theme les compte pareil. La sous-categorie est une SECONDE
+passe, a l'interieur d'un theme deja trouve : elle affine, elle ne reclasse
+pas. Un titre qu'aucune sous-categorie ne reconnait reste dans son theme, sans
+sous-categorie -- et c'est la bonne reponse, pas un trou a boucher.
+
+TROIS REGLES QUI NE SE NEGOCIENT PAS.
+
+1. UNE SOUS-CATEGORIE EST UN SUJET, JAMAIS QUELQU'UN. Pas de nom de chaine, pas
+   de pseudo, pas de nom de personne. Le theme protegeait deja ca ; le raffiner
+   au point de nommer QUI on regardait ferait exactement ce que la regle du
+   produit interdit depuis le debut.
+
+2. « SANTE » NE SE SOUS-CATEGORISE PAS EN DIAGNOSTICS. Ses sous-categories
+   nomment un DOMAINE -- le sommeil, le corps, le soin -- jamais un trouble.
+   « sante/tdah » qui remonte au site serait une etiquette clinique posee par
+   une table de mots-clefs, c'est-a-dire la chose precise que ce produit refuse
+   de faire.
+
+3. « ADULTE » N'A PAS DE SOUS-CATEGORIE, ET C'EST DELIBERE. Le theme dit deja
+   tout ce qui est utile a quelqu'un qui regarde ou passe son temps. Le
+   detailler transformerait un compteur grossier en un releve des gouts
+   sexuels de quelqu'un, range dans son journal, et aucune lecture de soi ne
+   vaut ce prix.
+
+L'ordre compte, comme pour les themes : la premiere sous-categorie qui
+correspond gagne. Les plus precises sont donc en haut.
+"""
+SOUS_THEMES = {
+    "guerre": (
+        ("ukraine",     ("ukraine", "ukrainien", "kherson", "bakhmut", "donbass", "kharkiv",
+                         "zaporijia", "avdiivka", "koursk", "kiev", "kyiv")),
+        ("proche-orient", ("gaza", "israel", "israël", "palestine", "liban", "hezbollah",
+                         "houthi", "yemen", "syrie", "tsahal")),
+        ("analyse",     ("analyse", "carte du front", "strategie", "stratégie", "doctrine",
+                         "osint", "geopolitique", "géopolitique", "renseignement", "briefing")),
+        ("materiel",    ("drone", "fpv", "artillerie", "char ", "missile", "himars", "javelin",
+                         "blinde", "blindé", "obus", "f-16", "systeme d arme")),
+        ("archives",    ("39-45", "1939", "1944", "seconde guerre", "wwii", "ww2", "vietnam",
+                         "indochine", "algerie", "algérie", "14-18", "grande guerre")),
+    ),
+    "politique": (
+        ("elections",   ("election", "élection", "sondage", "scrutin", "campagne", "candidat",
+                         "second tour", "legislative", "législative", "presidentielle")),
+        ("france",      ("assemblee nationale", "assemblée", "senat", "sénat", "gouvernement",
+                         "ministre", "matignon", "elysee", "élysée", "motion de censure",
+                         "conseil des ministres")),
+        ("social",      ("greve", "grève", "manifestation", "syndicat", "retraite", "salaire",
+                         "cgt", "mouvement social", "blocage")),
+        ("international", ("otan", "onu", "union europeenne", "union européenne", "bruxelles",
+                         "sommet", "diplomatie", "sanctions", "traite", "traité")),
+        ("debat",       ("debat", "débat", "editorial", "éditorial", "tribune", "chronique",
+                         "plateau", "face a face")),
+    ),
+    "influenceurs": (
+        ("drama",       ("drama", "clash", "cancel", "polemique", "polémique", "accusation",
+                         "mise au point", "reponse a", "réponse à", "je m explique")),
+        ("react",       ("react", "reaction", "réaction", "je regarde", "on regarde", "tier list",
+                         "je note", "je teste")),
+        ("recit",       ("storytime", "story time", "vlog", "ma journee", "ma journée",
+                         "mon histoire", "je raconte", "grwm", "routine")),
+        ("entretien",   ("podcast", "interview", "entretien", "invite", "invité", "q&a",
+                         "questions reponses")),
+        ("marque",      ("unboxing", "haul", "code promo", "sponsorise", "sponsorisé",
+                         "collab", "ma collection")),
+    ),
+    "urbex": (
+        ("souterrain",  ("souterrain", "catacombe", "carriere", "carrière", "tunnel", "bunker",
+                         "egout", "égout", "mine ")),
+        ("batiment",    ("hopital", "hôpital", "asile", "sanatorium", "ecole abandonnee",
+                         "usine", "chateau abandonne", "château abandonné", "manoir", "hotel abandonne")),
+        ("epave",       ("epave", "épave", "wreck", "navire abandonne", "avion abandonne",
+                         "cimetiere de", "cimetière de", "train abandonne")),
+        ("catastrophe", ("tchernobyl", "chernobyl", "pripyat", "fukushima", "zone d exclusion",
+                         "ville fantome", "ville fantôme", "ghost town")),
+    ),
+    "rp": (
+        ("table",       ("jdr", "dungeons", "donjons", "dnd", "d&d", "pathfinder", "maitre du jeu",
+                         "maître du jeu", "one shot", "campagne", "fiche de personnage")),
+        ("serveur",     ("gta rp", "fivem", "serveur rp", "whitelist", "minecraft rp", "arma",
+                         "dayz", "garry s mod")),
+        ("ecrit",       ("forum rp", "rp ecrit", "rp écrit", "roleplay ecrit", "fiche rp",
+                         "contexte rp", "intrigue")),
+        ("murder",      ("murder party", "enquete grandeur", "enquête grandeur", "escape game",
+                         "grandeur nature", "gn ")),
+    ),
+    "jeu": (
+        ("competitif",  ("ranked", "classe", "esport", "e-sport", "tournoi", "ligue", "scrim",
+                         "valorant", "league of legends", "counter", "rocket league", "montee elo")),
+        ("solo",        ("playthrough", "walkthrough", "let's play", "lets play", "no commentary",
+                         "elden ring", "boss fight", "fin du jeu", "soluce", "100%")),
+        ("bac-a-sable", ("minecraft", "modded", "moddé", "terraria", "factorio", "survie",
+                         "base building", "seed ", "farm ")),
+        ("actualite",   ("patch note", "trailer", "bande annonce", "sortie", "annonce",
+                         "gameplay reveal", "roadmap", "mise a jour du jeu")),
+        ("retro",       ("retro", "rétro", "speedrun", "any%", "nes ", "snes", "ps1", "n64",
+                         "emulateur", "émulateur", "abandonware")),
+    ),
+    "creation": (
+        ("3d",          ("blender", "zbrush", "substance", "maya ", "cinema 4d", "houdini",
+                         "sculpt", "rigging", "topologie", "shader", "render")),
+        ("2d",          ("photoshop", "krita", "procreate", "clip studio", "speedpaint",
+                         "line art", "concept art", "illustration", "palette", "perspective")),
+        ("video",       ("after effects", "davinci", "premiere", "montage video", "montage vidéo",
+                         "etalonnage", "étalonnage", "vfx", "compositing", "motion design")),
+        ("son",         ("fl studio", "ableton", "reaper", "cubase", "mixage", "mastering",
+                         "sound design", "synthese", "synthèse", "vst")),
+        ("ecriture",    ("scenario", "scénario", "worldbuilding", "structure du recit",
+                         "structure du récit", "dialogue", "personnage", "storyboard")),
+    ),
+    "musique": (
+        ("live",        ("live session", "concert", "en direct", "boiler room", "tiny desk",
+                         "unplugged", "festival", "set live")),
+        ("album",       ("full album", "album complet", " ost", "bande originale", "soundtrack",
+                         "deluxe", "ep ", "lp ")),
+        ("playlist",    ("playlist", "mix ", "lofi", "radio", "compilation", "ambient",
+                         "pour travailler", "pour dormir")),
+        ("clip",        ("official video", "clip officiel", "music video", "visualizer", "lyrics",
+                         "paroles")),
+        ("remix",       ("remix", "mashup", "cover", "reprise", "edit ", "nightcore", "slowed")),
+    ),
+    "science": (
+        ("espace",      ("nasa", "espace", "astronomie", "galaxie", "trou noir", "exoplanete",
+                         "exoplanète", "fusee", "fusée", "spacex", "james webb", "mars ")),
+        ("vivant",      ("biologie", "neuroscience", "cerveau", "adn", "evolution", "évolution",
+                         "cellule", "microbe", "animal", "espece", "espèce", "ecosysteme")),
+        ("physique",    ("physique", "quantique", "relativite", "relativité", "particule",
+                         "thermodynamique", "mathematique", "mathématique", "theoreme", "théorème")),
+        ("histoire",    ("histoire de", "archeologie", "archéologie", "antiquite", "antiquité",
+                         "moyen age", "moyen âge", "civilisation", "empire", "prehistoire")),
+        ("terre",       ("geologie", "géologie", "volcan", "climat", "ocean", "océan", "seisme",
+                         "séisme", "meteo", "météo", "glacier")),
+    ),
+    # « sante » nomme un DOMAINE, jamais un trouble : voir la regle 2 en tete.
+    "sante": (
+        ("sommeil",     ("sommeil", "insomnie", "dormir", "reveil nocturne", "réveil nocturne",
+                         "sieste", "rythme circadien", "apnee", "apnée")),
+        ("psy",         ("psy ", "psychologue", "psychiatre", "therapie", "thérapie", "tcc",
+                         "consultation", "emdr", "mindfulness", "meditation", "méditation")),
+        ("corps",       ("douleur", "dos ", "articulation", "migraine", "digestion", "peau",
+                         "kine", "kiné", "osteo", "ostéo", "posture")),
+        ("soin",        ("medecin", "médecin", "ordonnance", "pharmacie", "urgence", "hopital",
+                         "hôpital", "specialiste", "spécialiste", "rendez vous medical")),
+        ("hygiene",     ("alimentation", "nutrition", "vitamine", "hydratation", "sevrage",
+                         "arreter de", "arrêter de", "addiction")),
+    ),
+    "sport": (
+        ("football",    ("ligue 1", "premier league", "liga", "champions league", "coupe du monde",
+                         "psg", "om ", "ballon d or", "mercato", "football")),
+        ("combat",      ("ufc", "mma", "boxe", "judo", "lutte", "kickboxing", "grappling",
+                         "combat ", "ko ")),
+        ("moteur",      ("formule 1", "f1 ", "motogp", "rallye", "wrc", "endurance", "le mans",
+                         "grand prix", "qualifications")),
+        ("endurance",   ("marathon", "course a pied", "trail", "triathlon", "cyclisme",
+                         "tour de france", "natation", "chrono")),
+        ("muscu",       ("musculation", "entrainement", "entraînement", "workout", "programme",
+                         "seche", "sèche", "prise de masse", "squat", "developpe")),
+    ),
+    "cuisine": (
+        ("patisserie",  ("patisserie", "pâtisserie", "gateau", "gâteau", "tarte", "brioche",
+                         "chocolat", "creme", "crème", "levain", "pain ")),
+        ("recette",     ("recette", "marmiton", "plat ", "sauce", "mijote", "mijoté", "four ",
+                         "poele", "poêle", "en 20 minutes")),
+        ("restaurant",  ("restaurant", "chef ", "etoile", "étoile", "bistrot", "carte du",
+                         "critique culinaire", "food")),
+        ("regime",      ("vegan", "vegetarien", "végétarien", "batch cooking", "meal prep",
+                         "sans gluten", "proteine", "protéine", "calories")),
+    ),
+    "humour": (
+        ("sketch",      ("sketch", "stand up", "stand-up", "one man show", "spectacle",
+                         "improvisation", "parodie", "sketch comique")),
+        ("meme",        ("meme", "memes", "shitpost", "cursed", "brainrot", "copypasta")),
+        ("fail",        ("fail", "compilation drole", "compilation drôle", "moments genants",
+                         "moments gênants", "best of", "bloopers", "rate", "raté")),
+    ),
+    "voyage": (
+        ("preparation", ("billet d avion", "airbnb", "booking", "itineraire", "itinéraire",
+                         "budget voyage", "visa", "assurance voyage", "vol pas cher")),
+        ("randonnee",   ("randonnee", "randonnée", "gr ", "bivouac", "refuge", "sentier",
+                         "trek", "sac a dos", "camping")),
+        ("recit",       ("roadtrip", "road trip", "carnet de voyage", "jour 1", "vlog voyage",
+                         "on est arrive", "j ai visite")),
+        ("ville",       ("que faire a", "guide de", "week end a", "48h a", "city guide",
+                         "quartier", "musee", "musée")),
+    ),
+    # « adulte » reste sans sous-categorie : voir la regle 3 en tete.
+    "actu": (
+        ("faits-divers", ("fait divers", "proces", "procès", "enquete", "enquête", "police",
+                         "justice", "disparition", "accident", "incendie")),
+        ("monde",       ("international", "etats unis", "états unis", "chine", "russie", "afrique",
+                         "moyen orient", "correspondant", "a l etranger")),
+        ("economie",    ("inflation", "chomage", "chômage", "bourse", "croissance", "pouvoir d achat",
+                         "budget de l etat", "dette", "entreprise", "licenciement")),
+        ("france",      ("france info", "franceinfo", "bfm", "le monde", "mediapart", "liberation",
+                         "le figaro", "20 minutes", "journal televise", "20h")),
+    ),
+    "achat": (
+        ("commande",    ("panier", "checkout", "commande", "livraison", "suivi de colis",
+                         "retour produit", "facture d achat", "paiement")),
+        ("occasion",    ("leboncoin", "vinted", "occasion", "seconde main", "annonce", "negociation",
+                         "négociation", "reconditionne", "reconditionné")),
+        ("recherche",   ("comparatif", "avis ", "test ", "meilleur ", "guide d achat", "promo",
+                         "soldes", "black friday", "prix ")),
+    ),
+    "argent": (
+        ("banque",      ("banque", "compte courant", "virement", "rib", "decouvert", "découvert",
+                         "carte bancaire", "livret", "epargne", "épargne")),
+        ("impots",      ("impots", "impôts", "declaration", "déclaration", "urssaf", "tva",
+                         "avis d imposition", "prelevement", "prélèvement")),
+        ("crypto",      ("coinbase", "binance", "bitcoin", "ethereum", "crypto", "wallet",
+                         "blockchain", "staking")),
+        ("charges",     ("facture", "mutuelle", "assurance", "loyer", "abonnement", "edf",
+                         "resiliation", "résiliation", "caf ", "pole emploi", "pôle emploi")),
+    ),
+    "dev": (
+        ("erreur",      ("stack overflow", "stackoverflow", "error", "erreur", "traceback",
+                         "exception", "debug", "ne marche pas", "fix ", "issue ")),
+        ("depot",       ("github", "gitlab", "pull request", "commit", "merge", "branche",
+                         "diff ", "review", "ci ")),
+        ("doc",         ("documentation", "docs.", "reference", "référence", "api ", "guide",
+                         "getting started", "changelog", "man ")),
+        ("outil",       ("docker", " npm", "pypi", "webpack", "vite", "cli ", "config",
+                         "deploiement", "déploiement", "localhost")),
+        ("langage",     ("python", "javascript", "typescript", "rust", "golang", " go ", "sql ",
+                         "regex", "css ", "html")),
+    ),
+}
+
+
+def sous_theme_activite(theme, contexte):
+    """La sous-categorie DANS un theme deja trouve, ou None.
+
+    Deuxieme passe et deuxieme table : on ne cherche une sous-categorie que si
+    le theme est deja tombe. Un titre qui a donne « guerre » sans donner
+    « ukraine » ni « analyse » reste de la guerre sans plus de precision -- et
+    c'est plus honnete que de le ranger dans la sous-categorie la plus large
+    pour que la barre soit pleine.
+    """
+    sous = SOUS_THEMES.get(theme or "")
+    if not sous:
+        return None
+    contexte = (contexte or "").strip().lower()
+    if not contexte:
+        return None
+    proc, _, titre = contexte.partition("|")
+    plein = " " + " ".join((_titre_onglet(titre) + " " + proc.strip()).split()) + " "
+    for nom, mots in sous:
+        for mot in mots:
+            if mot in plein:
+                return nom
+    return None
+
+
 def categorie_activite(contexte):
     """'chrome.exe | voices of the void - youtube' -> 'web:youtube', 'code.exe' -> 'code'.
 
@@ -1249,7 +1507,8 @@ def _reinit_jour(reprendre=False, maintenant=None):
     ACTIVITE.update(jour=jour, contexte="", titre_courant="",
                     depuis=maintenant if maintenant is not None else time.time(),
                     temps={}, titres={}, themes={}, themes_web={},
-                    titres_theme={}, theme_courant=None, web_courant=False, bascules=0,
+                    titres_theme={}, sous_themes_web={},
+                    theme_courant=None, sous_courant=None, web_courant=False, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
                     trou_depuis=0.0, reprise=True)
     if not reprendre:
@@ -1271,6 +1530,8 @@ def _reinit_jour(reprendre=False, maintenant=None):
                                   if isinstance(v, (int, float)) and v > 0}
         ACTIVITE["titres_theme"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
                                     for k, v in (d.get("titres_par_theme") or {}).items()}
+        ACTIVITE["sous_themes_web"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
+                                       for k, v in (d.get("temps_par_sous_theme_web_s") or {}).items()}
         ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
         ACTIVITE["actif_s"] = float(d.get("actif_minutes") or 0) * 60.0
         plage = d.get("plage") or {}
@@ -1309,6 +1570,7 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # ferait glisser chaque minute d'un cran : les cinq heures de YouTube
     # atterriraient sous le theme de l'onglet ouvert juste apres.
     theme_avant = ACTIVITE.get("theme_courant")
+    sous_avant = ACTIVITE.get("sous_courant")
     web_avant = ACTIVITE.get("web_courant", False)
     if avant:
         ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
@@ -1324,6 +1586,15 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
             if web_avant:
                 ACTIVITE.setdefault("themes_web", {})
                 ACTIVITE["themes_web"][theme_avant] = ACTIVITE["themes_web"].get(theme_avant, 0.0) + ecoule
+                # ET LA SOUS-CATEGORIE, quand il y en a une. Elle est rangee SOUS
+                # son theme et non a plat : « recit » existe dans « influenceurs »
+                # comme dans « voyage », et deux totaux additionnes sous le meme
+                # nom ne voudraient plus rien dire. Le total des sous-categories
+                # d'un theme est toujours <= au theme : ce qui n'a pas ete affine
+                # reste compte une fois, dans le theme, et nulle part ailleurs.
+                if sous_avant:
+                    par_sous = ACTIVITE.setdefault("sous_themes_web", {}).setdefault(theme_avant, {})
+                    par_sous[sous_avant] = par_sous.get(sous_avant, 0.0) + ecoule
             # LE TITRE DERRIERE LE THEME, quand la personne l'a demande. Un
             # camembert de themes dit « 40 min de guerre » et laisse seul devant
             # le chiffre : c'est le TITRE qui rend la mesure verifiable, et
@@ -1384,6 +1655,10 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # le temps versé plus bas doit aller au theme de ce qu'on regardait, pas de
     # ce qu'on regardait avant.
     ACTIVITE["theme_courant"] = theme_activite(contexte)
+    # La sous-categorie se lit DANS le theme qu'on vient de trouver : deuxieme
+    # passe, meme fenetre, meme instant. Pas de theme, pas de sous-categorie --
+    # il n'y a rien a affiner.
+    ACTIVITE["sous_courant"] = sous_theme_activite(ACTIVITE["theme_courant"], contexte)
     ACTIVITE["web_courant"] = cat.startswith("web:")
     ACTIVITE["titre_courant"] = titre
 
@@ -1423,9 +1698,21 @@ def resume_activite():
     veille = sommeil_estime(ACTIVITE["jour"] or _jour_courant())
     if veille:
         resume["poste"] = veille
+    # LE NOM DE L'ONGLET, PAS CELUI DE LA FENETRE. Ces titres partaient bruts,
+    # avec « - Profil 1 - Microsoft Edge » colle derriere -- ce qui, a l'ecran,
+    # fait tenir le nom du navigateur et pas la page. Le meme nettoyage que pour
+    # `titres_par_theme` est applique ici, ET les entrees d'une journee reprise
+    # (ecrites brutes par une version d'avant) se replient sur la version propre
+    # au lieu de compter deux fois la meme page.
     if ACTIVITE["titres"]:
-        resume["titres"] = {cat: {t: round(s) for t, s in d.items()}
-                            for cat, d in ACTIVITE["titres"].items()}
+        propres = {}
+        for cat, d in ACTIVITE["titres"].items():
+            par = propres.setdefault(cat, {})
+            for t, sec in d.items():
+                nom = _titre_onglet(t) or t
+                par[nom] = par.get(nom, 0.0) + sec
+        resume["titres"] = {cat: {t: round(sec) for t, sec in d.items()}
+                            for cat, d in propres.items()}
     themes = {k: round(v) for k, v in sorted(
         (ACTIVITE.get("themes") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
     if themes:
@@ -1445,6 +1732,16 @@ def resume_activite():
             titres[theme] = dict(gardes)
     if titres:
         resume["titres_par_theme"] = titres
+    # LES SOUS-CATEGORIES, rangees sous leur theme. Le meme plancher d'une
+    # seconde que partout ailleurs : une sous-categorie effleuree n'est pas une
+    # sous-categorie, c'est un onglet ouvert par erreur.
+    sous = {}
+    for theme, d in (ACTIVITE.get("sous_themes_web") or {}).items():
+        gardes = {k: round(v) for k, v in sorted(d.items(), key=lambda kv: -kv[1]) if v >= 1}
+        if gardes:
+            sous[theme] = gardes
+    if sous:
+        resume["temps_par_sous_theme_web_s"] = sous
     return resume
 
 

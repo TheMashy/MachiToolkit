@@ -576,6 +576,141 @@ class Onglets(unittest.TestCase):
                          "l'ecran dit deja qu'on etait sur reddit")
 
 
+class SousCategories(unittest.TestCase):
+    """DANS UN SUJET, DE QUOI IL S'AGIT.
+
+    Le theme est la maille grossiere : « 40 min de guerre ». La sous-categorie
+    affine sans reclasser -- et surtout, elle a le droit de ne rien dire. Ces
+    tests fixent ce qu'elle ne fera jamais autant que ce qu'elle fait.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    def test_la_sous_categorie_affine_le_theme(self):
+        st = self.mt.sous_theme_activite
+        for theme, contexte, attendu in [
+            ("guerre", "chrome.exe | carte du front en ukraine - youtube - google chrome", "ukraine"),
+            ("guerre", "chrome.exe | la situation a gaza - le monde - firefox", "proche-orient"),
+            ("guerre", "chrome.exe | documentaire seconde guerre mondiale - youtube", "archives"),
+            ("jeu", "chrome.exe | elden ring playthrough part 4 - youtube - google chrome", "solo"),
+            ("jeu", "chrome.exe | valorant ranked highlights - twitch - google chrome", "competitif"),
+            ("creation", "blender.exe | scene.blend", "3d"),
+            ("dev", "chrome.exe | typeerror python traceback - stack overflow - firefox", "erreur"),
+            ("sante", "chrome.exe | insomnie : que faire - google chrome", "sommeil"),
+            ("urbex", "chrome.exe | hopital abandonne en normandie - youtube", "batiment"),
+        ]:
+            self.assertEqual(st(theme, contexte), attendu, contexte)
+
+    def test_un_titre_qui_n_affine_rien_reste_dans_son_theme(self):
+        """La sous-categorie a le droit de ne rien dire. La ranger de force dans
+        la plus large ferait une barre pleine et un chiffre faux."""
+        st = self.mt.sous_theme_activite
+        self.assertIsNone(st("guerre", "chrome.exe | reportage - youtube - google chrome"))
+        self.assertIsNone(st(None, "chrome.exe | n importe quoi"))
+        self.assertIsNone(st("guerre", ""))
+
+    def test_adulte_n_a_pas_de_sous_categorie(self):
+        """DELIBERE. Le theme dit deja ce qui est utile ; le detailler
+        transformerait un compteur grossier en un releve des gouts sexuels de
+        quelqu'un, range dans son journal."""
+        self.assertNotIn("adulte", self.mt.SOUS_THEMES)
+        self.assertIsNone(self.mt.sous_theme_activite("adulte", "chrome.exe | pornhub - google chrome"))
+
+    def test_sante_ne_nomme_jamais_un_trouble(self):
+        """Une etiquette clinique posee par une table de mots-clefs, et qui
+        remonte au site, est exactement ce que ce produit refuse de faire."""
+        noms = [n for n, _ in self.mt.SOUS_THEMES["sante"]]
+        for interdit in ("tdah", "adhd", "autisme", "depression", "bipolaire", "anxiete",
+                         "trouble", "burnout", "symptome", "diagnostic"):
+            self.assertNotIn(interdit, noms)
+
+    def test_aucune_sous_categorie_ne_nomme_quelqu_un(self):
+        """Le theme protegeait deja QUI on regardait. L'affiner au point de le
+        nommer defait la regle du produit."""
+        for theme, sous in self.mt.SOUS_THEMES.items():
+            for nom, mots in sous:
+                self.assertRegex(nom, r"^[a-z0-9-]+$", "%s/%s" % (theme, nom))
+                self.assertLessEqual(len(nom), 14, "%s/%s" % (theme, nom))
+
+    def test_la_table_reste_lisible(self):
+        """Trois a six sous-categories par theme. Au-dela ce n'est plus une
+        lecture, c'est une taxonomie."""
+        for theme, sous in self.mt.SOUS_THEMES.items():
+            self.assertIn(theme, [n for n, _ in self.mt.THEMES_ACTIVITE], theme)
+            noms = [n for n, _ in sous]
+            self.assertEqual(len(noms), len(set(noms)), theme)
+            self.assertGreaterEqual(len(noms), 3, theme)
+            self.assertLessEqual(len(noms), 6, theme)
+
+    def test_le_temps_web_se_repartit_sous_son_theme(self):
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        ukr = "chrome.exe | carte du front en ukraine - youtube - google chrome"
+        gaza = "chrome.exe | la situation a gaza - le monde - google chrome"
+        flou = "chrome.exe | guerre : reportage - youtube - google chrome"
+        for contexte, t in [(ukr, 1000), (ukr, 1120), (gaza, 1120), (gaza, 1240),
+                            (flou, 1240), (flou, 1300)]:
+            mt.activite_note(contexte, True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_theme_web_s"]["guerre"], 300)
+        self.assertEqual(r["temps_par_sous_theme_web_s"]["guerre"],
+                         {"ukraine": 120, "proche-orient": 120})
+        classe = sum(r["temps_par_sous_theme_web_s"]["guerre"].values())
+        self.assertLess(classe, r["temps_par_theme_web_s"]["guerre"],
+                        "les 60 s que rien n'affine restent dans le theme, "
+                        "comptees une seule fois")
+
+    def test_une_application_ne_nourrit_pas_les_sous_categories_web(self):
+        """Une heure passee DANS Blender et une heure a regarder un tuto de
+        Blender ne sont pas la meme heure. La regle vaut aussi ici."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        for t in (1000, 1120, 1180):
+            mt.activite_note("blender.exe | scene.blend", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertNotIn("temps_par_sous_theme_web_s", r)
+        self.assertIn("creation", r["temps_par_theme_s"])
+
+    def test_le_changement_de_jour_remet_les_sous_categories_a_zero(self):
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        mt.activite_note("chrome.exe | ukraine - youtube - google chrome", True, maintenant=1000.0)
+        mt.activite_note("chrome.exe | ukraine - youtube - google chrome", True, maintenant=1120.0)
+        self.assertTrue(mt.ACTIVITE["sous_themes_web"])
+        mt._reinit_jour(maintenant=2000.0)
+        self.assertEqual(mt.ACTIVITE["sous_themes_web"], {})
+        self.assertIsNone(mt.ACTIVITE["sous_courant"])
+
+    def test_le_titre_envoye_est_celui_de_l_onglet(self):
+        """Il partait brut, avec « - Profil 1 - Microsoft Edge » colle derriere :
+        a l'ecran, c'est le nom du navigateur qui tenait la ligne, pas la page."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        vu = "chrome.exe | carte du front en ukraine - youtube - profil 1 - microsoft edge"
+        for t in (1000, 1120):
+            mt.activite_note(vu, True, titres_complets=True, maintenant=t)
+        titres = mt.resume_activite()["titres"]["web:youtube"]
+        self.assertEqual(list(titres), ["carte du front en ukraine - youtube"])
+
+    def test_une_journee_reprise_ne_compte_pas_deux_fois_la_meme_page(self):
+        """Les entrees ecrites brutes par une version d'avant se replient sur la
+        version propre au lieu de faire deux lignes pour la meme page."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["titres"] = {"web:youtube": {
+            "carte du front en ukraine - youtube - google chrome": 300.0,
+            "carte du front en ukraine - youtube": 120.0,
+        }}
+        titres = mt.resume_activite()["titres"]["web:youtube"]
+        self.assertEqual(titres, {"carte du front en ukraine - youtube": 420})
+
+
 class Nuits(unittest.TestCase):
     """LA NUIT DE QUELQU'UN QUI SE LEVE A 16 H.
 
