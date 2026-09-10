@@ -19,6 +19,7 @@ import io
 import json
 import os
 import sys
+import shutil
 import tempfile
 import threading
 import time
@@ -1708,3 +1709,71 @@ class UnSeulFilDeCapture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class JournalAPorteeDeClic(unittest.TestCase):
+    """QUAND L'APPLICATION DISPARAIT, CE FICHIER EST LA SEULE CHOSE QUI PARLE.
+
+    C'est lui qui a nomme la violation d'acces de la v1.24.4 -- et il a fallu
+    expliquer un chemin entre %LOCALAPPDATA% et un dossier cache pour
+    l'obtenir. Le prochain rapport ne doit pas demander ca.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+        self.jrn = os.path.join(self.dossier, "journal.log")
+        self.mt.FICHIER_JOURNAL = self.jrn
+
+    def tearDown(self):
+        shutil.rmtree(self.dossier, ignore_errors=True)
+
+    def test_la_copie_est_une_COPIE_pas_le_fichier_tenu_en_ecriture(self):
+        """Le journal est ouvert en ecriture toute la vie du processus.
+
+        L'envoyer tel quel, c'est envoyer un fichier qui bouge encore -- et
+        sous Windows certains outils refusent de le lire pendant qu'il est
+        tenu. La copie est figee ; on verifie qu'elle est bien un autre
+        fichier, avec le meme contenu.
+        """
+        io.open(self.jrn, "w", encoding="utf-8").write("une ligne de panne\n")
+        poses, souci = self.mt.journal_pour_partage(self.dossier)
+        self.assertIsNone(souci)
+        self.assertEqual(len(poses), 1)
+        self.assertNotEqual(os.path.abspath(poses[0]), os.path.abspath(self.jrn),
+                            "ce doit etre une copie, pas le fichier lui-meme")
+        self.assertIn("une ligne de panne",
+                      io.open(poses[0], encoding="utf-8").read())
+
+    def test_LE_JOURNAL_PRECEDENT_PART_AVEC(self):
+        """Une panne d'avant le dernier demarrage n'est plus dans le fichier
+        courant -- la rotation l'a poussee dans .1 -- et c'est souvent
+        celle-la qu'on cherche."""
+        io.open(self.jrn, "w", encoding="utf-8").write("aujourd hui\n")
+        io.open(self.jrn + ".1", "w", encoding="utf-8").write("la vraie panne\n")
+        poses, souci = self.mt.journal_pour_partage(self.dossier)
+        self.assertIsNone(souci)
+        self.assertEqual(len(poses), 2, "les deux doivent partir")
+        ensemble = "".join(io.open(p, encoding="utf-8").read() for p in poses)
+        self.assertIn("la vraie panne", ensemble)
+
+    def test_la_copie_porte_sa_date_dans_son_nom(self):
+        """Deux copies faites deux jours de suite ne doivent pas s'ecraser :
+        celle d'hier est parfois la seule qui porte la panne."""
+        io.open(self.jrn, "w", encoding="utf-8").write("x\n")
+        poses, _ = self.mt.journal_pour_partage(self.dossier)
+        self.assertRegex(os.path.basename(poses[0]),
+                         r"^machitool-journal-\d{8}-\d{4}\.log$")
+
+    def test_un_journal_absent_le_dit_au_lieu_de_lever(self):
+        """Le bouton est sur un chemin d'erreur : s'il levait, il remplacerait
+        la panne a diagnostiquer par la sienne."""
+        poses, souci = self.mt.journal_pour_partage(self.dossier)
+        self.assertIsNone(poses)
+        self.assertTrue(souci)
+
+    def test_ouvrir_ce_qui_n_existe_pas_rend_une_raison(self):
+        """Une ouverture qui echoue en silence laisse quelqu'un cliquer trois
+        fois avant de comprendre qu'il ne se passera rien."""
+        souci = self.mt.ouvrir_dans_l_explorateur(os.path.join(self.dossier, "absent.log"))
+        self.assertTrue(souci)

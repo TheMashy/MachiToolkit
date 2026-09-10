@@ -40,7 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.24.4"
+VERSION = "1.25.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5903,12 +5903,86 @@ class Panneau:
 
         self.separateur(f)
 
+        """
+        LE JOURNAL, A PORTEE DE CLIC.
+
+        Quand l'application a disparu sous les doigts de quelqu'un, la seule
+        chose qui puisse le dire est ce fichier -- c'est lui qui a nomme la
+        violation d'acces de la v1.24.4, et il a fallu expliquer un chemin
+        entre %LOCALAPPDATA% et un dossier cache pour l'obtenir. Le prochain
+        rapport ne doit pas demander ca.
+
+        Deux gestes, parce qu'ils ne servent pas au meme moment : LIRE (on
+        regarde soi-meme ce qui s'est passe) et ENVOYER (on en donne une copie
+        a quelqu'un). La copie est datee et posee sur le Bureau, avec le
+        journal precedent s'il existe -- une panne d'avant le dernier
+        demarrage n'est plus dans le fichier courant, et c'est souvent
+        celle-la qu'on cherche.
+        """
+        self.titre(f, "journal de l'application").pack(fill="x", pady=(0, 5))
+        self.txt_journal = self.texte(f, "", BRUME, 8, largeur=460)
+        self.txt_journal.pack(fill="x", pady=(0, 8))
+        rang_j = tk.Frame(f, bg=NUIT)
+        rang_j.pack(fill="x")
+        self.bouton(rang_j, "Ouvrir le journal",
+                    self.action_ouvrir_journal, compact=True).pack(side="left")
+        self.bouton(rang_j, "En poser une copie sur le Bureau",
+                    self.action_copier_journal, compact=True).pack(side="left", padx=(8, 0))
+        self.bouton(rang_j, "Ouvrir le dossier",
+                    self.action_ouvrir_dossier, compact=True).pack(side="left", padx=(8, 0))
+        self.peindre_journal()
+
+        self.separateur(f)
+
         self.texte(f, "Les versions viennent des publications de github.com/"
                       + DEPOT_GITHUB + ". La verification est une simple lecture "
                       "de l'API publique de GitHub : rien de la machine n'est "
                       "envoye. Le nouvel exe remplace l'ancien dans "
                       + DOSSIER + " et config.json n'est jamais touche.",
                    BRUME, 8, largeur=460).pack(fill="x")
+
+    def peindre_journal(self):
+        """Ce que pese le journal, et depuis quand. Sans ca, « ouvrir le
+        journal » sur un fichier vide ne dit pas s'il est vide parce que tout
+        va bien ou parce qu'il n'a jamais rien ecrit."""
+        if not getattr(self, "txt_journal", None):
+            return
+        try:
+            n = os.path.getsize(FICHIER_JOURNAL)
+            quand = time.strftime("%d/%m a %H:%M",
+                                  time.localtime(os.path.getmtime(FICHIER_JOURNAL)))
+            taille = ("%d ko" % (n // 1024)) if n >= 1024 else ("%d octets" % n)
+            aussi = (" Le journal precedent est garde a cote."
+                     if os.path.exists(FICHIER_JOURNAL + ".1") else "")
+            texte = ("%s, derniere ligne le %s.%s C'est ce fichier qu'il faut "
+                     "envoyer quand l'application se ferme toute seule : il porte "
+                     "la raison." % (taille, quand, aussi))
+        except OSError:
+            texte = ("Aucun journal pour l'instant. Il se remplit tout seul des "
+                     "que l'application tourne sans console.")
+        self.txt_journal.configure(text=texte)
+
+    def action_ouvrir_journal(self):
+        souci = ouvrir_dans_l_explorateur(FICHIER_JOURNAL)
+        ETAT["message"] = ("Journal ouvert" if not souci
+                           else "Journal illisible : %s" % souci)
+
+    def action_ouvrir_dossier(self):
+        souci = ouvrir_dans_l_explorateur(DOSSIER)
+        ETAT["message"] = ("Dossier ouvert" if not souci
+                           else "Dossier illisible : %s" % souci)
+
+    def action_copier_journal(self):
+        poses, souci = journal_pour_partage()
+        if souci:
+            ETAT["message"] = "Copie impossible : %s" % souci
+            return
+        # On ouvre le dossier sur la copie : il ne reste plus qu'a la glisser.
+        ouvrir_dans_l_explorateur(os.path.dirname(poses[0]))
+        ETAT["message"] = ("%d fichier%s pose%s sur le Bureau"
+                           % (len(poses), "s" if len(poses) > 1 else "",
+                              "s" if len(poses) > 1 else ""))
+        self.peindre_journal()
 
     def action_maj(self):
         if MAJ["etat"] == "a_poser":
@@ -7630,6 +7704,60 @@ def journaliser_arret(pourquoi):
     except Exception:
         pass
     print("Arret :", pourquoi)
+
+
+def ouvrir_dans_l_explorateur(chemin):
+    """Ouvre un fichier ou un dossier avec ce que le systeme propose.
+
+    Rend None si ca a marche, sinon la raison -- l'appelant l'affiche. Une
+    ouverture qui echoue en silence laisse quelqu'un cliquer trois fois avant
+    de comprendre qu'il ne se passera rien.
+    """
+    try:
+        if not os.path.exists(chemin):
+            return "rien a cet endroit pour l'instant"
+        if os.name == "nt":
+            os.startfile(chemin)                       # noqa: S606 -- chemin a nous
+        else:
+            subprocess.Popen(["xdg-open", chemin], close_fds=True)
+        return None
+    except Exception as e:
+        return str(e)[:120]
+
+
+def journal_pour_partage(destination=None):
+    """Une COPIE du journal, datee, posee la ou on peut la retrouver.
+
+    POURQUOI UNE COPIE ET PAS LE FICHIER LUI-MEME. Le journal est ouvert en
+    ecriture pendant toute la vie du processus : l'envoyer tel quel, c'est
+    envoyer un fichier qui bouge encore, et sous Windows certains outils
+    refusent de le lire pendant qu'il est tenu. La copie est figee, elle porte
+    sa date dans son nom, et elle atterrit sur le Bureau -- l'endroit d'ou on
+    glisse un fichier dans une conversation sans avoir a le chercher.
+
+    Le journal precedent (journal.log.1, garde a la rotation) part avec quand
+    il existe : une panne qui s'est produite avant le dernier demarrage n'est
+    plus dans le fichier courant, et c'est justement celle qu'on cherche.
+    """
+    import shutil
+    dossier = destination or os.path.join(
+        os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Desktop"))
+    if not os.path.isdir(dossier):
+        dossier = os.path.expanduser("~")
+    quand = time.strftime("%Y%m%d-%H%M")
+    poses = []
+    for source, suffixe in ((FICHIER_JOURNAL, ""), (FICHIER_JOURNAL + ".1", "-precedent")):
+        if not os.path.exists(source):
+            continue
+        cible = os.path.join(dossier, "machitool-journal-%s%s.log" % (quand, suffixe))
+        try:
+            shutil.copyfile(source, cible)
+            poses.append(cible)
+        except Exception as e:
+            return None, str(e)[:120]
+    if not poses:
+        return None, "le journal est vide pour l'instant"
+    return poses, None
 
 
 def rapporter_plantage(e):
