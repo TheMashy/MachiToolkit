@@ -927,6 +927,106 @@ class LieuxWeb(unittest.TestCase):
         self.assertEqual(mt.ACTIVITE["lieux_web"], {},
                          "« video » vient de voler ce que « guerre » avait pris")
 
+    # ---- un mot-cle est un MOT ----
+
+    def test_un_nom_de_famille_n_est_pas_une_profession_medicale(self):
+        """TROUVE DANS UNE VRAIE JOURNEE. « leo kiner demoreel 2026 » etait
+        range en SANTE : « kine » se trouve dans « kiner ». Une etiquette
+        medicale posee sur le nom de famille de quelqu'un, dans le journal
+        d'une personne -- par la meme table qui promet ailleurs, noir sur
+        blanc, de ne jamais nommer un trouble."""
+        c = "chrome.exe|leo kiner demoreel 2026 - vimeo"
+        # « demoreel » en fait de la creation, et c'est juste. Ce qui compte
+        # ici est que ce ne soit PAS une etiquette medicale.
+        self.assertNotEqual(self.mt.theme_activite(c), "sante")
+        self.assertIsNone(self.mt.sous_theme_activite("sante", c))
+        # Et le vrai mot continue de repondre.
+        self.assertEqual(self.mt.sous_theme_activite(
+            "sante", "chrome.exe|rendez-vous kine pour le dos"), "corps")
+
+    def test_le_pluriel_passe_encore(self):
+        """La frontiere de mot tolere un « s » final, sinon la moitie de la
+        table cesserait de repondre au pluriel -- et on aurait soigne un faux
+        positif en fabriquant cinquante faux negatifs."""
+        # « bunker » EST SEUL A POUVOIR REPONDRE ICI. Une fixture ou un autre
+        # mot-clef repond aussi ne prouve rien du pluriel : c'est ce qui s'est
+        # passe au premier essai, avec « drones fpv » ou « fpv » suffisait.
+        self.assertEqual(self.mt.sous_theme_activite(
+            "urbex", "chrome.exe|visite de bunkers oublies"), "souterrain")
+
+    def test_un_mot_clef_qui_porte_de_la_ponctuation_garde_la_sous_chaine(self):
+        """« docs. » doit attraper « docs.python.org » : le borner le rendrait
+        muet. La regle ne s'applique qu'aux mots faits de lettres seules."""
+        # Un domaine que RIEN D'AUTRE ne reconnait : avec « docs.python.org »,
+        # c'est « python » qui repondait et la fixture ne prouvait rien.
+        self.assertEqual(self.mt.theme_activite("chrome.exe|docs.zzz.io/intro"), "dev")
+
+    def test_un_mot_anglais_courant_ne_fait_pas_un_fait_divers(self):
+        """« scamming the police department by selling them boots » est une
+        video de Garry's Mod, et comptait 8 minutes en faits-divers. Le mot
+        entier ne suffit pas quand le mot existe dans les deux langues : il
+        fallait le retirer. Et un faux SUJET coute deux fois -- il prend la
+        place, et il empeche le LIEU de repondre."""
+        c = "chrome.exe|scamming the police department by selling them boots - youtube"
+        self.assertNotEqual(self.mt.theme_activite(c), "actu")
+        self.assertEqual(self.mt.lieu_activite(c), "video",
+                         "le lieu doit reprendre la main des que le faux sujet part")
+
+    # ---- le site seul, dernier palier ----
+
+    def test_un_site_sans_type_garde_son_NOM(self):
+        """17 % d'une vraie journee etaient comptes « rien ne classe » alors
+        qu'on pouvait les citer : irontide, e621, braindebugger. Un nom trouve
+        et jete est pire qu'un nom qu'on n'a pas."""
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | irontide", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_site_seul_s"], {"irontide": 120})
+        self.assertNotIn("temps_par_lieu_web_s", r)
+
+    def test_UN_SITE_TYPE_N_EST_PAS_UN_SITE_SEUL(self):
+        """Les deux champs sont exclusifs : youtube a un type, il ne doit pas
+        compter deux fois. Sinon la barre depasse la journee."""
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | youtube", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_lieu_web_s"], {"video": 120})
+        self.assertNotIn("temps_par_site_seul_s", r)
+
+    def test_AUTRE_N_EST_PAS_UN_NOM(self):
+        """`_site_du_titre` ecrit « autre » quand il n'a pas reconnu le site.
+        C'est honnete la-bas. Ici ce serait habiller un trou -- et ce palier
+        n'existe que pour DIRE le nom qu'on a."""
+        mt = self._jour()
+        vu = "chrome.exe | i think they are wrong about all of this, honestly"
+        for t in (1000, 1120):
+            mt.activite_note(vu, True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertIn("web:autre", r["temps_par_contexte_s"],
+                      "la fixture ne prouve rien si le site n'est pas « autre »")
+        self.assertNotIn("temps_par_site_seul_s", r)
+
+    def test_le_rejeu_rend_aussi_les_sites_seuls(self):
+        mt = self._jour()
+        import json
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": mt.ACTIVITE["jour"],
+                "temps_par_contexte_s": {"web:irontide": 600, "web:youtube": 600,
+                                         "web:autre": 600},
+                # « autre » EST LA EXPRES : la regle vit dans les DEUX chemins,
+                # le temps reel et le rejeu, et un test qui n'en couvre qu'un
+                # laisse l'autre se faire changer sans que rien ne le dise.
+                "titres": {"web:irontide": {"irontide": 600},
+                           "web:youtube": {"youtube": 600},
+                           "web:autre": {"i think they are wrong about this": 600}},
+            }) + "\n")
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["sites_seuls"], {"irontide": 600.0})
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {"video": 600.0})
+
     def test_le_changement_de_jour_remet_les_lieux_a_zero(self):
         mt = self._jour()
         for t in (1000, 1120):

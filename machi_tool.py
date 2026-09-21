@@ -26,6 +26,7 @@ import sys
 import os
 import atexit
 import json
+import re
 import time
 import math
 import shutil
@@ -653,6 +654,7 @@ ACTIVITE = {
     "titres_theme": {},   # thematique -> {titre: secondes}, si titres complets
     "sous_themes_web": {},  # thematique -> {sous-categorie: secondes}, NAVIGATEUR seulement
     "lieux_web": {},      # secondes par LIEU, quand le sujet n'a rien su dire
+    "sites_seuls": {},    # secondes par SITE, quand meme le lieu n'a rien su dire
     "theme_courant": None,
     "sous_courant": None,
     "lieu_courant": None,
@@ -1248,8 +1250,17 @@ THEMES_ACTIVITE = [
     ("jeu",          ("gameplay", "speedrun", "let's play", "lets play", "walkthrough",
                       "no commentary", "steam", "minecraft", "fortnite", "valorant",
                       "league of legends", "elden ring", "boss fight", "modded", "playthrough",
-                      "soluce", "tier list", "patch note", "esport", "e-sport")),
-    ("creation",     ("artstation", "deviantart", "blender", "photoshop", "after effects",
+                      "soluce", "tier list", "patch note", "esport", "e-sport",
+                      # AJOUTES SUR DES TITRES REELS, pas par anticipation : une
+                      # journee ou 35 min de Garry's Mod ne se rangeaient nulle
+                      # part. Un nom de jeu tres connu se cherche sans risque ;
+                      # un nom obscur remplirait la table de faux.
+                      "gmod", "garry's mod", "garrys mod", "backrooms")),
+    # « showreel », « epidemic sound » : chercher de la musique libre de droits
+    # et des bruitages pour un montage EST du travail de creation. Vu sur une
+    # journee reelle a cote de Premiere et FL Studio, pas devine.
+    ("creation",     ("showreel", "demoreel", "epidemic sound", "royalty free",
+                      "sound effect", "artstation", "deviantart", "blender", "photoshop", "after effects",
                       "davinci", "tutorial", "tuto", "speedpaint", "timelapse", "fl studio",
                       "substance", "zbrush", "rigging", "sculpt", "concept art", "making of",
                       "breakdown vfx", "montage video")),
@@ -1291,6 +1302,45 @@ THEMES_ACTIVITE = [
                       "docs.", "localhost", "pull request", "commit", "python", "javascript",
                       "api ", "typescript", "docker", "regex")),
 ]
+
+
+# UN MOT-CLE EST UN MOT, PAS UNE SUITE DE LETTRES.
+#
+# Mesure sur une vraie journee : « leo kiner demoreel 2026 » etait range dans
+# SANTE, parce que « kine » se trouve dans « kiner ». Un nom de famille lu comme
+# une profession medicale, dans le journal de quelqu'un -- et la table qui dit
+# ailleurs, noir sur blanc, qu'elle ne nommera jamais un trouble. Meme maladie :
+# « scamming the police department » range en faits-divers.
+#
+# Le projet avait deja nomme cette maladie une fois, pour les sigles de trois
+# lettres (« donbass » contient « nba »), et l'avait soignee mot par mot, en
+# bordant d'espaces ceux qu'on avait vus rater. 276 mots courts sont restes nus.
+# Les soigner un par un, c'est exactement ce qui a laisse passer « kine ».
+#
+# LA REGLE, DONC : un mot fait de LETTRES SEULES doit commencer et finir sur une
+# frontiere de mot -- un « s » final tolere, pour que « drone » prenne
+# « drones » sans que « kine » prenne « kiner ». Un mot qui porte de la
+# ponctuation ou une espace garde la recherche en sous-chaine : « docs. » doit
+# attraper « docs.python.org », « d&d » et « 100% » ne se bordent pas, et une
+# expression de deux mots ne se perd pas au milieu d'un mot.
+_LETTRES = "abcdefghijklmnopqrstuvwxyz0123456789àâäçéèêëîïôöùûüÿœæ"
+_MOTS_BORNES = {}
+
+
+def _dit(plein, mot):
+    """`plein` contient-il `mot` EN TANT QUE MOT."""
+    nu = mot.strip()
+    if not nu:
+        return False
+    if not nu.isalpha():
+        # Ponctuation, chiffres, espaces : la sous-chaine est deja sans risque,
+        # et c'est parfois le comportement voulu (« docs. »).
+        return mot in plein
+    motif = _MOTS_BORNES.get(nu)
+    if motif is None:
+        motif = _MOTS_BORNES[nu] = re.compile(
+            "(?<![%s])%ss?(?![%s])" % (_LETTRES, re.escape(nu), _LETTRES))
+    return bool(motif.search(plein))
 
 
 def _plein(contexte):
@@ -1415,14 +1465,22 @@ def lieu_activite(contexte, theme=_INCONNU):
                 return nom
     for nom, mots in LIEUX:
         for mot in mots:
-            if mot in plein:
+            if _dit(plein, mot):
                 return nom
     return None
 
 
 
+# CE QUI N'EST PAS UN NOM. `_site_du_titre` ecrit « autre » quand il n'a pas
+# reconnu le site -- c'est honnete la-bas, et ce serait un mensonge ici : le
+# dernier palier existe pour DIRE le nom qu'on a, pas pour habiller un trou. Un
+# onglet sans titre non plus n'a pas de nom. Ces minutes-la restent du vide, et
+# l'ecran doit continuer a les compter comme du vide.
+SANS_NOM = ("autre", "sans titre", "inconnu", "")
+
+
 def _lieux_depuis_titres(titres):
-    """Les lieux du jour, RECALCULES depuis les titres deja enregistres.
+    """Les lieux ET les sites seuls du jour, RECALCULES depuis les titres.
 
     LE COMPTEUR NE PEUT PAS SAVOIR CE QUI S'EST PASSE AVANT LUI. `lieux_web`
     court pendant la journee : une version qui apprend a situer un onglet a
@@ -1440,10 +1498,11 @@ def _lieux_depuis_titres(titres):
     programme manque, lui, et c'est sans effet -- aucun mot des tables de lieux
     n'est un nom de programme, et seuls les contextes web sont rejoues.
     """
-    out = {}
+    lieux, seuls = {}, {}
     for cat, d in (titres or {}).items():
         if not str(cat).startswith("web:"):
             continue
+        site = str(cat)[4:]
         for t, sec in (d or {}).items():
             try:
                 sec = float(sec)
@@ -1451,10 +1510,13 @@ def _lieux_depuis_titres(titres):
                 continue
             if sec <= 0:
                 continue
-            ou = lieu_activite("|" + str(t))
+            contexte = "|" + str(t)
+            ou = lieu_activite(contexte)
             if ou:
-                out[ou] = out.get(ou, 0.0) + sec
-    return out
+                lieux[ou] = lieux.get(ou, 0.0) + sec
+            elif not theme_activite(contexte) and site not in SANS_NOM:
+                seuls[site] = seuls.get(site, 0.0) + sec
+    return lieux, seuls
 
 
 def theme_activite(contexte):
@@ -1464,7 +1526,7 @@ def theme_activite(contexte):
     plein = _plein(contexte)
     for nom, mots in THEMES_ACTIVITE:
         for mot in mots:
-            if mot in plein:
+            if _dit(plein, mot):
                 return nom
     # UNE SOUS-CATEGORIE RECONNUE IMPLIQUE SON THEME.
     #
@@ -1479,7 +1541,7 @@ def theme_activite(contexte):
     for nom, _ in THEMES_ACTIVITE:
         for _, mots in SOUS_THEMES.get(nom, ()):
             for mot in mots:
-                if mot in plein:
+                if _dit(plein, mot):
                     return nom
     return None
 
@@ -1688,8 +1750,15 @@ SOUS_THEMES = {
     ),
     # « adulte » reste sans sous-categorie : voir la regle 3 en tete.
     "actu": (
-        ("faits-divers", ("fait divers", "proces", "procès", "enquete", "enquête", "police",
-                         "justice", "disparition", "accident", "incendie")),
+        # « police » ET « justice » SONT SORTIS D'ICI. Ce sont de vrais mots, pas
+        # des sous-chaines -- la regle du mot entier ne les sauve pas. Ils sont
+        # simplement anglais autant que francais : « scamming the police
+        # department by selling them boots » est une video de Garry's Mod, et
+        # elle etait rangee en faits-divers, 8 minutes. Le reste de la liste est
+        # du francais qui ne se trompe pas de langue. Et un faux SUJET coute
+        # deux fois : il prend la place, et il empeche le LIEU de repondre.
+        ("faits-divers", ("fait divers", "proces", "procès", "enquete", "enquête",
+                         "disparition", "accident", "incendie")),
         ("monde",       ("international", "etats unis", "états unis", "chine", "russie", "afrique",
                          "moyen orient", "correspondant", "a l etranger")),
         ("economie",    ("inflation", "chomage", "chômage", "bourse", "croissance", "pouvoir d achat",
@@ -1748,7 +1817,7 @@ def sous_theme_activite(theme, contexte):
     plein = _plein(contexte)
     for nom, mots in sous:
         for mot in mots:
-            if mot in plein:
+            if _dit(plein, mot):
                 return nom
     return None
 
@@ -1805,7 +1874,7 @@ def _reinit_jour(reprendre=False, maintenant=None):
     ACTIVITE.update(jour=jour, contexte="", titre_courant="",
                     depuis=maintenant if maintenant is not None else time.time(),
                     temps={}, titres={}, themes={}, themes_web={},
-                    titres_theme={}, sous_themes_web={}, lieux_web={},
+                    titres_theme={}, sous_themes_web={}, lieux_web={}, sites_seuls={},
                     theme_courant=None, sous_courant=None, lieu_courant=None,
                     web_courant=False, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
@@ -1843,9 +1912,14 @@ def _reinit_jour(reprendre=False, maintenant=None):
         # c'est que les titres manquent (ils ne sont gardes que si la personne
         # l'a demande) : on garde alors ce qu'on avait, plutot que d'effacer une
         # mesure vraie avec un rejeu vide.
-        rejoue = _lieux_depuis_titres(ACTIVITE["titres"])
+        ACTIVITE["sites_seuls"] = {str(k): float(v)
+                                   for k, v in (d.get("temps_par_site_seul_s") or {}).items()
+                                   if isinstance(v, (int, float)) and v > 0}
+        rejoue, seuls = _lieux_depuis_titres(ACTIVITE["titres"])
         if sum(rejoue.values()) > sum(ACTIVITE["lieux_web"].values()):
             ACTIVITE["lieux_web"] = rejoue
+        if sum(seuls.values()) > sum(ACTIVITE["sites_seuls"].values()):
+            ACTIVITE["sites_seuls"] = seuls
         ACTIVITE["sous_themes_web"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
                                        for k, v in (d.get("temps_par_sous_theme_web_s") or {}).items()}
         ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
@@ -1935,6 +2009,21 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
         if web_avant and lieu_avant:
             ACTIVITE.setdefault("lieux_web", {})
             ACTIVITE["lieux_web"][lieu_avant] = ACTIVITE["lieux_web"].get(lieu_avant, 0.0) + ecoule
+        # ET LE SITE TOUT SEUL, quand meme le lieu n'a rien su dire.
+        #
+        # DERNIER PALIER DE CE QU'ON SAIT, et il n'est pas vide. « irontide »,
+        # « e621 », « the registry of trades » n'ont pas de type -- mais ils ont
+        # un NOM, et c'est nous qui l'avons trouve. Les compter comme « rien »
+        # transformait 17 % d'une journee en trou alors qu'on pouvait les citer.
+        #
+        # On ne les range pas parmi les lieux : « forum » est une categorie,
+        # « irontide » est un nom propre, et melanger les deux ferait croire que
+        # la liste des lieux est une taxonomie ou il y aurait « irontide ».
+        elif web_avant and avant:
+            nom = avant[4:] if avant.startswith("web:") else avant
+            if nom not in SANS_NOM:
+                ACTIVITE.setdefault("sites_seuls", {})
+                ACTIVITE["sites_seuls"][nom] = ACTIVITE["sites_seuls"].get(nom, 0.0) + ecoule
         if actif:
             ACTIVITE["actif_s"] += ecoule
         if titres_complets and ACTIVITE["titre_courant"]:
@@ -2064,6 +2153,11 @@ def resume_activite():
         (ACTIVITE.get("lieux_web") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
     if lieux:
         resume["temps_par_lieu_web_s"] = lieux
+    # ET LE SITE SEUL, dernier palier : un nom propre, pas une categorie.
+    seuls = {k: round(v) for k, v in sorted(
+        (ACTIVITE.get("sites_seuls") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
+    if seuls:
+        resume["temps_par_site_seul_s"] = seuls
     # Les titres : les DIX plus longs par theme, jamais toute la liste. Cent
     # onglets ouverts trois secondes ne disent rien de ce qu'on a regarde, et
     # les envoyer ferait grossir chaque journee sans rien apprendre a personne.

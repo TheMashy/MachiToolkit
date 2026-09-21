@@ -88,7 +88,7 @@ def _tables():
     while j < len(lignes) and (not lignes[j].strip() or lignes[j][0].isspace()
                                or lignes[j].startswith(('"""', "'''"))):
         j += 1
-    ns = {}
+    ns = {"re": re}
     exec(compile("\n".join(lignes[debut:j]), "machi_tool.py(tables)", "exec"), ns)
     return ns
 
