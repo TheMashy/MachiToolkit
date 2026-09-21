@@ -652,8 +652,10 @@ ACTIVITE = {
     "themes_web": {},     # secondes par thematique, NAVIGATEUR seulement
     "titres_theme": {},   # thematique -> {titre: secondes}, si titres complets
     "sous_themes_web": {},  # thematique -> {sous-categorie: secondes}, NAVIGATEUR seulement
+    "lieux_web": {},      # secondes par LIEU, quand le sujet n'a rien su dire
     "theme_courant": None,
     "sous_courant": None,
+    "lieu_courant": None,
     "web_courant": False,
     "premiere": "",       # premiere activite de la journee (HH:MM)
     "derniere": "",
@@ -1297,6 +1299,127 @@ def _plein(contexte):
     return " " + " ".join((_titre_onglet(titre) + " " + proc.strip()).split()) + " "
 
 
+"""OU L'ON EST, QUAND LE TITRE NE DIT PAS DE QUOI IL PARLE.
+
+MESURE SUR ONZE TITRES REELS -- les seuls dont on dispose, relus sur deux
+captures d'ecran : NEUF ne sont classes nulle part. Et en les regardant, ce ne
+sont pas des mots-cles qui manquent. Trois formes reviennent, et aucune ne parle
+d'un sujet :
+
+  « reddit - the heart of the internet », « youtube », « x », « google »
+      une page d'accueil. Le titre est le nom de l'endroit, et rien d'autre.
+  « #ecriture-de-sinj | pti' marchand de sable »
+      un salon et un serveur. C'est une conversation, pas un sujet.
+  « portal 2, but it's poorly translated », « wardogs », « the merchant's
+    ledger - skyrim market tracker »
+      un NOM PROPRE. Aucune table generique ne les contiendra jamais.
+
+Les deux premieres se reconnaissent a leur FORME, pas a leur contenu : c'est
+pour ca qu'on peut les traiter ici sans deviner. La troisieme ne se traite pas
+par une table du tout -- c'est le vocabulaire de quelqu'un, et il faudra le lui
+demander.
+
+CE QU'ON REND N'EST PAS UN SUJET, ET L'ECRAN DOIT LE DIRE. « video » et
+« social » avaient ete retires parce que, dans la meme liste que « guerre » et
+« science », ils raflaient tout ce que les familles precises n'avaient pas
+pris. Ici ils ne sont interroges qu'APRES l'echec du sujet : ils ne peuvent
+structurellement plus en voler un. Mais un lieu affiche comme un sujet
+raconterait qu'on sait de quoi ca parlait alors qu'on sait seulement ou
+c'etait -- d'ou `lieu_activite`, a part, et un champ a part dans le digest.
+"""
+# Un titre qui n'est QUE le nom de l'endroit : la page d'accueil, avant d'avoir
+# clique sur quoi que ce soit.
+COQUILLES = {
+    "reddit": "forum", "reddit the heart of the internet": "forum",
+    "youtube": "video", "twitch": "video", "netflix": "video",
+    "x": "reseau", "twitter": "reseau", "facebook": "reseau",
+    "instagram": "reseau", "tiktok": "reseau", "linkedin": "reseau",
+    "google": "recherche", "gmail": "courrier", "discord": "messagerie",
+    "nouvel onglet": "accueil", "new tab": "accueil", "accueil": "accueil",
+}
+
+LIEUX = (
+    ("messagerie", ("discord", "whatsapp", "messenger", "telegram", "signal", "slack", "teams")),
+    ("forum",      ("reddit", "hacker news", "stack overflow", "stackoverflow", "quora",
+                    "jeuxvideo.com", " forum")),
+    ("video",      ("youtube", "twitch", "netflix", "dailymotion", "vimeo", "prime video",
+                    "crunchyroll", "disney", "arte")),
+    ("reseau",     ("x.com", "twitter", "instagram", "tiktok", "facebook", "linkedin",
+                    "snapchat", "pinterest", "tumblr")),
+    ("recherche",  ("recherche google", "google search", "duckduckgo", "qwant", " bing")),
+    ("boutique",   ("amazon", "leboncoin", "aliexpress", "vinted", "ebay", "etsy",
+                    "cdiscount", "fnac")),
+    ("encyclo",    ("wikipedia", "wikipédia", " wiki", "documentation", "docs.")),
+)
+
+# LA SIGNATURE QU'UN SITE MET DANS SON PROPRE TITRE, lue AVANT les mots-cles.
+# « <n'importe quoi> / X » est la forme que X donne a toutes ses pages. Le mot
+# « x » est trop court pour entrer dans la table des lieux -- il rafferait la
+# moitie du web -- mais en fin de titre, derriere une barre oblique, il ne
+# designe que ca.
+#
+# ELLE PASSE AVANT LA TABLE, et il faut dire pourquoi, parce qu'une autre regle
+# generale a ete retiree d'ici pour avoir fait exactement l'inverse. Le diese ne
+# disait rien du site : n'importe qui en tape un, et la regle prenait « Bug
+# #1203 » pour une conversation. Une fin de titre en « / X », personne ne la
+# tape : c'est X qui la met. Un site qui se nomme lui-meme sait mieux ou l'on est
+# qu'un mot qui traine dans le titre -- « <quelqu'un> sur X : "youtube vient de
+# casser" / X » est un message sur X, pas une video, et c'est « video » que la
+# table repondait tant que cette lecture venait apres elle.
+#
+# MESURE : zero change sur les onze vrais titres -- leur seul X est la coquille
+# nue, deja prise plus haut. C'est une generalisation, pas un gain constate.
+SUFFIXES_WEB = (
+    ("reseau", (" / x",)),
+)
+
+# « on ne m'a pas dit le theme » n'est pas « il n'y a pas de theme » : None est
+# une reponse valable de `theme_activite`, et la confondre avec l'absence
+# d'argument ferait recalculer a chaque fois chez qui l'a deja.
+_INCONNU = object()
+
+
+def lieu_activite(contexte, theme=_INCONNU):
+    """L'ENDROIT, jamais a la place d'un sujet. None si on ne sait pas.
+
+    LA REGLE TIENT ICI, PAS AU POINT D'APPEL. Elle y etait -- « le lieu n'est lu
+    que si le sujet s'est tu » -- et un point d'appel est exactement l'endroit
+    ou une regle se perd : il suffit d'un second appelant qui l'ignore pour que
+    « video » se remette a rafler ce que « guerre » aurait pris. Le second
+    argument evite seulement de recalculer le theme a qui le connait deja.
+    """
+    if not (contexte or "").strip():
+        return None
+    if theme is _INCONNU:
+        theme = theme_activite(contexte)
+    if theme:
+        return None
+    plein = _plein(contexte)
+    # LA COQUILLE SE LIT SUR LE TITRE SEUL. `_plein` colle le nom du programme
+    # derriere le titre pour que les mots-cles le voient aussi ; « x » y devient
+    # « x chrome.exe » et ne ressemble plus a une page d'accueil. On compare donc
+    # au titre nu, lui, avant tout le reste.
+    proc, _, titre = (contexte or "").strip().lower().partition("|")
+    nu = " ".join(_titre_onglet(titre).split())
+    if nu in COQUILLES:
+        return COQUILLES[nu]
+    # PAS DE REGLE SUR LE DIESE. Elle y etait -- « un salon se reconnait a son
+    # dieze » -- et elle passait AVANT la table, donc elle lui volait : « #skyrim
+    # - Recherche / X » devenait une messagerie, « Bug #1203 - Bugzilla » aussi.
+    # Elle ne gagnait rien en echange : tout client de discussion met son nom
+    # dans le titre, et la table le prend deja. Mesure sur les onze vrais
+    # titres : zero change en la retirant, deux faux en la gardant.
+    for nom, fins in SUFFIXES_WEB:
+        for fin in fins:
+            if titre.strip().endswith(fin):
+                return nom
+    for nom, mots in LIEUX:
+        for mot in mots:
+            if mot in plein:
+                return nom
+    return None
+
+
 def theme_activite(contexte):
     """La thematique de ce qu'on regarde, ou None quand rien ne correspond."""
     if not (contexte or "").strip():
@@ -1645,8 +1768,9 @@ def _reinit_jour(reprendre=False, maintenant=None):
     ACTIVITE.update(jour=jour, contexte="", titre_courant="",
                     depuis=maintenant if maintenant is not None else time.time(),
                     temps={}, titres={}, themes={}, themes_web={},
-                    titres_theme={}, sous_themes_web={},
-                    theme_courant=None, sous_courant=None, web_courant=False, bascules=0,
+                    titres_theme={}, sous_themes_web={}, lieux_web={},
+                    theme_courant=None, sous_courant=None, lieu_courant=None,
+                    web_courant=False, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
                     trou_depuis=0.0, reprise=True)
     if not reprendre:
@@ -1668,6 +1792,11 @@ def _reinit_jour(reprendre=False, maintenant=None):
                                   if isinstance(v, (int, float)) and v > 0}
         ACTIVITE["titres_theme"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
                                     for k, v in (d.get("titres_par_theme") or {}).items()}
+        # Sans ca, un redemarrage en milieu de journee remet les lieux a zero et
+        # la journee se termine en disant moins que ce qu'elle a vu.
+        ACTIVITE["lieux_web"] = {str(k): float(v)
+                                 for k, v in (d.get("temps_par_lieu_web_s") or {}).items()
+                                 if isinstance(v, (int, float)) and v > 0}
         ACTIVITE["sous_themes_web"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
                                        for k, v in (d.get("temps_par_sous_theme_web_s") or {}).items()}
         ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
@@ -1709,6 +1838,7 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # atterriraient sous le theme de l'onglet ouvert juste apres.
     theme_avant = ACTIVITE.get("theme_courant")
     sous_avant = ACTIVITE.get("sous_courant")
+    lieu_avant = ACTIVITE.get("lieu_courant")
     web_avant = ACTIVITE.get("web_courant", False)
     if avant:
         ecoule = min(max(0.0, maintenant - ACTIVITE["depuis"]), 180.0)
@@ -1743,6 +1873,19 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
                 par = ACTIVITE.setdefault("titres_theme", {}).setdefault(theme_avant, {})
                 t = _titre_onglet(ACTIVITE["titre_courant"])[:120] or ACTIVITE["titre_courant"][:120]
                 par[t] = par.get(t, 0.0) + ecoule
+        # LE LIEU, QUAND LE SUJET N'A RIEN SU DIRE. A part du theme et jamais
+        # additionne avec lui : les deux ne repondent pas a la meme question, et
+        # un total qui les melangerait raconterait qu'on sait de quoi ca parlait
+        # alors qu'on sait seulement ou c'etait.
+        #
+        # PAS DE « and not theme_avant » ICI. Il y etait, et aucun test ne
+        # faisait la difference quand on le retirait : `lieu_activite` rend deja
+        # None des qu'un sujet a repondu, donc `lieu_avant` est vide dans ce cas.
+        # Une deuxieme copie de la regle ne la renforce pas -- elle en fait une
+        # qu'on peut changer a un endroit sans que l'autre le dise.
+        if web_avant and lieu_avant:
+            ACTIVITE.setdefault("lieux_web", {})
+            ACTIVITE["lieux_web"][lieu_avant] = ACTIVITE["lieux_web"].get(lieu_avant, 0.0) + ecoule
         if actif:
             ACTIVITE["actif_s"] += ecoule
         if titres_complets and ACTIVITE["titre_courant"]:
@@ -1797,6 +1940,10 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
     # passe, meme fenetre, meme instant. Pas de theme, pas de sous-categorie --
     # il n'y a rien a affiner.
     ACTIVITE["sous_courant"] = sous_theme_activite(ACTIVITE["theme_courant"], contexte)
+    # LE LIEU, troisieme passe. La regle « il n'est lu que si le sujet s'est tu »
+    # est DANS la fonction, pas ici ; on lui passe seulement le theme qu'on vient
+    # de calculer, pour qu'elle ne rescanne pas les tables a chaque seconde.
+    ACTIVITE["lieu_courant"] = lieu_activite(contexte, ACTIVITE["theme_courant"])
     ACTIVITE["web_courant"] = cat.startswith("web:")
     ACTIVITE["titre_courant"] = titre
 
@@ -1859,6 +2006,15 @@ def resume_activite():
         (ACTIVITE.get("themes_web") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
     if web:
         resume["temps_par_theme_web_s"] = web
+    # LE LIEU EST UN CHAMP A PART, ET C'EST TOUT L'ENJEU. Verse dans
+    # `temps_par_theme_web_s`, « video » se lirait comme « guerre » ou
+    # « science » : on saurait OU c'etait et l'ecran dirait DE QUOI ca parlait.
+    # C'est exactement ce qui avait coule « video » et « social » la premiere
+    # fois. Un nom different oblige l'ecran a les montrer differemment.
+    lieux = {k: round(v) for k, v in sorted(
+        (ACTIVITE.get("lieux_web") or {}).items(), key=lambda kv: -kv[1]) if v >= 1}
+    if lieux:
+        resume["temps_par_lieu_web_s"] = lieux
     # Les titres : les DIX plus longs par theme, jamais toute la liste. Cent
     # onglets ouverts trois secondes ne disent rien de ce qu'on a regarde, et
     # les envoyer ferait grossir chaque journee sans rien apprendre a personne.

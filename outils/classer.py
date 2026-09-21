@@ -95,6 +95,7 @@ def _tables():
 
 T = _tables()
 theme_actuel = T["theme_activite"]
+lieu_actuel = T.get("lieu_activite")
 titre_onglet = T["_titre_onglet"]
 
 
@@ -200,6 +201,16 @@ LIEUX = [
 
 
 def lieu(contexte):
+    """Le lieu tel que l'APPLICATION le calcule desormais.
+
+    Ce fichier en portait sa propre copie, du temps ou la chose n'existait que
+    comme proposition. Elle est dans `machi_tool.py` maintenant : une seconde
+    table ici divergerait, et le diagnostic mesurerait autre chose que ce qui
+    tourne. La copie reste en secours, pour une version de l'application qui
+    n'a pas encore la fonction.
+    """
+    if lieu_actuel:
+        return lieu_actuel(contexte)
     plein = _plein(contexte)
     for nom, mots in LIEUX:
         for mot in mots:

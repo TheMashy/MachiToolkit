@@ -690,6 +690,7 @@ class SousCategories(unittest.TestCase):
         self.assertEqual(mt.ACTIVITE["sous_themes_web"], {})
         self.assertIsNone(mt.ACTIVITE["sous_courant"])
 
+
     def test_un_sigle_de_trois_lettres_ne_se_cherche_pas_en_sous_chaine(self):
         """QUATRE MAUVAIS CLASSEMENTS, TROUVES EN RELISANT LA TABLE.
 
@@ -775,6 +776,85 @@ class SousCategories(unittest.TestCase):
         }}
         titres = mt.resume_activite()["titres"]["web:youtube"]
         self.assertEqual(titres, {"carte du front en ukraine - youtube": 420})
+
+
+class LieuxWeb(unittest.TestCase):
+    """OU L'ON ETAIT, QUAND LE TITRE N'A PAS DIT DE QUOI IL PARLAIT.
+
+    Sur onze titres reels releves a l'ecran, NEUF n'etaient classes nulle part
+    -- ce qui colle aux « 95 % » que la page web affichait. La moitie d'entre
+    eux n'avaient pas de sujet a trouver : c'etaient des pages d'accueil.
+
+    Ces tests tiennent la seule chose qui rend la mesure honnete : le lieu ne
+    prend jamais la place d'un sujet, et il ne voyage pas dans le meme champ.
+    `outils/lieux-test.py` tient la reconnaissance elle-meme, titre par titre ;
+    ici c'est le cablage -- l'accumulation, la separation, la reprise.
+    """
+
+    def setUp(self):
+        self.dossier = tempfile.mkdtemp()
+        self.mt = charger_module(self.dossier)
+
+    def _jour(self):
+        self.mt._reinit_jour(maintenant=1000.0)
+        self.mt.ACTIVITE["active"] = True
+        return self.mt
+
+    def test_une_page_d_accueil_compte_comme_un_lieu(self):
+        mt = self._jour()
+        for t in (1000, 1120, 1180):
+            mt.activite_note("chrome.exe | youtube", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_lieu_web_s"], {"video": 180})
+
+    def test_un_lieu_ne_voyage_jamais_dans_le_champ_des_sujets(self):
+        """LE POINT DE TOUT L'EXERCICE. « video » range parmi les themes se
+        lirait « on sait de quoi ca parlait » alors qu'on sait seulement ou
+        c'etait. Deux questions, deux champs."""
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | youtube", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_lieu_web_s"], {"video": 120})
+        self.assertNotIn("video", r.get("temps_par_theme_web_s") or {})
+
+    def test_un_titre_qui_dit_son_sujet_ne_compte_aucun_lieu(self):
+        """« Ukraine drone strike - YouTube » est de la guerre. Si « video »
+        prenait aussi ces 120 s, la journee durerait deux fois plus longtemps
+        qu'elle n'a dure."""
+        mt = self._jour()
+        vu = "chrome.exe | Ukraine drone strike frontline - YouTube"
+        for t in (1000, 1120):
+            mt.activite_note(vu, True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_theme_web_s"]["guerre"], 120)
+        self.assertNotIn("temps_par_lieu_web_s", r)
+
+    def test_une_application_ne_fait_pas_un_lieu_web(self):
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("Discord.exe | #salon | serveur", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertNotIn("temps_par_lieu_web_s", r)
+
+    def test_un_redemarrage_en_cours_de_journee_ne_perd_pas_les_lieux(self):
+        """Sans la reprise, la journee se termine en disant moins que ce
+        qu'elle a vu -- et le trou ressemble a du temps qu'on n'a pas passe."""
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | youtube", True, maintenant=t)
+        self.assertEqual(mt.sauver_activite()["temps_par_lieu_web_s"], {"video": 120})
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {"video": 120.0})
+
+    def test_le_changement_de_jour_remet_les_lieux_a_zero(self):
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | youtube", True, maintenant=t)
+        self.assertTrue(mt.ACTIVITE["lieux_web"])
+        mt._reinit_jour(maintenant=2000.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {})
+        self.assertIsNone(mt.ACTIVITE["lieu_courant"])
 
 
 class MiseAJourQuiDisparait(unittest.TestCase):
