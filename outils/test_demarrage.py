@@ -847,6 +847,86 @@ class LieuxWeb(unittest.TestCase):
         mt._reinit_jour(reprendre=True, maintenant=1200.0)
         self.assertEqual(mt.ACTIVITE["lieux_web"], {"video": 120.0})
 
+    def test_une_mise_a_jour_EN_COURS_DE_JOURNEE_ne_coute_pas_la_matinee(self):
+        """MESURE SUR UNE VRAIE JOURNEE : le digest portait 30 min de lieux la
+        ou ses propres titres en justifiaient 141. Le compteur avait demarre a
+        zero en fin d'apres-midi, quand l'application s'est mise a jour ; les
+        titres, eux, etaient la depuis le matin.
+
+        Ce que ces 111 minutes manquantes racontaient a l'ecran : « du temps
+        qu'on ne sait pas situer ». Ce qu'elles etaient : du temps ou personne
+        n'avait encore essaye. La difference est toute la question."""
+        mt = self._jour()
+        # Une journee deja ecrite par une version qui ne savait pas situer :
+        # des titres, pas un seul lieu.
+        mt.DIGEST_FORCE = None
+        import json, os
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": mt.ACTIVITE["jour"],
+                "temps_par_contexte_s": {"web:youtube": 3600, "web:reddit": 1200,
+                                         "web:x": 600},
+                # « x » EST LA EXPRES. Il ne se reconnait que sur le titre NU,
+                # donc seulement si le rejeu reconstruit un vrai contexte
+                # « |titre » : sans la barre, `_plein` le prend pour un nom de
+                # programme et la coquille ne se lit plus. Les deux autres
+                # passent par les mots-cles et ne verraient pas la difference.
+                "titres": {"web:youtube": {"youtube": 3600},
+                           "web:reddit": {"reddit - the heart of the internet": 1200},
+                           "web:x": {"x": 600}},
+            }) + "\n")
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"],
+                         {"video": 3600.0, "forum": 1200.0, "reseau": 600.0})
+
+    def test_le_rejeu_N_EFFACE_PAS_une_mesure_vraie(self):
+        """LE PLUS GRAND DES DEUX, ET DANS CE SENS-LA SEULEMENT. Les titres ne
+        sont gardes que si la personne l'a demande. Sans eux, le rejeu est vide
+        -- et un rejeu vide qui ecrase le compteur transformerait un reglage de
+        confidentialite en perte de mesure."""
+        mt = self._jour()
+        import json
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": mt.ACTIVITE["jour"],
+                "temps_par_contexte_s": {"web:youtube": 3600},
+                "temps_par_lieu_web_s": {"video": 3600},
+                # pas de titres : la personne ne les fait pas collecter
+            }) + "\n")
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {"video": 3600.0})
+
+    def test_le_rejeu_ne_touche_pas_aux_applications(self):
+        """Un lieu web est un lieu WEB. FL Studio a des titres comme tout le
+        monde ; les rejouer rangerait du temps d'application dans une mesure
+        qui annonce « sur internet »."""
+        mt = self._jour()
+        import json
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": mt.ACTIVITE["jour"],
+                "temps_par_contexte_s": {"discord": 3600},
+                "titres": {"discord": {"#salon | serveur - discord": 3600}},
+            }) + "\n")
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {})
+
+    def test_le_rejeu_respecte_la_regle_du_sujet(self):
+        """Elle tient dans `lieu_activite`, donc elle tient aussi au rejeu --
+        c'est precisement pour ca qu'elle y est."""
+        mt = self._jour()
+        import json
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": mt.ACTIVITE["jour"],
+                "temps_par_contexte_s": {"web:youtube": 3600},
+                "titres": {"web:youtube": {
+                    "Ukraine drone strike frontline - YouTube": 3600}},
+            }) + "\n")
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {},
+                         "« video » vient de voler ce que « guerre » avait pris")
+
     def test_le_changement_de_jour_remet_les_lieux_a_zero(self):
         mt = self._jour()
         for t in (1000, 1120):

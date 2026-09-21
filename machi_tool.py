@@ -1420,6 +1420,43 @@ def lieu_activite(contexte, theme=_INCONNU):
     return None
 
 
+
+def _lieux_depuis_titres(titres):
+    """Les lieux du jour, RECALCULES depuis les titres deja enregistres.
+
+    LE COMPTEUR NE PEUT PAS SAVOIR CE QUI S'EST PASSE AVANT LUI. `lieux_web`
+    court pendant la journee : une version qui apprend a situer un onglet a
+    midi ne sait rien des heures du matin, et la journee se termine en disant
+    beaucoup moins que ce qu'elle a vu. Mesure sur une vraie journee : le
+    digest portait 30 min de lieux la ou ses propres titres en justifiaient
+    141. Le reste n'etait pas du temps qu'on ne savait pas situer -- c'etait
+    du temps ou personne n'avait encore essaye.
+
+    Les titres, eux, sont la depuis le matin, et c'est LA MEME MESURE vue
+    autrement : la meme seconde, rangee sous un titre au lieu d'un lieu.
+
+    Le contexte est reconstruit en « |titre » : sans la barre, `_plein` prend
+    le titre pour un nom de programme et la coquille ne se lit plus. Le nom du
+    programme manque, lui, et c'est sans effet -- aucun mot des tables de lieux
+    n'est un nom de programme, et seuls les contextes web sont rejoues.
+    """
+    out = {}
+    for cat, d in (titres or {}).items():
+        if not str(cat).startswith("web:"):
+            continue
+        for t, sec in (d or {}).items():
+            try:
+                sec = float(sec)
+            except (TypeError, ValueError):
+                continue
+            if sec <= 0:
+                continue
+            ou = lieu_activite("|" + str(t))
+            if ou:
+                out[ou] = out.get(ou, 0.0) + sec
+    return out
+
+
 def theme_activite(contexte):
     """La thematique de ce qu'on regarde, ou None quand rien ne correspond."""
     if not (contexte or "").strip():
@@ -1797,6 +1834,18 @@ def _reinit_jour(reprendre=False, maintenant=None):
         ACTIVITE["lieux_web"] = {str(k): float(v)
                                  for k, v in (d.get("temps_par_lieu_web_s") or {}).items()
                                  if isinstance(v, (int, float)) and v > 0}
+        # ET ON REJOUE LES TITRES, quand ils en disent plus que le compteur.
+        #
+        # LE PLUS GRAND DES DEUX, ET DANS CE SENS-LA SEULEMENT. Les titres sont
+        # le releve du jour ; le compteur ne peut qu'en retard sur eux -- une
+        # mise a jour en cours de journee, une table qui apprend un site. Il ne
+        # peut pas legitimement les depasser. Quand il les depasse quand meme,
+        # c'est que les titres manquent (ils ne sont gardes que si la personne
+        # l'a demande) : on garde alors ce qu'on avait, plutot que d'effacer une
+        # mesure vraie avec un rejeu vide.
+        rejoue = _lieux_depuis_titres(ACTIVITE["titres"])
+        if sum(rejoue.values()) > sum(ACTIVITE["lieux_web"].values()):
+            ACTIVITE["lieux_web"] = rejoue
         ACTIVITE["sous_themes_web"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
                                        for k, v in (d.get("temps_par_sous_theme_web_s") or {}).items()}
         ACTIVITE["bascules"] = int(d.get("bascules_fenetre") or 0)
