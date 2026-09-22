@@ -202,6 +202,22 @@ class Dictee(unittest.TestCase):
         self.assertIsNone(self.m.DICTEE["modele"])
 
 
+class Rapidite(unittest.TestCase):
+    def test_savoir_si_le_moteur_est_la_ne_le_charge_pas(self):
+        """« es-tu la ? » doit repondre tout de suite : charger onnxruntime
+        prenait assez longtemps pour que la page conclue a une panne."""
+        tmp = tempfile.mkdtemp()
+        try:
+            m = charger_module(tmp)
+            for nom in [k for k in sys.modules if k.split(".")[0] in ("onnx_asr", "onnxruntime")]:
+                del sys.modules[nom]
+            m.dictee_possible()
+            charges = [k for k in sys.modules if k.split(".")[0] in ("onnx_asr", "onnxruntime")]
+            self.assertEqual(charges, [], "dictee_possible a importe le moteur")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class Route(unittest.TestCase):
     """La vraie passerelle, sur un port de test."""
 

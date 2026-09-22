@@ -42,7 +42,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.26.0"
+VERSION = "1.26.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -3788,13 +3788,24 @@ DICTEE = {"etat": "absent", "progres": 0.0, "source": None, "message": "",
 _DICTEE_VERROU = threading.Lock()
 
 
+_DICTEE_POSSIBLE = []
+
+
 def dictee_possible():
-    """Le moteur est-il installe ? (Faux en CI, et sur une version sans lui.)"""
-    try:
-        import onnx_asr  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Le moteur est-il installe ? (Faux en CI, et sur une version sans lui.)
+
+    SANS L'IMPORTER. `import onnx_asr` charge numpy et onnxruntime (ses DLL) :
+    dans l'exe, plusieurs secondes au premier appel — et la page, qui
+    n'attendait que quatre secondes la reponse a « es-tu la ? », concluait
+    « Machi Tool ne repond pas ». Savoir qu'il est la suffit ici ; le charger
+    attendra la premiere phrase."""
+    if not _DICTEE_POSSIBLE:
+        try:
+            import importlib.util
+            _DICTEE_POSSIBLE.append(importlib.util.find_spec("onnx_asr") is not None)
+        except Exception:
+            _DICTEE_POSSIBLE.append(False)
+    return _DICTEE_POSSIBLE[0]
 
 
 def dossier_dictee():
