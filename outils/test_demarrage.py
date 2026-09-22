@@ -765,6 +765,28 @@ class SousCategories(unittest.TestCase):
         titres = mt.resume_activite()["titres"]["web:youtube"]
         self.assertEqual(list(titres), ["carte du front en ukraine - youtube"])
 
+    def test_UN_TITRE_LONG_PERD_QUAND_MEME_SON_NAVIGATEUR(self):
+        """ON NETTOIE D'ABORD, ON COUPE ENSUITE — et l'inverse etait fait.
+
+        Le titre etait range brut, coupe a 80 caracteres, et nettoye seulement
+        a l'emission : trop tard. A 80 caracteres « … - youtube - google
+        chrome » est devenu « … - youtube - g », et « g » n'est plus un nom de
+        navigateur reconnaissable. Le bout collait au titre pour toujours, sur
+        chaque ligne affichee -- vu en ouvrant « video » sur une vraie journee.
+
+        Le titre du test fait 92 caracteres AVANT le navigateur : une fixture
+        plus courte ne prouverait rien, puisque la coupe ne mordrait pas."""
+        mt = self.mt
+        mt._reinit_jour(maintenant=1000.0)
+        mt.ACTIVITE["active"] = True
+        page = ("i invented a chair that either teleports you or brutally "
+                "kills you and then laughs - youtube")
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | " + page + " - google chrome", True,
+                             titres_complets=True, maintenant=t)
+        titres = mt.resume_activite()["titres"]["web:youtube"]
+        self.assertEqual(list(titres), [page])
+
     def test_une_journee_reprise_ne_compte_pas_deux_fois_la_meme_page(self):
         """Les entrees ecrites brutes par une version d'avant se replient sur la
         version propre au lieu de faire deux lignes pour la meme page."""

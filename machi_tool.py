@@ -2049,8 +2049,16 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
         if actif:
             ACTIVITE["actif_s"] += ecoule
         if titres_complets and ACTIVITE["titre_courant"]:
+            # ON NETTOIE D'ABORD, ON COUPE ENSUITE. L'inverse detruit ce dont
+            # le nettoyage a besoin : a 80 caracteres, « … - youtube - google
+            # chrome » devient « … - youtube - g », et « g » n'est plus un nom
+            # de navigateur reconnaissable. `resume_activite` renettoie a
+            # l'emission, mais trop tard -- le nom coupe reste colle au titre
+            # pour toujours, sur chaque ligne affichee. Meme ordre et meme
+            # plafond que pour les titres d'un theme, dix lignes plus haut.
             par_titre = ACTIVITE["titres"].setdefault(avant, {})
-            t = ACTIVITE["titre_courant"][:80]
+            t = (_titre_onglet(ACTIVITE["titre_courant"])[:120]
+                 or ACTIVITE["titre_courant"][:120])
             par_titre[t] = par_titre.get(t, 0.0) + ecoule
     avant_depuis = ACTIVITE["depuis"]
     ACTIVITE["depuis"] = maintenant
