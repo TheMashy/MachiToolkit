@@ -25,7 +25,12 @@ hiddenimports = ['win32gui', 'win32process', 'win32api', 'win32event',
 # elles, l'import echoue dans l'exe alors qu'il passe en mode script.
 hiddenimports += ['cffi', '_cffi_backend']
 
-for paquet in ('bleak', 'winrt', 'mss', 'soundcard', 'cffi', 'numpy'):
+# La dictee : onnxruntime porte ses DLL, et onnx_asr ses pretraitements
+# (preprocessors/data/nemo128.onnx pour Parakeet) — des DONNEES, que
+# PyInstaller ne voit pas seul. Sans elles, l'exe compile et la dictee plante
+# a la premiere phrase.
+for paquet in ('bleak', 'winrt', 'mss', 'soundcard', 'cffi', 'numpy',
+               'onnxruntime', 'onnx_asr'):
     try:
         d, b, h = collect_all(paquet)
     except Exception as e:

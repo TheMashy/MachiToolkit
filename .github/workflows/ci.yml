@@ -30,6 +30,13 @@ jobs:
       - name: Le demarrage survit a ce qui echoue
         run: python outils/test_demarrage.py
 
+      # numpy seul : les tests de la dictee lisent du vrai son, mais le modele
+      # (456 Mo) n'est jamais telecharge ici — un faux tient sa place.
+      - name: La dictee reste sur le poste
+        run: |
+          python -m pip install --quiet numpy
+          python outils/test_dictee.py
+
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"
 

@@ -36,12 +36,13 @@ import threading
 import traceback
 import subprocess
 import http.server
+import io
 import concurrent.futures
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.25.0"
+VERSION = "1.26.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -3749,6 +3750,225 @@ def couleur_de_regle(cfg, nom):
     return None
 
 
+# =====================================================================
+#  LA DICTEE — LA VOIX DEVIENT DU TEXTE, SUR CE POSTE ET NULLE PART AILLEURS.
+#
+#  Le meme moteur que Handy (github.com/cjpais/Handy, licence MIT) : Parakeet
+#  V3 de NVIDIA, exporte en ONNX et quantifie en int8, qui lit le francais et
+#  tourne sur le processeur. Handy l'appelle depuis Rust ; ici c'est onnx-asr,
+#  qui lit exactement les memes fichiers.
+#
+#  CE QUI EST PROMIS, ET QUE CE CODE TIENT :
+#    - le son n'est JAMAIS ecrit sur le disque : il arrive en memoire par la
+#      passerelle locale, devient du texte, et disparait ;
+#    - il ne quitte pas la machine : le site l'envoie a 127.0.0.1, pas au
+#      serveur, et le texte repart vers la page qui l'a demande ;
+#    - rien n'ecoute tant qu'on n'a pas appuye sur le micro — c'est la page
+#      qui tient le micro, avec l'autorisation du navigateur, pas Machi Tool.
+#      Pas de raccourci global : Machi Tool n'installe AUCUN crochet clavier.
+#
+#  LE MODELE (456 Mo) N'EST PAS DANS L'EXE. Si Handy l'a deja telecharge,
+#  on le reprend tel quel (liens durs : zero octet de plus) ; sinon on le
+#  telecharge une fois, a la demande explicite de la personne.
+# =====================================================================
+
+DICTEE_MODELE = "parakeet-tdt-0.6b-v3-int8"
+DICTEE_NOM = "nemo-parakeet-tdt-0.6b-v3"          # le nom que connait onnx-asr
+DICTEE_FICHIERS = ("encoder-model.int8.onnx", "decoder_joint-model.int8.onnx", "vocab.txt")
+# Parakeet lit 128 bandes de frequence, pas les 80 que suppose onnx-asr sans
+# config. Sans ce fichier le modele se charge — et rend du charabia.
+DICTEE_CONFIG = {"model_type": "nemo-conformer-tdt", "features_size": 128,
+                 "subsampling_factor": 8}
+DICTEE_SOURCE = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/"
+DICTEE_MAX_OCTETS = 20 * 1024 * 1024     # ~10 min de parole en 16 kHz mono
+DICTEE_DECHARGER_S = 10 * 60             # le modele occupe ~1 Go de memoire
+
+DICTEE = {"etat": "absent", "progres": 0.0, "source": None, "message": "",
+          "modele": None, "vu": 0.0}
+_DICTEE_VERROU = threading.Lock()
+
+
+def dictee_possible():
+    """Le moteur est-il installe ? (Faux en CI, et sur une version sans lui.)"""
+    try:
+        import onnx_asr  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def dossier_dictee():
+    return os.path.join(DOSSIER, "dictee", DICTEE_MODELE)
+
+
+def dossier_modele_handy():
+    """Le modele que Handy a telecharge, s'il y en a un sur ce poste.
+
+    Handy le range sous %APPDATA%\\com.pais.handy\\models\\. L'archive peut
+    avoir un dossier de plus a l'interieur : on regarde deux niveaux."""
+    base = os.environ.get("APPDATA", "")
+    if not base:
+        return None
+    racine = os.path.join(base, "com.pais.handy", "models", DICTEE_MODELE)
+    if not os.path.isdir(racine):
+        return None
+    for dossier, sous, _ in os.walk(racine):
+        if dossier_complet(dossier):
+            return dossier
+        if dossier.count(os.sep) - racine.count(os.sep) >= 2:
+            sous[:] = []
+    return None
+
+
+def dossier_complet(d):
+    return bool(d) and all(os.path.isfile(os.path.join(d, f)) and
+                           os.path.getsize(os.path.join(d, f)) > 0
+                           for f in DICTEE_FICHIERS)
+
+
+def _ecrire_config_dictee(d):
+    chemin = os.path.join(d, "config.json")
+    if not os.path.isfile(chemin):
+        with open(chemin, "w", encoding="utf-8") as f:
+            json.dump(DICTEE_CONFIG, f)
+
+
+def _reprendre_de_handy(source, cible):
+    """Liens durs vers les fichiers de Handy : meme disque, zero octet de plus.
+    Sur un autre disque le lien est impossible — on copie, une fois."""
+    for nom in DICTEE_FICHIERS:
+        dst = os.path.join(cible, nom)
+        if os.path.isfile(dst):
+            continue
+        src = os.path.join(source, nom)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copyfile(src, dst + ".part")
+            os.replace(dst + ".part", dst)
+
+
+def _telecharger_dictee(cible, ouvrir=None):
+    """Les trois fichiers, un par un, avec la progression pour l'ecran.
+    `.part` puis renommage : un telechargement coupe ne passe jamais pour un
+    modele complet."""
+    ouvrir = ouvrir or (lambda url: urllib.request.urlopen(url, timeout=60))
+    for i, nom in enumerate(DICTEE_FICHIERS):
+        dst = os.path.join(cible, nom)
+        if os.path.isfile(dst) and os.path.getsize(dst) > 0:
+            continue
+        with ouvrir(DICTEE_SOURCE + nom) as r, open(dst + ".part", "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            recu = 0
+            while True:
+                bout = r.read(1 << 20)
+                if not bout:
+                    break
+                f.write(bout)
+                recu += len(bout)
+                if total:
+                    DICTEE["progres"] = (i + recu / total) / len(DICTEE_FICHIERS)
+        os.replace(dst + ".part", dst)
+    DICTEE["progres"] = 1.0
+
+
+def preparer_dictee(ouvrir=None):
+    """Rend le modele disponible sur le disque. A lancer dans un fil a part."""
+    with _DICTEE_VERROU:
+        if DICTEE["etat"] in ("preparation", "pret"):
+            return DICTEE["etat"]
+        DICTEE.update(etat="preparation", progres=0.0, message="")
+    try:
+        cible = dossier_dictee()
+        os.makedirs(cible, exist_ok=True)
+        if not dossier_complet(cible):
+            handy = dossier_modele_handy()
+            if handy:
+                DICTEE["source"] = "handy"
+                _reprendre_de_handy(handy, cible)
+            else:
+                DICTEE["source"] = "telechargement"
+                _telecharger_dictee(cible, ouvrir)
+        _ecrire_config_dictee(cible)
+        if not dossier_complet(cible):
+            raise RuntimeError("modele incomplet")
+        DICTEE.update(etat="pret", progres=1.0)
+    except Exception as e:
+        DICTEE.update(etat="erreur", message=str(e)[:200])
+        print("Dictee : preparation impossible (%s)" % e)
+    return DICTEE["etat"]
+
+
+def etat_dictee():
+    """Ce que la page doit savoir pour afficher le bon bouton."""
+    if DICTEE["etat"] == "absent" and dossier_complet(dossier_dictee()):
+        DICTEE["etat"] = "pret"
+    return {"moteur": dictee_possible(), "etat": DICTEE["etat"],
+            "progres": round(DICTEE["progres"], 3), "source": DICTEE["source"],
+            "handy": bool(dossier_modele_handy()), "message": DICTEE["message"],
+            "taille_mo": 456}
+
+
+def son_depuis_wav(octets):
+    """WAV PCM 16 bits -> (echantillons float32 mono, frequence). En memoire."""
+    import wave
+    import numpy as np
+    with wave.open(io.BytesIO(octets)) as w:
+        if w.getsampwidth() != 2:
+            raise ValueError("WAV 16 bits attendu")
+        canaux, frequence = w.getnchannels(), w.getframerate()
+        brut = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+    if canaux > 1:
+        brut = brut.reshape(-1, canaux).mean(axis=1)
+    return brut.astype(np.float32) / 32768.0, frequence
+
+
+def _charger_modele_dictee():
+    import onnx_asr
+    return onnx_asr.load_model(DICTEE_NOM, dossier_dictee(), quantization="int8")
+
+
+def transcrire(octets, charger=None):
+    """Le texte dit dans ce WAV. Le son ne touche jamais le disque."""
+    if etat_dictee()["etat"] != "pret":
+        raise RuntimeError("le modele de dictee n'est pas pret")
+    son, frequence = son_depuis_wav(octets)
+    if frequence not in (8000, 16000, 22050, 24000, 32000, 44100, 48000):
+        raise ValueError("frequence non prise en charge : %s" % frequence)
+    if len(son) < frequence * 0.2:
+        return ""                                   # un clic, pas une phrase
+    with _DICTEE_VERROU:
+        if DICTEE["modele"] is None:
+            DICTEE["modele"] = (charger or _charger_modele_dictee)()
+        DICTEE["vu"] = time.time()
+        texte = DICTEE["modele"].recognize(son, sample_rate=frequence)
+    _programmer_dechargement()
+    return str(texte or "").strip()
+
+
+_DICTEE_MINUTEUR = [None]
+
+
+def _programmer_dechargement():
+    ancien = _DICTEE_MINUTEUR[0]
+    if ancien is not None:
+        ancien.cancel()
+    t = threading.Timer(DICTEE_DECHARGER_S + 5, decharger_dictee_si_oubliee)
+    t.daemon = True
+    t.start()
+    _DICTEE_MINUTEUR[0] = t
+
+
+def decharger_dictee_si_oubliee(maintenant=None):
+    """Un moteur de 1 Go ne reste pas en memoire pour une dictee par jour."""
+    maintenant = time.time() if maintenant is None else maintenant
+    with _DICTEE_VERROU:
+        if DICTEE["modele"] is not None and maintenant - DICTEE["vu"] > DICTEE_DECHARGER_S:
+            DICTEE["modele"] = None
+            return True
+    return False
+
+
 class Passerelle(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -3822,6 +4042,40 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    # ---------- la dictee ----------
+
+    def route_dictee(self, chemin):
+        """Le site envoie le son, Machi Tool rend le texte. Meme cle que la
+        lecture de l'activite : le site la tient deja."""
+        if not (self.jeton_permis({}) or self.cle_pont_permise()):
+            return self.repondre(401, {"erreur": "jeton invalide"})
+        if not dictee_possible():
+            return self.repondre(501, {"erreur": "moteur de dictee absent de cette version"})
+        if chemin == "/dictee/preparer":
+            if DICTEE["etat"] not in ("preparation", "pret"):
+                threading.Thread(target=preparer_dictee, daemon=True).start()
+            return self.repondre(202, etat_dictee())
+        try:
+            taille = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            taille = 0
+        if taille <= 0 or taille > DICTEE_MAX_OCTETS:
+            return self.repondre(413, {"erreur": "son vide ou trop long"})
+        octets = self.rfile.read(taille)
+        if etat_dictee()["etat"] != "pret":
+            return self.repondre(409, etat_dictee())
+        try:
+            texte = transcrire(octets)
+        except ValueError as e:
+            return self.repondre(400, {"erreur": str(e)[:200]})
+        except Exception as e:
+            print("Dictee : transcription impossible (%s)" % type(e).__name__)
+            return self.repondre(500, {"erreur": "transcription impossible"})
+        finally:
+            octets = None                          # le son ne survit pas a la requete
+        # Le texte n'est PAS journalise : c'est ce que la personne vient de dire.
+        return self.repondre(200, {"texte": texte})
+
     # ---------- routes ----------
 
     def do_GET(self):
@@ -3841,6 +4095,10 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
                 "force": bool(forcage and time.time() < forcage["expire"]),
                 "humeurs": [r_["nom"] for r_ in CFG.get("regles", [])],
             })
+        if chemin == "/dictee":
+            if not (self.jeton_permis({}) or self.cle_pont_permise()):
+                return self.repondre(401, {"erreur": "jeton invalide"})
+            return self.repondre(200, etat_dictee())
         if chemin == "/activite":
             # Le site tire le digest du jour quand il veut, avec le jeton de
             # la passerelle locale — pas la cle du pont. Aucune dependance a
@@ -3863,6 +4121,9 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
         chemin = self.path.split("?")[0].rstrip("/") or "/"
         if not self.origine_permise():
             return self.repondre(403, {"erreur": "origine non autorisee"})
+        # La dictee AVANT la lecture JSON : son corps est du son, pas du JSON.
+        if chemin in ("/dictee", "/dictee/preparer"):
+            return self.route_dictee(chemin)
         corps = self.lire_corps()
         if not self.jeton_permis(corps):
             return self.repondre(401, {"erreur": "jeton invalide"})
