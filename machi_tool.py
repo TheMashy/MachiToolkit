@@ -655,6 +655,7 @@ ACTIVITE = {
     "sous_themes_web": {},  # thematique -> {sous-categorie: secondes}, NAVIGATEUR seulement
     "lieux_web": {},      # secondes par LIEU, quand le sujet n'a rien su dire
     "sites_seuls": {},    # secondes par SITE, quand meme le lieu n'a rien su dire
+    "titres_lieu": {},    # lieu -> {titre: secondes}, si titres complets
     "theme_courant": None,
     "sous_courant": None,
     "lieu_courant": None,
@@ -1480,7 +1481,7 @@ SANS_NOM = ("autre", "sans titre", "inconnu", "")
 
 
 def _lieux_depuis_titres(titres):
-    """Les lieux ET les sites seuls du jour, RECALCULES depuis les titres.
+    """Les lieux, les sites seuls ET les titres derriere, depuis les titres.
 
     LE COMPTEUR NE PEUT PAS SAVOIR CE QUI S'EST PASSE AVANT LUI. `lieux_web`
     court pendant la journee : une version qui apprend a situer un onglet a
@@ -1498,7 +1499,7 @@ def _lieux_depuis_titres(titres):
     programme manque, lui, et c'est sans effet -- aucun mot des tables de lieux
     n'est un nom de programme, et seuls les contextes web sont rejoues.
     """
-    lieux, seuls = {}, {}
+    lieux, seuls, par_titre = {}, {}, {}
     for cat, d in (titres or {}).items():
         if not str(cat).startswith("web:"):
             continue
@@ -1514,9 +1515,11 @@ def _lieux_depuis_titres(titres):
             ou = lieu_activite(contexte)
             if ou:
                 lieux[ou] = lieux.get(ou, 0.0) + sec
+                par = par_titre.setdefault(ou, {})
+                par[str(t)] = par.get(str(t), 0.0) + sec
             elif not theme_activite(contexte) and site not in SANS_NOM:
                 seuls[site] = seuls.get(site, 0.0) + sec
-    return lieux, seuls
+    return lieux, seuls, par_titre
 
 
 def theme_activite(contexte):
@@ -1875,6 +1878,7 @@ def _reinit_jour(reprendre=False, maintenant=None):
                     depuis=maintenant if maintenant is not None else time.time(),
                     temps={}, titres={}, themes={}, themes_web={},
                     titres_theme={}, sous_themes_web={}, lieux_web={}, sites_seuls={},
+                    titres_lieu={},
                     theme_courant=None, sous_courant=None, lieu_courant=None,
                     web_courant=False, bascules=0,
                     actif_s=0.0, premiere="", derniere="", trous=[],
@@ -1912,12 +1916,19 @@ def _reinit_jour(reprendre=False, maintenant=None):
         # c'est que les titres manquent (ils ne sont gardes que si la personne
         # l'a demande) : on garde alors ce qu'on avait, plutot que d'effacer une
         # mesure vraie avec un rejeu vide.
+        ACTIVITE["titres_lieu"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
+                                   for k, v in (d.get("titres_par_lieu") or {}).items()}
         ACTIVITE["sites_seuls"] = {str(k): float(v)
                                    for k, v in (d.get("temps_par_site_seul_s") or {}).items()
                                    if isinstance(v, (int, float)) and v > 0}
-        rejoue, seuls = _lieux_depuis_titres(ACTIVITE["titres"])
+        rejoue, seuls, par_titre = _lieux_depuis_titres(ACTIVITE["titres"])
         if sum(rejoue.values()) > sum(ACTIVITE["lieux_web"].values()):
             ACTIVITE["lieux_web"] = rejoue
+            # LES TITRES SUIVENT LEUR LIEU. Les separer laisserait « 97 min de
+            # video » avec, dessous, les seuls titres d'apres la mise a jour --
+            # une liste qui ne fait pas son total, et qu'on lirait comme la
+            # liste complete.
+            ACTIVITE["titres_lieu"] = par_titre
         if sum(seuls.values()) > sum(ACTIVITE["sites_seuls"].values()):
             ACTIVITE["sites_seuls"] = seuls
         ACTIVITE["sous_themes_web"] = {str(k): {str(t): float(x) for t, x in (v or {}).items()}
@@ -2009,6 +2020,17 @@ def activite_note(contexte, actif, titres_complets=False, maintenant=None):
         if web_avant and lieu_avant:
             ACTIVITE.setdefault("lieux_web", {})
             ACTIVITE["lieux_web"][lieu_avant] = ACTIVITE["lieux_web"].get(lieu_avant, 0.0) + ecoule
+            # ET LE TITRE DERRIERE LE LIEU, pour la meme raison que derriere le
+            # theme : « 97 min de video » laisse seul devant le chiffre. Le
+            # titre est ce qui rend la mesure REFUTABLE -- et ici il fait plus
+            # que ca, il repond a la question que le lieu n'a pas su repondre.
+            # « forum, 60 min » ne dit rien ; « reddit - the heart of the
+            # internet, 48 min » dit qu'on a scrolle le fil, ce qui EST la
+            # reponse, meme si ce n'est pas un sujet.
+            if titres_complets and ACTIVITE["titre_courant"]:
+                par = ACTIVITE.setdefault("titres_lieu", {}).setdefault(lieu_avant, {})
+                t = _titre_onglet(ACTIVITE["titre_courant"])[:120] or ACTIVITE["titre_courant"][:120]
+                par[t] = par.get(t, 0.0) + ecoule
         # ET LE SITE TOUT SEUL, quand meme le lieu n'a rien su dire.
         #
         # DERNIER PALIER DE CE QU'ON SAIT, et il n'est pas vide. « irontide »,
@@ -2169,6 +2191,16 @@ def resume_activite():
             titres[theme] = dict(gardes)
     if titres:
         resume["titres_par_theme"] = titres
+    # ET LES MEMES DERRIERE LES LIEUX. Meme plafond, meme plancher : ce qui
+    # vaut pour verifier un sujet vaut pour savoir ce qu'il y avait dans « video ».
+    parlieu = {}
+    for ou, d in (ACTIVITE.get("titres_lieu") or {}).items():
+        gardes = sorted(d.items(), key=lambda kv: -kv[1])[:10]
+        gardes = [(t, round(sec)) for t, sec in gardes if sec >= 30]
+        if gardes:
+            parlieu[ou] = dict(gardes)
+    if parlieu:
+        resume["titres_par_lieu"] = parlieu
     # LES SOUS-CATEGORIES, rangees sous leur theme. Le meme plancher d'une
     # seconde que partout ailleurs : une sous-categorie effleuree n'est pas une
     # sous-categorie, c'est un onglet ouvert par erreur.
@@ -2430,6 +2462,107 @@ def demarrer_activite(cfg):
 FICHIER_MIGRATION = os.path.join(DOSSIER, "postes_v2")
 
 
+# QUAND LES TABLES CHANGENT, LE PASSE EST FAUX -- ET IL RESTE FAUX.
+#
+# Un digest est ecrit une fois, le soir, avec les tables de ce soir-la. Une
+# table qui apprend « gmod » demain ne dira jamais rien des 35 minutes d'hier :
+# elles resteront « rien ne classe » pour toujours, et l'ecran racontera un
+# passe ou la personne ne faisait rien d'identifiable. Pire, une table qui se
+# CORRIGE -- « kine » qui rangeait un nom de famille dans « sante » -- laisse
+# l'erreur en place sur chaque jour deja ecrit.
+#
+# Les titres, eux, sont sur le disque depuis le premier jour. Rejouer les
+# tables dessus n'invente rien : c'est la meme seconde, relue.
+#
+# LE NUMERO MONTE QUAND LES TABLES CHANGENT. C'est lui qui declenche la
+# relecture, une fois, et pas a chaque demarrage.
+CLASSEMENT_VERSION = 2
+
+
+def reclasser_le_passe(cfg=None):
+    """Rejoue les tables de classement sur toutes les journees gardees en local.
+
+    LE PLUS GRAND DES DEUX, PAR CHAMP, comme pour la reprise du jour : les
+    titres sont le releve, le compteur ne peut qu'etre en retard sur eux -- et
+    quand il les depasse, c'est que les titres manquent (ils ne sont gardes que
+    si la personne l'a demande), et on garde alors la mesure vraie.
+
+    CE QUI N'EST PAS RETROACTIF, et il faut que ce soit ecrit : une journee
+    passee SANS titres collectes ne sera jamais reclassee. On n'a pas jete
+    l'information -- on ne l'a jamais eue. La relecture ne la fabriquera pas.
+    """
+    reglages = cfg if isinstance(cfg, dict) else CFG
+    if int(reglages.get("classement_vu") or 0) >= CLASSEMENT_VERSION:
+        return False
+    try:
+        lignes = []
+        if os.path.exists(FICHIER_ACTIVITE):
+            with open(FICHIER_ACTIVITE, encoding="utf-8") as f:
+                lignes = [l for l in f if l.strip()]
+        neuves, touchees = [], 0
+        for l in lignes:
+            try:
+                d = json.loads(l)
+            except Exception:
+                neuves.append(l)
+                continue
+            titres = d.get("titres") or {}
+            if not isinstance(titres, dict) or not titres:
+                neuves.append(l)
+                continue
+            lieux, seuls, par_titre = _lieux_depuis_titres(titres)
+            themes = {}
+            for cat, dd in titres.items():
+                if not str(cat).startswith("web:"):
+                    continue
+                for t, sec in (dd or {}).items():
+                    th = theme_activite("|" + str(t))
+                    if th and isinstance(sec, (int, float)) and sec > 0:
+                        themes[th] = themes.get(th, 0.0) + float(sec)
+            avant = json.dumps(d, sort_keys=True, ensure_ascii=False)
+            for cle, calcule in (("temps_par_theme_web_s", themes),
+                                 ("temps_par_lieu_web_s", lieux),
+                                 ("temps_par_site_seul_s", seuls)):
+                garde = {k: round(v) for k, v in sorted(calcule.items(), key=lambda kv: -kv[1])
+                         if v >= 1}
+                # UN THEME QUI DISPARAIT EST UNE CORRECTION, PAS UNE PERTE :
+                # c'est tout l'interet de relire (« kine » qui s'en va). On
+                # remplace donc des que les titres ont quelque chose a dire,
+                # sans exiger que ce soit PLUS -- la regle du plus grand vaut
+                # pour la reprise d'un jour en cours, ou le compteur court
+                # encore, pas pour une journee close dont les titres sont le
+                # releve complet.
+                if garde:
+                    d[cle] = garde
+                else:
+                    d.pop(cle, None)
+            pt = {}
+            for ou, dd in par_titre.items():
+                gardes = [(t, round(sec)) for t, sec in
+                          sorted(dd.items(), key=lambda kv: -kv[1])[:10] if sec >= 30]
+                if gardes:
+                    pt[ou] = dict(gardes)
+            if pt:
+                d["titres_par_lieu"] = pt
+            else:
+                d.pop("titres_par_lieu", None)
+            if json.dumps(d, sort_keys=True, ensure_ascii=False) != avant:
+                touchees += 1
+            neuves.append(json.dumps(d, ensure_ascii=False) + "\n")
+        if touchees:
+            _ecrire_lignes(FICHIER_ACTIVITE, neuves)
+            SYNC["tout_a_pousser"] = True
+            reglages["historique_a_pousser"] = True
+        reglages["classement_vu"] = CLASSEMENT_VERSION
+        sauver_config(reglages)
+        if touchees:
+            print("Classement relu sur %d journee(s)." % touchees)
+        return bool(touchees)
+    except Exception as e:
+        print("Relecture du classement impossible :", e)
+        return False
+
+
 def migrer_postes(cfg=None):
     """Une fois par installation : recalculer `poste` de tout l'historique local.
 
@@ -2515,6 +2648,8 @@ def ouvrir_journal_du_poste(cfg):
     # La migration reecrit activite.jsonl : avant le fil, qui l'ecrit aussi.
     if cfg.get("collecte_active", False):
         migrer_postes(cfg)
+        # Apres la migration des postes, qui reecrit le meme fichier.
+        reclasser_le_passe(cfg)
     # Une migration d'un lancement precedent dont l'envoi n'a jamais abouti :
     # la consigne a survecu sur le disque, elle repart ici.
     if cfg.get("historique_a_pousser"):

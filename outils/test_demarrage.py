@@ -1027,6 +1027,148 @@ class LieuxWeb(unittest.TestCase):
         self.assertEqual(mt.ACTIVITE["sites_seuls"], {"irontide": 600.0})
         self.assertEqual(mt.ACTIVITE["lieux_web"], {"video": 600.0})
 
+    # ---- relire le passe quand les tables changent ----
+
+    def _passe(self, *jours):
+        import json
+        mt = self.mt
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            for d in jours:
+                f.write(json.dumps(d) + "\n")
+        return mt
+
+    def _relu(self):
+        import json
+        with open(self.mt.FICHIER_ACTIVITE, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def test_UNE_JOURNEE_PASSEE_EST_RECLASSEE(self):
+        """UN DIGEST EST ECRIT UNE FOIS, avec les tables de ce soir-la. Une
+        table qui apprend « gmod » demain ne dira jamais rien des 35 minutes
+        d'hier : elles resteront « rien ne classe » pour toujours, et l'ecran
+        racontera un passe ou la personne ne faisait rien d'identifiable.
+
+        Les titres, eux, sont sur le disque depuis le premier jour. Les
+        rejouer n'invente rien : c'est la meme seconde, relue."""
+        mt = self._passe({
+            "date": "2026-01-02",
+            "temps_par_contexte_s": {"web:youtube": 1200},
+            "titres": {"web:youtube": {"gmod ghost hunting - youtube": 1200}},
+            # Ecrit par une version qui ne savait ni situer ni reconnaitre gmod.
+        })
+        cfg = {"classement_vu": 0}
+        self.assertTrue(mt.reclasser_le_passe(cfg))
+        d = self._relu()[0]
+        self.assertEqual(d["temps_par_theme_web_s"], {"jeu": 1200})
+        self.assertTrue(cfg["historique_a_pousser"],
+                        "reclasse sur le disque mais jamais renvoye au site")
+
+    def test_UNE_CORRECTION_EFFACE_L_ERREUR_DU_PASSE(self):
+        """LE POINT LE PLUS IMPORTANT. « kine » rangeait un nom de famille
+        dans SANTE. Sans relecture, cette etiquette reste sur chaque jour deja
+        ecrit -- et une table qui se corrige ne corrige que l'avenir."""
+        mt = self._passe({
+            "date": "2026-01-03",
+            "temps_par_contexte_s": {"web:vimeo": 1200},
+            "temps_par_theme_web_s": {"sante": 1200},
+            "titres": {"web:vimeo": {"leo kiner demoreel 2026": 1200}},
+        })
+        mt.reclasser_le_passe({"classement_vu": 0})
+        d = self._relu()[0]
+        self.assertNotIn("sante", d["temps_par_theme_web_s"])
+
+    def test_UNE_JOURNEE_SANS_TITRES_N_EST_PAS_TOUCHEE(self):
+        """CE QUI N'EST PAS RETROACTIF, et qui doit etre ecrit quelque part :
+        sans titres collectes, on n'a pas jete l'information -- on ne l'a
+        jamais eue. La relecture ne la fabriquera pas, et surtout elle
+        n'effacera pas la mesure qui existe."""
+        mt = self._passe({
+            "date": "2026-01-04",
+            "temps_par_contexte_s": {"web:youtube": 1200},
+            "temps_par_theme_web_s": {"guerre": 1200},
+        })
+        mt.reclasser_le_passe({"classement_vu": 0})
+        self.assertEqual(self._relu()[0]["temps_par_theme_web_s"], {"guerre": 1200})
+
+    def test_LA_RELECTURE_NE_SE_REJOUE_PAS_A_CHAQUE_DEMARRAGE(self):
+        """Reecrire tout l'historique et le repousser au site a chaque
+        lancement couterait un envoi complet par demarrage. Le numero de
+        version le declenche une fois, quand les tables ont change."""
+        mt = self._passe({
+            "date": "2026-01-05",
+            "temps_par_contexte_s": {"web:youtube": 1200},
+            "titres": {"web:youtube": {"youtube": 1200}},
+        })
+        import json
+        cfg = {"classement_vu": 0}
+        self.assertTrue(mt.reclasser_le_passe(cfg))
+        self.assertEqual(cfg["classement_vu"], mt.CLASSEMENT_VERSION)
+        # ET IL FAUT QU'IL Y AIT QUELQUE CHOSE A RECLASSER, sinon la seconde
+        # passe ne fait rien de toute facon et le test passe sans le garde.
+        with open(mt.FICHIER_ACTIVITE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": "2026-01-06",
+                "temps_par_contexte_s": {"web:youtube": 1200},
+                "temps_par_theme_web_s": {"actu": 1200},
+                "titres": {"web:youtube": {"gmod ghost hunting - youtube": 1200}},
+            }) + "\n")
+        cfg["historique_a_pousser"] = False
+        self.assertFalse(mt.reclasser_le_passe(cfg))
+        self.assertFalse(cfg["historique_a_pousser"])
+        self.assertEqual(self._relu()[1]["temps_par_theme_web_s"], {"actu": 1200},
+                         "le passe a ete relu une seconde fois, a chaque demarrage")
+
+    # ---- ce qu'il y avait DANS le lieu ----
+
+    def test_le_titre_remonte_derriere_son_lieu(self):
+        """« 97 min de video » laisse seul devant le chiffre. Le titre est ce
+        qui rend la mesure refutable -- et ici il fait plus : il repond a la
+        question que le lieu n'a pas su repondre."""
+        mt = self._jour()
+        vu = "chrome.exe | reddit - the heart of the internet"
+        for t in (1000, 1120):
+            mt.activite_note(vu, True, titres_complets=True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["titres_par_lieu"],
+                         {"forum": {"reddit - the heart of the internet": 120}})
+
+    def test_SANS_TITRES_COLLECTES_le_lieu_reste_un_chiffre(self):
+        """Le reglage decide, pas la commodite : sans titres, on montre le
+        chiffre et rien d'autre plutot que d'en fabriquer."""
+        mt = self._jour()
+        for t in (1000, 1120):
+            mt.activite_note("chrome.exe | youtube", True, maintenant=t)
+        r = mt.resume_activite()
+        self.assertEqual(r["temps_par_lieu_web_s"], {"video": 120})
+        self.assertNotIn("titres_par_lieu", r)
+
+    def test_un_onglet_effleure_ne_fait_pas_une_ligne(self):
+        """Meme plancher que pour les titres d'un theme : trente secondes. Cent
+        onglets ouverts trois secondes ne disent rien de ce qu'on a regarde."""
+        mt = self._jour()
+        mt.activite_note("chrome.exe | youtube", True, titres_complets=True, maintenant=1000)
+        mt.activite_note("chrome.exe | twitch", True, titres_complets=True, maintenant=1010)
+        mt.activite_note("chrome.exe | twitch", True, titres_complets=True, maintenant=1210)
+        r = mt.resume_activite()
+        self.assertEqual(list(r["titres_par_lieu"]["video"]), ["twitch"],
+                         "dix secondes de youtube ne sont pas une ligne")
+
+    def test_le_rejeu_rend_les_titres_AVEC_leur_lieu(self):
+        """Les separer laisserait « 97 min de video » avec, dessous, les seuls
+        titres d'apres la mise a jour : une liste qui ne fait pas son total et
+        qu'on lirait comme la liste complete."""
+        mt = self._jour()
+        import json
+        with open(mt.FICHIER_ACTIVITE, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": mt.ACTIVITE["jour"],
+                "temps_par_contexte_s": {"web:youtube": 1200},
+                "titres": {"web:youtube": {"twitch": 600, "youtube": 600}},
+            }) + "\n")
+        mt._reinit_jour(reprendre=True, maintenant=1200.0)
+        self.assertEqual(mt.ACTIVITE["lieux_web"], {"video": 1200.0})
+        self.assertEqual(sum(mt.ACTIVITE["titres_lieu"]["video"].values()), 1200.0)
+
     def test_le_changement_de_jour_remet_les_lieux_a_zero(self):
         mt = self._jour()
         for t in (1000, 1120):
