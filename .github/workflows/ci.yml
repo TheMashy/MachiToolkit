@@ -59,6 +59,14 @@ jobs:
           JARVIS_PIPER_VOIX="$RUNNER_TEMP/voix/fr-gilles-low.onnx" \
             python outils/test_jarvis.py
 
+      # Le panneau montre ce que la guirlande EMET, a sa cadence : la couleur
+      # convertie, une colonne par image, une icone par page. La partie a
+      # l'ecran tourne sous un ecran virtuel ; sans Tk, elle se saute.
+      - name: Le panneau montre ce que la guirlande montre
+        run: |
+          sudo apt-get install -y -qq xvfb >/dev/null
+          xvfb-run -a python outils/test_panneau.py
+
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"
 

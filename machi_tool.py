@@ -42,11 +42,13 @@ import socket
 import struct
 import wave
 import concurrent.futures
+import random
+from collections import deque
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.28.0"
+VERSION = "1.29.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -420,7 +422,88 @@ PONT = {
 
 CFG = {}
 
-ACCENT_DEPART = "#B79CF5"   # accent au repos, avant la premiere couleur
+ACCENT_DEPART = "#F2C94C"   # accent au repos, avant la premiere couleur
+
+
+"""
+CE QUE LA GUIRLANDE MONTRE, ET CE QUE L'ECRAN DOIT AFFICHER POUR LE DIRE.
+
+Le panneau peignait la couleur ENVOYEE telle quelle -- et paraissait beaucoup
+plus sombre que la guirlande. Les deux ne parlent pas la meme langue :
+
+  - une LED emet une lumiere PROPORTIONNELLE a la valeur recue (modulation de
+    largeur d'impulsion) : 24 sur 255, c'est 9 % de sa lumiere ;
+  - un ecran, lui, applique une courbe (sRVB) : la valeur 24 n'y donne que
+    0,9 % de sa lumiere -- dix fois moins.
+
+Pour montrer a l'ecran ce que la LED emet, il faut donc ENCODER la valeur
+envoyee comme une lumiere lineaire : 24 devient 87. C'est le seul calcul juste ;
+tout le reste (halos, melanges au fond) ne faisait qu'assombrir encore.
+"""
+
+
+def vu_a_l_oeil(rgb):
+    """La couleur a peindre a l'ecran pour montrer ce que la LED emet."""
+    def canal(c):
+        x = max(0.0, min(1.0, float(c) / 255.0))
+        v = 12.92 * x if x <= 0.0031308 else 1.055 * x ** (1 / 2.4) - 0.055
+        return int(round(v * 255))
+    return tuple(canal(c) for c in rgb)
+
+
+def eclat(rgb):
+    """L'intensite percue de ce que la LED emet, de 0 a 1 : la luminance de sa
+    lumiere (lineaire), encodee comme l'oeil la sent."""
+    r, v, b = (max(0.0, min(1.0, float(c) / 255.0)) for c in rgb)
+    y = 0.2126 * r + 0.7152 * v + 0.0722 * b
+    return 12.92 * y if y <= 0.0031308 else 1.055 * y ** (1 / 2.4) - 0.055
+
+
+"""
+LES IMAGES REELLEMENT ENVOYEES, A LA CADENCE DE LA GUIRLANDE.
+
+La bande d'historique du panneau prenait une mesure toutes les 400 ms, quelle
+que soit la cadence reglee : a 30 images par seconde, elle en montrait moins
+d'une sur dix. La boucle Bluetooth note maintenant CHAQUE image qu'elle fixe,
+avec son instant ; le graphe du panneau les dessine une par une, et dit la
+cadence reellement tenue a cote de celle qui est reglee.
+"""
+
+IMAGES_LED = deque(maxlen=2400)      # (numero, instant, (r, v, b))
+_IMAGES_N = [0]
+
+
+def noter_image_led(rgb, instant=None):
+    _IMAGES_N[0] += 1
+    IMAGES_LED.append((_IMAGES_N[0], time.time() if instant is None else instant,
+                       tuple(int(c) for c in rgb)))
+
+
+def images_depuis(numero):
+    """Les images posterieures a `numero`, dans l'ordre."""
+    nouvelles = []
+    for im in reversed(IMAGES_LED):
+        if im[0] <= numero:
+            break
+        nouvelles.append(im)
+    nouvelles.reverse()
+    return nouvelles
+
+
+def cadence_reelle(fenetre=2.0, maintenant=None):
+    """Images par seconde reellement fixees sur les `fenetre` dernieres
+    secondes. 0 si la guirlande ne recoit plus rien."""
+    t = time.time() if maintenant is None else maintenant
+    n, premier = 0, None
+    for _, instant, _ in reversed(IMAGES_LED):
+        if t - instant > fenetre:
+            break
+        n += 1
+        premier = instant
+    if n < 2 or premier is None:
+        return 0.0
+    duree = max(1e-6, t - premier)
+    return (n - 1) / duree if duree < fenetre * 1.01 else n / fenetre
 
 
 def entier(valeur, defaut):
@@ -5964,6 +6047,10 @@ async def une_session(cfg):
 
                 envoi = (int(r_a), int(v_a), int(b_a))
                 ETAT["couleur"] = envoi
+                # L'image que la guirlande tient pendant ce tour -- envoyee ou
+                # non (un changement de moins de 2 n'est pas renvoye, elle garde
+                # la precedente, qui en differe a peine).
+                noter_image_led(envoi)
                 if max(abs(x - y) for x, y in zip(envoi, dernier)) >= 2:
                     try:
                         await client.write_gatt_char(
@@ -6458,59 +6545,46 @@ def echelle_ecran(racine, forcee=0.0):
 # ==========================================================================
 #  Panneau
 #
-#  Direction : la fenetre porte la lumiere de l'objet qu'elle pilote.
-#  Un brin d'ampoules vivant tient l'en-tete et donne son accent au reste
-#  de l'interface — onglet actif, bouton principal, liseres. Tout le reste
-#  reste sourd pour que le brin soit la seule chose qui brille.
+#  Direction : un ciel de nuit gris-bleu, calme, ou une seule chose bouge --
+#  le graphe de ce que la guirlande montre, en tete, image par image. Le rail
+#  ne porte plus que des icones, une par page, sur un semis de petites etoiles
+#  jaunes ; la page ouverte a la sienne. Le reste se tait.
 # ==========================================================================
 
-NUIT    = "#140E1C"   # fond, presque noir violace
-VELOURS = "#1E1530"   # panneaux
-ENCRE   = "#191024"   # champs et creux
-FIL     = "#3B2A55"   # filets, comme le cable de la guirlande
-CRAIE   = "#EDE4F2"   # texte
-BRUME   = "#9683AA"   # texte secondaire
+NUIT    = "#171C26"   # fond : gris-bleu de nuit
+VELOURS = "#1F2633"   # panneaux
+ENCRE   = "#131821"   # champs et creux
+FIL     = "#2B3445"   # filets
+CRAIE   = "#E4E9F1"   # texte
+BRUME   = "#8A95A8"   # texte secondaire
+ETOILE  = "#F2C94C"   # les petites etoiles jaunes
 VIF     = "#5CE6A4"   # connecte
 ALERTE  = "#FF8A6B"   # deconnecte
+SOURD   = (92, 104, 124)   # une lumiere eteinte, un objet au repos
 
 NUIT_RGB = hex_vers_rgb(NUIT)
 
-# Le rail suit l'idee du toolkit : l'accueil en haut, puis les pages du
-# module ouvert. Une entree ("", "Titre") est un intitule de groupe, pas
-# une page — c'est ce qui fera la separation le jour ou un deuxieme
-# module viendra s'ajouter sous le premier.
-# Le rail portait neuf entrees a plat. Il en porte quatre, dont trois se
-# deplient : on voit d'abord de quoi il s'agit, le detail vient si on le
-# demande. Le groupe de la page ouverte se deplie tout seul.
+# UNE PAGE = UNE ICONE. Plus de groupes a deplier : on voit tout d'un coup
+# d'oeil, et le nom de la page apparait au survol. Le groupe ne sert plus qu'a
+# deux choses : un petit ecart entre les icones, et savoir quelles pages le
+# bandeau de la lampe (ou du pont) coiffe.
 MENU = [
-    ("page", "accueil", "Accueil", "\u2302", None),
-    ("groupe", "lampe", "Lampe", "\u2600", [
-        ("etat",      "Etat",      "\u25cf"),   # \u25cf
-        ("ecran",     "Ecran",     "\u25ad"),   # \u25ad
-        ("son",       "Son",       "\u266a"),   # \u266a
-        ("appairage", "Appairage", "\u21c4"),   # \u21c4
-    ]),
-    ("page", "jarvis", "Jarvis", "\u25ce", None),
-    ("groupe", "pont", "BrainDebugger", "\u25c9", [
-        ("passerelle", "Passerelle",      "\u25c8"),   # \u25c8
-        ("activite",   "Quantified Self", "\u25a4"),   # \u25a4
-    ]),
-    ("groupe", "app", "Application", "\u2699", [
-        ("reglages", "Reglages",     "\u2630"),   # \u2630
-        ("maj",      "Mises a jour", "\u21bb"),   # \u21bb
-    ]),
+    # (cle, nom, icone, groupe)
+    ("accueil",    "Accueil",         "\u2302", None),
+    ("etat",       "Lampe",           "\u2600", "lampe"),
+    ("ecran",      "Ecran",           "\u25ad", "lampe"),
+    ("son",        "Son",             "\u266a", "lampe"),
+    ("appairage",  "Appairage",       "\u21c4", "lampe"),
+    ("jarvis",     "Jarvis",          "\u25ce", "jarvis"),
+    ("passerelle", "BrainDebugger",   "\u25c8", "pont"),
+    ("activite",   "Quantified Self", "\u25a4", "pont"),
+    ("reglages",   "Reglages",        "\u2699", "app"),
+    ("maj",        "Mises a jour",    "\u21bb", "app"),
 ]
 
-# Ou se range chaque page, pour deplier le bon groupe en y arrivant.
-GROUPE_DE = {}
-for _e in MENU:
-    if _e[0] == "groupe":
-        for _entree in _e[4]:
-            GROUPE_DE[_entree[0]] = _e[1]
-
-# Page sans entree dans le rail : on y arrive depuis le mode Regles de la
-# page Ecran, ou depuis l'appairage d'une fenetre. Elle appartient quand
-# meme au module Lampe, pour que le bandeau la coiffe aussi.
+# Ou se range chaque page : le bandeau de la lampe coiffe les pages du groupe
+# « lampe », et la page Regles, sans icone, en fait partie.
+GROUPE_DE = {cle: groupe for cle, _, _, groupe in MENU if groupe}
 GROUPE_DE["regles"] = "lampe"
 
 
@@ -6524,6 +6598,11 @@ def lisible(rgb):
     h, s, v = colorsys.rgb_to_hsv(*[c / 255 for c in rgb])
     r, g, b = colorsys.hsv_to_rgb(h, s, max(0.72, v))
     return rgb_vers_hex((r * 255, g * 255, b * 255))
+
+
+RAIL_LARGEUR = 64          # le rail d'icones, en pixels a l'echelle 1
+GRAPHE_HAUTEUR = 74       # le graphe de la guirlande, en tete
+GRAPHE_PAS = 3            # largeur d'une image dans le graphe
 
 
 class Panneau:
@@ -6600,7 +6679,7 @@ class Panneau:
         corps = tk.Frame(self.root, bg=NUIT)
         corps.pack(fill="both", expand=True)
 
-        self.rail = tk.Frame(corps, bg=NUIT, width=self.px(152))
+        self.rail = tk.Frame(corps, bg=NUIT, width=self.px(RAIL_LARGEUR))
         self.rail.pack(side="left", fill="y")
         self.rail.pack_propagate(False)
         self.construire_rail()
@@ -6693,56 +6772,108 @@ class Panneau:
             return False
 
     # ------------------------------------------------------------------
-    #  Signature : le brin d'ampoules
+    #  Signature : le graphe de ce que la guirlande montre
+    #
+    #  Il remplace le brin d'ampoules decoratif : une colonne par image que la
+    #  guirlande a reellement tenue, a sa cadence -- sa couleur est celle que la
+    #  LED emet (vu_a_l_oeil), sa hauteur son intensite (eclat). Il defile donc
+    #  exactement a la vitesse reglee, et le coin dit la cadence tenue.
     # ------------------------------------------------------------------
 
     def construire_entete(self):
         tk = self.tk
-        bande = tk.Frame(self.root, bg=NUIT)
-        bande.pack(fill="x")
+        self.graphe = tk.Canvas(self.root, height=self.px(GRAPHE_HAUTEUR), bg=NUIT,
+                                highlightthickness=0)
+        self.graphe.pack(fill="x")
+        self.graphe_vu = 0
+        self.graphe_barres = deque()
+        self.graphe_largeur = 0
+        self.cadence_vue = 0.0
+        self.graphe.bind("<Configure>", lambda e: self.redessiner_graphe(e.width))
+        # Des maintenant, pas au premier <Configure> : sans image (guirlande pas
+        # encore connectee), le compteur de cadence doit deja exister.
+        self.redessiner_graphe(self.px(FENETRE_BASE[0]))
 
-        self.brin = tk.Canvas(bande, height=self.px(104), bg=NUIT, highlightthickness=0)
-        self.brin.pack(fill="x")
-        self.n_bulbes = 26
-        self.cable = self.brin.create_line(0, 0, 0, 0, fill=FIL, width=1, smooth=True)
-        self.bulbes = []
-        for _ in range(self.n_bulbes):
-            halos = [self.brin.create_oval(0, 0, 0, 0, outline="", fill=NUIT)
-                     for _ in (19, 13, 8)]
-            coeur = self.brin.create_oval(0, 0, 0, 0, outline="", fill=NUIT)
-            self.bulbes.append([halos, coeur, 0.0, 0.0])
-        self.brin.bind("<Configure>", lambda e: self.placer_bulbes(e.width))
-
-        ligne = tk.Frame(self.root, bg=NUIT, padx=22)
-        ligne.pack(fill="x", pady=(0, 12))
+        ligne = tk.Frame(self.root, bg=NUIT, padx=self.px(18))
+        ligne.pack(fill="x", pady=(self.px(4), self.px(10)))
         self.txt_titre = tk.Label(ligne, text="M A C H I   T O O L", bg=NUIT, fg=CRAIE,
-                                  font=(self.f_titre, 19), anchor="w")
+                                  font=(self.f_titre, 14), anchor="w")
         self.txt_titre.pack(side="left")
         self.txt_trame = tk.Label(ligne, text="", bg=NUIT, fg=BRUME,
-                                  font=(self.f_mono, 9), anchor="e")
+                                  font=(self.f_mono, 8), anchor="e")
         self.txt_trame.pack(side="right")
         self.txt_statut = tk.Label(ligne, text="", bg=NUIT, fg=BRUME,
                                    font=(self.f_ui, 9), anchor="w")
-        self.txt_statut.pack(side="left", padx=(14, 0))
+        self.txt_statut.pack(side="left", padx=(12, 0))
 
         tk.Frame(self.root, bg=FIL, height=1).pack(fill="x")
 
-    def placer_bulbes(self, largeur):
-        marge, creux = self.px(30), self.px(21)
-        pas = (largeur - 2 * marge) / max(1, self.n_bulbes - 1)
-        points = []
-        rayons = [self.px(19), self.px(13), self.px(8)]
-        coeur = self.px(34) / 10.0
-        for i, bulbe in enumerate(self.bulbes):
-            x = marge + i * pas
-            y = self.px(47) + math.sin(i / (self.n_bulbes - 1) * math.pi) * creux
-            bulbe[2], bulbe[3] = x, y
-            points += [x, y]
-            for r, h in zip(rayons, bulbe[0]):
-                self.brin.coords(h, x - r, y - r, x + r, y + r)
-            self.brin.coords(bulbe[1], x - coeur, y - coeur, x + coeur, y + coeur)
-        if len(points) >= 4:
-            self.brin.coords(self.cable, *points)
+    def _geometrie_graphe(self):
+        h = self.px(GRAPHE_HAUTEUR)
+        return h - self.px(10), h - self.px(24)          # ligne de base, hauteur utile
+
+    def _barre(self, x, rgb):
+        base, utile = self._geometrie_graphe()
+        haut = base - max(self.px(2), eclat(rgb) * utile)
+        return self.graphe.create_rectangle(x, haut, x + self.px(GRAPHE_PAS), base, outline="",
+                                            fill=rgb_vers_hex(vu_a_l_oeil(rgb)), tags=("barre",))
+
+    def redessiner_graphe(self, largeur=None):
+        """Tout redessiner depuis l'historique : au redimensionnement, et quand
+        la fenetre revient apres avoir ete cachee (les images ont continue)."""
+        g = self.graphe
+        largeur = largeur or g.winfo_width()
+        self.graphe_largeur = largeur
+        g.delete("all")
+        self.graphe_barres = deque()
+        base, _ = self._geometrie_graphe()
+        g.create_line(self.px(18), base + self.px(1), largeur - self.px(18), base + self.px(1),
+                      fill=FIL, tags=("socle",))
+        self.graphe_cadence = g.create_text(largeur - self.px(18), self.px(10), text="",
+                                            anchor="ne", fill=BRUME, font=(self.f_mono, 8))
+        self.graphe_absent = g.create_text(self.px(18), self.px(10), text="", anchor="nw",
+                                           fill=BRUME, font=(self.f_ui, 8))
+        pas = self.px(GRAPHE_PAS)
+        capacite = max(1, (largeur - 2 * self.px(18)) // pas)
+        images = list(IMAGES_LED)[-capacite:]
+        x = largeur - self.px(18) - len(images) * pas
+        for _, _, rgb in images:
+            self.graphe_barres.append(self._barre(x, rgb))
+            x += pas
+        g.tag_raise(self.graphe_cadence)
+        self.graphe_vu = images[-1][0] if images else _IMAGES_N[0]
+
+    def avancer_graphe(self):
+        """Les images arrivees depuis le dernier tour, une colonne chacune : le
+        graphe avance au pas de la guirlande, pas a celui du panneau."""
+        nouvelles = images_depuis(self.graphe_vu)
+        pas = self.px(GRAPHE_PAS)
+        largeur = self.graphe_largeur or self.graphe.winfo_width()
+        capacite = max(1, (largeur - 2 * self.px(18)) // pas)
+        if len(nouvelles) >= capacite or (nouvelles and not self.graphe_barres):
+            self.redessiner_graphe(largeur)
+        elif nouvelles:
+            self.graphe.move("barre", -pas * len(nouvelles), 0)
+            x = largeur - self.px(18) - len(nouvelles) * pas
+            for _, _, rgb in nouvelles:
+                self.graphe_barres.append(self._barre(x, rgb))
+                x += pas
+            while len(self.graphe_barres) > capacite:
+                self.graphe.delete(self.graphe_barres.popleft())
+            self.graphe_vu = nouvelles[-1][0]
+        # La cadence tenue, a cote de celle qui est reglee -- deux fois par seconde.
+        if time.time() - self.cadence_vue > 0.5:
+            self.cadence_vue = time.time()
+            reelle = cadence_reelle()
+            reglee = entier(self.cfg.get("images_par_seconde", 8), 8)
+            self.graphe.itemconfig(
+                self.graphe_cadence,
+                text=("%.0f im/s  \u00b7  reglee %d" % (reelle, reglee)) if reelle
+                else "reglee %d im/s" % reglee)
+            self.graphe.itemconfig(
+                self.graphe_absent,
+                text="" if reelle else ("en pause" if ETAT.get("pause") else
+                                        "la guirlande ne recoit rien"))
 
     def animer(self):
         g = self.generation
@@ -6759,138 +6890,116 @@ class Panneau:
         if not self.interface_visible():
             return self.root.after(400, lambda: g == self.generation and self.animer())
         self.phase += 0.09
-        couleur = ETAT["couleur"]
-        vive = hex_vers_rgb(self.accent)
-        eteinte = max(couleur) < 6
-        for i, (halos, coeur, _, _) in enumerate(self.bulbes):
-            if not ETAT["connecte"]:
-                force = 0.10 + 0.06 * math.sin(self.phase * 0.5 + i * 0.4)
-                teinte = (90, 74, 110)
-            else:
-                onde = math.sin(self.phase * 0.7 - i * 0.26)
-                force = 0.74 + 0.26 * onde
-                teinte = vive if eteinte else couleur
-            for part, h in zip((0.14, 0.28, 0.48), halos):
-                self.brin.itemconfig(h, fill=melange(teinte, NUIT_RGB, part * force))
-            self.brin.itemconfig(coeur, fill=melange(teinte, NUIT_RGB,
-                                                     min(1.0, 0.4 + 0.6 * force)))
+        self.avancer_graphe()
+        self.scintiller()
         self.peindre_vumetre()
-        self.root.after(70, lambda: g == self.generation and self.animer())
+        self.root.after(50, lambda: g == self.generation and self.animer())
 
     # ------------------------------------------------------------------
-    #  Rail de navigation
+    #  Rail de navigation : une icone par page, sur un semis d'etoiles
     # ------------------------------------------------------------------
 
     def construire_rail(self):
         tk = self.tk
-        tk.Frame(self.rail, bg=NUIT, height=self.px(10)).pack()
-        self.entetes = {}      # cle de groupe -> (rang, etiquette, cadre)
+        c = self.rail_toile = tk.Canvas(self.rail, bg=NUIT, highlightthickness=0,
+                                        width=self.px(RAIL_LARGEUR))
+        c.pack(fill="both", expand=True)
+        self.etoiles = []
+        cx, r = self.px(RAIL_LARGEUR) // 2, self.px(17)
+        y, groupe_avant = self.px(26), "debut"
+        self.onglets = {}
+        for cle, nom, icone, groupe in MENU:
+            if groupe_avant != "debut" and groupe != groupe_avant:
+                y += self.px(12)          # un ecart entre deux groupes, rien de plus
+            groupe_avant = groupe
+            fond = c.create_oval(cx - r, y - r, cx + r, y + r, outline="", fill=NUIT)
+            signe = c.create_text(cx, y, text=icone, fill=BRUME, font=(self.f_icone, 13))
+            marque = c.create_text(cx + self.px(15), y - self.px(14), text="\u2726",
+                                   fill=ETOILE, font=(self.f_icone, 7), state="hidden")
+            for item in (fond, signe):
+                c.tag_bind(item, "<Button-1>", lambda e, k=cle: self.aller(k))
+                c.tag_bind(item, "<Enter>", lambda e, k=cle, n=nom: self.survol(k, n, True))
+                c.tag_bind(item, "<Leave>", lambda e, k=cle, n=nom: self.survol(k, n, False))
+            self.onglets[cle] = (fond, signe, marque, y)
+            y += self.px(42)
+        # Une mise a jour qui attend : un point vert sur l'icone des mises a jour.
+        _, _, _, ym = self.onglets["maj"]
+        self.badge_maj = c.create_oval(cx + self.px(8), ym - self.px(13), cx + self.px(14),
+                                       ym - self.px(7), outline="", fill=VIF, state="hidden")
+        c.tag_bind(self.badge_maj, "<Button-1>", lambda e: self.aller("maj"))
+        self.bulle = tk.Label(self.root, text="", bg=VELOURS, fg=CRAIE, font=(self.f_ui, 9),
+                              padx=self.px(8), pady=self.px(3))
+        c.bind("<Configure>", lambda e: self.semer_etoiles(e.width, e.height))
 
-        for genre, cle, libelle, icone, enfants in MENU:
-            if genre == "page":
-                self.rang_page(self.rail, cle, libelle, retrait=0, icone=icone)
+    def semer_etoiles(self, largeur, hauteur):
+        """De petites etoiles jaunes, toujours au meme endroit (graine fixe), plus
+        rares pres des icones pour ne jamais les gener."""
+        c = self.rail_toile
+        c.delete("etoile")
+        self.etoiles = []
+        des = random.Random(7)
+        cx = largeur / 2.0
+        centres = [y_ for _, _, _, y_ in self.onglets.values()]
+        for _ in range(max(16, int(hauteur / 11))):
+            x = des.uniform(self.px(5), largeur - self.px(5))
+            y = des.uniform(self.px(6), hauteur - self.px(6))
+            # Jamais sur une icone : un peu d'air autour de chacune.
+            if any(math.hypot(x - cx, y - yc) < self.px(22) for yc in centres):
                 continue
+            eclat_ = des.uniform(0.25, 0.9)
+            if des.random() < 0.18:
+                item = c.create_text(x, y, text="\u2726", font=(self.f_icone, des.choice((5, 6, 7))),
+                                     fill=melange(hex_vers_rgb(ETOILE), NUIT_RGB, eclat_), tags=("etoile",))
+            else:
+                t = self.px(1) * des.choice((0.6, 1.0, 1.4))
+                item = c.create_oval(x - t, y - t, x + t, y + t, outline="",
+                                     fill=melange(hex_vers_rgb(ETOILE), NUIT_RGB, eclat_), tags=("etoile",))
+            self.etoiles.append((item, eclat_))
+        c.tag_lower("etoile")
 
-            rang = tk.Frame(self.rail, bg=NUIT, cursor="hand2")
-            rang.pack(fill="x")
-            marque = tk.Label(rang, text=icone, bg=NUIT, fg=CRAIE,
-                              font=(self.f_icone, 12), width=2)
-            marque.pack(side="left", padx=(self.px(8), 0))
-            etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=CRAIE,
-                            anchor="w", font=(self.f_ui, 10, "bold"),
-                            padx=self.px(4), pady=self.px(9))
-            etiq.pack(side="left", fill="x", expand=True)
-            fleche = tk.Label(rang, text="\u203a", bg=NUIT, fg=BRUME,
-                              font=(self.f_ui, 11), padx=10)
-            fleche.pack(side="right")
-
-            cadre = tk.Frame(self.rail, bg=NUIT)
-            for sous_cle, sous_libelle, sous_icone in enfants:
-                self.rang_page(cadre, sous_cle, sous_libelle, retrait=1,
-                               icone=sous_icone)
-
-            for w in (rang, etiq, fleche, marque):
-                w.bind("<Button-1>", lambda e, g=cle: self.basculer_groupe(g))
-                w.bind("<Enter>", lambda e, r=rang, l=etiq, f=fleche, m=marque:
-                       [x.configure(bg=VELOURS) for x in (r, l, f, m)])
-                w.bind("<Leave>", lambda e, r=rang, l=etiq, f=fleche, m=marque:
-                       [x.configure(bg=NUIT) for x in (r, l, f, m)])
-            self.entetes[cle] = (rang, etiq, fleche, cadre)
-
-        for cle in self.entetes:
-            self.poser_groupe(cle)
-
-        # Pastille « mise a jour disponible » sur le groupe Application : visible
-        # meme quand le groupe est replie, elle s'allume des qu'une version ou un
-        # build attend, et mene a la page Mises a jour. rafraichir la pilote.
-        rang_app = self.entetes["app"][0]
-        self.badge_maj = self.tk.Label(rang_app, text="●", bg=NUIT, fg=VIF,
-                                       font=(self.f_ui, 10), cursor="hand2")
-        self.badge_maj.bind("<Button-1>", lambda e: self.aller("maj"))
-        # non posee par defaut ; rafraichir la montre quand une maj attend
-
-    def rang_page(self, parent, cle, libelle, retrait=0, icone=None):
-        """Une ligne cliquable menant a une page."""
-        tk = self.tk
-        rang = tk.Frame(parent, bg=NUIT, cursor="hand2")
-        rang.pack(fill="x")
-        barre = tk.Frame(rang, bg=NUIT, width=self.px(3))
-        barre.pack(side="left", fill="y")
-        if icone:
-            tk.Label(rang, text=icone, bg=NUIT, fg=BRUME,
-                     font=(self.f_icone, 12), width=2).pack(
-                         side="left", padx=(self.px(5), 0))
-        etiq = tk.Label(rang, text=libelle, bg=NUIT, fg=BRUME, anchor="w",
-                        font=(self.f_ui, 10),
-                        padx=self.px(4 if icone else 14 + 12 * retrait),
-                        pady=self.px(7))
-        etiq.pack(side="left", fill="x", expand=True)
-        for w in (rang, etiq):
-            w.bind("<Button-1>", lambda e, c=cle: self.aller(c))
-            w.bind("<Enter>", lambda e, r=rang, l=etiq, c=cle:
-                   self.survol(r, l, c, True))
-            w.bind("<Leave>", lambda e, r=rang, l=etiq, c=cle:
-                   self.survol(r, l, c, False))
-        self.onglets[cle] = (rang, barre, etiq)
-        return rang
-
-    def basculer_groupe(self, cle):
-        self.groupes[cle] = not self.groupes.get(cle, False)
-        self.poser_groupe(cle)
-
-    def poser_groupe(self, cle):
-        rang, etiq, fleche, cadre = self.entetes[cle]
-        ouvert = self.groupes.get(cle, False)
-        fleche.configure(text="\u2039" if ouvert else "\u203a")
-        if ouvert:
-            cadre.pack(fill="x", after=rang)
-        else:
-            cadre.pack_forget()
-
-    def survol(self, rang, etiq, cle, dedans):
-        if cle == self.section:
+    def scintiller(self):
+        """Une etoile a la fois change d'eclat : le ciel vit sans rien distraire."""
+        if not self.etoiles or int(self.phase * 10) % 3:
             return
-        fond = VELOURS if dedans else NUIT
-        rang.configure(bg=fond)
-        etiq.configure(bg=fond, fg=CRAIE if dedans else BRUME)
+        item, base = random.choice(self.etoiles)
+        part = max(0.15, min(1.0, base + random.uniform(-0.35, 0.35)))
+        try:
+            self.rail_toile.itemconfig(item, fill=melange(hex_vers_rgb(ETOILE), NUIT_RGB, part))
+        except Exception:
+            pass
+
+    def survol(self, cle, nom, dedans):
+        c = self.rail_toile
+        fond, signe, _, y = self.onglets[cle]
+        if dedans:
+            c.configure(cursor="hand2")
+            if cle != self.section:
+                c.itemconfig(fond, fill=VELOURS)
+                c.itemconfig(signe, fill=CRAIE)
+            # Le nom de la page, a cote de l'icone : l'icone suffit une fois
+            # apprise, le nom est la pour la premiere fois.
+            self.bulle.configure(text=nom)
+            self.root.update_idletasks()
+            haut = c.winfo_rooty() - self.root.winfo_rooty() + y - self.bulle.winfo_reqheight() // 2
+            self.bulle.place(x=self.px(RAIL_LARGEUR) + self.px(6), y=haut)
+            self.bulle.lift()
+        else:
+            c.configure(cursor="")
+            self.bulle.place_forget()
+            if cle != self.section:
+                c.itemconfig(fond, fill=NUIT)
+                c.itemconfig(signe, fill=BRUME)
 
     def aller(self, cle):
         self.section = cle
-        # Arriver sur une page par un autre chemin que le rail — l'accueil,
-        # une notification — doit deplier le groupe qui la contient.
-        groupe = GROUPE_DE.get(cle)
-        if groupe and not self.groupes.get(groupe):
-            self.groupes[groupe] = True
-            self.poser_groupe(groupe)
-        for c, (rang, barre, etiq) in self.onglets.items():
-            actif = c == cle
-            fond = VELOURS if actif else NUIT
-            rang.configure(bg=fond)
-            etiq.configure(bg=fond, fg=CRAIE if actif else BRUME,
-                           font=(self.f_ui, 10, "bold" if actif else "normal"))
-            barre.configure(bg=self.accent if actif else fond)
-        for c, page in self.pages.items():
-            page.pack_forget()
+        c = self.rail_toile
+        for k, (fond, signe, marque, _) in self.onglets.items():
+            actif = k == cle
+            c.itemconfig(fond, fill=VELOURS if actif else NUIT)
+            c.itemconfig(signe, fill=self.accent if actif else BRUME)
+            c.itemconfig(marque, state="normal" if actif else "hidden")
+        for p in self.pages.values():
+            p.pack_forget()
         # Le bandeau ne concerne que la lampe, et doit rester au-dessus.
         self.bandeau.pack_forget()
         self.bandeau_pont.pack_forget()
@@ -6942,9 +7051,9 @@ class Panneau:
         b = self.tk.Button(
             parent, text=texte, command=action, relief="flat", bd=0,
             bg=(self.accent if principal else ENCRE),
-            fg=("#140E1C" if principal else CRAIE),
+            fg=(NUIT if principal else CRAIE),
             activebackground=(self.accent if principal else FIL),
-            activeforeground=("#140E1C" if principal else CRAIE),
+            activeforeground=(NUIT if principal else CRAIE),
             font=(self.f_ui, 9, "bold" if principal else "normal"),
             padx=(12 if compact else 18), pady=(6 if compact else 8),
             cursor="hand2", highlightthickness=1,
@@ -7120,16 +7229,10 @@ class Panneau:
                                      font=(self.f_mono, 8), anchor="w")
         self.txt_contexte.pack(fill="x", pady=(self.px(4), 0))
 
-        self.bande = tk.Canvas(self.bandeau, height=self.px(22), bg=ENCRE,
-                               highlightthickness=0)
-        self.bande.pack(fill="x", pady=(self.px(8), 0))
-
         # Reconnecter ne concerne que la guirlande : il n'avait rien a
         # faire dans le pied, ou il suivait jusqu'aux pages du site.
         self.bouton(self.bandeau, "Reconnecter", self.reconnecter,
                     compact=True).pack(anchor="w", pady=(self.px(8), 0))
-        self.historique = []
-        self.traits = []
 
     def construire_bandeau_pont(self):
         """Relever et ouvrir le site valaient pour Calendrier comme pour
@@ -7235,8 +7338,8 @@ class Panneau:
         c.delete("all")
         c.configure(bg=fond)
         vif = ETAT["connecte"] and max(ETAT["couleur"]) > 8
-        teinte = ETAT["couleur"] if vif else hex_vers_rgb(self.accent)
-        sourd = (110, 92, 132)
+        teinte = vu_a_l_oeil(ETAT["couleur"]) if vif else hex_vers_rgb(self.accent)
+        sourd = SOURD
         corps = teinte if vif else sourd
         arriere = hex_vers_rgb(fond)
 
@@ -7260,9 +7363,9 @@ class Panneau:
                            fill=melange(corps, arriere, 0.35))
         for y in (78, 84, 90):
             c.create_line(e(39), e(y), e(57), e(y),
-                          fill=melange((190, 175, 205), arriere, 0.5), width=e(3))
+                          fill=melange((178, 188, 206), arriere, 0.5), width=e(3))
         c.create_arc(e(39), e(92), e(57), e(102), start=180, extent=180,
-                     outline="", fill=melange((190, 175, 205), arriere, 0.4))
+                     outline="", fill=melange((178, 188, 206), arriere, 0.4))
 
     def tuile_a_venir(self, parent):
         """Place tenue pour le prochain outil. Une grille a une seule tuile
@@ -7766,7 +7869,7 @@ class Panneau:
         self.titre(f, "ta voix").pack(fill="x", pady=(0, 4))
         self.texte(f, "« Hey Jarvis » marche tout de suite, dit a l'anglaise. Pour que "
                       "« Jarvis » tout seul marche, avec ton accent, dis-le trois fois ici, "
-                      "quand la guirlande devient cyan. On garde une empreinte (des nombres), pas "
+                      "quand la guirlande s'allume. On garde une empreinte (des nombres), pas "
                       "le son.", BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
@@ -7979,9 +8082,9 @@ class Panneau:
                 toile.delete("all")
                 c = self.px(cote)
                 arriere = hex_vers_rgb(fond)
-                couleur = ETAT["couleur"]
-                vif = ETAT["connecte"] and max(couleur) > 6
-                corps = couleur if vif else (90, 74, 110)
+                couleur = vu_a_l_oeil(ETAT["couleur"])
+                vif = ETAT["connecte"] and max(ETAT["couleur"]) > 6
+                corps = couleur if vif else SOURD
                 for part, marge in ((0.16, 0), (0.30, 6), (0.60, 12)):
                     m = self.px(marge)
                     toile.create_oval(m, m, c - m, c - m, outline="",
@@ -8493,7 +8596,7 @@ class Panneau:
 
         self.boite = tk.Listbox(f, bg=ENCRE, fg=CRAIE, relief="flat", bd=0, height=9,
                                 font=(self.f_mono, 9), selectbackground=self.accent,
-                                selectforeground="#140E1C", highlightthickness=0,
+                                selectforeground=NUIT, highlightthickness=0,
                                 activestyle="none")
         self.boite.pack(fill="both", expand=True, pady=(0, 12))
 
@@ -8729,7 +8832,7 @@ class Panneau:
             return self.root.after(600, lambda: g == self.generation and self.rafraichir())
         r, v, b = ETAT["couleur"]
         hexa = rgb_vers_hex((r, v, b))
-        accent = lisible((r, v, b)) if max(r, v, b) > 8 else ACCENT_DEPART
+        accent = lisible(vu_a_l_oeil((r, v, b))) if max(r, v, b) > 8 else ACCENT_DEPART
         if accent != self.accent:
             self.accent = accent
             self.appliquer_accent()
@@ -8755,7 +8858,6 @@ class Panneau:
         if not self.cfg.get("echelle_interface", 0.0) and self.suivre_ecran():
             return
 
-        self.tracer_bande(hexa)
         self.peindre_apercus()
         self.txt_apercu_ecran.configure(text=hexa)
         if self.section == "calendrier":
@@ -8829,10 +8931,8 @@ class Panneau:
                   else ("En cours..." if occupe else "Verifier maintenant")),
             state="disabled" if occupe else "normal")
         # La pastille du rail s'allume des qu'une maj attend, meme groupe replie.
-        if (pret or a_poser) and not self.badge_maj.winfo_ismapped():
-            self.badge_maj.pack(side="right", padx=(0, 2))
-        elif not (pret or a_poser) and self.badge_maj.winfo_ismapped():
-            self.badge_maj.pack_forget()
+        self.rail_toile.itemconfig(self.badge_maj,
+                                   state="normal" if (pret or a_poser) else "hidden")
 
         forc = ETAT.get("forcage")
         if forc and forc.get("manuel"):
@@ -8894,30 +8994,12 @@ class Panneau:
 
         self.root.after(400, lambda: g == self.generation and self.rafraichir())
 
-    def tracer_bande(self, hexa):
-        """Un trait par mesure : environ une minute d'historique visible."""
-        self.historique.append(hexa)
-        largeur = max(1, self.bande.winfo_width())
-        capacite = max(20, largeur // self.px(4))
-        del self.historique[:-capacite]
-        while len(self.traits) < capacite:
-            self.traits.append(self.bande.create_rectangle(
-                0, 0, 0, 0, outline="", fill=ENCRE))
-        pas = largeur / capacite
-        debut = capacite - len(self.historique)
-        for i, trait in enumerate(self.traits[:capacite]):
-            j = i - debut
-            couleur = self.historique[j] if 0 <= j < len(self.historique) else ENCRE
-            x = i * pas
-            self.bande.coords(trait, x, 0, x + pas + 1, self.px(26))
-            self.bande.itemconfig(trait, fill=couleur)
-
     def appliquer_accent(self):
         try:
             self.bouton_principal.configure(bg=self.accent, activebackground=self.accent)
             self.boite.configure(selectbackground=self.accent)
-            rang, barre, etiq = self.onglets[self.section]
-            barre.configure(bg=self.accent)
+            _, signe, _, _ = self.onglets[self.section]
+            self.rail_toile.itemconfig(signe, fill=self.accent)
             for peindre in self.reglettes:
                 peindre()
         except Exception:
@@ -9537,7 +9619,7 @@ def deja_lance():
 
 def image_icone(rgb):
     from PIL import Image, ImageDraw
-    img = Image.new("RGB", (64, 64), (23, 16, 31))
+    img = Image.new("RGB", (64, 64), NUIT_RGB)
     d = ImageDraw.Draw(img)
     r, v, b = [max(30, int(c)) for c in rgb]
     for i, x in enumerate(range(9, 60, 11)):
@@ -9549,7 +9631,7 @@ def image_icone(rgb):
 def ecrire_icone(chemin):
     """Genere icone.ico pour la compilation."""
     from PIL import Image, ImageDraw
-    grand = Image.new("RGB", (256, 256), (23, 16, 31))
+    grand = Image.new("RGB", (256, 256), NUIT_RGB)
     d = ImageDraw.Draw(grand)
     for i, x in enumerate(range(30, 240, 42)):
         y = 105 + int(42 * math.sin(i * 1.1))
@@ -9614,7 +9696,7 @@ def lancer():
     # L'icone vit dans TRAY, pas dans une variable locale : elle peut etre
     # REPOSEE en cours de route (voir fil_icone), et tout ce qui la touche --
     # notifications, couleur, menu, arret -- doit trouver la nouvelle.
-    TRAY["icone"] = pystray.Icon("machitool", image_icone((139, 92, 246)), NOM_APP)
+    TRAY["icone"] = pystray.Icon("machitool", image_icone(hex_vers_rgb(ACCENT_DEPART)), NOM_APP)
 
     # ---- mise a jour -------------------------------------------------
     # Tout passe par un fil separe : une requete reseau dans le fil de
@@ -9840,7 +9922,7 @@ def lancer():
                 time.sleep(3)
                 if not ETAT["en_marche"] or demande_arret.is_set():
                     return
-                TRAY["icone"] = pystray.Icon("machitool", image_icone(ETAT["couleur"]), NOM_APP)
+                TRAY["icone"] = pystray.Icon("machitool", image_icone(vu_a_l_oeil(ETAT["couleur"])), NOM_APP)
                 TRAY["icone"].menu = construire_menu()
                 print("Icone reposee dans la barre.")
             premiere = False
@@ -9920,7 +10002,7 @@ def lancer():
         if time.time() - dernier[0] > 2.0:
             dernier[0] = time.time()
             try:
-                TRAY["icone"].icon = image_icone(ETAT["couleur"])
+                TRAY["icone"].icon = image_icone(vu_a_l_oeil(ETAT["couleur"]))
             except Exception:
                 pass
         if ETAT.get("rappel_neuf") and PONT["rappels"]:
