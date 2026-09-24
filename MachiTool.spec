@@ -25,6 +25,12 @@ hiddenimports = ['win32gui', 'win32process', 'win32api', 'win32event',
 # elles, l'import echoue dans l'exe alors qu'il passe en mode script.
 hiddenimports += ['cffi', '_cffi_backend']
 
+# Jarvis : son module, le son de Windows (le carillon), et SAPI pour la voix de
+# secours. Importes dans des fonctions -- on les nomme pour ne rien laisser au
+# hasard de l'analyse. Piper, lui, n'est PAS dans l'exe : c'est un programme a
+# part, telecharge a la demande (et espeak-ng, qu'il appelle, est sous GPL).
+hiddenimports += ['jarvis', 'winsound', 'pythoncom', 'win32com.client']
+
 # La dictee : onnxruntime porte ses DLL, et onnx_asr ses pretraitements
 # (preprocessors/data/nemo128.onnx pour Parakeet) — des DONNEES, que
 # PyInstaller ne voit pas seul. Sans elles, l'exe compile et la dictee plante

@@ -21,7 +21,7 @@ jobs:
           python-version: '3.12'
 
       - name: Compilation du source
-        run: python -m compileall -q machi_tool.py outils
+        run: python -m compileall -q machi_tool.py jarvis.py outils
 
       # Un plantage au demarrage est le seul defaut qu'on ne peut pas
       # diagnostiquer : sans console, l'exception tue le processus sans
@@ -36,6 +36,20 @@ jobs:
         run: |
           python -m pip install --quiet numpy
           python outils/test_dictee.py
+
+      # Jarvis POUR DE VRAI : les trois petits modeles d'openWakeWord (3,6 Mo)
+      # et des voix de synthese (espeak-ng) -- « Hey Jarvis » le reveille, une
+      # conversation non, et « Jarvis » appris a la francaise le reveille sans
+      # que « j'arrive » ou « Travis » le fassent.
+      - name: Jarvis ecoute, et n'entend que son nom
+        run: |
+          sudo apt-get install -y -qq espeak-ng >/dev/null
+          python -m pip install --quiet numpy onnxruntime
+          mkdir -p "$RUNNER_TEMP/oww"
+          for f in melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx; do
+            curl -sSfL -o "$RUNNER_TEMP/oww/$f" "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/$f"
+          done
+          JARVIS_MODELES="$RUNNER_TEMP/oww" python outils/test_jarvis.py
 
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"
