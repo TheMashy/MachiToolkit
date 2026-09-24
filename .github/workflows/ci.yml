@@ -41,7 +41,7 @@ jobs:
       # et des voix de synthese (espeak-ng) -- « Hey Jarvis » le reveille, une
       # conversation non, et « Jarvis » appris a la francaise le reveille sans
       # que « j'arrive » ou « Travis » le fassent.
-      - name: Jarvis ecoute, et n'entend que son nom
+      - name: Jarvis ecoute, n'entend que son nom, et parle
         run: |
           sudo apt-get install -y -qq espeak-ng >/dev/null
           python -m pip install --quiet numpy onnxruntime
@@ -49,7 +49,15 @@ jobs:
           for f in melspectrogram.onnx embedding_model.onnx hey_jarvis_v0.1.onnx; do
             curl -sSfL -o "$RUNNER_TEMP/oww/$f" "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/$f"
           done
-          JARVIS_MODELES="$RUNNER_TEMP/oww" python outils/test_jarvis.py
+          # Sa voix : Piper (espeak-ng + une voix legere), chargee en memoire --
+          # les memes phonemes que piper.exe, et « stop » qui coupe net.
+          curl -sSfL "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz" | tar xz -C "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/voix"
+          curl -sSfL "https://github.com/rhasspy/piper/releases/download/v0.0.2/voice-fr-gilles-low.tar.gz" | tar xz -C "$RUNNER_TEMP/voix"
+          JARVIS_MODELES="$RUNNER_TEMP/oww" \
+          JARVIS_PIPER_DOSSIER="$RUNNER_TEMP/piper" \
+          JARVIS_PIPER_VOIX="$RUNNER_TEMP/voix/fr-gilles-low.onnx" \
+            python outils/test_jarvis.py
 
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"

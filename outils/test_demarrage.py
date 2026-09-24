@@ -49,7 +49,7 @@ class Demarrage(unittest.TestCase):
 
     def test_config_absente(self):
         cfg = self.mt.charger_config()
-        self.assertEqual(cfg["config_version"], 4)
+        self.assertEqual(cfg["config_version"], 5)
 
     def test_config_illisible_ne_tue_pas(self):
         """Une ecriture interrompue laisse du JSON tronque. On repart des
@@ -71,7 +71,7 @@ class Demarrage(unittest.TestCase):
         self.ecrire_config({"config_version": 3, "collecte_titres_complets": False})
         cfg = self.mt.charger_config()
         self.assertTrue(cfg["collecte_titres_complets"])
-        self.assertEqual(cfg["config_version"], 4)
+        self.assertEqual(cfg["config_version"], 5)
         # Et une fois passee, elle ne repasse plus : quelqu'un qui decoche la
         # case ne doit pas la retrouver cochee au lancement suivant.
         self.ecrire_config(dict(cfg, collecte_titres_complets=False))
@@ -85,7 +85,7 @@ class Demarrage(unittest.TestCase):
                                 "pont_intervalle": mauvaise,
                                 "maj_intervalle_heures": mauvaise})
             cfg = self.mt.charger_config()
-            self.assertEqual(cfg["config_version"], 4, repr(mauvaise))
+            self.assertEqual(cfg["config_version"], 5, repr(mauvaise))
 
     def test_entier(self):
         self.assertEqual(self.mt.entier("7", 3), 7)

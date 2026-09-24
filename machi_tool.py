@@ -46,7 +46,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.27.0"
+VERSION = "1.28.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -338,7 +338,8 @@ CONFIG_DEFAUT = {
     "jarvis_leds": True,              # la guirlande dit ou il en est
     "jarvis_voix": True,              # il repond a voix haute
     "jarvis_voix_modele": "fr_FR-tom-medium",   # une voix Piper, ou "windows"
-    "jarvis_lenteur": 1.08,           # Piper : > 1 plus pose, < 1 plus vif
+    "jarvis_lenteur": 0.95,           # Piper : > 1 plus pose, < 1 plus vif
+    "jarvis_appellation": "",         # comment Jarvis vous appelle ; vide = ni Monsieur ni Madame
     "jarvis_debit": 0,                # voix de Windows : -10 .. 10
     "jarvis_suite": True,             # apres sa reponse, il ecoute encore 5 s sans mot d'eveil
     # Raccourcis a soi : [{"dit": "ouvre spotify", "ouvre": "spotify:"}] -- une
@@ -347,7 +348,7 @@ CONFIG_DEFAUT = {
     "jarvis_couleurs": {},            # {"pense": "#FF00AA"} pour changer une couleur d'etat
 
     # Mises a jour depuis les publications GitHub du depot.
-    "config_version": 4,              # sert aux migrations, voir charger_config
+    "config_version": 5,              # sert aux migrations, voir charger_config
     "derniere_version": "",           # la version du dernier demarrage : dit au
                                       # retour qu'une mise a jour est passee, et
                                       # qu'il ne s'agissait pas d'un plantage
@@ -505,7 +506,16 @@ def charger_config():
         print("Configuration migree (v4) : les titres d'onglets sont gardes, "
               "pour que les sujets soient verifiables. Reglages > Site web pour "
               "revenir en arriere.")
-    cfg["config_version"] = 4
+    # Version 5 : la voix de Jarvis parle plus vite. L'ancien reglage (1,08)
+    # avait ete ecrit dans le fichier par n'importe quel enregistrement : on ne
+    # le change que s'il vaut encore exactement ca.
+    if enregistre and entier(enregistre.get("config_version", 1), 1) < 5:
+        try:
+            if abs(float(cfg.get("jarvis_lenteur", 0.95)) - 1.08) < 1e-6:
+                cfg["jarvis_lenteur"] = 0.95
+        except (TypeError, ValueError):
+            cfg["jarvis_lenteur"] = 0.95
+    cfg["config_version"] = 5
     """
     ET ON SE SOUVIENT DE LA VERSION QU'ON ETAIT LA FOIS D'AVANT.
 
@@ -4250,6 +4260,13 @@ JARVIS = {
     "modeles": "absent", "progres": 0.0,
     "apprentissage": None,    # {"n", "total", "message", "fini"}
     "minuteurs": [],          # [{"fin", "quoi", "minuteur"}]
+    # Deux modes : « jarvis » (orange, le majordome du PC) et « psy » (bleu, le
+    # compagnon de BrainDebugger). Le mode psy se referme sur « non rien »,
+    # « oublie », « degage »... ou apres PSY_DUREE_S sans un mot.
+    "mode": "jarvis", "mode_vu": 0.0,
+    "historique": [],         # la conversation en cours avec le majordome
+    "vu": 0.0,                # dernier echange
+    "propose_psy": False,     # il vient de proposer le mode psy : « oui » y passe
 }
 _OREILLE = {"proc": None, "sock": None, "echecs": 0, "prochain": 0.0}
 _OREILLE_VERROU = threading.Lock()
@@ -4347,7 +4364,8 @@ def couleur_jarvis(cfg, maintenant=None):
     if JARVIS["led_fin"] and t > JARVIS["led_fin"]:
         JARVIS["led"] = None
         return None
-    return _jv.couleur_etat(etat, t - JARVIS["led_t0"], cfg.get("jarvis_couleurs") or {})
+    return _jv.couleur_etat(etat, t - JARVIS["led_t0"], cfg.get("jarvis_couleurs") or {},
+                            JARVIS.get("mode", "jarvis"))
 
 
 # ---------- la voix ----------
@@ -4360,8 +4378,11 @@ def dossier_piper():
     return os.path.join(dossier_jarvis(), "piper")
 
 
-def exe_piper():
-    return os.path.join(dossier_piper(), "piper", "piper.exe" if os.name == "nt" else "piper")
+def bibli_espeak():
+    """espeak-ng, livre dans l'archive de Piper avec ses donnees : c'est lui
+    qui transforme le texte en phonemes."""
+    nom = "espeak-ng.dll" if os.name == "nt" else "libespeak-ng.so.1"
+    return os.path.join(dossier_piper(), "piper", nom)
 
 
 def fichier_voix(nom):
@@ -4379,15 +4400,26 @@ def voix_choisie(cfg):
 
 
 def piper_pret(cfg):
-    """(exe, modele, frequence) si la voix neuronale peut parler, sinon None.
-    La voix choisie d'abord ; a defaut, celle de secours si elle est la."""
+    """De quoi charger la voix neuronale, ou None. La voix choisie d'abord ;
+    a defaut, celle de secours si elle est la."""
     nom = voix_choisie(cfg)
-    if nom == "windows" or not os.path.isfile(exe_piper()):
+    if nom == "windows" or not os.path.isfile(bibli_espeak()):
         return None
     for n in (nom, _jv.VOIX_SECOURS):
         if voix_presente(n):
             f = fichier_voix(n)
-            return exe_piper(), f, _jv.frequence_du_modele(f + ".json")
+            try:
+                with open(f + ".json", encoding="utf-8") as fj:
+                    conf = json.load(fj)
+            except Exception:
+                continue
+            locuteur = _jv.VOIX_PIPER.get(n, {}).get("locuteur")
+            ids = conf.get("speaker_id_map") or {}
+            return {"nom": n, "bibliotheque": bibli_espeak(),
+                    "donnees": os.path.join(dossier_piper(), "piper"),
+                    "modele": f, "frequence": _jv.frequence_du_modele(f + ".json"),
+                    "espeak": str((conf.get("espeak") or {}).get("voice") or "fr"),
+                    "locuteur": int(ids.get(locuteur, 0)) if locuteur else 0}
     return None
 
 
@@ -4424,7 +4456,7 @@ def preparer_piper(cfg, ouvrir=None):
             import tarfile
             os.makedirs(dossier_piper(), exist_ok=True)
             os.makedirs(os.path.dirname(fichier_voix(nom)), exist_ok=True)
-            if not os.path.isfile(exe_piper()):
+            if not os.path.isfile(bibli_espeak()):
                 archive = os.path.join(dossier_piper(), "piper.zip")
                 _telecharger(_jv.PIPER_MOTEUR, archive, ouvrir, (0.0, 0.3))
                 with zipfile.ZipFile(archive) as z:
@@ -4472,13 +4504,93 @@ def preparer_piper(cfg, ouvrir=None):
             return False
 
 
-class Voix:
-    """Ce que Jarvis dit, dans son propre fil : une phrase de trente secondes
-    ne doit rien bloquer, et `taire()` coupe net -- « Jarvis, stop ».
+VOIX_ENFANT_ARG = "--voix"
+_VOIX_ENFANT = {"proc": None, "sock": None, "pret": False, "charge": None,
+                "echecs": 0, "prochain": 0.0}
+_VOIX_VERROU = threading.Lock()
 
-    Piper quand il est la (une vraie voix, calculee sur ce poste), la voix de
-    Windows sinon -- ou s'il echoue en route : mieux vaut une voix de GPS
-    que pas de reponse du tout."""
+
+def _commande_voix(port, secret):
+    base = [sys.executable] if FIGE else [sys.executable, os.path.abspath(__file__)]
+    return base + [VOIX_ENFANT_ARG, str(port), secret]
+
+
+def voix_prete():
+    p = _VOIX_ENFANT["proc"]
+    return (p is not None and p.poll() is None and _VOIX_ENFANT["sock"] is not None
+            and _VOIX_ENFANT["pret"])
+
+
+def envoyer_voix(objet):
+    sock = _VOIX_ENFANT["sock"]
+    if sock is None:
+        return False
+    try:
+        _jv.envoyer(sock, objet, _VOIX_VERROU)
+        return True
+    except Exception:
+        return False
+
+
+def demarrer_voix(cfg):
+    """Le processus de la voix, avec la voix choisie chargee UNE fois."""
+    arreter_voix()
+    moteur = piper_pret(cfg)
+    if not moteur:
+        return False
+    proc, sock = _lancer_enfant(lambda port, secret: _commande_voix(port, secret), "de la voix")
+    _VOIX_ENFANT.update(proc=proc, sock=sock, pret=False, charge=moteur["modele"])
+    threading.Thread(target=_lire_voix, args=(sock,), daemon=True).start()
+    envoyer_voix({"cmd": "charger", "bibliotheque": moteur["bibliotheque"],
+                  "donnees": moteur["donnees"], "modele": moteur["modele"],
+                  "espeak": moteur["espeak"], "locuteur": moteur["locuteur"],
+                  "silence": 0.2, "fils": 2})
+    return True
+
+
+def arreter_voix():
+    sock, proc = _VOIX_ENFANT["sock"], _VOIX_ENFANT["proc"]
+    _VOIX_ENFANT.update(sock=None, proc=None, pret=False, charge=None)
+    _fermer_enfant(sock, proc)
+    VOIX.enfant_perdu()
+
+
+atexit.register(arreter_voix)
+
+
+def _lire_voix(sock):
+    while True:
+        try:
+            ev = _jv.recevoir(sock)
+        except Exception:
+            ev = None
+        if ev is None:
+            break
+        quoi = ev.get("evt")
+        if quoi == "pret":
+            _VOIX_ENFANT.update(pret=True, echecs=0)
+        elif quoi == "fini":
+            VOIX.fini(ev.get("id"), bool(ev.get("coupe")))
+        elif quoi == "erreur":
+            print("Jarvis : voix : %s" % str(ev.get("message"))[:200])
+    if _VOIX_ENFANT["sock"] is sock:
+        # Tombee sans qu'on l'arrete : la voix de Windows prend le relais, et
+        # celle-ci repart plus tard, de plus en plus lentement.
+        n = _VOIX_ENFANT["echecs"]
+        _VOIX_ENFANT.update(sock=None, pret=False, charge=None, echecs=n + 1,
+                            prochain=time.time() + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)])
+        VOIX.enfant_perdu()
+
+
+class Voix:
+    """Ce que Jarvis dit. La voix neuronale (Piper) vit dans son processus, le
+    modele charge une fois : la premiere phrase sonne en quelques dizaines de
+    millisecondes, les suivantes se calculent pendant qu'elle se dit, et
+    `taire()` coupe au dixieme de seconde -- « Jarvis, stop ».
+
+    Si elle n'est pas la (pas encore telechargee, ou tombee), c'est la voix de
+    Windows (SAPI), dans un fil a part : mieux vaut une voix de GPS que pas de
+    reponse du tout."""
 
     def __init__(self):
         self.file = []
@@ -4487,11 +4599,29 @@ class Voix:
         self.parle = False
         self.fil = None
         self.sapi = None
-        self.disponible = os.name == "nt"
+        self.disponible = os.name == "nt"      # la voix de Windows
+        self.attentes = {}
+        self.n = 0
+
+    def peut_parler(self):
+        return voix_prete() or self.disponible
 
     def dire(self, texte, fin=None):
         texte = _jv.texte_pour_piper(texte)
-        if not texte or not self.disponible:
+        if not texte:
+            if fin:
+                fin()
+            return
+        if voix_prete():
+            self.n += 1
+            ident = self.n
+            self.attentes[ident] = fin
+            self.parle = True
+            if envoyer_voix({"cmd": "dire", "id": ident, "texte": texte,
+                             "lenteur": float(CFG.get("jarvis_lenteur", 0.95))}):
+                return
+            self.attentes.pop(ident, None)
+        if not self.disponible:
             if fin:
                 fin()
             return
@@ -4501,61 +4631,34 @@ class Voix:
             self.fil = threading.Thread(target=self._tourner, daemon=True)
             self.fil.start()
 
-    def taire(self):
-        self.file.clear()
-        if self.parle:
-            self.couper.set()
-
-    def _piper(self, texte, moteur):
-        """Rend True (dit), False (coupe) ou None (echec : on passera a SAPI)."""
-        exe, modele, frequence = moteur
-        kw = {}
-        if os.name == "nt":
-            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            import numpy as np
-            import soundcard as sc
-            p = subprocess.Popen(_jv.commande_piper(exe, modele, CFG.get("jarvis_lenteur", 1.08)),
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, cwd=os.path.dirname(exe), **kw)
-        except Exception as e:
-            print("Jarvis : piper ne demarre pas (%s)" % e)
-            return None
-        joue = False
-        try:
-            p.stdin.write(texte.encode("utf-8") + b"\n")
-            p.stdin.close()
-            pas = frequence // 10 * 2                      # 100 ms de son par morceau
-            with sc.default_speaker().player(samplerate=frequence, channels=1) as lecteur:
-                reste = b""
-                while True:
-                    if self.couper.is_set():
-                        return False
-                    bout = p.stdout.read(pas)
-                    if not bout:
-                        break
-                    bout = reste + bout
-                    n = len(bout) // 2 * 2
-                    reste = bout[n:]
-                    lecteur.play(np.frombuffer(bout[:n], dtype="<i2").astype(np.float32) / 32768.0)
-                    joue = True
-            p.wait(timeout=5)
-            return True if joue else None
-        except Exception as e:
-            print("Jarvis : lecture piper impossible (%s)" % type(e).__name__)
-            return True if joue else None
-        finally:
-            # Coupe, fini ou rate : le processus ne survit pas a la phrase.
-            if p.poll() is None:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
+    def fini(self, ident, coupe):
+        fin = self.attentes.pop(ident, None)
+        if not self.attentes:
+            self.parle = False
+        if fin and not coupe:
             try:
-                p.wait(timeout=5)
-                p.stdout.close()
+                fin()
             except Exception:
                 pass
+
+    def enfant_perdu(self):
+        """La voix est tombee en pleine phrase : on ne laisse pas la suite
+        (la guirlande, l'ecoute d'apres) attendre une fin qui ne viendra pas."""
+        attentes, self.attentes = self.attentes, {}
+        self.parle = False
+        for fin in attentes.values():
+            if fin:
+                try:
+                    fin()
+                except Exception:
+                    pass
+
+    def taire(self):
+        self.file.clear()
+        self.attentes.clear()
+        envoyer_voix({"cmd": "taire"})
+        self.couper.set()
+        self.parle = False
 
     def _sapi(self, texte):
         if self.sapi is None:
@@ -4587,16 +4690,11 @@ class Voix:
                 texte, fin = self.file.pop(0)
                 self.couper.clear()
                 self.parle = True
-                dit = None
+                dit = True
                 try:
-                    moteur = piper_pret(CFG)
-                    if moteur:
-                        dit = self._piper(texte, moteur)
-                    if dit is None:
-                        dit = self._sapi(texte)
+                    dit = self._sapi(texte)
                 except Exception as e:
-                    print("Jarvis : lecture impossible (%s)" % type(e).__name__)
-                    dit = True                     # on n'attend pas une voix qui ne viendra pas
+                    print("Jarvis : voix de Windows impossible (%s)" % type(e).__name__)
                 finally:
                     self.parle = False
                 if fin and dit:
@@ -4644,9 +4742,9 @@ def oreille_vivante():
     return p is not None and p.poll() is None and _OREILLE["sock"] is not None
 
 
-def demarrer_oreille(cfg):
-    arreter_oreille()
-    JARVIS.update(etat="demarrage", message="Ouverture du micro...")
+def _lancer_enfant(commande, quoi):
+    """Relance cet exe en processus enfant et attend sa poignee de main : un
+    secret a usage unique, sur une socket locale. Rend (processus, socket)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         srv.bind(("127.0.0.1", 0))
@@ -4658,13 +4756,13 @@ def demarrer_oreille(cfg):
             kw["creationflags"] = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                                    | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
         sortie = _JOURNAL if _JOURNAL is not None else None
-        proc = subprocess.Popen(_commande_oreille(srv.getsockname()[1], secret),
+        proc = subprocess.Popen(commande(srv.getsockname()[1], secret),
                                 stdin=subprocess.DEVNULL, stdout=sortie, stderr=sortie, **kw)
         try:
             sock, _ = srv.accept()
         except socket.timeout:
             proc.kill()
-            raise RuntimeError("le processus du micro n'a pas demarre")
+            raise RuntimeError("le processus %s n'a pas demarre" % quoi)
         sock.settimeout(30)
         try:
             ok = secrets.compare_digest(_recevoir_trame(sock, 64), secret.encode())
@@ -4673,18 +4771,14 @@ def demarrer_oreille(cfg):
         if not ok:
             sock.close()
             proc.kill()
-            raise RuntimeError("le processus du micro n'a pas repondu comme prevu")
+            raise RuntimeError("le processus %s n'a pas repondu comme prevu" % quoi)
         sock.settimeout(None)
     finally:
         srv.close()
-    _OREILLE.update(proc=proc, sock=sock)
-    envoyer_oreille(config_oreille(cfg))
-    threading.Thread(target=_lire_oreille, args=(sock,), daemon=True).start()
+    return proc, sock
 
 
-def arreter_oreille():
-    sock, proc = _OREILLE["sock"], _OREILLE["proc"]
-    _OREILLE.update(sock=None, proc=None)
+def _fermer_enfant(sock, proc):
     if sock is not None:
         try:
             _envoyer_trame(sock, b"")
@@ -4702,6 +4796,21 @@ def arreter_oreille():
                 proc.kill()
             except Exception:
                 pass
+
+
+def demarrer_oreille(cfg):
+    arreter_oreille()
+    JARVIS.update(etat="demarrage", message="Ouverture du micro...")
+    proc, sock = _lancer_enfant(lambda port, secret: _commande_oreille(port, secret), "du micro")
+    _OREILLE.update(proc=proc, sock=sock)
+    envoyer_oreille(config_oreille(cfg))
+    threading.Thread(target=_lire_oreille, args=(sock,), daemon=True).start()
+
+
+def arreter_oreille():
+    sock, proc = _OREILLE["sock"], _OREILLE["proc"]
+    _OREILLE.update(sock=None, proc=None)
+    _fermer_enfant(sock, proc)
 
 
 atexit.register(arreter_oreille)
@@ -4739,8 +4848,9 @@ def traiter_evenement(ev):
     elif quoi == "reveil":
         print("Jarvis : eveil (%s)" % ev.get("par"))
         VOIX.taire()
+        mode_courant()
         poser_led("ecoute")
-        JARVIS.update(etat="ecoute", message="Je t'ecoute.")
+        JARVIS.update(etat="ecoute", message="Je vous ecoute.")
         # Le moteur de transcription se reveille PENDANT qu'on parle : sa
         # premiere phrase apres un long silence ne paie pas son chargement.
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
@@ -4809,6 +4919,22 @@ def veiller_sur_jarvis(cfg):
                 _OREILLE["prochain"] = time.time() + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)]
             if not voulu and JARVIS["etat"] != "eteint" and _OREILLE["proc"] is None:
                 JARVIS.update(etat="eteint", message="")
+            # LA VOIX : un processus a part, la voix chargee tant qu'il ecoute.
+            # Relancee si elle tombe, rechargee si on en change.
+            veut_voix = voulu and cfg.get("jarvis_voix", True) and voix_choisie(cfg) != "windows"
+            moteur = piper_pret(cfg) if veut_voix else None
+            if moteur and time.time() >= _VOIX_ENFANT["prochain"] and (
+                    _VOIX_ENFANT["proc"] is None or _VOIX_ENFANT["proc"].poll() is not None
+                    or _VOIX_ENFANT["charge"] != moteur["modele"]):
+                try:
+                    demarrer_voix(cfg)
+                except Exception as e:
+                    n = _VOIX_ENFANT["echecs"]
+                    _VOIX_ENFANT.update(echecs=n + 1, prochain=time.time()
+                                        + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)])
+                    print("Jarvis : voix neuronale impossible (%s)" % e)
+            elif not moteur and _VOIX_ENFANT["proc"] is not None:
+                arreter_voix()
         except Exception as e:
             print("Jarvis : veille (%s)" % e)
         time.sleep(1.0)
@@ -4856,6 +4982,41 @@ def prechauffer_dictee():
     _programmer_dechargement()
 
 
+PSY_DUREE_S = 180            # le mode psy se referme apres trois minutes sans un mot
+CONVERSATION_S = 300         # au-dela, le majordome oublie la conversation d'avant
+_OUI = {"oui", "ouais", "oui vas y", "vas y", "d'accord", "ok", "okay", "volontiers", "allez",
+        "oui merci", "oui s'il te plait", "oui s'il vous plait", "oui stp", "carrement", "bien sur",
+        "oui oui", "ouais vas y", "go", "oui volontiers", "oui je veux bien", "je veux bien"}
+
+
+def poser_mode(mode):
+    if mode != JARVIS.get("mode"):
+        JARVIS["historique"] = []
+    JARVIS.update(mode=mode, mode_vu=time.time(), propose_psy=False)
+
+
+def mode_courant(maintenant=None):
+    t = time.time() if maintenant is None else maintenant
+    if JARVIS.get("mode") == "psy" and t - JARVIS.get("mode_vu", 0.0) > PSY_DUREE_S:
+        poser_mode("jarvis")
+    if t - JARVIS.get("vu", 0.0) > CONVERSATION_S:
+        JARVIS["historique"] = []
+        JARVIS["propose_psy"] = False
+    return JARVIS.get("mode", "jarvis")
+
+
+def terminer_conversation():
+    """« Non rien », « oublie », « degage » : on se tait, on n'ecoute plus la
+    suite, le mode psy se referme, la guirlande rend la main."""
+    VOIX.taire()
+    envoyer_oreille({"cmd": "annuler"})
+    poser_mode("jarvis")
+    JARVIS["historique"] = []
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+    jouer_son("fin")
+
+
 def dire(texte, suite=False):
     """Repond : a voix haute si on l'a voulu, sinon en notification. Ensuite,
     s'il y a une suite possible, on ecoute encore un peu -- sans mot d'eveil."""
@@ -4865,9 +5026,9 @@ def dire(texte, suite=False):
         if suite and CFG.get("jarvis_suite", True) and oreille_vivante():
             jouer_son("eveil")
             poser_led("ecoute")
-            JARVIS.update(etat="ecoute", message="Je t'ecoute encore un instant.")
+            JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.")
             envoyer_oreille({"cmd": "ecouter", "attente": 5.0})
-    if CFG.get("jarvis_voix", True) and VOIX.disponible:
+    if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
         poser_led("parle")
         JARVIS.update(etat="parle", message="Je reponds.")
         VOIX.dire(texte, fin)
@@ -4882,7 +5043,7 @@ def signaler_erreur(texte):
     poser_led("erreur", 1.6)
     jouer_son("erreur")
     JARVIS.update(etat="erreur", message=texte)
-    if CFG.get("jarvis_voix", True) and VOIX.disponible:
+    if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
         VOIX.dire(texte, lambda: JARVIS.update(etat="attente", message=message_attente()))
 
 
@@ -4894,7 +5055,7 @@ def traiter_phrase(wav64, cfg):
     except Exception:
         return signaler_erreur("Je n'ai pas pu lire ce que le micro m'a donné.")
     if etat_dictee()["etat"] != "pret":
-        return signaler_erreur("La transcription n'est pas encore prête. Jette un œil à la page Jarvis de Machi Tool.")
+        return signaler_erreur("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.")
     try:
         texte = transcrire(octets)
     except DicteeImpossible as e:
@@ -4908,15 +5069,34 @@ def traiter_phrase(wav64, cfg):
     if not texte:
         # « Jarvis. » tout court : il attend la suite.
         return dire("Oui ?", suite=True)
+    if _jv.fin_de_conversation(texte):
+        print("Jarvis : fin de conversation")
+        return terminer_conversation()
+    changement = _jv.changement_de_mode(texte)
+    if (changement is None and JARVIS.get("propose_psy")
+            and _jv.normaliser(texte).replace("-", " ").strip() in _OUI):
+        changement = ("psy", "")
+    JARVIS["propose_psy"] = False
+    if changement:
+        mode, reste = changement
+        poser_mode(mode)
+        print("Jarvis : mode %s" % mode)
+        if not reste:
+            return dire("Mode psychologue. Je vous écoute." if mode == "psy"
+                        else "Mode Jarvis. À votre service.", suite=True)
+        texte = reste
+    JARVIS["vu"] = time.time()
     action = _jv.comprendre(texte, cfg.get("jarvis_raccourcis") or [])
     if action:
         print("Jarvis : commande %s" % action["action"])
+        if action["action"] == "fin":
+            return terminer_conversation()
         try:
             reponse = executer_commande(action, cfg)
         except Exception as e:
             print("Jarvis : commande ratee (%s)" % e)
             return signaler_erreur("Je n'ai pas pu le faire, désolé.")
-        if action["action"] in ("silence", "annuler"):
+        if action["action"] == "silence":
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
             jouer_son("fin")
@@ -4928,39 +5108,101 @@ def traiter_phrase(wav64, cfg):
             jouer_son("fait")
             JARVIS.update(etat="attente", message=message_attente())
         return
-    parler_au_compagnon(texte, cfg)
+    if mode_courant() == "psy":
+        JARVIS["mode_vu"] = time.time()
+        return parler_au_compagnon(texte, cfg)
+    return parler_a_jarvis(texte, cfg)
 
 
-def parler_au_compagnon(texte, cfg):
+def _requete_bd(chemin, charge, cfg, delai):
+    """POST a BrainDebugger avec la cle de la passerelle. Rend le JSON, leve
+    urllib.error.HTTPError ou une erreur reseau."""
     base = str(cfg.get("pont_site", "")).strip().rstrip("/")
     cle = str(cfg.get("pont_cle", "")).strip()
-    if not base or not cle:
-        return signaler_erreur("Pour te répondre, il me faut la clé de BrainDebugger, "
-                               "dans la page Passerelle de Machi Tool.")
-    poser_led("pense")
-    JARVIS.update(etat="pense", message="Le compagnon reflechit...")
-    print("Jarvis : message au compagnon (%d signes)" % len(texte))
     decalage = -(time.altzone if time.localtime().tm_isdst > 0 else time.timezone) // 3600
     entetes = {"User-Agent": "MachiToolkit/" + VERSION, "Content-Type": "application/json",
                "Authorization": "Bearer " + cle, "X-Machitool-Cle": cle,
                # Sa journee, pas celle du serveur : un fuseau a heure fixe suffit
                # pour dater MAINTENANT.
                "X-Fuseau": "UTC" if not decalage else "Etc/GMT%+d" % -decalage}
+    corps = json.dumps(charge, ensure_ascii=False).encode("utf-8")
+    requete = urllib.request.Request(base + chemin, data=corps, headers=entetes)
+    with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _cle_presente(cfg):
+    return bool(str(cfg.get("pont_site", "")).strip() and str(cfg.get("pont_cle", "")).strip())
+
+
+def _detail_http(e):
     try:
-        corps = json.dumps({"texte": texte}, ensure_ascii=False).encode("utf-8")
-        requete = urllib.request.Request(base + "/api/machitool/parler", data=corps, headers=entetes)
-        with urllib.request.urlopen(requete, timeout=180, context=_contexte_ssl()) as r:
-            donnees = json.loads(r.read().decode("utf-8"))
+        return str(json.loads(e.read().decode("utf-8")).get("error") or "")
+    except Exception:
+        return ""
+
+
+def parler_au_compagnon(texte, cfg):
+    """Le mode psychologue : le compagnon de BrainDebugger, son fil, son journal."""
+    if not _cle_presente(cfg):
+        return signaler_erreur("Pour vous répondre, il me faut la clé de BrainDebugger : "
+                               "page Passerelle de Machi Tool.")
+    poser_led("pense")
+    JARVIS.update(etat="pense", message="Le compagnon reflechit...")
+    print("Jarvis : message au compagnon (%d signes)" % len(texte))
+    try:
+        donnees = _requete_bd("/api/machitool/parler", {"texte": texte}, cfg, 180)
     except urllib.error.HTTPError as e:
         return signaler_erreur(
             "BrainDebugger refuse ma clé." if e.code in (401, 403)
-            else "Ta version de BrainDebugger ne sait pas encore m'écouter." if e.code == 404
+            else "Votre version de BrainDebugger ne sait pas encore m'écouter." if e.code == 404
             else "BrainDebugger a répondu par une erreur %s." % e.code)
     except Exception:
         return signaler_erreur("Je n'arrive pas à joindre BrainDebugger.")
     reponse = str((donnees or {}).get("texte") or "").strip()
     if not reponse:
         return signaler_erreur("Le compagnon n'a rien répondu.")
+    JARVIS["mode_vu"] = time.time()
+    dire(reponse, suite=True)
+
+
+def parler_a_jarvis(texte, cfg):
+    """Le mode Jarvis : le majordome du PC, par BrainDebugger (qui tient la cle
+    Claude) -- Sonnet, effort bas. Rien n'entre dans le journal, sauf un
+    message grave : BrainDebugger l'envoie alors au compagnon, et on passe en
+    mode psychologue."""
+    if not _cle_presente(cfg):
+        return signaler_erreur("Pour vous répondre, il me faut la clé de BrainDebugger : "
+                               "page Passerelle de Machi Tool.")
+    poser_led("pense")
+    JARVIS.update(etat="pense", message="Jarvis reflechit...")
+    print("Jarvis : question au majordome (%d signes)" % len(texte))
+    try:
+        donnees = _requete_bd("/api/machitool/jarvis",
+                              {"texte": texte, "historique": JARVIS["historique"][-12:],
+                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
+                              cfg, 90)
+    except urllib.error.HTTPError as e:
+        detail = _detail_http(e)
+        return signaler_erreur(
+            "BrainDebugger refuse ma clé." if e.code in (401, 403)
+            else "Votre version de BrainDebugger ne connaît pas encore le mode Jarvis." if e.code == 404
+            else "BrainDebugger n'a pas de clé Claude pour me faire parler." if "clé API" in detail
+            else "BrainDebugger a répondu par une erreur %s." % e.code)
+    except Exception:
+        return signaler_erreur("Je n'arrive pas à joindre BrainDebugger.")
+    reponse = str((donnees or {}).get("texte") or "").strip()
+    if not reponse:
+        return signaler_erreur("Je n'ai rien à répondre à cela, curieusement.")
+    if (donnees or {}).get("mode") == "psy":
+        # Grave : c'est le compagnon qui a repondu, et on reste avec lui.
+        print("Jarvis : bascule en mode psychologue")
+        poser_mode("psy")
+    else:
+        JARVIS["historique"] = (JARVIS["historique"] + [
+            {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+        JARVIS["propose_psy"] = "mode psychologue" in _jv.normaliser(reponse)
+    JARVIS["vu"] = time.time()
     dire(reponse, suite=True)
 
 
@@ -4976,12 +5218,12 @@ def executer_commande(a, cfg, maintenant=None):
     if quoi == "silence":
         VOIX.taire()
         return None
-    if quoi == "annuler":
+    if quoi in ("annuler", "fin"):
         return None
     if quoi == "dormir":
         cfg["jarvis_actif"] = False
         sauver_config(cfg)
-        return "Très bien. Je cesse d'écouter ; tu me réveilleras depuis Machi Tool."
+        return "Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool."
     if quoi == "heure":
         return "Il est %d heure%s %02d." % (t.tm_hour, "s" if t.tm_hour > 1 else "", t.tm_min) \
             if t.tm_min else "Il est %d heure%s pile." % (t.tm_hour, "s" if t.tm_hour > 1 else "")
@@ -5029,9 +5271,9 @@ def executer_commande(a, cfg, maintenant=None):
         return None
     if quoi == "synchro":
         if not (ACTIVITE["active"] and cfg.get("collecte_envoi", False)):
-            return "L'envoi de ta journée est coupé dans Machi Tool."
+            return "L'envoi de votre journée est coupé dans Machi Tool."
         threading.Thread(target=lambda: envoyer_activite_au_site(cfg), daemon=True).start()
-        return "J'envoie ta journée à BrainDebugger."
+        return "J'envoie votre journée à BrainDebugger."
     if quoi == "ouvrir":
         cible = a["cible"]
         if os.name == "nt":
@@ -5052,11 +5294,11 @@ def poser_minuteur(secondes, quoi=""):
             JARVIS["minuteurs"].remove(entree)
         jouer_son("minuteur")
         poser_led("minuteur", 5)
-        texte = ("Je te rappelle : %s." % quoi) if quoi else ("Le minuteur de %s est terminé." % _jv.dire_duree(secondes))
+        texte = ("Je vous rappelle : %s." % quoi) if quoi else ("Le minuteur de %s est terminé." % _jv.dire_duree(secondes))
         notifier = JARVIS_CROCHETS.get("notifier")
         if notifier:
             notifier("Jarvis", texte)
-        if CFG.get("jarvis_voix", True) and VOIX.disponible:
+        if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
             VOIX.dire(texte)
 
     entree["minuteur"] = threading.Timer(secondes, sonner)
@@ -5064,7 +5306,7 @@ def poser_minuteur(secondes, quoi=""):
     entree["minuteur"].start()
     JARVIS["minuteurs"].append(entree)
     if quoi:
-        return "Entendu. Je te le rappelle dans %s." % _jv.dire_duree(secondes)
+        return "Entendu. Je vous le rappelle dans %s." % _jv.dire_duree(secondes)
     return "Minuteur de %s, lancé." % _jv.dire_duree(secondes)
 
 
@@ -7563,15 +7805,30 @@ class Panneau:
         for cle, libelle in (
                 ("jarvis_voix", "Repondre a voix haute (sinon : une notification)"),
                 ("jarvis_son", "Un petit son quand il s'allume"),
-                ("jarvis_leds", "La guirlande dit ou il en est : cyan il ecoute, bleu il "
-                                "transcrit, violet il reflechit, ambre il parle, vert c'est fait, "
-                                "rouge c'est rate"),
+                ("jarvis_leds", "La guirlande dit a qui tu parles et ou il en est : orange "
+                                "Jarvis, bleu le mode psychologue ; elle respire quand il ecoute, "
+                                "pulse quand il transcrit, ondule quand il reflechit, vibre quand "
+                                "il parle ; vert c'est fait, rouge c'est rate"),
                 ("jarvis_suite", "Apres sa reponse, il ecoute encore 5 secondes sans qu'on "
                                  "redise « Jarvis »"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(8, 0))
+        self.texte(ligne, "Il t'appelle", CRAIE, 9).pack(side="left")
+        self.champ_appellation = self.champ(ligne, self.cfg.get("jarvis_appellation", ""), 16)
+        self.champ_appellation.pack(side="left", padx=(8, 0))
+        self.texte(ligne, "vide = ni Monsieur ni Madame. Enregistrer pour appliquer.", BRUME, 8,
+                   largeur=260).pack(side="left", padx=(8, 0))
+        self.texte(f, "Deux modes. JARVIS (orange) : le majordome du PC, a la maniere d'Iron Man "
+                      "-- Sonnet, effort bas, rien dans ton journal. PSYCHOLOGUE (bleu) : le "
+                      "compagnon de BrainDebugger, avec ton journal ; dis « psychologue », "
+                      "« notes psy » ou « note que... » pour y passer, « mode Jarvis » pour "
+                      "revenir. Un message grave part toujours au compagnon. « Non rien », "
+                      "« oublie », « degage » : fin de la conversation.",
+                   BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
         self.texte(f, "Commandes : « allume / eteins la lumiere », « mets la "
                       "lumiere en bleu », « lumiere normale », « mode ecran / son / "
                       "applications », « minuteur de 10 minutes », « rappelle-moi "
@@ -7613,7 +7870,7 @@ class Panneau:
             threading.Thread(target=preparer_piper, args=(self.cfg,), daemon=True).start()
 
     def essai_voix(self):
-        VOIX.dire("Bonjour. Tous les systèmes sont opérationnels. Que puis-je faire pour toi ?")
+        VOIX.dire("Bonjour. Tous les systèmes sont opérationnels. Que puis-je faire pour vous ?")
 
     def peindre_jarvis(self):
         etat = JARVIS.get("etat", "eteint")
@@ -7625,7 +7882,7 @@ class Panneau:
         self.txt_jarvis.configure(
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)
-        details = []
+        details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
         if JARVIS.get("db") is not None and etat != "eteint":
             details.append("micro %.0f dB" % JARVIS["db"])
         d = etat_dictee()
@@ -7642,8 +7899,10 @@ class Panneau:
             piper = "Voix de Windows."
         elif PIPER["etat"] == "preparation":
             piper = "Telechargement de la voix : %d %%" % (PIPER["progres"] * 100)
+        elif voix_prete():
+            piper = PIPER.get("message") or "Voix chargee : elle repond tout de suite."
         elif piper_pret(self.cfg):
-            piper = PIPER.get("message") or "Voix prete."
+            piper = "Voix telechargee ; elle se charge quand Jarvis ecoute."
         else:
             piper = PIPER.get("message") or "La voix se telecharge quand Jarvis ecoute."
         self.txt_piper.configure(text=piper)
@@ -8367,6 +8626,7 @@ class Panneau:
         self.cfg["son_luminosite_fixe"] = round(self.var_lum_fixe.get(), 2)
         self.cfg["jarvis_sensibilite"] = round(self.var_jarvis_sens.get(), 2)
         self.cfg["jarvis_lenteur"] = round(self.var_jarvis_lenteur.get(), 2)
+        self.cfg["jarvis_appellation"] = self.champ_appellation.get().strip()[:40]
         envoyer_oreille(config_oreille(self.cfg))
         self.cfg["api_active"] = bool(self.var_api.get())
         try:
@@ -9850,6 +10110,11 @@ if __name__ == "__main__":
     # Le processus de l'oreille de Jarvis : le micro, le mot d'eveil, rien d'autre.
     if JARVIS_ENFANT_ARG in sys.argv:
         oreille_enfant_depuis_argv()
+        sys.exit(0)
+    # Le processus de sa voix : la voix chargee, des phrases a dire.
+    if VOIX_ENFANT_ARG in sys.argv:
+        _i = sys.argv.index(VOIX_ENFANT_ARG)
+        _jv.voix_enfant(sys.argv[_i + 1], sys.argv[_i + 2])
         sys.exit(0)
     try:
         main()

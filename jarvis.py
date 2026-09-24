@@ -408,16 +408,18 @@ def jouer(genre):
 #  LES COULEURS D'ETAT
 # ======================================================================
 
+# DEUX MODES, DEUX COULEURS. Jarvis est orange ; le mode psychologue -- le
+# compagnon de BrainDebugger -- est bleu. L'etat (il ecoute, il transcrit, il
+# reflechit, il parle) se lit dans le MOUVEMENT de la couleur, le mode dans sa
+# teinte : d'un coup d'oeil, on sait a qui on parle.
+COULEURS_MODE = {"jarvis": "#FF7A00", "psy": "#2563EB"}
+COULEURS_REFLEXION = {"jarvis": "#FFC04D", "psy": "#7C3AED"}
 COULEURS = {
-    "ecoute":   "#22D3EE",    # il t'entend : cyan qui respire
-    "comprend": "#3B82F6",    # il transcrit, sur ce poste : bleu
-    "pense":    "#A855F7",    # le compagnon reflechit : violet qui ondule
-    "parle":    "#F59E0B",    # il repond a voix haute : ambre
     "fait":     "#22C55E",    # commande faite : vert, un instant
     "erreur":   "#EF4444",    # rate : rouge, un instant
-    "apprend":  "#22D3EE",
-    "minuteur": "#FFB000",
+    "minuteur": "#FFB000",    # un minuteur sonne : ambre qui clignote
 }
+ETATS_DU_MODE = ("ecoute", "comprend", "pense", "parle", "apprend")
 
 
 def _hex(h):
@@ -425,23 +427,29 @@ def _hex(h):
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def couleur_etat(etat, t, couleurs=None):
+def couleur_etat(etat, t, couleurs=None, mode="jarvis"):
     """(r, v, b), gain pour l'etat donne a l'instant t (en secondes depuis
-    son debut). Rend None pour un etat sans couleur."""
-    tab = dict(COULEURS)
-    tab.update(couleurs or {})
-    if etat not in tab:
+    son debut), dans le mode donne. Rend None pour un etat sans couleur.
+
+    `couleurs` remplace ce qu'on veut : {"jarvis": "#...", "psy": "#...",
+    "fait": ..., "erreur": ..., "minuteur": ...}."""
+    perso = couleurs or {}
+    mode = mode if mode in COULEURS_MODE else "jarvis"
+    if etat in ETATS_DU_MODE:
+        rvb = _hex(perso.get(mode, COULEURS_MODE[mode]))
+    elif etat in COULEURS:
+        rvb = _hex(perso.get(etat, COULEURS[etat]))
+    else:
         return None
-    rvb = _hex(tab[etat])
     if etat in ("ecoute", "apprend"):
         gain = 0.78 + 0.22 * math.sin(2 * math.pi * 0.8 * t)
     elif etat == "comprend":
         gain = 0.55 + 0.45 * abs(math.sin(math.pi * 1.4 * t))
     elif etat == "pense":
-        # La reflexion : la teinte glisse du violet a l'indigo et revient,
-        # l'eclat ondule. C'est l'etat qui dure, il doit se voir vivant.
+        # La reflexion : la teinte glisse vers sa voisine et revient, l'eclat
+        # ondule. C'est l'etat qui dure, il doit se voir vivant.
         k = 0.5 + 0.5 * math.sin(2 * math.pi * 0.35 * t)
-        autre = _hex("#6366F1")
+        autre = _hex(COULEURS_REFLEXION[mode])
         rvb = tuple(a + (b - a) * k for a, b in zip(rvb, autre))
         gain = 0.5 + 0.5 * (0.5 + 0.5 * math.sin(2 * math.pi * 0.9 * t))
     elif etat == "parle":
@@ -592,9 +600,67 @@ _MODES = {"ecran": "ecran", "son": "son", "musique": "son", "application": "appl
 
 _SILENCE = {"stop", "tais toi", "tais-toi", "chut", "silence", "arrete", "ca suffit",
             "arrete de parler", "stop stop", "c'est bon arrete", "ta gueule", "ferme la"}
-_ANNULER = {"annule", "annuler", "laisse tomber", "rien", "non rien", "oublie", "c'est bon",
-            "non merci", "rien du tout", "pardon rien", "non", "merci", "merci c'est bon",
-            "c'est rien", "fausse alerte"}
+# LA FIN D'UNE CONVERSATION. « Non rien », « oublie », « degage » : on se tait,
+# on n'ecoute plus la suite, et le mode psychologue se referme. Une phrase
+# COURTE, faite de ces mots-la et de politesses autour -- « non merci c'est
+# tout » oui, « j'ai rien fait de la journee » non.
+_FIN = re.compile(
+    r"^(?:(?:non|bon|ben|euh|ah|oh|finalement|en fait|merci|pardon|ok|okay|d'accord|"
+    r"c'est bon|jarvis|bah)\s+)*"
+    r"(?:non|merci|rien(?: du tout)?|c'est rien|oublie(?: ca| tout| c'est pas grave)?|"
+    r"laisse(?: tomber| beton| moi)?|degage|casse toi|va t'en|dehors|du vent|"
+    r"c'est tout|c'est bon|ca ira|ca va aller|pas besoin|au revoir|a plus|salut|bye|"
+    r"fin de (?:la )?conversation|termine|annule|annuler|fausse alerte|non merci|"
+    r"rien merci|rien de rien|c'est fini)"
+    r"(?:\s+(?:merci|jarvis|c'est bon|ca ira|c'est tout|laisse|pour l'instant|pour le moment))*$")
+
+
+def fin_de_conversation(texte):
+    t = normaliser(texte).replace("-", " ").strip(" '")
+    return bool(t) and len(t.split()) <= 7 and bool(_FIN.match(t))
+
+
+# LES MODES. « Psychologue », « notes psy », « notes » : la conversation passe
+# au compagnon de BrainDebugger (bleu). « Mode Jarvis », « quitte le mode
+# psy » : retour a Jarvis (orange). Rend (mode, reste) -- le reste est ce qui
+# suit dans la meme phrase, a envoyer tel quel -- ou None.
+_VERS_PSY = re.compile(
+    r"^(?:(?:passe|passons|mets toi|mets-toi|bascule|va|on passe|je veux)\s+(?:en\s+|au\s+)?)?"
+    r"(?:(?:le\s+)?mode\s+)?(?:psychologue|psy|psychologie|therapeute|le psy|la psy)\b")
+_VERS_NOTES_PSY = re.compile(r"^(?:mes\s+|les\s+)?notes?\s+(?:psy|psychologue|de psy)\b")
+_VERS_NOTES = re.compile(r"^(?:(?:prends|fais|ajoute|ecris|prend)\s+(?:une\s+|des\s+)?)?notes?\b")
+_VERS_JARVIS = re.compile(
+    r"^(?:(?:passe|reviens|repasse|retour|retourne|bascule|on repasse)\s+(?:en\s+|a\s+|au\s+)?)?"
+    r"(?:(?:le\s+)?mode\s+)?(?:jarvis|normal)$|^(?:quitte|sors|sors du|arrete|ferme)\s+"
+    r"(?:le\s+)?(?:mode\s+)?(?:psy|psychologue)$")
+
+
+def _apres(texte, n_mots):
+    """Le texte original moins ses n premiers mots (comptes comme normaliser)."""
+    mots = [m for m in str(texte).split() if normaliser(m)]
+    reste = " ".join(mots[n_mots:])
+    return re.sub(r"^[\s,.;:!?\u2026-]+", "", reste).strip()
+
+
+def changement_de_mode(texte):
+    t = normaliser(texte).strip(" -'")
+    if not t:
+        return None
+    if _VERS_JARVIS.match(t):
+        return ("jarvis", "")
+    for motif, garder in ((_VERS_PSY, False), (_VERS_NOTES_PSY, False), (_VERS_NOTES, True)):
+        m = motif.match(t)
+        if m:
+            # « Note que j'ai mal dormi » : la phrase entiere part au journal,
+            # c'est une note. « Psychologue, j'ai mal dormi » : le mot de
+            # bascule n'en fait pas partie.
+            if garder:
+                return ("psy", str(texte).strip() if t != m.group(0) else "")
+            reste = _apres(texte, len(m.group(0).split()))
+            if normaliser(reste) in ("", "s'il te plait", "stp", "merci", "s'il vous plait", "svp"):
+                reste = ""
+            return ("psy", reste)
+    return None
 
 
 def comprendre(texte, raccourcis=()):
@@ -614,8 +680,8 @@ def comprendre(texte, raccourcis=()):
 
     if t in _SILENCE:
         return {"action": "silence"}
-    if t in _ANNULER:
-        return {"action": "annuler"}
+    if fin_de_conversation(texte):
+        return {"action": "fin"}
 
     for r in raccourcis or ():
         dit = normaliser(r.get("dit", ""))
@@ -728,6 +794,8 @@ VOIX_PIPER = {
     "fr_FR-tom-medium":   {"nom": "Tom -- francais, homme, pose", "hf": "fr/fr_FR/tom/medium/"},
     "fr_FR-gilles-low":   {"nom": "Gilles -- francais, homme, plus leger", "hf": "fr/fr_FR/gilles/low/",
                            "github": "voice-fr-gilles-low"},
+    "fr_FR-upmc-medium":  {"nom": "Pierre -- francais, homme, clair", "hf": "fr/fr_FR/upmc/medium/",
+                           "locuteur": "pierre"},
     "fr_FR-siwis-medium": {"nom": "Siwis -- francais, femme", "hf": "fr/fr_FR/siwis/medium/",
                            "github": "voice-fr-siwis-medium"},
     "en_GB-alan-medium":  {"nom": "Alan -- anglais britannique, homme (lit le francais avec un accent)",
@@ -737,21 +805,128 @@ VOIX_DEFAUT = "fr_FR-tom-medium"
 VOIX_SECOURS = "fr_FR-gilles-low"       # aussi publiee sur GitHub, si Hugging Face ne repond pas
 
 
-def commande_piper(exe, modele, lenteur=1.08, silence=0.3):
-    """La ligne de commande : son brut 16 bits mono sur la sortie standard,
-    que l'on joue au fur et a mesure (la premiere phrase sonne avant que la
-    derniere soit calculee)."""
-    return [exe, "--model", modele, "--output_raw",
-            "--length_scale", "%.2f" % max(0.6, min(1.6, float(lenteur))),
-            "--sentence_silence", "%.2f" % max(0.0, min(1.5, float(silence)))]
-
-
 def frequence_du_modele(chemin_json, defaut=22050):
     try:
         with open(chemin_json, encoding="utf-8") as f:
             return int(json.load(f)["audio"]["sample_rate"])
     except Exception:
         return defaut
+
+
+class Phonemiseur:
+    """Le texte devient des phonemes (API) par espeak-ng -- la bibliotheque
+    livree avec Piper, appelee directement : c'est ce que fait piper.exe, sans
+    relancer un programme a chaque phrase.
+
+    Meme decoupage que piper-phonemize : une proposition a la fois, sa
+    ponctuation ajoutee a la fin, un espace entre deux propositions, et une
+    phrase par ligne de sortie (chacune se synthetise a part, la premiere
+    sonne pendant que la suivante se calcule)."""
+
+    PONCTUATION = {".": ".", "?": "?", "!": "!", ",": ",", ":": ":", ";": ";",
+                   "\u2026": ".", "\u00bb": "", "\u00ab": ""}
+
+    def __init__(self, bibliotheque, dossier_donnees, voix="fr"):
+        import ctypes
+        self.ct = ctypes
+        self.lib = ctypes.cdll.LoadLibrary(bibliotheque)
+        self.lib.espeak_Initialize.restype = ctypes.c_int
+        self.lib.espeak_Initialize.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        self.lib.espeak_SetVoiceByName.argtypes = [ctypes.c_char_p]
+        self.lib.espeak_TextToPhonemes.restype = ctypes.c_char_p
+        self.lib.espeak_TextToPhonemes.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int]
+        # 2 = AUDIO_OUTPUT_SYNCHRONOUS : espeak ne touche a aucun peripherique.
+        # Le chemin dans l'encodage du systeme : espeak l'ouvre avec fopen().
+        chemin = dossier_donnees.encode("mbcs" if os.name == "nt" else "utf-8")
+        if self.lib.espeak_Initialize(2, 0, chemin, 0) < 0:
+            raise RuntimeError("espeak-ng ne s'initialise pas (%s)" % dossier_donnees)
+        if self.lib.espeak_SetVoiceByName(voix.encode("ascii")) != 0:
+            raise RuntimeError("voix espeak-ng inconnue : %s" % voix)
+
+    def _proposition(self, texte):
+        ct = self.ct
+        tampon = ct.create_string_buffer(texte.encode("utf-8"))
+        ptr = ct.c_void_p(ct.addressof(tampon))
+        morceaux = []
+        while ptr.value:
+            r = self.lib.espeak_TextToPhonemes(ct.byref(ptr), 1, 0x02)   # UTF-8 -> API
+            if r:
+                morceaux.append(r.decode("utf-8"))
+        return " ".join(m.strip() for m in morceaux if m.strip())
+
+    def phrases(self, texte):
+        """[[phonemes de la phrase 1], [phrase 2], ...] -- des caracteres NFD."""
+        sortie, courante = [], ""
+        for bout, ponct in re.findall(r"([^.?!,:;\u2026]+)([.?!,:;\u2026]*)", texte):
+            if not bout.strip():
+                continue
+            p = self._proposition(bout.strip())
+            if not p:
+                continue
+            signe = self.PONCTUATION.get(ponct[:1], "") if ponct else ""
+            courante += p + signe
+            if ponct[:1] in (".", "?", "!", "\u2026"):
+                sortie.append(list(unicodedata.normalize("NFD", courante)))
+                courante = ""
+            else:
+                courante += " "
+        if courante.strip():
+            sortie.append(list(unicodedata.normalize("NFD", courante.rstrip())))
+        return sortie
+
+
+class Synthese:
+    """Une voix Piper (un modele VITS en ONNX), chargee UNE fois : chaque phrase
+    ne coute plus que son calcul -- quelques dizaines de millisecondes."""
+
+    def __init__(self, modele, phonemiseur, fils=2, locuteur=0):
+        import numpy as np
+        import onnxruntime as rt
+        self.np = np
+        with open(modele + ".json", encoding="utf-8") as f:
+            self.config = json.load(f)
+        o = rt.SessionOptions()
+        o.intra_op_num_threads = max(1, int(fils))
+        o.inter_op_num_threads = 1
+        self.session = rt.InferenceSession(modele, o, providers=["CPUExecutionProvider"])
+        self.entrees = {i.name for i in self.session.get_inputs()}
+        self.ids = self.config["phoneme_id_map"]
+        self.frequence = int(self.config["audio"]["sample_rate"])
+        inf = self.config.get("inference", {})
+        self.bruit = float(inf.get("noise_scale", 0.667))
+        self.bruit_w = float(inf.get("noise_w", 0.8))
+        self.multi = int(self.config.get("num_speakers", 1)) > 1
+        self.phonemiseur = phonemiseur
+        self.locuteur = int(locuteur or 0)
+
+    def identifiants(self, phonemes):
+        """Comme piper : ^ _ p1 _ p2 _ ... pn _ $ ; un phoneme inconnu est saute."""
+        pad, ids = self.ids["_"], list(self.ids["^"]) + list(self.ids["_"])
+        for p in phonemes:
+            if p in self.ids:
+                ids += list(self.ids[p]) + list(pad)
+        return ids + list(self.ids["$"])
+
+    def phrase(self, phonemes, lenteur=1.0, bruit=None, bruit_w=None, locuteur=None):
+        """Le son d'une phrase : int16 normalise comme piper (crete a 32767)."""
+        np = self.np
+        ids = self.identifiants(phonemes)
+        entrees = {"input": np.array([ids], dtype=np.int64),
+                   "input_lengths": np.array([len(ids)], dtype=np.int64),
+                   "scales": np.array([self.bruit if bruit is None else bruit, float(lenteur),
+                                       self.bruit_w if bruit_w is None else bruit_w], dtype=np.float32)}
+        if self.multi and "sid" in self.entrees:
+            entrees["sid"] = np.array([self.locuteur if locuteur is None else int(locuteur)],
+                                      dtype=np.int64)
+        son = self.session.run(None, entrees)[0].reshape(-1)
+        crete = max(0.01, float(np.max(np.abs(son))))
+        return np.clip(son * (32767.0 / crete), -32768, 32767).astype(np.int16)
+
+    def phrases(self, texte, lenteur=1.0, **kw):
+        """Genere le son phrase par phrase : on joue la premiere pendant que
+        la suivante se calcule."""
+        for ph in self.phonemiseur.phrases(texte):
+            yield self.phrase(ph, lenteur, **kw)
 
 
 def texte_pour_piper(texte):
@@ -845,7 +1020,7 @@ class Oreille:
             self.phrase = Phrase(self.det.parle, attente=float(c.get("attente", 5.0)),
                                  ignorer=float(c.get("ignorer", 0.35)))
             self.etat = "phrase"
-        elif cmd == "annuler":
+        elif cmd == "annuler":  # l'oreille : on laisse tomber ce qu'on ecoutait
             self.phrase, self.appris, self.etat = None, None, "veille"
         elif cmd == "apprendre":
             # PAS DE BIP ICI : la fenetre du modele couvre 775 ms, un bip juste
@@ -968,6 +1143,139 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None):
                 if not vivant.is_set():
                     break
                 time.sleep(0.1)
+    try:
+        s.close()
+    except Exception:
+        pass
+
+
+# ======================================================================
+#  LA VOIX -- LE PROCESSUS QUI PARLE
+#
+#  Le modele reste charge tant que Jarvis ecoute : une reponse ne paie plus
+#  le demarrage d'un programme ni le chargement d'une voix, seulement le
+#  calcul de sa premiere phrase (trente millisecondes pour une voix legere),
+#  pendant que la suivante se calcule. « Stop » coupe au dixieme de seconde.
+# ======================================================================
+
+def haut_parleur_windows(frequence):
+    import soundcard as sc
+    return sc.default_speaker().player(samplerate=frequence, channels=1)
+
+
+class Bouche:
+    """Dit des textes, un a la fois, et s'arrete net quand on le lui demande.
+    `lecteur(frequence)` rend un gestionnaire de contexte qui a `play(float32)`."""
+
+    def __init__(self, synthese, sortie, lecteur=None, silence=0.2):
+        self.syn = synthese
+        self.sortie = sortie
+        self.lecteur = lecteur or haut_parleur_windows
+        self.silence = silence
+        self.couper = threading.Event()
+
+    def dire(self, ident, texte, lenteur=1.0):
+        import numpy as np
+        self.couper.clear()
+        file_ = queue.Queue(maxsize=3)
+        fin = object()
+
+        def produire():
+            try:
+                for son in self.syn.phrases(texte_pour_piper(texte), lenteur):
+                    if self.couper.is_set():
+                        break
+                    file_.put(son)
+            except Exception as e:
+                file_.put(e)
+            file_.put(fin)
+
+        threading.Thread(target=produire, daemon=True).start()
+        pas = self.syn.frequence // 10
+        coupe, premiere = False, True
+        with self.lecteur(self.syn.frequence) as hp:
+            while True:
+                son = file_.get()
+                if son is fin:
+                    break
+                if isinstance(son, Exception):
+                    self.sortie({"evt": "erreur", "message": "synthese : %s" % str(son)[:160]})
+                    break
+                if premiere:
+                    self.sortie({"evt": "debut", "id": ident})
+                    premiere = False
+                son = np.concatenate([son, np.zeros(int(self.silence * self.syn.frequence), np.int16)])
+                for i in range(0, len(son), pas):
+                    if self.couper.is_set():
+                        coupe = True
+                        break
+                    hp.play(son[i:i + pas].astype(np.float32) / 32768.0)
+                if coupe:
+                    break
+        # Le producteur peut attendre une place dans la file : on la vide.
+        while not file_.empty():
+            try:
+                file_.get_nowait()
+            except queue.Empty:
+                break
+        self.sortie({"evt": "fini", "id": ident, "coupe": coupe})
+
+
+def voix_enfant(port, secret, lecteur=None):
+    """Le processus de la voix. Attend « charger », puis des « dire »."""
+    s = socket.create_connection(("127.0.0.1", int(port)), timeout=30)
+    s.settimeout(None)
+    s.sendall(struct.pack(">I", len(secret)) + str(secret).encode())
+    verrou = threading.Lock()
+    commandes = queue.Queue()
+    etat = {"bouche": None}
+
+    def sortie(ev):
+        try:
+            envoyer(s, ev, verrou)
+        except Exception:
+            pass
+
+    def lire():
+        try:
+            while True:
+                c = recevoir(s)
+                if c is None:
+                    break
+                # « taire » n'attend pas son tour : il coupe la phrase en cours.
+                if c.get("cmd") == "taire":
+                    if etat["bouche"] is not None:
+                        etat["bouche"].couper.set()
+                    while True:
+                        try:
+                            commandes.get_nowait()
+                        except queue.Empty:
+                            break
+                    continue
+                commandes.put(c)
+        except Exception:
+            pass
+        if etat["bouche"] is not None:
+            etat["bouche"].couper.set()
+        commandes.put(None)
+
+    threading.Thread(target=lire, daemon=True).start()
+    while True:
+        c = commandes.get()
+        if c is None:
+            break
+        try:
+            if c.get("cmd") == "charger":
+                ph = Phonemiseur(c["bibliotheque"], c["donnees"], c.get("espeak", "fr"))
+                syn = Synthese(c["modele"], ph, c.get("fils", 2), c.get("locuteur", 0))
+                etat["bouche"] = Bouche(syn, sortie, lecteur, float(c.get("silence", 0.2)))
+                sortie({"evt": "pret", "frequence": syn.frequence})
+            elif c.get("cmd") == "dire" and etat["bouche"] is not None:
+                etat["bouche"].dire(c.get("id"), c.get("texte", ""), float(c.get("lenteur", 1.0)))
+        except Exception as e:
+            sortie({"evt": "erreur", "message": "%s : %s" % (type(e).__name__, str(e)[:160])})
+            if c.get("cmd") == "dire":
+                sortie({"evt": "fini", "id": c.get("id"), "coupe": False, "rate": True})
     try:
         s.close()
     except Exception:

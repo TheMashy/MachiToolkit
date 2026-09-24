@@ -116,7 +116,7 @@ class Commandes(unittest.TestCase):
         self.assertEqual(self.action("synchronise"), "synchro")
         self.assertEqual(self.action("Stop."), "silence")
         self.assertEqual(self.action("tais-toi"), "silence")
-        self.assertEqual(self.action("Laisse tomber."), "annuler")
+        self.assertEqual(self.action("Laisse tomber."), "fin")
         self.assertEqual(self.action("arrête d'écouter"), "dormir")
         self.assertEqual(self.action("s'il te plaît, quelle heure est-il"), "heure")
 
@@ -146,6 +146,35 @@ class Commandes(unittest.TestCase):
         a = J.comprendre("Ouvre Spotify.", r)
         self.assertEqual((a["action"], a["cible"]), ("ouvrir", "spotify:"))
         self.assertIsNone(J.comprendre("ouvre spotifyyy", r))
+
+
+class FinEtModes(unittest.TestCase):
+    def test_la_fin_d_une_conversation(self):
+        for t in ("Non rien.", "Oublie.", "Dégage !", "non merci c'est tout", "laisse tomber",
+                  "rien", "merci Jarvis", "Non, c'est bon.", "oublie ça", "Casse-toi.", "au revoir",
+                  "bon, rien", "ça ira, merci"):
+            self.assertTrue(J.fin_de_conversation(t), t)
+        for t in ("j'ai rien fait de la journée", "oublie pas de me rappeler le rendez-vous",
+                  "rien ne va aujourd'hui", "je voudrais que tu dégages ce bug de mon code",
+                  "merci pour tout ce que tu fais, vraiment, ça compte beaucoup pour moi"):
+            self.assertFalse(J.fin_de_conversation(t), t)
+
+    def test_vers_le_mode_psy(self):
+        for t, reste in (("Psychologue.", ""), ("Passe en mode psy", ""), ("notes psy", ""),
+                         ("Notes.", ""), ("Mets-toi en mode psychologue s'il te plaît", ""),
+                         ("Psychologue, j'ai mal dormi cette nuit.", "j'ai mal dormi cette nuit."),
+                         ("Note que j'ai pris mon traitement à 9h.", "Note que j'ai pris mon traitement à 9h."),
+                         ("Prends une note : appeler le médecin", "Prends une note : appeler le médecin")):
+            self.assertEqual(J.changement_de_mode(t), ("psy", reste), t)
+
+    def test_retour_a_jarvis(self):
+        for t in ("mode Jarvis", "Quitte le mode psy.", "reviens en mode normal", "sors du mode psychologue"):
+            self.assertEqual(J.changement_de_mode(t), ("jarvis", ""), t)
+
+    def test_pas_de_bascule_par_hasard(self):
+        for t in ("je note que ça va mieux", "les notes de cours", "j'ai vu mon psy hier",
+                  "c'est un truc de psychologue ça", "combien font 12 fois 12"):
+            self.assertIsNone(J.changement_de_mode(t), t)
 
 
 class MotEveil(unittest.TestCase):
@@ -213,17 +242,24 @@ class SonsEtCouleurs(unittest.TestCase):
         # de la parole (voir Phrase), et il ne doit pas masquer le debut.
         self.assertLess(J.duree_son("eveil"), 0.2)
 
-    def test_une_couleur_par_etat(self):
-        vus = set()
-        for etat in ("ecoute", "comprend", "pense", "parle", "fait", "erreur"):
+    def test_jarvis_orange_psy_bleu(self):
+        """« De base Jarvis est orange, le mode psychologue est bleu. » L'etat
+        se lit dans le mouvement, le mode dans la teinte."""
+        for etat in ("ecoute", "comprend", "pense", "parle"):
             for t in (0.0, 0.3, 1.1, 2.7):
-                rvb, gain = J.couleur_etat(etat, t)
+                (r, v, b), gain = J.couleur_etat(etat, t, mode="jarvis")
                 self.assertTrue(0.05 <= gain <= 1.0)
-                self.assertTrue(all(0 <= c <= 255 for c in rvb))
-            vus.add(J.COULEURS[etat])
-        self.assertEqual(len(vus), 6, "chaque etat se distingue a l'oeil")
+                self.assertGreater(r, b, "orange : %s" % etat)
+                (r, v, b), _ = J.couleur_etat(etat, t, mode="psy")
+                self.assertGreater(b, r, "bleu : %s" % etat)
+        # Le mouvement differe d'un etat a l'autre.
+        gains = {e: tuple(round(J.couleur_etat(e, t / 7.0)[1], 3) for t in range(14))
+                 for e in ("ecoute", "comprend", "pense", "parle")}
+        self.assertEqual(len(set(gains.values())), 4)
+        self.assertNotEqual(J.COULEURS["fait"], J.COULEURS["erreur"])
         self.assertIsNone(J.couleur_etat("inconnu", 0))
         self.assertEqual(J.couleur_etat("fait", 0, {"fait": "#010203"})[0], (1.0, 2.0, 3.0))
+        self.assertEqual(J.couleur_etat("ecoute", 0.3125, {"psy": "#00FF00"}, "psy")[0], (0.0, 255.0, 0.0))
 
     def test_la_reflexion_ondule(self):
         """« En fonction de sa reflexion » : pendant que le compagnon pense,
@@ -474,12 +510,13 @@ class DansMachiTool(unittest.TestCase):
         m.CFG.update(json.loads(json.dumps(m.CONFIG_DEFAUT)))
         m.CFG.update(pont_site="https://bd.exemple", pont_cle="CLE", jarvis_voix=False)
         m.ETAT["forcage"] = None
-        m.JARVIS.update(led=None, led_fin=0.0, minuteurs=[], etat="attente")
+        m.JARVIS.update(led=None, led_fin=0.0, minuteurs=[], etat="attente", mode="jarvis",
+                        mode_vu=0.0, historique=[], vu=0.0, propose_psy=False)
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
         m.JARVIS_CROCHETS["notifier"] = lambda t, x: self.dit.append(x)
         self._origines = {k: getattr(m, k) for k in ("transcrire", "etat_dictee", "parler_au_compagnon",
-                                                      "jouer_son", "sauver_config")}
+                                                      "parler_a_jarvis", "jouer_son", "sauver_config")}
         m.jouer_son = lambda g: None
         m.sauver_config = lambda cfg: True
         m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
@@ -496,19 +533,98 @@ class DansMachiTool(unittest.TestCase):
         self.m.transcrire = lambda octets: texte
         self.m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), self.m.CFG)
 
+    def espions(self):
+        vus = {"jarvis": [], "psy": []}
+        self.m.parler_a_jarvis = lambda t, cfg: vus["jarvis"].append(t)
+        self.m.parler_au_compagnon = lambda t, cfg: vus["psy"].append(t)
+        return vus
+
     def test_une_commande_reste_ici(self):
-        vus = []
-        self.m.parler_au_compagnon = lambda t, cfg: vus.append(t)
+        vus = self.espions()
         self.phrase("Jarvis, mets la lumière en rouge.")
-        self.assertEqual(vus, [])
+        self.assertEqual(vus, {"jarvis": [], "psy": []})
         self.assertEqual(self.m.ETAT["forcage"]["couleur"], (255, 26, 26))
         self.assertEqual(self.m.JARVIS["led"], "fait")
 
-    def test_le_reste_va_au_compagnon_sans_le_mot(self):
-        vus = []
-        self.m.parler_au_compagnon = lambda t, cfg: vus.append(t)
-        self.phrase("Hey Jarvis, je rentre du sport et je suis crevé.")
-        self.assertEqual(vus, ["je rentre du sport et je suis crevé."])
+    def test_par_defaut_c_est_le_majordome(self):
+        vus = self.espions()
+        self.phrase("Hey Jarvis, combien de mégaoctets dans un gigaoctet ?")
+        self.assertEqual(vus["jarvis"], ["combien de mégaoctets dans un gigaoctet ?"])
+        self.assertEqual(vus["psy"], [])
+
+    def test_psychologue_passe_au_compagnon_et_en_bleu(self):
+        vus = self.espions()
+        self.phrase("Jarvis, psychologue.")
+        self.assertEqual(self.m.JARVIS["mode"], "psy")
+        self.assertEqual(self.dit, ["Mode psychologue. Je vous écoute."])
+        self.phrase("je rentre du sport et je suis crevé")
+        self.assertEqual(vus["psy"], ["je rentre du sport et je suis crevé"])
+        # La guirlande : bleu en mode psy, orange en mode Jarvis.
+        self.m.poser_led("ecoute")
+        (r, v, b), _ = self.m.couleur_jarvis(self.m.CFG)
+        self.assertGreater(b, r)
+        self.m.poser_mode("jarvis")
+        (r, v, b), _ = self.m.couleur_jarvis(self.m.CFG)
+        self.assertGreater(r, b)
+
+    def test_une_note_part_entiere_au_journal(self):
+        vus = self.espions()
+        self.phrase("Jarvis, note que j'ai pris mon traitement à 9 heures.")
+        self.assertEqual(vus["psy"], ["note que j'ai pris mon traitement à 9 heures."])
+        self.assertEqual(self.m.JARVIS["mode"], "psy")
+
+    def test_non_rien_oublie_degage_terminent(self):
+        for fin in ("Jarvis, non rien.", "oublie", "Dégage !", "non merci c'est tout"):
+            vus = self.espions()
+            self.m.poser_mode("psy")
+            envoye = []
+            self.m.envoyer_oreille = lambda o, e=envoye: e.append(o) or True
+            self.phrase(fin)
+            self.assertEqual(vus, {"jarvis": [], "psy": []}, fin)
+            self.assertEqual(self.m.JARVIS["mode"], "jarvis", fin)
+            self.assertIn({"cmd": "annuler"}, envoye, "il n'ecoute plus la suite")
+        self.assertEqual(self.dit, [], "on se tait, on ne repond pas « au revoir »")
+
+    def test_oui_apres_la_proposition(self):
+        vus = self.espions()
+        self.m.JARVIS["propose_psy"] = True
+        self.phrase("Oui vas-y.")
+        self.assertEqual(self.m.JARVIS["mode"], "psy")
+        self.assertEqual(vus, {"jarvis": [], "psy": []})
+        # Sans proposition, « oui » est une phrase comme une autre.
+        self.m.poser_mode("jarvis")
+        self.phrase("oui")
+        self.assertEqual(vus["jarvis"], ["oui"])
+
+    def test_le_mode_psy_se_referme_seul(self):
+        self.m.poser_mode("psy")
+        self.assertEqual(self.m.mode_courant(), "psy")
+        self.assertEqual(self.m.mode_courant(time.time() + self.m.PSY_DUREE_S + 1), "jarvis")
+
+    def test_le_majordome_par_la_cle_avec_la_conversation(self):
+        self.m.CFG["jarvis_appellation"] = "Alex"
+        with mock_urlopen(self.m, {"texte": "Mille vingt-quatre.", "mode": "jarvis"}) as req:
+            self.phrase("Jarvis, combien de mégaoctets dans un gigaoctet")
+            self.phrase("Jarvis, et en kilo ?")
+        self.assertEqual(req[0].full_url, "https://bd.exemple/api/machitool/jarvis")
+        self.assertEqual(req[0].get_header("Authorization"), "Bearer CLE")
+        premier, second = (json.loads(r.data.decode()) for r in req)
+        self.assertEqual(premier["historique"], [])
+        self.assertEqual(premier["appellation"], "Alex")
+        self.assertEqual([h["role"] for h in second["historique"]], ["user", "assistant"])
+        self.assertEqual(self.dit, ["Mille vingt-quatre.", "Mille vingt-quatre."])
+
+    def test_grave_le_majordome_passe_la_main(self):
+        with mock_urlopen(self.m, {"texte": "Je suis là. On en parle ?", "mode": "psy"}):
+            self.phrase("Jarvis, j'ai envie de mourir")
+        self.assertEqual(self.m.JARVIS["mode"], "psy")
+        self.assertEqual(self.dit, ["Je suis là. On en parle ?"])
+
+    def test_il_propose_le_mode_psy_et_on_s_en_souvient(self):
+        with mock_urlopen(self.m, {"texte": "Voulez-vous que je passe en mode psychologue ?",
+                                   "mode": "jarvis"}):
+            self.phrase("Jarvis, j'ai mal dormi")
+        self.assertTrue(self.m.JARVIS["propose_psy"])
 
     def test_jarvis_tout_seul_attend_la_suite(self):
         self.phrase("Jarvis.")
@@ -517,18 +633,18 @@ class DansMachiTool(unittest.TestCase):
     def test_ce_qui_est_dit_n_est_jamais_journalise(self):
         journal = io.StringIO()
         secret = "mon secret intime numero 7"
-        self.m.parler_au_compagnon = self._origines["parler_au_compagnon"]
-        with mock_urlopen(self.m, {"texte": "Je t'entends."}):
+        with mock_urlopen(self.m, {"texte": "Je t'entends.", "mode": "jarvis"}):
             with redirect_stdout(journal):
                 self.phrase("Jarvis, " + secret)
                 self.phrase("Jarvis, rappelle-moi dans 10 minutes de " + secret)
+                self.phrase("Jarvis, psychologue, " + secret)
         for m_ in self.m.JARVIS["minuteurs"]:
             m_["minuteur"].cancel()
         self.assertNotIn("secret", journal.getvalue())
         self.assertIn("commande minuteur", journal.getvalue())
 
     def test_le_compagnon_recoit_la_phrase_par_la_cle(self):
-        self.m.parler_au_compagnon = self._origines["parler_au_compagnon"]
+        self.m.poser_mode("psy")
         with mock_urlopen(self.m, {"texte": "Bonne soirée."}) as req:
             self.phrase("Jarvis, bonne nuit")
         r = req[0]
@@ -540,7 +656,6 @@ class DansMachiTool(unittest.TestCase):
 
     def test_sans_cle_on_le_dit(self):
         self.m.CFG["pont_cle"] = ""
-        self.m.parler_au_compagnon = self._origines["parler_au_compagnon"]
         self.phrase("Jarvis, raconte-moi une histoire")
         self.assertEqual(self.m.JARVIS["etat"], "erreur")
         self.assertIn("clé", self.m.JARVIS["message"])
@@ -595,11 +710,13 @@ class DansMachiTool(unittest.TestCase):
         m.CFG["jarvis_voix_modele"] = "fr_FR-tom-medium"
         zip_ = io.BytesIO()
         with zipfile.ZipFile(zip_, "w") as z:
-            z.writestr("piper/piper.exe" if os.name == "nt" else "piper/piper", b"exe")
+            z.writestr("piper/" + os.path.basename(m.bibli_espeak()), b"dll")
+            z.writestr("piper/espeak-ng-data/phontab", b"donnees")
         tar_ = io.BytesIO()
         with tarfile.open(fileobj=tar_, mode="w:gz") as t:
             for nom, contenu in (("fr-gilles-low.onnx", b"modele"),
-                                 ("fr-gilles-low.onnx.json", b'{"audio": {"sample_rate": 16000}}')):
+                                 ("fr-gilles-low.onnx.json",
+                                  b'{"audio": {"sample_rate": 16000}, "espeak": {"voice": "fr"}}')):
                 info = tarfile.TarInfo(nom)
                 info.size = len(contenu)
                 t.addfile(info, io.BytesIO(contenu))
@@ -614,18 +731,27 @@ class DansMachiTool(unittest.TestCase):
             raise OSError("inattendu : " + url)
         m.PIPER["etat"] = "absent"
         self.assertTrue(m.preparer_piper(m.CFG, ouvrir))
-        exe, modele, freq = m.piper_pret(m.CFG)
-        self.assertTrue(modele.endswith("fr_FR-gilles-low.onnx"))
-        self.assertEqual(freq, 16000)
+        moteur = m.piper_pret(m.CFG)
+        self.assertTrue(moteur["modele"].endswith("fr_FR-gilles-low.onnx"))
+        self.assertEqual(moteur["frequence"], 16000)
+        self.assertEqual(moteur["espeak"], "fr")
+        self.assertTrue(os.path.isdir(os.path.join(moteur["donnees"], "espeak-ng-data")))
         self.assertIn("secours", m.PIPER["message"])
         m.CFG["jarvis_voix_modele"] = "windows"
         self.assertIsNone(m.piper_pret(m.CFG))
 
-    def test_la_commande_piper(self):
-        c = J.commande_piper("piper.exe", "voix.onnx", 1.08)
-        self.assertEqual(c[:4], ["piper.exe", "--model", "voix.onnx", "--output_raw"])
-        self.assertIn("1.08", c)
-        self.assertIn("1.60", J.commande_piper("p", "v", 9))
+    def test_un_locuteur_pour_les_voix_a_plusieurs(self):
+        m = self.m
+        m.CFG["jarvis_voix_modele"] = "fr_FR-upmc-medium"
+        os.makedirs(os.path.dirname(m.bibli_espeak()))
+        open(m.bibli_espeak(), "wb").write(b"dll")
+        f = m.fichier_voix("fr_FR-upmc-medium")
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        open(f, "wb").write(b"modele")
+        with open(f + ".json", "w") as fj:
+            json.dump({"audio": {"sample_rate": 22050}, "espeak": {"voice": "fr"},
+                       "speaker_id_map": {"jessica": 0, "pierre": 1}}, fj)
+        self.assertEqual(m.piper_pret(m.CFG)["locuteur"], 1)
 
 
 class mock_urlopen:
@@ -801,66 +927,135 @@ class ProcessusReel(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-PIPER_EXE = os.environ.get("JARVIS_PIPER", "")
+PIPER_DOSSIER = os.environ.get("JARVIS_PIPER_DOSSIER", "")     # le dossier « piper » de l'archive
 PIPER_VOIX = os.environ.get("JARVIS_PIPER_VOIX", "")
+PIPER = bool(NUMPY and ONNX and PIPER_DOSSIER and PIPER_VOIX and os.path.isfile(PIPER_VOIX))
 
 
-@unittest.skipUnless(NUMPY and PIPER_EXE and PIPER_VOIX, "JARVIS_PIPER / JARVIS_PIPER_VOIX absents")
-class VoixPiper(unittest.TestCase):
-    """La vraie synthese, jouee dans un faux haut-parleur : elle arrive par
-    morceaux (on parle avant d'avoir tout calcule), et « stop » coupe net."""
+def bibli_de_test():
+    for nom in ("libespeak-ng.so.1", "espeak-ng.dll", "libespeak-ng.dylib"):
+        if os.path.isfile(os.path.join(PIPER_DOSSIER, nom)):
+            return os.path.join(PIPER_DOSSIER, nom)
+    return ""
 
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.m = charger_module(self.tmp)
-        self.joue = []
-        test = self
 
-        class Lecteur:
-            def __enter__(self):
-                return self
+class FauxHautParleur:
+    def __init__(self, test=None, couper_apres=0):
+        self.morceaux, self.test, self.couper_apres, self.frequence = [], test, couper_apres, None
 
-            def __exit__(self, *a):
-                return False
+    def __call__(self, frequence):
+        self.frequence = frequence
+        return self
 
-            def play(self, data):
-                test.joue.append(len(data))
-                if test.couper_apres and len(test.joue) >= test.couper_apres:
-                    test.voix.couper.set()
+    def __enter__(self):
+        return self
 
-        class HautParleur:
-            def player(self, samplerate, channels=1):
-                test.frequence = samplerate
-                return Lecteur()
+    def __exit__(self, *a):
+        return False
 
-        faux = type(sys)("soundcard")
-        faux.default_speaker = lambda: HautParleur()
-        self.avant = sys.modules.get("soundcard")
-        sys.modules["soundcard"] = faux
-        self.voix = self.m.Voix()
-        self.couper_apres = 0
-        self.moteur = (PIPER_EXE, PIPER_VOIX, J.frequence_du_modele(PIPER_VOIX + ".json"))
+    def play(self, data):
+        self.morceaux.append(len(data))
+        if self.couper_apres and len(self.morceaux) >= self.couper_apres:
+            self.test.bouche.couper.set()
 
-    def tearDown(self):
-        if self.avant is not None:
-            sys.modules["soundcard"] = self.avant
-        else:
-            sys.modules.pop("soundcard", None)
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_elle_parle_par_morceaux(self):
-        r = self.voix._piper(J.texte_pour_piper("Bonjour. Tous les systèmes sont opérationnels."),
-                             self.moteur)
-        self.assertTrue(r)
-        secondes = sum(self.joue) / float(self.moteur[2])
-        self.assertGreater(secondes, 1.5)
-        self.assertGreater(len(self.joue), 10, "joue au fil de l'eau, pas d'un bloc")
+@unittest.skipUnless(PIPER, "JARVIS_PIPER_DOSSIER / JARVIS_PIPER_VOIX absents")
+class VoixEnMemoire(unittest.TestCase):
+    """La voix de Jarvis : Piper, le modele charge UNE fois, espeak-ng appele
+    directement. Les memes phonemes que piper.exe, la premiere phrase prete en
+    quelques dizaines de millisecondes, et « stop » qui coupe net."""
 
-    def test_stop_coupe_net(self):
-        self.couper_apres = 3
-        r = self.voix._piper("Une tres longue phrase. " * 20, self.moteur)
-        self.assertIs(r, False)
-        self.assertLessEqual(len(self.joue), 4)
+    @classmethod
+    def setUpClass(cls):
+        cls.ph = J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, "fr")
+        cls.syn = J.Synthese(PIPER_VOIX, cls.ph)
+
+    def test_les_phonemes_de_piper(self):
+        """Releves sur piper.exe --debug : « Bonjour, monsieur. »"""
+        phrases = self.ph.phrases("Bonjour, monsieur.")
+        self.assertEqual(len(phrases), 1)
+        self.assertEqual(self.syn.identifiants(phrases[0]),
+                         [1, 0, 15, 0, 54, 0, 108, 0, 120, 0, 33, 0, 94, 0, 8, 0, 3, 0, 25, 0, 59, 0,
+                          31, 0, 22, 0, 120, 0, 42, 0, 10, 0, 2])
+
+    def test_une_phrase_a_la_fois_et_vite(self):
+        sons = self.syn.phrases("Très bien. Minuteur de dix minutes, lancé. Autre chose ?", 0.95)
+        t0 = time.time()
+        premiere = next(sons)
+        delai = time.time() - t0
+        self.assertEqual(len(list(sons)), 2, "trois phrases, trois morceaux")
+        self.assertGreater(len(premiere) / float(self.syn.frequence), 0.3)
+        self.assertLess(delai, 1.0, "la premiere phrase doit etre prete tout de suite")
+        self.assertGreater(int(np.max(np.abs(premiere))), 30000, "crete normalisee, comme piper")
+
+    def test_la_bouche_parle_par_morceaux_et_se_tait(self):
+        hp = FauxHautParleur()
+        evts = []
+        self.bouche = J.Bouche(self.syn, evts.append, hp)
+        self.bouche.dire(7, "Bonjour. Tous les systèmes sont opérationnels.")
+        self.assertEqual([e["evt"] for e in evts], ["debut", "fini"])
+        self.assertFalse(evts[-1]["coupe"])
+        self.assertGreater(len(hp.morceaux), 15, "joue par dixiemes de seconde")
+        hp2 = FauxHautParleur(self, couper_apres=3)
+        evts.clear()
+        self.bouche = J.Bouche(self.syn, evts.append, hp2)
+        self.bouche.dire(8, "Une tres longue phrase. " * 12)
+        self.assertEqual(evts[-1], {"evt": "fini", "id": 8, "coupe": True})
+        self.assertLessEqual(len(hp2.morceaux), 4)
+
+    def test_le_processus_de_la_voix(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        hp = FauxHautParleur()
+        fil = threading.Thread(target=J.voix_enfant, args=(srv.getsockname()[1], "S3CRET", hp), daemon=True)
+        fil.start()
+        c, _ = srv.accept()
+        srv.close()
+        taille = int.from_bytes(c.recv(4), "big")
+        self.assertEqual(c.recv(taille), b"S3CRET")
+        J.envoyer(c, {"cmd": "charger", "bibliotheque": bibli_de_test(), "donnees": PIPER_DOSSIER,
+                      "modele": PIPER_VOIX, "espeak": "fr"})
+        self.assertEqual(J.recevoir(c)["evt"], "pret")
+        J.envoyer(c, {"cmd": "dire", "id": 1, "texte": "Mode psychologue. Je vous écoute."})
+        self.assertEqual(J.recevoir(c), {"evt": "debut", "id": 1})
+        self.assertEqual(J.recevoir(c), {"evt": "fini", "id": 1, "coupe": False})
+        J.envoyer(c, None)
+        c.close()
+        fil.join(5)
+        self.assertFalse(fil.is_alive())
+
+    def test_de_machi_tool_a_la_voix(self):
+        """Machi Tool lance le processus de la voix, la voix se charge, une
+        phrase part, et la fin revient -- c'est elle qui relance l'ecoute."""
+        tmp = tempfile.mkdtemp()
+        try:
+            m = charger_module(tmp)
+            m.DOSSIER = tmp
+            script = os.path.join(tmp, "voix.py")
+            with open(script, "w", encoding="utf-8") as f:
+                f.write("import sys\nsys.path.insert(0, %r)\nsys.path.insert(0, %r)\n"
+                        "import jarvis as J\nfrom test_jarvis import FauxHautParleur\n"
+                        "J.voix_enfant(sys.argv[1], sys.argv[2], FauxHautParleur())\n"
+                        % (RACINE, os.path.dirname(os.path.abspath(__file__))))
+            m._commande_voix = lambda port, secret: [sys.executable, script, str(port), secret]
+            m.piper_pret = lambda cfg: {"nom": "essai", "bibliotheque": bibli_de_test(),
+                                        "donnees": PIPER_DOSSIER, "modele": PIPER_VOIX,
+                                        "frequence": 16000, "espeak": "fr", "locuteur": 0}
+            self.assertTrue(m.demarrer_voix(m.CFG))
+            fin = time.time() + 30
+            while time.time() < fin and not m.voix_prete():
+                time.sleep(0.05)
+            self.assertTrue(m.voix_prete())
+            dit = threading.Event()
+            t0 = time.time()
+            m.VOIX.dire("Bonjour. Tous les systèmes sont opérationnels.", dit.set)
+            self.assertTrue(dit.wait(20))
+            self.assertLess(time.time() - t0, 5)
+            m.arreter_voix()
+            self.assertFalse(m.voix_prete())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
