@@ -41,6 +41,14 @@ jobs:
       # et des voix de synthese (espeak-ng) -- « Hey Jarvis » le reveille, une
       # conversation non, et « Jarvis » appris a la francaise le reveille sans
       # que « j'arrive » ou « Travis » le fassent.
+      # Sa voix anglaise (Kokoro, 340 Mo) : en cache, pour ne pas la retelecharger a
+      # chaque poussee. Les fichiers sont versionnes par leur nom.
+      - name: La voix anglaise, en cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kokoro
+          key: kokoro-v1.0-float32
+
       - name: Jarvis ecoute, n'entend que son nom, et parle
         run: |
           sudo apt-get install -y -qq espeak-ng >/dev/null
@@ -54,9 +62,17 @@ jobs:
           curl -sSfL "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz" | tar xz -C "$RUNNER_TEMP"
           mkdir -p "$RUNNER_TEMP/voix"
           curl -sSfL "https://github.com/rhasspy/piper/releases/download/v0.0.2/voice-fr-gilles-low.tar.gz" | tar xz -C "$RUNNER_TEMP/voix"
+          # Et Kokoro, la voix anglaise de Jarvis : le vrai modele, en memoire, avec
+          # l'espeak-ng de Piper -- et les deux langues dans un processus.
+          mkdir -p "$HOME/.cache/kokoro"
+          for f in kokoro-v1.0.onnx voices-v1.0.bin; do
+            [ -s "$HOME/.cache/kokoro/$f" ] || curl -sSfL -o "$HOME/.cache/kokoro/$f" \
+              "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/$f"
+          done
           JARVIS_MODELES="$RUNNER_TEMP/oww" \
           JARVIS_PIPER_DOSSIER="$RUNNER_TEMP/piper" \
           JARVIS_PIPER_VOIX="$RUNNER_TEMP/voix/fr-gilles-low.onnx" \
+          JARVIS_KOKORO_DOSSIER="$HOME/.cache/kokoro" \
             python outils/test_jarvis.py
 
       # Le panneau montre ce que la guirlande EMET, a sa cadence : la couleur

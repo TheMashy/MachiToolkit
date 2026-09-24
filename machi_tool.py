@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.29.0"
+VERSION = "1.30.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -339,8 +339,14 @@ CONFIG_DEFAUT = {
     "jarvis_son": True,               # le petit son quand il s'allume
     "jarvis_leds": True,              # la guirlande dit ou il en est
     "jarvis_voix": True,              # il repond a voix haute
-    "jarvis_voix_modele": "fr_FR-tom-medium",   # une voix Piper, ou "windows"
-    "jarvis_lenteur": 0.95,           # Piper : > 1 plus pose, < 1 plus vif
+    "jarvis_voix_modele": "fr_FR-tom-medium",   # la voix FRANCAISE (Piper) : le mode psy, ou "windows"
+    # « And in English as well » : Jarvis repond en anglais, avec Kokoro -- une
+    # voix d'homme britannique, pas celle d'un acteur. Le mode psy reste en
+    # francais, avec la voix du dessus. "fr" remet Jarvis en francais.
+    "jarvis_langue": "en",
+    "jarvis_voix_kokoro": "jarvis",   # sa voix anglaise, voir VOIX_KOKORO dans jarvis.py
+    "jarvis_astuce_voix": False,      # il a deja dit comment l'appeler par « Jarvis » tout seul
+    "jarvis_lenteur": 0.95,           # > 1 plus pose, < 1 plus vif (Piper et Kokoro)
     "jarvis_appellation": "",         # comment Jarvis vous appelle ; vide = ni Monsieur ni Madame
     "jarvis_debit": 0,                # voix de Windows : -10 .. 10
     "jarvis_suite": True,             # apres sa reponse, il ecoute encore 5 s sans mot d'eveil
@@ -4350,6 +4356,10 @@ JARVIS = {
     "historique": [],         # la conversation en cours avec le majordome
     "vu": 0.0,                # dernier echange
     "propose_psy": False,     # il vient de proposer le mode psy : « oui » y passe
+    # La seance en cours avec le psychologue, en memoire seulement (jamais sur
+    # le disque) : a l'« au revoir », Jarvis se tait si c'etait lourd.
+    "psy_echange": [],
+    "psy_grave": False,       # un message grave y est passe : alors il se tait, toujours
 }
 _OREILLE = {"proc": None, "sock": None, "echecs": 0, "prochain": 0.0}
 _OREILLE_VERROU = threading.Lock()
@@ -4506,7 +4516,8 @@ def piper_pret(cfg):
     return None
 
 
-def _telecharger(url, dst, ouvrir, part=None):
+def _telecharger(url, dst, ouvrir, part=None, etat=None):
+    etat = PIPER if etat is None else etat
     with ouvrir(url) as r, open(dst + ".part", "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         recu = 0
@@ -4517,8 +4528,22 @@ def _telecharger(url, dst, ouvrir, part=None):
             f.write(bout)
             recu += len(bout)
             if part and total:
-                PIPER["progres"] = part[0] + (part[1] - part[0]) * recu / total
+                etat["progres"] = part[0] + (part[1] - part[0]) * recu / total
     os.replace(dst + ".part", dst)
+
+
+def _preparer_espeak(ouvrir, part=(0.0, 0.3), etat=None):
+    """espeak-ng et ses donnees : l'archive du moteur Piper (21 Mo). Les deux
+    voix en ont besoin -- c'est lui qui fait les phonemes."""
+    if os.path.isfile(bibli_espeak()):
+        return
+    import zipfile
+    os.makedirs(dossier_piper(), exist_ok=True)
+    archive = os.path.join(dossier_piper(), "piper.zip")
+    _telecharger(_jv.PIPER_MOTEUR, archive, ouvrir, part, etat)
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(dossier_piper())
+    os.remove(archive)
 
 
 def preparer_piper(cfg, ouvrir=None):
@@ -4535,16 +4560,11 @@ def preparer_piper(cfg, ouvrir=None):
         ouvrir = ouvrir or (lambda url: urllib.request.urlopen(url, timeout=60, context=_contexte_ssl()))
         PIPER.update(etat="preparation", progres=0.0, message="")
         try:
-            import zipfile
             import tarfile
             os.makedirs(dossier_piper(), exist_ok=True)
             os.makedirs(os.path.dirname(fichier_voix(nom)), exist_ok=True)
-            if not os.path.isfile(bibli_espeak()):
-                archive = os.path.join(dossier_piper(), "piper.zip")
-                _telecharger(_jv.PIPER_MOTEUR, archive, ouvrir, (0.0, 0.3))
-                with zipfile.ZipFile(archive) as z:
-                    z.extractall(dossier_piper())
-                os.remove(archive)
+            with _ESPEAK_VERROU:
+                _preparer_espeak(ouvrir, (0.0, 0.3))
             for n in (nom, _jv.VOIX_SECOURS):
                 if voix_presente(n):
                     break
@@ -4587,8 +4607,102 @@ def preparer_piper(cfg, ouvrir=None):
             return False
 
 
+# ---------- la voix anglaise de Jarvis : Kokoro ----------
+
+KOKORO = {"etat": "absent", "progres": 0.0, "message": ""}
+_KOKORO_VERROU = threading.Lock()
+_ESPEAK_VERROU = threading.Lock()     # les deux preparations peuvent vouloir l'archive en meme temps
+
+
+def langue_jarvis(cfg):
+    return "fr" if str(cfg.get("jarvis_langue", "en")) == "fr" else "en"
+
+
+def dossier_kokoro():
+    return os.path.join(dossier_jarvis(), "kokoro")
+
+
+def fichier_kokoro(nom):
+    return os.path.join(dossier_kokoro(), nom)
+
+
+def kokoro_present():
+    """Les deux fichiers, a l'octet pres : un telechargement coupe ne passe
+    jamais pour complet."""
+    return all(os.path.isfile(fichier_kokoro(n)) and os.path.getsize(fichier_kokoro(n)) == taille
+               for n, taille in _jv.KOKORO_TAILLES.items())
+
+
+def voix_kokoro_choisie(cfg):
+    v = str(cfg.get("jarvis_voix_kokoro") or _jv.KOKORO_DEFAUT)
+    return v if v in _jv.VOIX_KOKORO else _jv.KOKORO_DEFAUT
+
+
+def fils_kokoro():
+    """La moitie des coeurs, entre deux et six : la phrase suivante se calcule
+    pendant que la premiere se dit, sans prendre le PC."""
+    return max(2, min(6, (os.cpu_count() or 4) // 2))
+
+
+def kokoro_pret(cfg):
+    """De quoi charger la voix anglaise, ou None."""
+    if langue_jarvis(cfg) != "en" or not kokoro_present() or not os.path.isfile(bibli_espeak()):
+        return None
+    return {"cle": "en", "moteur": "kokoro", "bibliotheque": bibli_espeak(),
+            "donnees": os.path.join(dossier_piper(), "piper"), "espeak": _jv.KOKORO_ESPEAK,
+            "modele": fichier_kokoro(_jv.KOKORO_MODELE), "voix_fichier": fichier_kokoro(_jv.KOKORO_VOIX),
+            "voix": voix_kokoro_choisie(cfg), "fils": fils_kokoro()}
+
+
+def preparer_kokoro(cfg, ouvrir=None):
+    """Le modele (310 Mo) et les voix (27 Mo), une fois, depuis GitHub -- et
+    espeak-ng, l'archive de Piper, s'il n'est pas deja la."""
+    with _KOKORO_VERROU:
+        if kokoro_present() and os.path.isfile(bibli_espeak()):
+            KOKORO.update(etat="pret", progres=1.0, message="")
+            return True
+        ouvrir = ouvrir or (lambda url: urllib.request.urlopen(url, timeout=60, context=_contexte_ssl()))
+        KOKORO.update(etat="preparation", progres=0.0, message="")
+        try:
+            os.makedirs(dossier_kokoro(), exist_ok=True)
+            with _ESPEAK_VERROU:
+                _preparer_espeak(ouvrir, (0.0, 0.06), KOKORO)
+            for nom, part in ((_jv.KOKORO_VOIX, (0.06, 0.14)), (_jv.KOKORO_MODELE, (0.14, 1.0))):
+                dst = fichier_kokoro(nom)
+                if os.path.isfile(dst) and os.path.getsize(dst) == _jv.KOKORO_TAILLES[nom]:
+                    continue
+                _telecharger(_jv.KOKORO_SOURCE + nom, dst, ouvrir, part, KOKORO)
+                if os.path.getsize(dst) != _jv.KOKORO_TAILLES[nom]:
+                    os.remove(dst)
+                    raise RuntimeError("%s : pas la taille attendue" % nom)
+            KOKORO.update(etat="pret", progres=1.0, message="")
+            return True
+        except Exception as e:
+            KOKORO.update(etat="erreur", message="Voix anglaise non telechargee : %s" % str(e)[:120])
+            print("Jarvis : voix anglaise indisponible (%s)" % e)
+            return False
+
+
+def charges_voix(cfg):
+    """Ce que porte le processus de la voix : l'anglais de Jarvis (Kokoro) et
+    le francais du mode psy (Piper), chacun s'il est la."""
+    out = []
+    k = kokoro_pret(cfg)
+    if k:
+        out.append(k)
+    p = piper_pret(cfg)
+    if p:
+        out.append(dict(p, cle="fr", moteur="piper", fils=2))
+    return out
+
+
+def signature_voix(charges):
+    return "|".join("%s:%s:%s" % (c["cle"], c["modele"], c.get("voix", c.get("locuteur", "")))
+                    for c in charges)
+
+
 VOIX_ENFANT_ARG = "--voix"
-_VOIX_ENFANT = {"proc": None, "sock": None, "pret": False, "charge": None,
+_VOIX_ENFANT = {"proc": None, "sock": None, "pret": False, "pretes": set(), "charge": None,
                 "echecs": 0, "prochain": 0.0}
 _VOIX_VERROU = threading.Lock()
 
@@ -4598,10 +4712,13 @@ def _commande_voix(port, secret):
     return base + [VOIX_ENFANT_ARG, str(port), secret]
 
 
-def voix_prete():
+def voix_prete(cle=None):
+    """Une voix chargee -- celle de cette langue, si on la nomme."""
     p = _VOIX_ENFANT["proc"]
-    return (p is not None and p.poll() is None and _VOIX_ENFANT["sock"] is not None
-            and _VOIX_ENFANT["pret"])
+    if not (p is not None and p.poll() is None and _VOIX_ENFANT["sock"] is not None
+            and _VOIX_ENFANT["pret"]):
+        return False
+    return cle is None or cle in _VOIX_ENFANT["pretes"]
 
 
 def envoyer_voix(objet):
@@ -4616,24 +4733,23 @@ def envoyer_voix(objet):
 
 
 def demarrer_voix(cfg):
-    """Le processus de la voix, avec la voix choisie chargee UNE fois."""
+    """Le processus de la voix, avec ses voix chargees UNE fois : l'anglais
+    de Jarvis d'abord (c'est lui qui parle le plus), le francais ensuite."""
     arreter_voix()
-    moteur = piper_pret(cfg)
-    if not moteur:
+    charges = charges_voix(cfg)
+    if not charges:
         return False
     proc, sock = _lancer_enfant(lambda port, secret: _commande_voix(port, secret), "de la voix")
-    _VOIX_ENFANT.update(proc=proc, sock=sock, pret=False, charge=moteur["modele"])
+    _VOIX_ENFANT.update(proc=proc, sock=sock, pret=False, pretes=set(), charge=signature_voix(charges))
     threading.Thread(target=_lire_voix, args=(sock,), daemon=True).start()
-    envoyer_voix({"cmd": "charger", "bibliotheque": moteur["bibliotheque"],
-                  "donnees": moteur["donnees"], "modele": moteur["modele"],
-                  "espeak": moteur["espeak"], "locuteur": moteur["locuteur"],
-                  "silence": 0.2, "fils": 2})
+    for c in charges:
+        envoyer_voix(dict({"cmd": "charger", "silence": 0.2}, **c))
     return True
 
 
 def arreter_voix():
     sock, proc = _VOIX_ENFANT["sock"], _VOIX_ENFANT["proc"]
-    _VOIX_ENFANT.update(sock=None, proc=None, pret=False, charge=None)
+    _VOIX_ENFANT.update(sock=None, proc=None, pret=False, pretes=set(), charge=None)
     _fermer_enfant(sock, proc)
     VOIX.enfant_perdu()
 
@@ -4651,11 +4767,19 @@ def _lire_voix(sock):
             break
         quoi = ev.get("evt")
         if quoi == "pret":
+            _VOIX_ENFANT["pretes"].add(str(ev.get("cle") or "fr"))
             _VOIX_ENFANT.update(pret=True, echecs=0)
+            if ev.get("cle") == "en":
+                KOKORO.update(etat="pret", message="")
         elif quoi == "fini":
             VOIX.fini(ev.get("id"), bool(ev.get("coupe")))
         elif quoi == "erreur":
             print("Jarvis : voix : %s" % str(ev.get("message"))[:200])
+            # La voix anglaise n'a pas pu se charger : on le DIT, au lieu de
+            # laisser Jarvis parler avec la voix de Windows sans explication.
+            if ev.get("cle") == "en":
+                KOKORO.update(etat="erreur", message="Voix anglaise impossible a charger : %s"
+                              % str(ev.get("message"))[:120])
     if _VOIX_ENFANT["sock"] is sock:
         # Tombee sans qu'on l'arrete : la voix de Windows prend le relais, et
         # celle-ci repart plus tard, de plus en plus lentement.
@@ -4689,18 +4813,24 @@ class Voix:
     def peut_parler(self):
         return voix_prete() or self.disponible
 
-    def dire(self, texte, fin=None):
-        texte = _jv.texte_pour_piper(texte)
+    def dire(self, texte, fin=None, langue="fr"):
+        """UNE VOIX PAR LANGUE : l'anglais par Kokoro, le francais par Piper.
+        Si celle de la langue n'est pas chargee, la voix de Windows DANS CETTE
+        LANGUE -- une voix francaise qui lit de l'anglais est pire qu'un GPS."""
+        langue = "en" if langue == "en" else "fr"
+        texte = _jv.texte_pour_piper(texte, langue)
         if not texte:
             if fin:
                 fin()
             return
-        if voix_prete():
+        cle = langue if voix_prete(langue) else (None if self.disponible else
+                                                  ("fr" if voix_prete("fr") else "en" if voix_prete("en") else None))
+        if cle:
             self.n += 1
             ident = self.n
             self.attentes[ident] = fin
             self.parle = True
-            if envoyer_voix({"cmd": "dire", "id": ident, "texte": texte,
+            if envoyer_voix({"cmd": "dire", "id": ident, "texte": texte, "cle": cle,
                              "lenteur": float(CFG.get("jarvis_lenteur", 0.95))}):
                 return
             self.attentes.pop(ident, None)
@@ -4708,7 +4838,7 @@ class Voix:
             if fin:
                 fin()
             return
-        self.file.append((texte, fin))
+        self.file.append((texte, fin, langue))
         self.signal.set()
         if self.fil is None or not self.fil.is_alive():
             self.fil = threading.Thread(target=self._tourner, daemon=True)
@@ -4743,20 +4873,35 @@ class Voix:
         self.couper.set()
         self.parle = False
 
-    def _sapi(self, texte):
+    # Les voix de Windows a essayer, par langue : l'anglais britannique d'abord
+    # (809), puis l'americain (409) ; le francais (40C).
+    _SAPI_LANGUES = {"fr": ("Language=40C",),
+                     "en": ("Language=809;Gender=Male", "Language=409;Gender=Male", "Language=809",
+                            "Language=409")}
+
+    def _sapi(self, texte, langue="fr"):
         if self.sapi is None:
             import pythoncom
             import win32com.client
             pythoncom.CoInitialize()
-            v = win32com.client.Dispatch("SAPI.SpVoice")
-            try:
-                fr = v.GetVoices("Language=40C")     # une voix francaise, s'il y en a
-                if fr.Count:
-                    v.Voice = fr.Item(0)
-            except Exception:
-                pass
-            self.sapi = v
+            self.sapi = win32com.client.Dispatch("SAPI.SpVoice")
+            self.sapi_voix = {}
+            self.sapi_langue = None
         v = self.sapi
+        if self.sapi_langue != langue:
+            if langue not in self.sapi_voix:
+                self.sapi_voix[langue] = None
+                for requete in self._SAPI_LANGUES.get(langue, ()):
+                    try:
+                        trouvees = v.GetVoices(requete)
+                        if trouvees.Count:
+                            self.sapi_voix[langue] = trouvees.Item(0)
+                            break
+                    except Exception:
+                        pass
+            if self.sapi_voix[langue] is not None:
+                v.Voice = self.sapi_voix[langue]
+            self.sapi_langue = langue
         v.Rate = max(-10, min(10, entier(CFG.get("jarvis_debit", 0), 0)))
         v.Speak(texte, 1)                          # SVSFlagsAsync
         while not v.WaitUntilDone(100):
@@ -4770,12 +4915,12 @@ class Voix:
             self.signal.wait()
             self.signal.clear()
             while self.file:
-                texte, fin = self.file.pop(0)
+                texte, fin, langue = self.file.pop(0)
                 self.couper.clear()
                 self.parle = True
                 dit = True
                 try:
-                    dit = self._sapi(texte)
+                    dit = self._sapi(texte, langue)
                 except Exception as e:
                     print("Jarvis : voix de Windows impossible (%s)" % type(e).__name__)
                 finally:
@@ -4932,6 +5077,11 @@ def traiter_evenement(ev):
         print("Jarvis : eveil (%s)" % ev.get("par"))
         VOIX.taire()
         mode_courant()
+        # « Quand Jarvis s'allume, il doit toujours etre en mode Jarvis (meme
+        # s'il etait en psychologue avant). » La seance continue tant qu'on se
+        # repond sans le rappeler ; l'appeler, c'est revenir au majordome.
+        JARVIS["reveil_par"] = ev.get("par")
+        poser_mode("jarvis")
         poser_led("ecoute")
         JARVIS.update(etat="ecoute", message="Je vous ecoute.")
         # Le moteur de transcription se reveille PENDANT qu'on parle : sa
@@ -5002,13 +5152,19 @@ def veiller_sur_jarvis(cfg):
                 _OREILLE["prochain"] = time.time() + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)]
             if not voulu and JARVIS["etat"] != "eteint" and _OREILLE["proc"] is None:
                 JARVIS.update(etat="eteint", message="")
-            # LA VOIX : un processus a part, la voix chargee tant qu'il ecoute.
+            # LA VOIX : un processus a part, ses voix chargees tant qu'il ecoute.
             # Relancee si elle tombe, rechargee si on en change.
-            veut_voix = voulu and cfg.get("jarvis_voix", True) and voix_choisie(cfg) != "windows"
-            moteur = piper_pret(cfg) if veut_voix else None
-            if moteur and time.time() >= _VOIX_ENFANT["prochain"] and (
+            veut_voix = voulu and cfg.get("jarvis_voix", True)
+            # La voix anglaise se telecharge des qu'elle manque, pas seulement
+            # au demarrage de l'oreille : passer Jarvis en anglais la fait venir.
+            if (veut_voix and langue_jarvis(cfg) == "en" and KOKORO["etat"] == "absent"
+                    and not kokoro_present()):
+                KOKORO["etat"] = "preparation"
+                threading.Thread(target=preparer_kokoro, args=(cfg,), daemon=True).start()
+            charges = charges_voix(cfg) if veut_voix else []
+            if charges and time.time() >= _VOIX_ENFANT["prochain"] and (
                     _VOIX_ENFANT["proc"] is None or _VOIX_ENFANT["proc"].poll() is not None
-                    or _VOIX_ENFANT["charge"] != moteur["modele"]):
+                    or _VOIX_ENFANT["charge"] != signature_voix(charges)):
                 try:
                     demarrer_voix(cfg)
                 except Exception as e:
@@ -5016,7 +5172,7 @@ def veiller_sur_jarvis(cfg):
                     _VOIX_ENFANT.update(echecs=n + 1, prochain=time.time()
                                         + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)])
                     print("Jarvis : voix neuronale impossible (%s)" % e)
-            elif not moteur and _VOIX_ENFANT["proc"] is not None:
+            elif not charges and _VOIX_ENFANT["proc"] is not None:
                 arreter_voix()
         except Exception as e:
             print("Jarvis : veille (%s)" % e)
@@ -5069,12 +5225,76 @@ PSY_DUREE_S = 180            # le mode psy se referme apres trois minutes sans u
 CONVERSATION_S = 300         # au-dela, le majordome oublie la conversation d'avant
 _OUI = {"oui", "ouais", "oui vas y", "vas y", "d'accord", "ok", "okay", "volontiers", "allez",
         "oui merci", "oui s'il te plait", "oui s'il vous plait", "oui stp", "carrement", "bien sur",
-        "oui oui", "ouais vas y", "go", "oui volontiers", "oui je veux bien", "je veux bien"}
+        "oui oui", "ouais vas y", "go", "oui volontiers", "oui je veux bien", "je veux bien",
+        "yes", "yeah", "yep", "sure", "yes please", "please", "please do", "go ahead", "do it",
+        "of course", "absolutely", "certainly", "yes do", "why not", "sounds good", "ok go ahead"}
+
+# CE QUE JARVIS DIT DE LUI-MEME, dans ses deux langues. Le mode psy parle
+# francais (le compagnon est francais) ; le majordome parle la langue choisie.
+_PHRASES = {
+    "oui": ("Oui ?", "Yes?"),
+    "mode_psy": ("Mode psychologue. Je vous écoute.", None),
+    "mode_jarvis": ("Mode Jarvis. À votre service.", "At your service."),
+    "retour": ("Content de vous revoir.", "Welcome back."),
+    "lecture": ("Je n'ai pas pu lire ce que le micro m'a donné.", "I couldn't read what the microphone gave me."),
+    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.",
+                              "Transcription isn't ready yet. Have a look at the Jarvis page in Machi Tool."),
+    "transcription_ratee": ("Pardon, je n'ai pas réussi à transcrire.", "Sorry, I couldn't make that out."),
+    "commande_ratee": ("Je n'ai pas pu le faire, désolé.", "I'm afraid I couldn't do that."),
+    "rate": ("Quelque chose a raté de mon côté.", "Something went wrong on my side, I'm afraid."),
+    "cle_absente": ("Pour vous répondre, il me faut la clé de BrainDebugger : page Passerelle de Machi Tool.",
+                    "To answer you, I need the BrainDebugger key. It's on the Passerelle page of Machi Tool."),
+    "cle_refusee": ("BrainDebugger refuse ma clé.", "BrainDebugger is refusing my key."),
+    "bd_ancien_psy": ("Votre version de BrainDebugger ne sait pas encore m'écouter.", None),
+    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode Jarvis.",
+                         "Your BrainDebugger doesn't know Jarvis mode yet."),
+    "bd_sans_cle": ("BrainDebugger n'a pas de clé Claude pour me faire parler.",
+                    "BrainDebugger has no Claude key to let me speak."),
+    "bd_erreur": ("BrainDebugger a répondu par une erreur %s.", "BrainDebugger answered with error %s."),
+    "bd_injoignable": ("Je n'arrive pas à joindre BrainDebugger.", "I can't reach BrainDebugger."),
+    "compagnon_muet": ("Le compagnon n'a rien répondu.", None),
+    "sans_reponse": ("Je n'ai rien à répondre à cela, curieusement.", "Curiously, I have nothing to say to that."),
+    "dormir": ("Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool.",
+               "Very well. I'll stop listening; you can wake me from Machi Tool."),
+    "annule": ("C'est annulé.", "Cancelled."),
+    "aucun_minuteur": ("Il n'y avait aucun minuteur en cours.", "There were no timers running."),
+    "synchro_coupee": ("L'envoi de votre journée est coupé dans Machi Tool.",
+                       "Sending your day is switched off in Machi Tool."),
+    "synchro": ("J'envoie votre journée à BrainDebugger.", "Sending your day to BrainDebugger."),
+    "minuteur": ("Minuteur de %s, lancé.", "Timer set for %s."),
+    "rappel_pose": ("Entendu. Je vous le rappelle dans %s.", "Very well. I'll remind you in %s."),
+    "rappel": ("Je vous rappelle : %s.", "A reminder: %s."),
+    "minuteur_fini": ("Le minuteur de %s est terminé.", "Your timer for %s is up."),
+    "apprendre": ("Très bien. Chaque fois que la guirlande s'allume, dites mon nom, comme vous "
+                  "m'appellerez. Trois fois.",
+                  "Very well. Each time the lights come on, say my name, the way you'll call me. Three times."),
+    "appris": ("C'est noté. Mon nom suffit, désormais.", "Noted. My name alone will do from now on."),
+    "pas_appris": ("Je n'ai pas réussi à retenir votre voix. On réessaiera au calme.",
+                   "I couldn't quite learn your voice. Let's try again somewhere quieter."),
+    "astuce_voix": ("Oui ? Pour m'appeler juste par mon nom, dites : apprends ma voix.",
+                    "Yes? By the way, to call me by my name alone, just say: learn my voice."),
+}
+
+
+def langue_du_mode(cfg=None):
+    """Le mode psy parle francais ; le majordome, la langue choisie."""
+    return "fr" if JARVIS.get("mode") == "psy" else langue_jarvis(cfg if cfg is not None else CFG)
+
+
+def phrase(cle, langue, *args):
+    fr, en = _PHRASES[cle]
+    t = en if langue == "en" and en else fr
+    return t % args if args else t
 
 
 def poser_mode(mode):
     if mode != JARVIS.get("mode"):
         JARVIS["historique"] = []
+        if mode == "psy":
+            # ce qui se dit au psychologue, gardé en memoire le temps de la
+            # seance -- pour savoir, a l'au revoir, s'il faut se taire
+            JARVIS["psy_echange"] = []
+            JARVIS["psy_grave"] = False
     JARVIS.update(mode=mode, mode_vu=time.time(), propose_psy=False)
 
 
@@ -5100,9 +5320,49 @@ def terminer_conversation():
     jouer_son("fin")
 
 
-def dire(texte, suite=False):
+def quitter_psy(cfg):
+    """« AU REVOIR » AU PSYCHOLOGUE : retour au majordome, qui a demande en
+    toutes lettres « il peut ne pas parler si la discussion etait intense, il
+    peut aussi rebondir sur un sujet de maniere humoristique mais pas lourde ».
+
+    C'est BrainDebugger qui en decide, avec la seance sous les yeux (elle est
+    deja dans son journal : rien de neuf ne sort d'ici) -- et qui se tait
+    TOUJOURS si un message grave y est passe. Ici aussi : `psy_grave` coupe
+    avant meme de demander."""
+    echange = list(JARVIS.get("psy_echange") or [])[-12:]
+    grave = bool(JARVIS.get("psy_grave"))
+    VOIX.taire()
+    envoyer_oreille({"cmd": "annuler"})
+    poser_mode("jarvis")
+    JARVIS["historique"] = []
+    JARVIS.update(psy_echange=[], psy_grave=False)
+    retour = ""
+    if echange and not grave and _cle_presente(cfg):
+        poser_led("pense")
+        JARVIS.update(etat="pense", message="Retour au majordome...")
+        try:
+            d = _requete_bd("/api/machitool/jarvis",
+                            {"texte": "au revoir", "transition": "fin_psy", "psy": echange,
+                             "langue": langue_jarvis(cfg),
+                             "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]}, cfg, 30)
+            if (d or {}).get("mode") == "jarvis":
+                retour = str((d or {}).get("texte") or "").strip()
+        except Exception:
+            retour = ""
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+    if retour:
+        dire(retour, langue=langue_jarvis(cfg))
+    else:
+        jouer_son("fin")
+
+
+def dire(texte, suite=False, langue=None):
     """Repond : a voix haute si on l'a voulu, sinon en notification. Ensuite,
-    s'il y a une suite possible, on ecoute encore un peu -- sans mot d'eveil."""
+    s'il y a une suite possible, on ecoute encore un peu -- sans mot d'eveil.
+    La langue est celle du mode, sauf si on la donne."""
+    langue = langue or langue_du_mode()
+
     def fin():
         poser_led(None)
         JARVIS.update(etat="attente", message=message_attente())
@@ -5114,7 +5374,7 @@ def dire(texte, suite=False):
     if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
         poser_led("parle")
         JARVIS.update(etat="parle", message="Je reponds.")
-        VOIX.dire(texte, fin)
+        VOIX.dire(texte, fin, langue)
     else:
         notifier = JARVIS_CROCHETS.get("notifier")
         if notifier and texte:
@@ -5122,63 +5382,94 @@ def dire(texte, suite=False):
         fin()
 
 
+def dire_et_attendre(texte, langue=None, delai=30.0):
+    """Dit, et rend la main quand c'est dit (ou apres `delai`)."""
+    fini = threading.Event()
+    langue = langue or langue_du_mode()
+    if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
+        VOIX.dire(texte, fini.set, langue)
+        fini.wait(delai)
+    return fini.is_set()
+
+
 def signaler_erreur(texte):
     poser_led("erreur", 1.6)
     jouer_son("erreur")
     JARVIS.update(etat="erreur", message=texte)
     if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
-        VOIX.dire(texte, lambda: JARVIS.update(etat="attente", message=message_attente()))
+        VOIX.dire(texte, lambda: JARVIS.update(etat="attente", message=message_attente()),
+                  langue_du_mode())
 
 
 def traiter_phrase(wav64, cfg):
     poser_led("comprend")
     JARVIS.update(etat="comprend", message="Je transcris...")
+    L = langue_du_mode(cfg)
     try:
         octets = base64.b64decode(wav64)
     except Exception:
-        return signaler_erreur("Je n'ai pas pu lire ce que le micro m'a donné.")
+        return signaler_erreur(phrase("lecture", L))
     if etat_dictee()["etat"] != "pret":
-        return signaler_erreur("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.")
+        return signaler_erreur(phrase("transcription_absente", L))
     try:
         texte = transcrire(octets)
     except DicteeImpossible as e:
         return signaler_erreur(str(e)[:160])
     except Exception as e:
         print("Jarvis : transcription impossible (%s)" % type(e).__name__)
-        return signaler_erreur("Pardon, je n'ai pas réussi à transcrire.")
+        return signaler_erreur(phrase("transcription_ratee", L))
     finally:
         octets = None
     texte = _jv.retirer_mot_eveil(texte)
     if not texte:
-        # « Jarvis. » tout court : il attend la suite.
-        return dire("Oui ?", suite=True)
+        # « Jarvis. » tout court : il attend la suite -- et, UNE fois, s'il
+        # a ete reveille par « Hey Jarvis » sans connaitre la voix, il dit
+        # comment l'appeler par son nom seul.
+        if (JARVIS.get("reveil_par") == "hey" and JARVIS.get("mode") == "jarvis"
+                and not gabarits_jarvis() and not cfg.get("jarvis_astuce_voix")):
+            cfg["jarvis_astuce_voix"] = True
+            sauver_config(cfg)
+            return dire(phrase("astuce_voix", L), suite=True)
+        return dire(phrase("oui", L), suite=True)
     if _jv.fin_de_conversation(texte):
         print("Jarvis : fin de conversation")
+        # « Au revoir » au psychologue : retour au majordome, qui se tait si
+        # c'etait lourd -- voir `quitter_psy`.
+        if JARVIS.get("mode") == "psy":
+            return quitter_psy(cfg)
         return terminer_conversation()
     changement = _jv.changement_de_mode(texte)
     if (changement is None and JARVIS.get("propose_psy")
-            and _jv.normaliser(texte).replace("-", " ").strip() in _OUI):
+            and _jv.normaliser(texte).replace("-", " ").strip(" '") in _OUI):
         changement = ("psy", "")
     JARVIS["propose_psy"] = False
     if changement:
         mode, reste = changement
+        revient = JARVIS.get("mode") == "psy" and mode == "jarvis"
         poser_mode(mode)
         print("Jarvis : mode %s" % mode)
         if not reste:
-            return dire("Mode psychologue. Je vous écoute." if mode == "psy"
-                        else "Mode Jarvis. À votre service.", suite=True)
+            if mode == "psy":
+                return dire(phrase("mode_psy", "fr"), suite=True, langue="fr")
+            # « Jarvis ? Re ! » : de retour aupres du majordome
+            return dire(phrase("retour" if revient else "mode_jarvis", langue_jarvis(cfg)), suite=True,
+                        langue=langue_jarvis(cfg))
         texte = reste
+    L = langue_du_mode(cfg)
     JARVIS["vu"] = time.time()
     action = _jv.comprendre(texte, cfg.get("jarvis_raccourcis") or [])
     if action:
         print("Jarvis : commande %s" % action["action"])
         if action["action"] == "fin":
             return terminer_conversation()
+        if action["action"] == "apprendre":
+            threading.Thread(target=apprendre_a_voix_haute, args=(cfg,), daemon=True).start()
+            return
         try:
             reponse = executer_commande(action, cfg)
         except Exception as e:
             print("Jarvis : commande ratee (%s)" % e)
-            return signaler_erreur("Je n'ai pas pu le faire, désolé.")
+            return signaler_erreur(phrase("commande_ratee", L))
         if action["action"] == "silence":
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
@@ -5228,8 +5519,7 @@ def _detail_http(e):
 def parler_au_compagnon(texte, cfg):
     """Le mode psychologue : le compagnon de BrainDebugger, son fil, son journal."""
     if not _cle_presente(cfg):
-        return signaler_erreur("Pour vous répondre, il me faut la clé de BrainDebugger : "
-                               "page Passerelle de Machi Tool.")
+        return signaler_erreur(phrase("cle_absente", "fr"))
     poser_led("pense")
     JARVIS.update(etat="pense", message="Le compagnon reflechit...")
     print("Jarvis : message au compagnon (%d signes)" % len(texte))
@@ -5237,16 +5527,18 @@ def parler_au_compagnon(texte, cfg):
         donnees = _requete_bd("/api/machitool/parler", {"texte": texte}, cfg, 180)
     except urllib.error.HTTPError as e:
         return signaler_erreur(
-            "BrainDebugger refuse ma clé." if e.code in (401, 403)
-            else "Votre version de BrainDebugger ne sait pas encore m'écouter." if e.code == 404
-            else "BrainDebugger a répondu par une erreur %s." % e.code)
+            phrase("cle_refusee", "fr") if e.code in (401, 403)
+            else phrase("bd_ancien_psy", "fr") if e.code == 404
+            else phrase("bd_erreur", "fr", e.code))
     except Exception:
-        return signaler_erreur("Je n'arrive pas à joindre BrainDebugger.")
+        return signaler_erreur(phrase("bd_injoignable", "fr"))
     reponse = str((donnees or {}).get("texte") or "").strip()
     if not reponse:
-        return signaler_erreur("Le compagnon n'a rien répondu.")
+        return signaler_erreur(phrase("compagnon_muet", "fr"))
     JARVIS["mode_vu"] = time.time()
-    dire(reponse, suite=True)
+    JARVIS["psy_echange"] = (list(JARVIS.get("psy_echange") or []) + [
+        {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+    dire(reponse, suite=True, langue="fr")
 
 
 def parler_a_jarvis(texte, cfg):
@@ -5254,39 +5546,44 @@ def parler_a_jarvis(texte, cfg):
     Claude) -- Sonnet, effort bas. Rien n'entre dans le journal, sauf un
     message grave : BrainDebugger l'envoie alors au compagnon, et on passe en
     mode psychologue."""
+    L = langue_jarvis(cfg)
     if not _cle_presente(cfg):
-        return signaler_erreur("Pour vous répondre, il me faut la clé de BrainDebugger : "
-                               "page Passerelle de Machi Tool.")
+        return signaler_erreur(phrase("cle_absente", L))
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis reflechit...")
     print("Jarvis : question au majordome (%d signes)" % len(texte))
     try:
         donnees = _requete_bd("/api/machitool/jarvis",
-                              {"texte": texte, "historique": JARVIS["historique"][-12:],
+                              {"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
                                "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
                               cfg, 90)
     except urllib.error.HTTPError as e:
         detail = _detail_http(e)
         return signaler_erreur(
-            "BrainDebugger refuse ma clé." if e.code in (401, 403)
-            else "Votre version de BrainDebugger ne connaît pas encore le mode Jarvis." if e.code == 404
-            else "BrainDebugger n'a pas de clé Claude pour me faire parler." if "clé API" in detail
-            else "BrainDebugger a répondu par une erreur %s." % e.code)
+            phrase("cle_refusee", L) if e.code in (401, 403)
+            else phrase("bd_ancien_jarvis", L) if e.code == 404
+            else phrase("bd_sans_cle", L) if "clé API" in detail
+            else phrase("bd_erreur", L, e.code))
     except Exception:
-        return signaler_erreur("Je n'arrive pas à joindre BrainDebugger.")
+        return signaler_erreur(phrase("bd_injoignable", L))
     reponse = str((donnees or {}).get("texte") or "").strip()
     if not reponse:
-        return signaler_erreur("Je n'ai rien à répondre à cela, curieusement.")
+        return signaler_erreur(phrase("sans_reponse", L))
     if (donnees or {}).get("mode") == "psy":
-        # Grave : c'est le compagnon qui a repondu, et on reste avec lui.
+        # Grave : c'est le compagnon qui a repondu, et on reste avec lui. Et
+        # a l'au revoir, Jarvis se taira : `psy_grave`.
         print("Jarvis : bascule en mode psychologue")
         poser_mode("psy")
-    else:
-        JARVIS["historique"] = (JARVIS["historique"] + [
-            {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
-        JARVIS["propose_psy"] = "mode psychologue" in _jv.normaliser(reponse)
+        JARVIS.update(psy_grave=True, psy_echange=[{"role": "user", "texte": texte},
+                                                   {"role": "assistant", "texte": reponse}])
+        JARVIS["vu"] = time.time()
+        return dire(reponse, suite=True, langue="fr")
+    JARVIS["historique"] = (JARVIS["historique"] + [
+        {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+    n = _jv.normaliser(reponse)
+    JARVIS["propose_psy"] = "mode psychologue" in n or "therapist mode" in n
     JARVIS["vu"] = time.time()
-    dire(reponse, suite=True)
+    dire(reponse, suite=True, langue=L)
 
 
 _JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -5294,10 +5591,31 @@ _MOIS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "aoû
          "septembre", "octobre", "novembre", "décembre")
 
 
+_JOURS_EN = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_MOIS_EN = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+            "October", "November", "December")
+
+
+def heure_en(t):
+    """« It's 6:30 in the evening. » -- espeak lit « 6:30 » comme on le dit."""
+    h, m = t.tm_hour, t.tm_min
+    moment = ("in the morning" if 5 <= h < 12 else "in the afternoon" if 12 <= h < 18
+              else "in the evening" if 18 <= h < 22 else "at night")
+    h12 = h % 12 or 12
+    return ("It's %d o'clock %s." % (h12, moment)) if not m else ("It's %d:%02d %s." % (h12, m, moment))
+
+
+def date_en(t):
+    d = t.tm_mday
+    suffixe = "th" if 11 <= d % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
+    return "It's %s, the %d%s of %s." % (_JOURS_EN[t.tm_wday], d, suffixe, _MOIS_EN[t.tm_mon - 1])
+
+
 def executer_commande(a, cfg, maintenant=None):
     """Fait la commande. Rend la phrase a dire, ou None (un son suffit)."""
     quoi = a["action"]
     t = time.localtime(maintenant) if maintenant is not None else time.localtime()
+    L = langue_du_mode(cfg)
     if quoi == "silence":
         VOIX.taire()
         return None
@@ -5306,11 +5624,15 @@ def executer_commande(a, cfg, maintenant=None):
     if quoi == "dormir":
         cfg["jarvis_actif"] = False
         sauver_config(cfg)
-        return "Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool."
+        return phrase("dormir", L)
     if quoi == "heure":
+        if L == "en":
+            return heure_en(t)
         return "Il est %d heure%s %02d." % (t.tm_hour, "s" if t.tm_hour > 1 else "", t.tm_min) \
             if t.tm_min else "Il est %d heure%s pile." % (t.tm_hour, "s" if t.tm_hour > 1 else "")
     if quoi == "date":
+        if L == "en":
+            return date_en(t)
         return "Nous sommes le %s %d %s." % (_JOURS[t.tm_wday], t.tm_mday, _MOIS[t.tm_mon - 1])
     if quoi == "mode":
         cfg["mode"] = a["mode"]
@@ -5334,13 +5656,13 @@ def executer_commande(a, cfg, maintenant=None):
         ETAT["pause"] = False
         return None
     if quoi == "minuteur":
-        return poser_minuteur(a["secondes"], a.get("quoi") or "")
+        return poser_minuteur(a["secondes"], a.get("quoi") or "", L)
     if quoi == "minuteurs_annuler":
         n = len(JARVIS["minuteurs"])
         for m in JARVIS["minuteurs"]:
             m["minuteur"].cancel()
         JARVIS["minuteurs"] = []
-        return "C'est annulé." if n else "Il n'y avait aucun minuteur en cours."
+        return phrase("annule" if n else "aucun_minuteur", L)
     if quoi == "ouvrir_site":
         import webbrowser
         adresse = str(cfg.get("pont_site", "")).strip()
@@ -5354,9 +5676,9 @@ def executer_commande(a, cfg, maintenant=None):
         return None
     if quoi == "synchro":
         if not (ACTIVITE["active"] and cfg.get("collecte_envoi", False)):
-            return "L'envoi de votre journée est coupé dans Machi Tool."
+            return phrase("synchro_coupee", L)
         threading.Thread(target=lambda: envoyer_activite_au_site(cfg), daemon=True).start()
-        return "J'envoie votre journée à BrainDebugger."
+        return phrase("synchro", L)
     if quoi == "ouvrir":
         cible = a["cible"]
         if os.name == "nt":
@@ -5368,7 +5690,7 @@ def executer_commande(a, cfg, maintenant=None):
     return None
 
 
-def poser_minuteur(secondes, quoi=""):
+def poser_minuteur(secondes, quoi="", langue="fr"):
     secondes = max(1.0, min(24 * 3600.0, float(secondes)))
     entree = {"fin": time.time() + secondes, "quoi": quoi, "duree": secondes}
 
@@ -5377,23 +5699,42 @@ def poser_minuteur(secondes, quoi=""):
             JARVIS["minuteurs"].remove(entree)
         jouer_son("minuteur")
         poser_led("minuteur", 5)
-        texte = ("Je vous rappelle : %s." % quoi) if quoi else ("Le minuteur de %s est terminé." % _jv.dire_duree(secondes))
+        texte = (phrase("rappel", langue, quoi) if quoi
+                 else phrase("minuteur_fini", langue, _jv.dire_duree(secondes, langue)))
         notifier = JARVIS_CROCHETS.get("notifier")
         if notifier:
             notifier("Jarvis", texte)
         if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
-            VOIX.dire(texte)
+            VOIX.dire(texte, None, langue)
 
     entree["minuteur"] = threading.Timer(secondes, sonner)
     entree["minuteur"].daemon = True
     entree["minuteur"].start()
     JARVIS["minuteurs"].append(entree)
     if quoi:
-        return "Entendu. Je vous le rappelle dans %s." % _jv.dire_duree(secondes)
-    return "Minuteur de %s, lancé." % _jv.dire_duree(secondes)
+        return phrase("rappel_pose", langue, _jv.dire_duree(secondes, langue))
+    return phrase("minuteur", langue, _jv.dire_duree(secondes, langue))
 
 
 # ---------- apprendre la voix ----------
+
+def apprendre_a_voix_haute(cfg):
+    """« Apprends ma voix » / « learn my voice », dit a Jarvis -- demande :
+    « fait en sorte qu'on puisse juste Jarvis pour lui parler ». Le modele
+    d'openWakeWord ne connait que « Hey Jarvis » ; « Jarvis » tout seul, c'est
+    la voix de la personne, apprise. Il l'explique a voix haute, se TAIT, et
+    ecoute trois fois son nom, la guirlande allumee a chaque fois : sa propre
+    voix dans l'empreinte serait une empreinte de lui-meme."""
+    a = JARVIS.get("apprentissage")
+    if a and not a.get("fini"):
+        return False
+    L = langue_jarvis(cfg)
+    dire_et_attendre(phrase("apprendre", L), L)
+    time.sleep(0.8)                        # que l'echo de sa voix se taise
+    ok = apprendre_voix()
+    dire(phrase("appris" if ok else "pas_appris", L), langue=L)
+    return ok
+
 
 def apprendre_voix(total=3, essais_max=6):
     """« Jarvis », trois fois, dit par la personne. A lancer dans un fil."""
@@ -7883,9 +8224,30 @@ class Panneau:
             "Enregistrer pour appliquer.")
 
         self.separateur(f, 12, 8)
-        self.titre(f, "sa voix").pack(fill="x", pady=(0, 4))
+        self.titre(f, "sa langue et sa voix").pack(fill="x", pady=(0, 4))
+        self.texte(f, "En anglais, Jarvis parle avec Kokoro : une voix d'homme britannique, "
+                      "calculee sur ce PC (rien ne part sur Internet), telechargee une fois "
+                      "(340 Mo). Tu peux lui parler en francais ou en anglais : il comprend "
+                      "les deux. Le mode psychologue, lui, reste en francais.",
+                   BRUME, 8, largeur=500).pack(fill="x")
+        self.var_jarvis_langue = tk.StringVar(value=langue_jarvis(self.cfg))
+        self.radio(f, "English -- Jarvis repond en anglais (voix Kokoro)", self.var_jarvis_langue,
+                   "en").pack(fill="x")
+        self.radio(f, "Francais -- Jarvis repond en francais (voix Piper, ci-dessous)",
+                   self.var_jarvis_langue, "fr").pack(fill="x")
+        self.var_jarvis_langue.trace_add("write", lambda *_: self.choisir_langue())
+        self.var_voix_kokoro = tk.StringVar(value=voix_kokoro_choisie(self.cfg))
+        for cle, entree in _jv.VOIX_KOKORO.items():
+            self.radio(f, entree["nom"], self.var_voix_kokoro, cle).pack(fill="x", padx=(18, 0))
+        self.var_voix_kokoro.trace_add("write", lambda *_: self.choisir_voix_kokoro())
+        self.txt_kokoro = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_kokoro.pack(fill="x", pady=(4, 0))
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "sa voix francaise").pack(fill="x", pady=(0, 4))
         self.texte(f, "Une vraie voix (Piper), calculee sur ce PC : rien ne part sur Internet. "
-                      "Telechargee une fois (20 a 80 Mo). En attendant, c'est la voix de Windows.",
+                      "Telechargee une fois (20 a 80 Mo). C'est celle du mode psychologue, et "
+                      "de Jarvis s'il parle francais. En attendant, c'est la voix de Windows.",
                    BRUME, 8, largeur=500).pack(fill="x")
         self.var_voix_modele = tk.StringVar(value=voix_choisie(self.cfg))
         for cle, entree in _jv.VOIX_PIPER.items():
@@ -7928,19 +8290,24 @@ class Panneau:
         self.texte(f, "Deux modes. JARVIS (orange) : le majordome du PC, a la maniere d'Iron Man "
                       "-- Sonnet, effort bas, rien dans ton journal. PSYCHOLOGUE (bleu) : le "
                       "compagnon de BrainDebugger, avec ton journal ; dis « psychologue », "
-                      "« notes psy » ou « note que... » pour y passer, « mode Jarvis » pour "
-                      "revenir. Un message grave part toujours au compagnon. « Non rien », "
-                      "« oublie », « degage » : fin de la conversation.",
+                      "« notes psy » ou « note que... » (« therapist », « take a note ») pour y "
+                      "passer. Pour revenir : « Jarvis ? Re ! », « mode Jarvis », ou simplement "
+                      "le rappeler -- il se reveille toujours en mode Jarvis. « Au revoir » au "
+                      "psychologue : retour au majordome, qui se tait si c'etait lourd, ou dit "
+                      "un mot leger. Un message grave part toujours au compagnon. « Non rien », "
+                      "« oublie », « never mind » : fin de la conversation.",
                    BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
-        self.texte(f, "Commandes : « allume / eteins la lumiere », « mets la "
-                      "lumiere en bleu », « lumiere normale », « mode ecran / son / "
-                      "applications », « minuteur de 10 minutes », « rappelle-moi "
-                      "dans 20 minutes de sortir le linge », « annule les minuteurs », "
-                      "« quelle heure est-il », « quel jour on est », « ouvre "
-                      "BrainDebugger », « ouvre Machi Tool », « synchronise », "
-                      "« stop », « annule », « arrete d'ecouter ». Tout le "
-                      "reste va au compagnon. Tes propres raccourcis : jarvis_raccourcis dans "
-                      "config.json.", BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
+        self.texte(f, "Commandes, en francais ou en anglais : « allume / eteins la lumiere » "
+                      "(« lights on / off »), « mets la lumiere en bleu » (« make the lights "
+                      "blue »), « lumiere normale », « mode ecran / son / applications », "
+                      "« minuteur de 10 minutes » (« set a timer for ten minutes »), "
+                      "« rappelle-moi dans 20 minutes de sortir le linge » (« remind me in 20 "
+                      "minutes to... »), « annule les minuteurs », « quelle heure est-il » "
+                      "(« what time is it »), « quel jour on est », « ouvre BrainDebugger », "
+                      "« ouvre Machi Tool », « synchronise », « stop », « arrete d'ecouter », "
+                      "« apprends ma voix » (« learn my voice »). Tout le reste va a Jarvis. "
+                      "Tes propres raccourcis : jarvis_raccourcis dans config.json.",
+                   BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
 
     def basculer_jarvis(self):
         self.cfg["jarvis_actif"] = bool(self.var_jarvis.get())
@@ -7972,8 +8339,21 @@ class Panneau:
             PIPER["etat"] = "absent"
             threading.Thread(target=preparer_piper, args=(self.cfg,), daemon=True).start()
 
+    def choisir_langue(self):
+        self.cfg["jarvis_langue"] = self.var_jarvis_langue.get()
+        sauver_config(self.cfg)
+        if langue_jarvis(self.cfg) == "en" and not kokoro_present() and KOKORO["etat"] != "preparation":
+            KOKORO["etat"] = "absent"        # la veille le fait venir
+
+    def choisir_voix_kokoro(self):
+        self.cfg["jarvis_voix_kokoro"] = self.var_voix_kokoro.get()
+        sauver_config(self.cfg)             # la veille recharge la voix : sa signature a change
+
     def essai_voix(self):
-        VOIX.dire("Bonjour. Tous les systèmes sont opérationnels. Que puis-je faire pour vous ?")
+        if langue_jarvis(self.cfg) == "en":
+            VOIX.dire("Good evening. All systems are operational. How may I help?", None, "en")
+        else:
+            VOIX.dire("Bonjour. Tous les systèmes sont opérationnels. Que puis-je faire pour vous ?")
 
     def peindre_jarvis(self):
         etat = JARVIS.get("etat", "eteint")
@@ -8002,13 +8382,26 @@ class Panneau:
             piper = "Voix de Windows."
         elif PIPER["etat"] == "preparation":
             piper = "Telechargement de la voix : %d %%" % (PIPER["progres"] * 100)
-        elif voix_prete():
+        elif voix_prete("fr"):
             piper = PIPER.get("message") or "Voix chargee : elle repond tout de suite."
         elif piper_pret(self.cfg):
             piper = "Voix telechargee ; elle se charge quand Jarvis ecoute."
         else:
             piper = PIPER.get("message") or "La voix se telecharge quand Jarvis ecoute."
         self.txt_piper.configure(text=piper)
+        if langue_jarvis(self.cfg) != "en":
+            kokoro = "Jarvis parle francais : la voix anglaise ne sert pas."
+        elif KOKORO["etat"] == "preparation":
+            kokoro = "Telechargement de la voix anglaise : %d %%" % (KOKORO["progres"] * 100)
+        elif KOKORO["etat"] == "erreur":
+            kokoro = KOKORO.get("message") or "La voix anglaise n'a pas pu venir."
+        elif voix_prete("en"):
+            kokoro = "Voix anglaise chargee : elle repond tout de suite."
+        elif kokoro_present():
+            kokoro = "Voix anglaise telechargee ; elle se charge quand Jarvis ecoute."
+        else:
+            kokoro = "La voix anglaise se telecharge quand Jarvis ecoute (340 Mo, une fois)."
+        self.txt_kokoro.configure(text=kokoro)
 
     # ------------------------------------------------------------------
     #  Page Reglages

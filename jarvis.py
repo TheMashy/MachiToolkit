@@ -563,11 +563,96 @@ def duree_fr(texte):
     return total if trouve and total > 0 else None
 
 
-def dire_duree(secondes):
+# ---------- ET EN ANGLAIS ----------
+# « And in English as well » : Jarvis repond en anglais, et on peut lui parler
+# dans les deux langues -- les commandes se lisent en francais ET en anglais,
+# quelle que soit la langue de ses reponses.
+
+_UNITS_EN = {"zero": 0, "one": 1, "a": 1, "an": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+             "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+             "eighteen": 18, "nineteen": 19}
+_TENS_EN = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+            "eighty": 80, "ninety": 90}
+
+
+def nombre_en(mots):
+    """« 10 », « twenty-five », « an » (an hour) -> (valeur, mots lus)."""
+    if not mots:
+        return None, 0
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", mots[0]):
+        return float(mots[0].replace(",", ".")), 1
+    morceaux = [(p, i) for i, m in enumerate(mots[:3]) for p in m.split("-") if p]
+    if not morceaux:
+        return None, 0
+    p0 = morceaux[0][0]
+    if p0 in _TENS_EN:
+        val, k = _TENS_EN[p0], 1
+        if k < len(morceaux) and 1 <= _UNITS_EN.get(morceaux[k][0], 0) <= 9 and morceaux[k][0] not in ("a", "an"):
+            val, k = val + _UNITS_EN[morceaux[k][0]], k + 1
+    elif p0 in _UNITS_EN:
+        val, k = _UNITS_EN[p0], 1
+    else:
+        return None, 0
+    return float(val), morceaux[k - 1][1] + 1
+
+
+def duree_en(texte):
+    """« 10 minutes », « an hour and a half », « half an hour », « a quarter of
+    an hour », « 90 seconds », « a ten minute timer » -> secondes, ou None."""
+    t = normaliser(texte).replace("-", " ")
+    if re.search(r"\bhalf an hour\b|\bhalf hour\b", t) and not re.search(r"\band a half\b", t):
+        return 1800.0
+    if re.search(r"\bquarter of an hour\b|\bquarter hour\b", t):
+        return 900.0 * (3 if re.search(r"\bthree quarters?\b", t) else 1)
+
+    # « one and a half hours » : la demie AVANT l'unite
+    def _demie(m):
+        v, n = nombre_en([m.group(1)])
+        return "%g %s" % (v + 0.5, m.group(2)) if v is not None else m.group(0)
+    t = re.sub(r"\b(\d+|[a-z]+) and a half (hours?|hrs?|minutes?|mins?)\b", _demie, t)
+    mots = t.split()
+    total, trouve, i = 0.0, False, 0
+    while i < len(mots):
+        v, n = nombre_en(mots[i:])
+        if v is None:
+            i += 1
+            continue
+        unite = mots[i + n] if i + n < len(mots) else ""
+        # « an hour and a half » : la demie APRES l'unite
+        demi = mots[i + n + 1:i + n + 4] == ["and", "a", "half"]
+        if re.fullmatch(r"h|hrs?|hours?", unite):
+            total += v * 3600 + (1800 if demi else 0)
+            trouve, i = True, i + n + (4 if demi else 1)
+        elif re.fullmatch(r"mins?|minutes?", unite):
+            total += v * 60 + (30 if demi else 0)
+            trouve, i = True, i + n + (4 if demi else 1)
+        elif re.fullmatch(r"s|secs?|seconds?", unite):
+            total += v
+            trouve, i = True, i + n + 1
+        else:
+            i += n
+    return total if trouve and total > 0 else None
+
+
+def duree(texte):
+    """Une duree dite en francais ou en anglais."""
+    return duree_fr(texte) or duree_en(texte)
+
+
+def dire_duree(secondes, langue="fr"):
     s = int(round(secondes))
     h, reste = divmod(s, 3600)
     m, s = divmod(reste, 60)
     morceaux = []
+    if langue == "en":
+        if h:
+            morceaux.append("%d hour%s" % (h, "s" if h > 1 else ""))
+        if m:
+            morceaux.append("%d minute%s" % (m, "s" if m > 1 else ""))
+        if s and not h:
+            morceaux.append("%d second%s" % (s, "s" if s > 1 else ""))
+        return " and ".join(morceaux) or "0 seconds"
     if h:
         morceaux.append("%d heure%s" % (h, "s" if h > 1 else ""))
     if m:
@@ -584,8 +669,18 @@ COULEURS_NOMMEES = {
     "ambre": "#FFB000", "indigo": "#4B3DFF", "or": "#FFC21A", "dore": "#FFC21A",
 }
 
+# Les memes couleurs, dites en anglais : le nom francais reste celui qu'affiche
+# le panneau.
+COULEURS_EN = {"red": "rouge", "orange": "orange", "yellow": "jaune", "green": "vert", "blue": "bleu",
+               "cyan": "cyan", "turquoise": "turquoise", "purple": "violet", "violet": "violet",
+               "mauve": "mauve", "pink": "rose", "magenta": "magenta", "white": "blanc", "amber": "ambre",
+               "indigo": "indigo", "gold": "or", "golden": "or"}
+
+
 def _couleur_nommee(mot):
-    """bleue, vertes, violette, blanche -> la couleur."""
+    """bleue, vertes, violette, blanche, blue -> la couleur."""
+    if mot in COULEURS_EN:
+        return COULEURS_EN[mot]
     for c in (mot, mot.rstrip("s"), mot.rstrip("s").rstrip("e"),
               re.sub(r"(?:te|che)s?$", lambda m_: "c" if m_.group(0).startswith("ch") else "", mot)):
         if c in COULEURS_NOMMEES:
@@ -599,7 +694,9 @@ _MODES = {"ecran": "ecran", "son": "son", "musique": "son", "application": "appl
           "regle": "applications", "regles": "applications", "mixte": "mixte"}
 
 _SILENCE = {"stop", "tais toi", "tais-toi", "chut", "silence", "arrete", "ca suffit",
-            "arrete de parler", "stop stop", "c'est bon arrete", "ta gueule", "ferme la"}
+            "arrete de parler", "stop stop", "c'est bon arrete", "ta gueule", "ferme la",
+            "shut up", "quiet", "be quiet", "hush", "enough", "that's enough", "stop talking",
+            "okay stop", "ok stop", "stop it"}
 # LA FIN D'UNE CONVERSATION. « Non rien », « oublie », « degage » : on se tait,
 # on n'ecoute plus la suite, et le mode psychologue se referme. Une phrase
 # COURTE, faite de ces mots-la et de politesses autour -- « non merci c'est
@@ -613,11 +710,20 @@ _FIN = re.compile(
     r"fin de (?:la )?conversation|termine|annule|annuler|fausse alerte|non merci|"
     r"rien merci|rien de rien|c'est fini)"
     r"(?:\s+(?:merci|jarvis|c'est bon|ca ira|c'est tout|laisse|pour l'instant|pour le moment))*$")
+# Et en anglais : « never mind », « forget it », « that'll be all »...
+_FIN_EN = re.compile(
+    r"^(?:(?:no|well|oh|um|uh|actually|thanks|thank you|okay|ok|sorry|jarvis|right)\s+)*"
+    r"(?:no|nope|nothing(?: at all)?|never ?mind|forget it|forget about it|forget that|"
+    r"cancel|that's all|that is all|that'll be all|that will be all|that's it|go away|leave it|"
+    r"leave me alone|dismissed|goodbye|good bye|bye(?: bye)?|see you(?: later)?|false alarm|"
+    r"end (?:the )?conversation|we're done|i'm done|all good|i'm good|no thanks|no thank you|"
+    r"nothing thanks|it's nothing)"
+    r"(?:\s+(?:thanks|thank you|jarvis|for now|that's all|then))*$")
 
 
 def fin_de_conversation(texte):
     t = normaliser(texte).replace("-", " ").strip(" '")
-    return bool(t) and len(t.split()) <= 7 and bool(_FIN.match(t))
+    return bool(t) and len(t.split()) <= 7 and bool(_FIN.match(t) or _FIN_EN.match(t))
 
 
 # LES MODES. « Psychologue », « notes psy », « notes » : la conversation passe
@@ -626,13 +732,24 @@ def fin_de_conversation(texte):
 # suit dans la meme phrase, a envoyer tel quel -- ou None.
 _VERS_PSY = re.compile(
     r"^(?:(?:passe|passons|mets toi|mets-toi|bascule|va|on passe|je veux)\s+(?:en\s+|au\s+)?)?"
-    r"(?:(?:le\s+)?mode\s+)?(?:psychologue|psy|psychologie|therapeute|le psy|la psy)\b")
-_VERS_NOTES_PSY = re.compile(r"^(?:mes\s+|les\s+)?notes?\s+(?:psy|psychologue|de psy)\b")
-_VERS_NOTES = re.compile(r"^(?:(?:prends|fais|ajoute|ecris|prend)\s+(?:une\s+|des\s+)?)?notes?\b")
+    r"(?:(?:le\s+)?mode\s+)?(?:psychologue|psy|psychologie|therapeute|le psy|la psy)\b"
+    # et en anglais : « therapist », « switch to therapist mode », « psych mode »
+    r"|^(?:(?:switch|go|change|put me|let's go|i want|take me)\s+(?:back\s+)?(?:to\s+|into\s+|in\s+)?)?"
+    r"(?:the\s+)?(?:therapist|therapy|psychologist|psych|psy|counsell?or)(?:\s+mode)?\b")
+_VERS_NOTES_PSY = re.compile(r"^(?:mes\s+|les\s+|my\s+)?(?:notes?\s+(?:psy|psychologue|de psy)|"
+                             r"(?:psych|psy|therapy|therapist)\s+notes?)\b")
+_VERS_NOTES = re.compile(r"^(?:(?:prends|fais|ajoute|ecris|prend|take|make|add|write)\s+"
+                         r"(?:une\s+|des\s+|a\s+|some\s+)?)?notes?\b")
 _VERS_JARVIS = re.compile(
     r"^(?:(?:passe|reviens|repasse|retour|retourne|bascule|on repasse)\s+(?:en\s+|a\s+|au\s+)?)?"
     r"(?:(?:le\s+)?mode\s+)?(?:jarvis|normal)$|^(?:quitte|sors|sors du|arrete|ferme)\s+"
-    r"(?:le\s+)?(?:mode\s+)?(?:psy|psychologue)$")
+    r"(?:le\s+)?(?:mode\s+)?(?:psy|psychologue)$"
+    # « Jarvis ? Re ! » : de retour aupres du majordome (le mot d'eveil est deja
+    # retire -- il reste « re »)
+    r"|^(?:re|re jarvis|jarvis re|me revoila|je suis de retour|c'est re moi|i'm back|im back|"
+    r"back to jarvis|back to normal|normal mode|jarvis mode)$"
+    r"|^(?:switch|go|change|get)\s+(?:back\s+)?(?:to\s+)?(?:the\s+)?(?:jarvis|normal)(?:\s+mode)?$"
+    r"|^(?:exit|leave|quit|stop|close)\s+(?:the\s+)?(?:therapist|therapy|psych|psy)(?:\s+mode)?$")
 
 
 def _apres(texte, n_mots):
@@ -663,6 +780,81 @@ def changement_de_mode(texte):
     return None
 
 
+_LUMIERE_EN = r"(?:lights?|leds?|lamps?|garland|light strip|strip)"
+_MODES_EN = {"screen": "ecran", "sound": "son", "music": "son", "audio": "son", "app": "applications",
+             "apps": "applications", "application": "applications", "applications": "applications",
+             "rules": "applications", "mixed": "mixte", "mix": "mixte"}
+
+
+def _comprendre_en(t, mots):
+    """Les memes commandes, dites en anglais -- et aussi prudent : une phrase
+    courte, qui commence comme une commande. `t` est deja normalise."""
+    L = _LUMIERE_EN
+    if len(mots) <= 22:
+        m = re.match(r"^(?:set|start|put|make|run)?\s*(?:me\s+)?(?:up\s+)?(?:a|an|the)?\s*(?:timer|countdown)"
+                     r"\s+(?:for|of|on)?\s*(.+)$", t)
+        if m and duree_en(m.group(1)):
+            return {"action": "minuteur", "secondes": duree_en(m.group(1)), "quoi": ""}
+        m = re.match(r"^(?:set|start|put|make|run)?\s*(?:me\s+)?(?:a|an|the)?\s*(.+?)\s+timer$", t)
+        if m and duree_en(m.group(1)):
+            return {"action": "minuteur", "secondes": duree_en(m.group(1)), "quoi": ""}
+        m = re.match(r"^remind me\s+(.+)$", t)
+        if m:
+            reste = m.group(1)
+            q = re.match(r"^in\s+(.+?)\s+(?:to|that|about)\s+(.+)$", reste)
+            q2 = re.match(r"^(?:to|that|about)\s+(.+?)\s+in\s+(.+)$", reste)
+            if q and duree_en(q.group(1)):
+                return {"action": "minuteur", "secondes": duree_en(q.group(1)), "quoi": q.group(2)}
+            if q2 and duree_en(q2.group(2)):
+                return {"action": "minuteur", "secondes": duree_en(q2.group(2)), "quoi": q2.group(1)}
+            q3 = re.match(r"^in\s+(.+)$", reste)
+            if q3 and duree_en(q3.group(1)):
+                return {"action": "minuteur", "secondes": duree_en(q3.group(1)), "quoi": ""}
+        if re.match(r"^(?:cancel|stop|clear|delete|kill|remove)\s+(?:the\s+|my\s+|all\s+(?:the\s+|my\s+)?)?"
+                    r"(?:timers?|reminders?|countdowns?)$", t):
+            return {"action": "minuteurs_annuler"}
+    if len(mots) > 12:
+        return None
+    if re.match(r"^(?:stop listening|go to sleep|sleep mode|go to standby|mute yourself|"
+                r"turn off (?:the )?(?:microphone|mic))$", t):
+        return {"action": "dormir"}
+    if re.match(r"^(?:what time is it|what's the time|what is the time|tell me the time|do you have the time|"
+                r"time please|current time)\b", t):
+        return {"action": "heure"}
+    if re.match(r"^(?:what's the date|what is the date|what day is it|what's today's date|what is today's date|"
+                r"what date is it|today's date|what day is today)\b", t):
+        return {"action": "date"}
+    m = re.match(r"^(?:switch|change|set|put|go)\s+(?:the\s+)?(?:lights?\s+)?(?:to|into|in)\s+(\w+)\s+mode$", t) \
+        or re.match(r"^(\w+)\s+mode$", t)
+    if m and m.group(1) in _MODES_EN:
+        return {"action": "mode", "mode": _MODES_EN[m.group(1)]}
+    qui = r"(?:the |my |all the )?"
+    if re.match(r"^(?:(?:turn|switch|shut|put)\s+off\s+" + qui + L + r"|(?:turn|switch|shut|put)\s+" + qui + L
+                + r"\s+off|" + L + r"\s+off|kill " + qui + L + r"|lights? out)$", t):
+        return {"action": "lumiere_off"}
+    if re.match(r"^(?:(?:turn|switch|put)\s+on\s+" + qui + L + r"|(?:turn|switch|put)\s+" + qui + L + r"\s+on|"
+                + L + r"\s+on)$", t):
+        return {"action": "lumiere_on"}
+    if re.match(r"^(?:(?:set|put|turn|switch|reset|bring)\s+" + qui + L + r"\s+(?:back\s+)?(?:to\s+)?"
+                r"(?:normal|auto|automatic)|" + L + r"\s+(?:back\s+)?(?:to\s+)?(?:normal|auto|automatic)|normal "
+                + L + r"|reset " + qui + L + r"|automatic " + L + r")$", t):
+        return {"action": "lumiere_normale"}
+    m = re.match(r"^(?:(?:make|turn|set|change|switch|paint|put)\s+)?" + qui + L + r"\s+(?:to\s+|in\s+)?(\w+)$", t) \
+        or re.match(r"^(?:make it|go|turn|set it to|change to)\s+(\w+)$", t) \
+        or re.match(r"^(\w+)\s+" + L + r"$", t)
+    nom = _couleur_nommee(m.group(1)) if m else None
+    if nom:
+        return {"action": "lumiere_couleur", "couleur": COULEURS_NOMMEES[nom], "nom": nom}
+    if re.match(r"^(?:open|show|launch|pull up|bring up)\s+(?:me\s+)?(?:my |the )?"
+                r"(?:braindebugger|brain debugger|brain|journal|diary|site)$", t):
+        return {"action": "ouvrir_site"}
+    if re.match(r"^(?:open|show)\s+(?:me\s+)?(?:the )?(?:machi ?tool|machitool|panel|settings)$", t):
+        return {"action": "ouvrir_panneau"}
+    if re.match(r"^(?:sync|synchronise|synchronize|send my day|upload my day|sync my day)\b", t):
+        return {"action": "synchro"}
+    return None
+
+
 def comprendre(texte, raccourcis=()):
     """La commande locale que dit ce texte, ou None : alors c'est pour le
     compagnon.
@@ -674,8 +866,8 @@ def comprendre(texte, raccourcis=()):
     if not t:
         return None
     t = re.sub(r"^(?:s'il te plait|stp|dis|dis moi|est ce que tu peux|tu peux|peux tu|"
-               r"tu pourrais|pourrais tu)\s+", "", t)
-    t = re.sub(r"\s+(?:s'il te plait|stp|merci)$", "", t)
+               r"tu pourrais|pourrais tu|please|could you|can you|would you|will you)\s+", "", t)
+    t = re.sub(r"\s+(?:s'il te plait|stp|merci|please|thanks|thank you)$", "", t)
     mots = t.split()
 
     if t in _SILENCE:
@@ -687,6 +879,16 @@ def comprendre(texte, raccourcis=()):
         dit = normaliser(r.get("dit", ""))
         if dit and (t == dit or t.startswith(dit + " ")) and r.get("ouvre"):
             return {"action": "ouvrir", "cible": str(r["ouvre"]), "nom": r.get("dit", "")}
+
+    # « Juste "Jarvis" » : il faut qu'il connaisse la voix de la personne -- on
+    # le lui demande a voix haute.
+    if re.match(r"^(?:apprends?|retiens|enregistre)\s+(?:ma voix|mon jarvis|a reconnaitre ma voix)$"
+                r"|^(?:learn|remember)\s+my\s+(?:voice|jarvis)$", t):
+        return {"action": "apprendre"}
+
+    en = _comprendre_en(t, mots)
+    if en:
+        return en
 
     # Minuteurs et rappels : peuvent etre un peu plus longs.
     if len(mots) <= 22:
@@ -754,13 +956,13 @@ def comprendre(texte, raccourcis=()):
     return None
 
 
-def pour_la_voix(texte, plafond=1200):
+def pour_la_voix(texte, plafond=1200, lien="le lien"):
     """Le texte d'une reponse, tel qu'on peut le lire a voix haute : sans
     markdown, sans liens, sans emojis, et coupe a une fin de phrase."""
     t = str(texte or "")
     t = re.sub(r"```.*?```", " ", t, flags=re.S)
     t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
-    t = re.sub(r"https?://\S+", "le lien", t)
+    t = re.sub(r"https?://\S+", lien, t)
     t = re.sub(r"[*_`#>|~]+", "", t)
     t = re.sub(r"^\s*[-•]\s+", "", t, flags=re.M)
     t = "".join(c for c in t if not (unicodedata.category(c) in ("So", "Cs", "Sk")
@@ -826,32 +1028,58 @@ class Phonemiseur:
     PONCTUATION = {".": ".", "?": "?", "!": "!", ",": ",", ":": ":", ";": ";",
                    "\u2026": ".", "\u00bb": "", "\u00ab": ""}
 
+    # ESPEAK-NG N'A QU'UNE VOIX PAR PROCESSUS. La bibliotheque garde sa langue
+    # en etat global : deux phonemiseurs (le francais du mode psy, l'anglais de
+    # Jarvis) dans le meme processus se la voleraient -- le second chargeait
+    # l'anglais, et le premier lisait alors le francais avec. Elle est donc
+    # initialisee UNE fois, et chaque phonemiseur remet SA voix, sous verrou,
+    # a chaque proposition.
+    _BIBLIS = {}
+    _VERROU = threading.Lock()
+
     def __init__(self, bibliotheque, dossier_donnees, voix="fr"):
         import ctypes
         self.ct = ctypes
-        self.lib = ctypes.cdll.LoadLibrary(bibliotheque)
-        self.lib.espeak_Initialize.restype = ctypes.c_int
-        self.lib.espeak_Initialize.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-        self.lib.espeak_SetVoiceByName.argtypes = [ctypes.c_char_p]
-        self.lib.espeak_TextToPhonemes.restype = ctypes.c_char_p
-        self.lib.espeak_TextToPhonemes.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int]
-        # 2 = AUDIO_OUTPUT_SYNCHRONOUS : espeak ne touche a aucun peripherique.
-        # Le chemin dans l'encodage du systeme : espeak l'ouvre avec fopen().
-        chemin = dossier_donnees.encode("mbcs" if os.name == "nt" else "utf-8")
-        if self.lib.espeak_Initialize(2, 0, chemin, 0) < 0:
-            raise RuntimeError("espeak-ng ne s'initialise pas (%s)" % dossier_donnees)
-        if self.lib.espeak_SetVoiceByName(voix.encode("ascii")) != 0:
-            raise RuntimeError("voix espeak-ng inconnue : %s" % voix)
+        self.voix = voix.encode("ascii")
+        with Phonemiseur._VERROU:
+            cle = (os.path.abspath(bibliotheque), os.path.abspath(dossier_donnees))
+            deja = Phonemiseur._BIBLIS.get(cle)
+            if deja is None:
+                lib = ctypes.cdll.LoadLibrary(bibliotheque)
+                lib.espeak_Initialize.restype = ctypes.c_int
+                lib.espeak_Initialize.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+                lib.espeak_SetVoiceByName.argtypes = [ctypes.c_char_p]
+                lib.espeak_TextToPhonemes.restype = ctypes.c_char_p
+                lib.espeak_TextToPhonemes.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int]
+                # 2 = AUDIO_OUTPUT_SYNCHRONOUS : espeak ne touche a aucun peripherique.
+                # Le chemin dans l'encodage du systeme : espeak l'ouvre avec fopen().
+                chemin = dossier_donnees.encode("mbcs" if os.name == "nt" else "utf-8")
+                if lib.espeak_Initialize(2, 0, chemin, 0) < 0:
+                    raise RuntimeError("espeak-ng ne s'initialise pas (%s)" % dossier_donnees)
+                deja = Phonemiseur._BIBLIS[cle] = {"lib": lib, "voix": None}
+            self.partage = deja
+            self.lib = deja["lib"]
+            self._poser_voix()
+
+    def _poser_voix(self):
+        """A appeler sous le verrou."""
+        if self.partage["voix"] != self.voix:
+            if self.lib.espeak_SetVoiceByName(self.voix) != 0:
+                self.partage["voix"] = None
+                raise RuntimeError("voix espeak-ng inconnue : %s" % self.voix.decode())
+            self.partage["voix"] = self.voix
 
     def _proposition(self, texte):
         ct = self.ct
         tampon = ct.create_string_buffer(texte.encode("utf-8"))
         ptr = ct.c_void_p(ct.addressof(tampon))
         morceaux = []
-        while ptr.value:
-            r = self.lib.espeak_TextToPhonemes(ct.byref(ptr), 1, 0x02)   # UTF-8 -> API
-            if r:
-                morceaux.append(r.decode("utf-8"))
+        with Phonemiseur._VERROU:
+            self._poser_voix()
+            while ptr.value:
+                r = self.lib.espeak_TextToPhonemes(ct.byref(ptr), 1, 0x02)   # UTF-8 -> API
+                if r:
+                    morceaux.append(r.decode("utf-8"))
         return " ".join(m.strip() for m in morceaux if m.strip())
 
     def phrases(self, texte):
@@ -898,6 +1126,8 @@ class Synthese:
         self.multi = int(self.config.get("num_speakers", 1)) > 1
         self.phonemiseur = phonemiseur
         self.locuteur = int(locuteur or 0)
+        # la langue de ce qu'on lui donne a lire -- voir `texte_pour_piper`
+        self.langue = "en" if str((self.config.get("espeak") or {}).get("voice", "")).startswith("en") else "fr"
 
     def identifiants(self, phonemes):
         """Comme piper : ^ _ p1 _ p2 _ ... pn _ $ ; un phoneme inconnu est saute."""
@@ -929,11 +1159,158 @@ class Synthese:
             yield self.phrase(ph, lenteur, **kw)
 
 
-def texte_pour_piper(texte):
-    """Une seule ligne (piper lit ligne par ligne) et des nombres qui se disent."""
-    t = pour_la_voix(texte)
-    t = re.sub(r"(\d{1,2})\s*h\s*(\d{2})\b", r"\1 heures \2", t)
+def texte_pour_piper(texte, langue="fr"):
+    """Une seule ligne (piper lit ligne par ligne) et des nombres qui se disent.
+    « 18h30 » est francais : en anglais, espeak lit « 18:30 » tout seul."""
+    t = pour_la_voix(texte, lien="the link" if langue == "en" else "le lien")
+    if langue != "en":
+        t = re.sub(r"(\d{1,2})\s*h\s*(\d{2})\b", r"\1 heures \2", t)
     return t.replace("\n", " ").strip()
+
+
+# ======================================================================
+#  LA VOIX DE JARVIS -- KOKORO, EN ANGLAIS BRITANNIQUE
+#
+#  « The voice is very bad », « it's robotic as well » : Piper lit juste, mais
+#  il lit. Kokoro-82M (hexgrad, Apache-2.0 ; l'export ONNX de thewh1teagle/
+#  kokoro-onnx, MIT) est d'une autre generation -- une voix qui respire, qui
+#  place l'accent de phrase -- et il a des voix d'hommes britanniques.
+#
+#  « Comme Jarvis », toujours PAS la voix de l'acteur : on prend deux voix du
+#  modele, Fable et un peu de Lewis, melangees (la moyenne de leurs vecteurs de
+#  style) pour un timbre pose, un peu grave -- 116 Hz de fondamentale mesures,
+#  contre 122 pour Fable seul. Une voix de majordome britannique, celle de
+#  personne.
+#
+#  LE FLOAT32 ET PAS L'INT8. Mesure sur un Xeon a 2,1 GHz : l'int8 met 1,2 a
+#  1,4 fois la duree de la phrase a la calculer (plus lent que la parole), le
+#  float32 0,29 fois avec quatre fils. La quantification dynamique ne paie que
+#  sur un processeur qui a VNNI, et on ne sait pas sur quoi Jarvis tourne. 310
+#  Mo telecharges une fois, contre des phrases qui arrivent a l'heure.
+#
+#  Les phonemes viennent du meme espeak-ng que Piper (livre dans son archive),
+#  en anglais britannique -- ce que kokoro-onnx fait aussi.
+# ======================================================================
+
+KOKORO_SOURCE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+KOKORO_MODELE = "kokoro-v1.0.onnx"
+KOKORO_VOIX = "voices-v1.0.bin"
+# La taille exacte de chaque fichier : un telechargement coupe ne passe jamais
+# pour complet, et un fichier remplace en amont se voit.
+KOKORO_TAILLES = {KOKORO_MODELE: 325532387, KOKORO_VOIX: 28214398}
+KOKORO_FREQ = 24000
+KOKORO_ESPEAK = "en"          # espeak-ng : lang/gmw/en, l'anglais de Grande-Bretagne
+KOKORO_MAX = 510              # jetons par passe : la longueur de la table des styles
+
+VOIX_KOKORO = {
+    "jarvis":    {"nom": "Jarvis -- britannique, homme, pose (Fable et un peu de Lewis)",
+                  "melange": {"bm_fable": 0.7, "bm_lewis": 0.3}},
+    "bm_fable":  {"nom": "Fable -- britannique, homme, clair", "melange": {"bm_fable": 1.0}},
+    "bm_george": {"nom": "George -- britannique, homme, plus aigu", "melange": {"bm_george": 1.0}},
+    "bm_daniel": {"nom": "Daniel -- britannique, homme", "melange": {"bm_daniel": 1.0}},
+    "bm_lewis":  {"nom": "Lewis -- britannique, homme, tres grave", "melange": {"bm_lewis": 1.0}},
+}
+KOKORO_DEFAUT = "jarvis"
+
+# LE VOCABULAIRE DU MODELE : un phoneme, un jeton. Recopie du config.json de
+# Kokoro-82M ; un test le compare au fichier quand il est la. Le tilde
+# combinant (U+0303, les nasales) est un symbole a lui seul.
+_KOKORO_SYMBOLES = (';:,.!?—…"()“” ̃ʣʥʦʨᵝꭧAIOQSTWYᵊabcdefhijk'
+                    'lmnopqrstuvwxyzɑɐɒæβɔɕçɖðʤəɚɛɜɟɡɥɨɪʝɯɰŋɳɲɴøɸθœɹɾɻʁɽʂʃʈʧʊʋʌɣɤχʎʒʔˈˌːʰʲ↓→↗↘ᵻ')
+_KOKORO_IDS = (1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 31,
+               33, 35, 36, 39, 41, 42, 43, 44, 45, 46, 47, 48, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+               60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 75, 76, 77, 78, 80, 81, 82, 83, 85,
+               86, 87, 90, 92, 99, 101, 102, 103, 110, 111, 112, 113, 114, 115, 116, 118, 119, 120, 123,
+               125, 126, 128, 129, 130, 131, 132, 133, 135, 136, 138, 139, 140, 142, 143, 147, 148, 156,
+               157, 158, 162, 164, 169, 171, 172, 173, 177)
+KOKORO_VOCAB = dict(zip(_KOKORO_SYMBOLES, _KOKORO_IDS))
+
+
+def style_kokoro(pack, voix):
+    """La table des styles d'une voix du catalogue : (510, 1, 256), un vecteur
+    par longueur de phrase. Un melange est la moyenne ponderee des tables."""
+    entree = VOIX_KOKORO.get(voix) or VOIX_KOKORO[KOKORO_DEFAUT]
+    total = sum(entree["melange"].values())
+    style = None
+    for nom, poids in entree["melange"].items():
+        s = pack[nom].astype("float32") * (poids / total)
+        style = s if style is None else style + s
+    return style
+
+
+def phonemes_kokoro(liste):
+    """Les phonemes d'une phrase (la liste de caracteres du Phonemiseur), tels
+    que Kokoro les lit : sans les marques de changement de langue d'espeak
+    (« (fr) », « (en) » -- les parentheses sont dans son vocabulaire, et il
+    les aurait lues), les espaces ramasses."""
+    p = unicodedata.normalize("NFC", "".join(liste))
+    p = re.sub(r"\([a-z]{2,3}(?:-[a-z0-9]+)*\)", "", p)
+    return re.sub(r"\s+", " ", p).strip()
+
+
+def morceaux_kokoro(phonemes, plafond=KOKORO_MAX):
+    """Une phrase trop longue pour une passe, coupee a une virgule, sinon a un
+    espace, sinon net."""
+    reste, sortie = phonemes, []
+    while len(reste) > plafond:
+        coupe = max(reste.rfind(", ", 0, plafond), reste.rfind("; ", 0, plafond))
+        if coupe < plafond // 3:
+            coupe = reste.rfind(" ", 0, plafond)
+        if coupe < plafond // 3:
+            coupe = plafond - 1
+        sortie.append(reste[:coupe + 1].strip())
+        reste = reste[coupe + 1:].strip()
+    if reste:
+        sortie.append(reste)
+    return sortie
+
+
+class SyntheseKokoro:
+    """Kokoro-82M, charge UNE fois. Meme interface que `Synthese` : la Bouche
+    ne sait pas laquelle elle fait parler."""
+
+    def __init__(self, modele, fichier_voix, phonemiseur, voix=KOKORO_DEFAUT, fils=4):
+        import numpy as np
+        import onnxruntime as rt
+        self.np = np
+        o = rt.SessionOptions()
+        o.intra_op_num_threads = max(1, int(fils))
+        o.inter_op_num_threads = 1
+        self.session = rt.InferenceSession(modele, o, providers=["CPUExecutionProvider"])
+        noms = {i.name for i in self.session.get_inputs()}
+        # « tokens » dans l'export v1.0, « input_ids » dans les suivants
+        self.entree = "input_ids" if "input_ids" in noms else "tokens"
+        with np.load(fichier_voix) as pack:
+            self.styles = style_kokoro(pack, voix)
+        self.phonemiseur = phonemiseur
+        self.frequence = KOKORO_FREQ
+        self.langue = "en"
+
+    def jetons(self, phonemes):
+        return [KOKORO_VOCAB[c] for c in phonemes if c in KOKORO_VOCAB]
+
+    def phrase(self, phonemes, lenteur=1.0):
+        """Le son d'une phrase : int16, crete normalisee comme Piper. `lenteur`
+        est celle de Piper (1,1 = plus lent) ; Kokoro veut une vitesse."""
+        np = self.np
+        ids = self.jetons(phonemes)[:KOKORO_MAX]
+        if not ids:
+            return np.zeros(0, dtype=np.int16)
+        # Un vecteur de style par longueur : n phonemes, la ligne n - 1.
+        style = self.styles[min(len(ids), len(self.styles)) - 1].reshape(1, -1).astype(np.float32)
+        vitesse = 1.0 / max(0.5, min(2.0, float(lenteur or 1.0)))
+        son = self.session.run(None, {self.entree: np.array([[0] + ids + [0]], dtype=np.int64),
+                                      "style": style,
+                                      "speed": np.array([vitesse], dtype=np.float32)})[0].reshape(-1)
+        crete = max(0.01, float(np.max(np.abs(son))))
+        return np.clip(son * (32767.0 / crete), -32768, 32767).astype(np.int16)
+
+    def phrases(self, texte, lenteur=1.0, **kw):
+        for ph in self.phonemiseur.phrases(texte):
+            for bout in morceaux_kokoro(phonemes_kokoro(ph)):
+                son = self.phrase(bout, lenteur)
+                if len(son):
+                    yield son
 
 
 # ======================================================================
@@ -1165,24 +1542,35 @@ def haut_parleur_windows(frequence):
 
 class Bouche:
     """Dit des textes, un a la fois, et s'arrete net quand on le lui demande.
-    `lecteur(frequence)` rend un gestionnaire de contexte qui a `play(float32)`."""
+    `lecteur(frequence)` rend un gestionnaire de contexte qui a `play(float32)`.
 
-    def __init__(self, synthese, sortie, lecteur=None, silence=0.2):
-        self.syn = synthese
+    PLUSIEURS VOIX, UNE BOUCHE : Jarvis parle anglais avec Kokoro, le mode psy
+    francais avec Piper. `syntheses` est {cle: synthese} (une synthese seule
+    est rangee sous sa langue), et chaque « dire » nomme la sienne."""
+
+    def __init__(self, syntheses, sortie, lecteur=None, silence=0.2):
+        if not isinstance(syntheses, dict):
+            syntheses = {getattr(syntheses, "langue", "fr"): syntheses}
+        self.syns = dict(syntheses)
         self.sortie = sortie
         self.lecteur = lecteur or haut_parleur_windows
         self.silence = silence
         self.couper = threading.Event()
 
-    def dire(self, ident, texte, lenteur=1.0):
+    @property
+    def syn(self):
+        return next(iter(self.syns.values()))
+
+    def dire(self, ident, texte, lenteur=1.0, cle=None):
         import numpy as np
+        syn = self.syns.get(cle) or self.syn
         self.couper.clear()
         file_ = queue.Queue(maxsize=3)
         fin = object()
 
         def produire():
             try:
-                for son in self.syn.phrases(texte_pour_piper(texte), lenteur):
+                for son in syn.phrases(texte_pour_piper(texte, getattr(syn, "langue", "fr")), lenteur):
                     if self.couper.is_set():
                         break
                     file_.put(son)
@@ -1191,9 +1579,9 @@ class Bouche:
             file_.put(fin)
 
         threading.Thread(target=produire, daemon=True).start()
-        pas = self.syn.frequence // 10
+        pas = syn.frequence // 10
         coupe, premiere = False, True
-        with self.lecteur(self.syn.frequence) as hp:
+        with self.lecteur(syn.frequence) as hp:
             while True:
                 son = file_.get()
                 if son is fin:
@@ -1266,14 +1654,26 @@ def voix_enfant(port, secret, lecteur=None):
             break
         try:
             if c.get("cmd") == "charger":
+                # UNE VOIX PAR LANGUE, chargees l'une apres l'autre : l'anglais
+                # de Jarvis (Kokoro) et le francais du mode psy (Piper).
+                cle = str(c.get("cle") or "fr")
                 ph = Phonemiseur(c["bibliotheque"], c["donnees"], c.get("espeak", "fr"))
-                syn = Synthese(c["modele"], ph, c.get("fils", 2), c.get("locuteur", 0))
-                etat["bouche"] = Bouche(syn, sortie, lecteur, float(c.get("silence", 0.2)))
-                sortie({"evt": "pret", "frequence": syn.frequence})
+                if c.get("moteur") == "kokoro":
+                    syn = SyntheseKokoro(c["modele"], c["voix_fichier"], ph, c.get("voix", KOKORO_DEFAUT),
+                                         c.get("fils", 4))
+                else:
+                    syn = Synthese(c["modele"], ph, c.get("fils", 2), c.get("locuteur", 0))
+                if etat["bouche"] is None:
+                    etat["bouche"] = Bouche({cle: syn}, sortie, lecteur, float(c.get("silence", 0.2)))
+                else:
+                    etat["bouche"].syns[cle] = syn
+                sortie({"evt": "pret", "cle": cle, "frequence": syn.frequence})
             elif c.get("cmd") == "dire" and etat["bouche"] is not None:
-                etat["bouche"].dire(c.get("id"), c.get("texte", ""), float(c.get("lenteur", 1.0)))
+                etat["bouche"].dire(c.get("id"), c.get("texte", ""), float(c.get("lenteur", 1.0)),
+                                    c.get("cle"))
         except Exception as e:
-            sortie({"evt": "erreur", "message": "%s : %s" % (type(e).__name__, str(e)[:160])})
+            sortie({"evt": "erreur", "cle": c.get("cle") if c.get("cmd") == "charger" else None,
+                    "message": "%s : %s" % (type(e).__name__, str(e)[:160])})
             if c.get("cmd") == "dire":
                 sortie({"evt": "fini", "id": c.get("id"), "coupe": False, "rate": True})
     try:

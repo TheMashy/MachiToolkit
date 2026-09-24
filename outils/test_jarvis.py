@@ -177,6 +177,124 @@ class FinEtModes(unittest.TestCase):
             self.assertIsNone(J.changement_de_mode(t), t)
 
 
+class EnAnglais(unittest.TestCase):
+    """« And in English as well » : on peut lui parler anglais -- les commandes
+    se lisent dans les deux langues, et une phrase sur soi n'en devient pas une."""
+
+    def action(self, texte):
+        a = J.comprendre(texte)
+        return a and a["action"]
+
+    def test_la_lumiere(self):
+        for t, a in (("Turn off the lights.", "lumiere_off"), ("lights off", "lumiere_off"),
+                     ("Turn the lights off", "lumiere_off"), ("kill the lights", "lumiere_off"),
+                     ("Turn on the lights", "lumiere_on"), ("lights on please", "lumiere_on"),
+                     ("Lights back to normal", "lumiere_normale"), ("normal lights", "lumiere_normale")):
+            self.assertEqual(self.action(t), a, t)
+        a = J.comprendre("Make the lights blue.")
+        self.assertEqual((a["action"], a["nom"]), ("lumiere_couleur", "bleu"))
+        self.assertEqual(J.comprendre("set the lights to red")["nom"], "rouge")
+        self.assertEqual(J.comprendre("purple lights")["nom"], "violet")
+
+    def test_minuteurs_et_rappels(self):
+        a = J.comprendre("Set a timer for ten minutes")
+        self.assertEqual((a["action"], a["secondes"]), ("minuteur", 600))
+        self.assertEqual(J.comprendre("a 5 minute timer")["secondes"], 300)
+        self.assertEqual(J.comprendre("timer for an hour and a half")["secondes"], 5400)
+        a = J.comprendre("Remind me in 20 minutes to take the laundry out")
+        self.assertEqual((a["secondes"], a["quoi"]), (1200, "take the laundry out"))
+        a = J.comprendre("remind me to call mum in half an hour")
+        self.assertEqual((a["secondes"], a["quoi"]), (1800, "call mum"))
+        self.assertEqual(self.action("cancel the timers"), "minuteurs_annuler")
+
+    def test_heure_date_et_le_reste(self):
+        for t, a in (("What time is it?", "heure"), ("what's the date", "date"), ("What day is it today", "date"),
+                     ("stop listening", "dormir"), ("screen mode", "mode"), ("switch to music mode", "mode"),
+                     ("open BrainDebugger", "ouvrir_site"), ("open machi tool", "ouvrir_panneau"),
+                     ("sync my day", "synchro"), ("shut up", "silence"), ("never mind", "fin"),
+                     ("learn my voice", "apprendre"), ("Apprends ma voix.", "apprendre")):
+            self.assertEqual(self.action(t), a, t)
+        self.assertEqual(J.comprendre("switch to music mode")["mode"], "son")
+
+    def test_ce_qui_parle_de_soi_va_a_jarvis(self):
+        for t in ("I feel switched off today", "the lights in my head are off", "what a day it has been",
+                  "tell me a joke about timers", "why is the sky blue", "go home and rest"):
+            self.assertIsNone(J.comprendre(t), t)
+
+    def test_durees(self):
+        for t, s in (("10 minutes", 600), ("ten minutes", 600), ("twenty-five minutes", 1500),
+                     ("an hour", 3600), ("half an hour", 1800), ("a quarter of an hour", 900),
+                     ("an hour and a half", 5400), ("one and a half hours", 5400), ("90 seconds", 90),
+                     ("two hours and thirty minutes", 9000)):
+            self.assertEqual(J.duree_en(t), s, t)
+        self.assertIsNone(J.duree_en("a nice day"))
+        self.assertEqual(J.duree("dix minutes"), 600)
+        self.assertEqual(J.duree("ten minutes"), 600)
+        self.assertEqual(J.dire_duree(5400, "en"), "1 hour and 30 minutes")
+        self.assertEqual(J.dire_duree(45, "en"), "45 seconds")
+
+    def test_fin_et_modes(self):
+        for t in ("never mind", "Forget it.", "no thanks", "that'll be all, Jarvis", "goodbye", "nothing"):
+            self.assertTrue(J.fin_de_conversation(t), t)
+        self.assertFalse(J.fin_de_conversation("nothing works on my computer today"))
+        self.assertEqual(J.changement_de_mode("therapist mode"), ("psy", ""))
+        self.assertEqual(J.changement_de_mode("switch to therapist mode, I slept badly"), ("psy", "I slept badly"))
+        self.assertEqual(J.changement_de_mode("take a note that I took my meds"),
+                         ("psy", "take a note that I took my meds"))
+        self.assertEqual(J.changement_de_mode("back to Jarvis"), ("jarvis", ""))
+        self.assertEqual(J.changement_de_mode("exit therapist mode"), ("jarvis", ""))
+        self.assertIsNone(J.changement_de_mode("shrink the window"))
+
+    def test_jarvis_re(self):
+        """« Jarvis ? Re ! » : de retour aupres du majordome -- le mot d'eveil
+        retire, il reste « re »."""
+        self.assertEqual(J.changement_de_mode(J.retirer_mot_eveil("Jarvis ? Re !")), ("jarvis", ""))
+        for t in ("re", "Ré !", "je suis de retour", "I'm back"):
+            self.assertEqual(J.changement_de_mode(t), ("jarvis", ""), t)
+        for t in ("regarde ça", "recommence", "respire"):
+            self.assertIsNone(J.changement_de_mode(t), t)
+
+
+class Kokoro(unittest.TestCase):
+    """La voix anglaise, sans le modele : son vocabulaire, ses phonemes, ses
+    morceaux et le melange des voix."""
+
+    def test_le_vocabulaire(self):
+        v = J.KOKORO_VOCAB
+        self.assertEqual(len(v), 114)
+        self.assertEqual((v[";"], v[" "], v["̃"], v["ᵻ"]), (1, 16, 17, 177))
+        self.assertEqual(len(set(v.values())), 114)
+        # Le fichier de Kokoro-82M, quand il est la : la table recopiee lui est identique.
+        conf = os.path.join(os.environ.get("JARVIS_KOKORO_DOSSIER", ""), "config.json")
+        if os.path.isfile(conf):
+            with open(conf, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["vocab"], v)
+
+    def test_les_phonemes(self):
+        import unicodedata
+        self.assertEqual(J.phonemes_kokoro(list("həlˈəʊ  (fr)wˈɜːld.")), "həlˈəʊ wˈɜːld.")
+        # « ç » est un symbole du vocabulaire : decompose, la cedille s'y perdait
+        self.assertEqual(J.phonemes_kokoro(list(unicodedata.normalize("NFD", "ça"))), "ça")
+
+    def test_une_phrase_trop_longue_en_morceaux(self):
+        long_ = ", ".join(["wˈʌn tˈuː θɹˈiː fˈɔː"] * 60)
+        bouts = J.morceaux_kokoro(long_)
+        self.assertGreater(len(bouts), 1)
+        self.assertTrue(all(len(b) <= J.KOKORO_MAX for b in bouts))
+        self.assertEqual("".join(bouts).replace(" ", "").replace(",", ""),
+                         long_.replace(" ", "").replace(",", ""))
+
+    @unittest.skipUnless(NUMPY, "numpy")
+    def test_le_melange_des_voix(self):
+        pack = {"bm_fable": np.ones((510, 1, 256), np.float32), "bm_lewis": 2 * np.ones((510, 1, 256), np.float32)}
+        s = J.style_kokoro(pack, "jarvis")
+        self.assertEqual(s.shape, (510, 1, 256))
+        self.assertAlmostEqual(float(s[0, 0, 0]), 0.7 * 1 + 0.3 * 2, places=5)
+        self.assertAlmostEqual(float(J.style_kokoro(pack, "bm_fable")[3, 0, 7]), 1.0)
+        # une voix inconnue : celle de Jarvis
+        self.assertAlmostEqual(float(J.style_kokoro(pack, "nimporte")[0, 0, 0]), 1.3, places=5)
+
+
 class MotEveil(unittest.TestCase):
     def test_on_coupe_jusqu_au_mot(self):
         self.assertEqual(J.retirer_mot_eveil("Jarvis, allume la lumière."), "allume la lumière.")
@@ -511,12 +629,16 @@ class DansMachiTool(unittest.TestCase):
         m.CFG.update(pont_site="https://bd.exemple", pont_cle="CLE", jarvis_voix=False)
         m.ETAT["forcage"] = None
         m.JARVIS.update(led=None, led_fin=0.0, minuteurs=[], etat="attente", mode="jarvis",
-                        mode_vu=0.0, historique=[], vu=0.0, propose_psy=False)
+                        mode_vu=0.0, historique=[], vu=0.0, propose_psy=False,
+                        psy_echange=[], psy_grave=False, reveil_par=None)
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
         m.JARVIS_CROCHETS["notifier"] = lambda t, x: self.dit.append(x)
         self._origines = {k: getattr(m, k) for k in ("transcrire", "etat_dictee", "parler_au_compagnon",
-                                                      "parler_a_jarvis", "jouer_son", "sauver_config")}
+                                                      "parler_a_jarvis", "jouer_son", "sauver_config",
+                                                      "prechauffer_dictee", "apprendre_a_voix_haute",
+                                                      "gabarits_jarvis", "envoyer_voix", "voix_prete",
+                                                      "envoyer_oreille")}
         m.jouer_son = lambda g: None
         m.sauver_config = lambda cfg: True
         m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
@@ -628,7 +750,10 @@ class DansMachiTool(unittest.TestCase):
 
     def test_jarvis_tout_seul_attend_la_suite(self):
         self.phrase("Jarvis.")
-        self.assertEqual(self.dit, ["Oui ?"])
+        self.assertEqual(self.dit, ["Yes?"])
+        self.m.CFG["jarvis_langue"] = "fr"
+        self.phrase("Jarvis.")
+        self.assertEqual(self.dit, ["Yes?", "Oui ?"])
 
     def test_ce_qui_est_dit_n_est_jamais_journalise(self):
         journal = io.StringIO()
@@ -658,9 +783,13 @@ class DansMachiTool(unittest.TestCase):
         self.m.CFG["pont_cle"] = ""
         self.phrase("Jarvis, raconte-moi une histoire")
         self.assertEqual(self.m.JARVIS["etat"], "erreur")
+        self.assertIn("BrainDebugger key", self.m.JARVIS["message"])
+        self.m.CFG["jarvis_langue"] = "fr"
+        self.phrase("Jarvis, raconte-moi une histoire")
         self.assertIn("clé", self.m.JARVIS["message"])
 
     def test_l_heure_et_les_minuteurs(self):
+        self.m.CFG["jarvis_langue"] = "fr"
         t = time.mktime((2026, 9, 24, 14, 5, 0, 0, 0, -1))
         self.assertEqual(self.m.executer_commande({"action": "heure"}, self.m.CFG, t), "Il est 14 heures 05.")
         self.assertEqual(self.m.executer_commande({"action": "date"}, self.m.CFG, t),
@@ -670,6 +799,164 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(len(self.m.JARVIS["minuteurs"]), 1)
         self.assertEqual(self.m.executer_commande({"action": "minuteurs_annuler"}, self.m.CFG), "C'est annulé.")
         self.assertEqual(self.m.JARVIS["minuteurs"], [])
+
+    def test_jarvis_parle_anglais_par_defaut(self):
+        m = self.m
+        self.assertEqual(m.CONFIG_DEFAUT["jarvis_langue"], "en")
+        t = time.mktime((2026, 9, 24, 14, 5, 0, 0, 0, -1))
+        self.assertEqual(m.executer_commande({"action": "heure"}, m.CFG, t), "It's 2:05 in the afternoon.")
+        self.assertEqual(m.executer_commande({"action": "heure"}, m.CFG, time.mktime((2026, 9, 24, 18, 0, 0, 0, 0, -1))),
+                         "It's 6 o'clock in the evening.")
+        self.assertEqual(m.executer_commande({"action": "date"}, m.CFG, t), "It's Thursday, the 24th of September.")
+        self.assertEqual(m.executer_commande({"action": "minuteur", "secondes": 600, "quoi": ""}, m.CFG),
+                         "Timer set for 10 minutes.")
+        self.assertEqual(m.executer_commande({"action": "minuteurs_annuler"}, m.CFG), "Cancelled.")
+        # le mode psy, lui, reste francais
+        m.poser_mode("psy")
+        self.assertEqual(m.executer_commande({"action": "minuteurs_annuler"}, m.CFG),
+                         "Il n'y avait aucun minuteur en cours.")
+
+    def test_le_reveil_remet_toujours_en_mode_jarvis(self):
+        """« Quand Jarvis s'allume il doit toujours etre en mode Jarvis (meme
+        s'il etait en psychologue avant). »"""
+        m = self.m
+        m.prechauffer_dictee = lambda: None
+        m.envoyer_oreille = lambda o: True
+        m.poser_mode("psy")
+        m.traiter_evenement({"evt": "reveil", "par": "voix", "score": 0.1})
+        self.assertEqual(m.JARVIS["mode"], "jarvis")
+
+    def test_jarvis_re_revient_du_psy(self):
+        vus = self.espions()
+        self.m.poser_mode("psy")
+        self.phrase("Jarvis ? Re !")
+        self.assertEqual(self.m.JARVIS["mode"], "jarvis")
+        self.assertEqual(self.dit, ["Welcome back."])
+        self.assertEqual(vus, {"jarvis": [], "psy": []})
+
+    def _seance(self):
+        m = self.m
+        m.envoyer_oreille = lambda o: True
+        m.poser_mode("psy")
+        echange = [{"role": "user", "texte": "j'ai raté mon gâteau"}, {"role": "assistant", "texte": "Ça arrive."}]
+        m.JARVIS["psy_echange"] = list(echange)
+        return echange
+
+    def test_au_revoir_au_psy_un_mot_leger_au_plus(self):
+        echange = self._seance()
+        with mock_urlopen(self.m, {"texte": "Back to business. Shall I order a cake?", "mode": "jarvis"}) as req:
+            self.phrase("Au revoir.")
+        self.assertEqual(req[0].full_url, "https://bd.exemple/api/machitool/jarvis")
+        corps = json.loads(req[0].data.decode())
+        self.assertEqual((corps["transition"], corps["psy"], corps["langue"]), ("fin_psy", echange, "en"))
+        self.assertEqual(self.dit, ["Back to business. Shall I order a cake?"])
+        self.assertEqual(self.m.JARVIS["mode"], "jarvis")
+        self.assertEqual(self.m.JARVIS["psy_echange"], [], "la seance ne reste pas en memoire")
+
+    def test_au_revoir_au_psy_brain_debugger_choisit_le_silence(self):
+        self._seance()
+        with mock_urlopen(self.m, {"texte": "", "mode": "jarvis"}):
+            self.phrase("au revoir")
+        self.assertEqual(self.dit, [])
+        self.assertEqual(self.m.JARVIS["mode"], "jarvis")
+
+    def test_au_revoir_au_psy_apres_un_message_grave_il_se_tait_sans_demander(self):
+        self._seance()
+        self.m.JARVIS["psy_grave"] = True
+        with mock_urlopen(self.m, {"texte": "Ha, splendid.", "mode": "jarvis"}) as req:
+            self.phrase("Au revoir.")
+        self.assertEqual(req, [], "il ne demande meme pas")
+        self.assertEqual(self.dit, [])
+
+    def test_la_seance_psy_en_memoire_et_le_grave_retenu(self):
+        m = self.m
+        m.poser_mode("psy")
+        with mock_urlopen(m, {"texte": "Je vous entends."}):
+            m.parler_au_compagnon("journée difficile", m.CFG)
+        self.assertEqual(m.JARVIS["psy_echange"], [{"role": "user", "texte": "journée difficile"},
+                                                   {"role": "assistant", "texte": "Je vous entends."}])
+        m.poser_mode("jarvis")
+        with mock_urlopen(m, {"texte": "Je suis là.", "mode": "psy"}):
+            self.phrase("Jarvis, j'ai envie de mourir")
+        self.assertEqual(m.JARVIS["mode"], "psy")
+        self.assertTrue(m.JARVIS["psy_grave"])
+
+    def test_apprends_ma_voix_a_voix_haute(self):
+        lance = threading.Event()
+        self.m.apprendre_a_voix_haute = lambda cfg: lance.set()
+        self.phrase("Jarvis, learn my voice.")
+        self.assertTrue(lance.wait(2.0))
+
+    def test_l_astuce_pour_jarvis_tout_seul_une_seule_fois(self):
+        m = self.m
+        m.gabarits_jarvis = lambda: []
+        m.JARVIS["reveil_par"] = "hey"
+        self.phrase("Hey Jarvis.")
+        self.assertIn("learn my voice", self.dit[-1])
+        self.assertTrue(m.CFG["jarvis_astuce_voix"])
+        self.phrase("Hey Jarvis.")
+        self.assertEqual(self.dit[-1], "Yes?")
+
+    def test_une_voix_par_langue(self):
+        """L'anglais a Kokoro, le francais a Piper ; sans la voix anglaise, la
+        voix de Windows EN ANGLAIS plutot que Piper qui lirait de l'anglais."""
+        m = self.m
+        envoyes = []
+        m.envoyer_voix = lambda o: envoyes.append(o) or True
+        m.voix_prete = lambda cle=None: cle in (None, "en", "fr")
+        v = m.Voix()
+        v.disponible = False
+        v.dire("Good evening.", None, "en")
+        v.dire("Bonsoir.", None, "fr")
+        self.assertEqual([(e["cle"], e["texte"]) for e in envoyes], [("en", "Good evening."), ("fr", "Bonsoir.")])
+        m.voix_prete = lambda cle=None: cle in (None, "fr")
+        v = m.Voix()
+        v.disponible = True
+        v.fil = type("Vivant", (), {"is_alive": lambda self: True})()
+        v.dire("Good evening.", None, "en")
+        self.assertEqual(len(envoyes), 2, "pas de Piper francais pour lire de l'anglais")
+        self.assertEqual(v.file[0][0::2], ("Good evening.", "en"))
+
+    def test_la_voix_anglaise_telechargee_a_l_octet_pres(self):
+        m = self.m
+        tailles = dict(J.KOKORO_TAILLES)
+        J.KOKORO_TAILLES.update({J.KOKORO_MODELE: 12, J.KOKORO_VOIX: 7})
+        try:
+            zip_ = io.BytesIO()
+            with zipfile.ZipFile(zip_, "w") as z:
+                z.writestr("piper/" + os.path.basename(m.bibli_espeak()), b"dll")
+                z.writestr("piper/espeak-ng-data/phontab", b"donnees")
+            demandes = []
+
+            def ouvrir(url):
+                demandes.append(url)
+                if url == J.PIPER_MOTEUR:
+                    return FausseReponse(zip_.getvalue())
+                if url == J.KOKORO_SOURCE + J.KOKORO_MODELE:
+                    return FausseReponse(b"m" * 12)
+                if url == J.KOKORO_SOURCE + J.KOKORO_VOIX:
+                    return FausseReponse(b"v" * 7)
+                raise OSError("inattendu : " + url)
+            m.KOKORO.update(etat="absent")
+            self.assertTrue(m.preparer_kokoro(m.CFG, ouvrir))
+            self.assertTrue(m.kokoro_present())
+            k = m.kokoro_pret(m.CFG)
+            self.assertEqual((k["cle"], k["moteur"], k["espeak"], k["voix"]), ("en", "kokoro", "en", "jarvis"))
+            self.assertEqual(m.charges_voix(m.CFG)[0]["cle"], "en")
+            # Coupe en route : il ne passe pas pour complet.
+            os.remove(m.fichier_kokoro(J.KOKORO_MODELE))
+
+            def coupe(url):
+                return FausseReponse(b"m" * 5)
+            self.assertFalse(m.preparer_kokoro(m.CFG, coupe))
+            self.assertFalse(m.kokoro_present())
+            self.assertEqual(m.KOKORO["etat"], "erreur")
+            # Jarvis en francais : la voix anglaise ne se charge pas.
+            m.CFG["jarvis_langue"] = "fr"
+            self.assertIsNone(m.kokoro_pret(m.CFG))
+        finally:
+            J.KOKORO_TAILLES.clear()
+            J.KOKORO_TAILLES.update(tailles)
 
     def test_la_guirlande_passe_devant_puis_rend_la_main(self):
         m = self.m
@@ -1056,6 +1343,60 @@ class VoixEnMemoire(unittest.TestCase):
             self.assertFalse(m.voix_prete())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+KOKORO_DOSSIER = os.environ.get("JARVIS_KOKORO_DOSSIER", "")   # kokoro-v1.0.onnx et voices-v1.0.bin
+KOKORO = bool(NUMPY and ONNX and PIPER_DOSSIER and bibli_de_test()
+              and all(os.path.isfile(os.path.join(KOKORO_DOSSIER, n)) for n in (J.KOKORO_MODELE, J.KOKORO_VOIX)))
+
+
+@unittest.skipUnless(KOKORO, "JARVIS_KOKORO_DOSSIER / JARVIS_PIPER_DOSSIER absents")
+class VoixAnglaise(unittest.TestCase):
+    """« The voice is very bad », « it's robotic as well » : la voix anglaise de
+    Jarvis, Kokoro, en memoire, avec l'espeak-ng de Piper -- et les deux langues
+    dans le meme processus sans se voler leur voix."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.en = J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, J.KOKORO_ESPEAK)
+        cls.syn = J.SyntheseKokoro(os.path.join(KOKORO_DOSSIER, J.KOKORO_MODELE),
+                                   os.path.join(KOKORO_DOSSIER, J.KOKORO_VOIX), cls.en, "jarvis", 2)
+
+    def test_les_phonemes_anglais(self):
+        p = J.phonemes_kokoro(self.en.phrases("Good evening.")[0])
+        self.assertEqual(p, "ɡˈʊd ˈiːvnɪŋ.")
+        self.assertTrue(all(c in J.KOKORO_VOCAB for c in p), "rien ne se perd en route")
+
+    def test_il_parle_anglais_une_phrase_a_la_fois(self):
+        sons = list(self.syn.phrases("Good evening. All systems are operational.", 0.95))
+        self.assertEqual(len(sons), 2, "deux phrases, deux morceaux")
+        for s in sons:
+            d = len(s) / float(J.KOKORO_FREQ)
+            self.assertTrue(0.4 < d < 6, d)
+            self.assertGreater(float(np.sqrt(np.mean(s.astype(np.float64) ** 2))), 1500, "il parle, il ne souffle pas")
+        self.assertGreater(int(np.max(np.abs(sons[0]))), 30000, "crete normalisee, comme piper")
+
+    def test_deux_langues_dans_un_processus(self):
+        """espeak-ng n'a qu'une voix par processus : le francais du mode psy
+        et l'anglais de Jarvis ne doivent pas se voler la leur."""
+        fr = J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, "fr")
+        avant = self.en.phrases("Hello there.")
+        bonjour = fr.phrases("Bonjour.")
+        apres = self.en.phrases("Hello there.")
+        self.assertEqual(avant, apres, "l'anglais reste anglais apres le francais")
+        self.assertIn("ʁ", "".join(bonjour[0]), "le francais reste francais")
+        self.assertNotEqual(avant, fr.phrases("Hello there."))
+
+    @unittest.skipUnless(PIPER, "JARVIS_PIPER_VOIX absent")
+    def test_une_bouche_deux_voix(self):
+        piper = J.Synthese(PIPER_VOIX, J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, "fr"))
+        hp, evts = FauxHautParleur(), []
+        b = J.Bouche({"en": self.syn, "fr": piper}, evts.append, hp)
+        b.dire(1, "Good evening.", 1.0, "en")
+        self.assertEqual(hp.frequence, J.KOKORO_FREQ)
+        b.dire(2, "Bonsoir.", 1.0, "fr")
+        self.assertEqual(hp.frequence, piper.frequence)
+        self.assertEqual([e["evt"] for e in evts], ["debut", "fini", "debut", "fini"])
 
 
 if __name__ == "__main__":
