@@ -37,12 +37,15 @@ import traceback
 import subprocess
 import http.server
 import io
+import socket
+import struct
+import wave
 import concurrent.futures
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.26.1"
+VERSION = "1.26.2"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -3783,8 +3786,7 @@ DICTEE_SOURCE = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/reso
 DICTEE_MAX_OCTETS = 20 * 1024 * 1024     # ~10 min de parole en 16 kHz mono
 DICTEE_DECHARGER_S = 10 * 60             # le modele occupe ~1 Go de memoire
 
-DICTEE = {"etat": "absent", "progres": 0.0, "source": None, "message": "",
-          "modele": None, "vu": 0.0}
+DICTEE = {"etat": "absent", "progres": 0.0, "source": None, "message": ""}
 _DICTEE_VERROU = threading.Lock()
 
 
@@ -3934,27 +3936,235 @@ def son_depuis_wav(octets):
     return brut.astype(np.float32) / 32768.0, frequence
 
 
+def _options_onnx():
+    """La moitie des coeurs, et pas d'arene memoire gardee apres usage.
+
+    Par defaut onnxruntime prend TOUS les coeurs : pendant le chargement et
+    la transcription, le reste du PC ne repondait plus — jusqu'a faire
+    tomber d'autres applications."""
+    import onnxruntime as rt
+    o = rt.SessionOptions()
+    o.intra_op_num_threads = max(1, (os.cpu_count() or 2) // 2)
+    o.inter_op_num_threads = 1
+    o.enable_cpu_mem_arena = False
+    return o
+
+
 def _charger_modele_dictee():
     import onnx_asr
-    return onnx_asr.load_model(DICTEE_NOM, dossier_dictee(), quantization="int8")
+    return onnx_asr.load_model(DICTEE_NOM, dossier_dictee(), quantization="int8",
+                               sess_options=_options_onnx())
 
 
-def transcrire(octets, charger=None):
+# ---------------------------------------------------------------------
+#  LE MOTEUR VIT DANS SON PROPRE PROCESSUS.
+#
+#  Vu en vrai : a la premiere dictee, le PC a gele, Claude a plante, et
+#  Machi Tool s'est ETEINT (« Failed to fetch » cote page). Le modele de
+#  456 Mo se chargeait DANS Machi Tool : une panne de memoire ou du moteur
+#  natif emportait l'application entiere — ses LEDs, sa passerelle, son
+#  journal d'activite. Rien de facultatif ne doit pouvoir faire ca.
+#
+#  Le moteur tourne donc dans un processus enfant (le meme exe, lance avec
+#  DICTEE_ENFANT_ARG), en priorite basse, sur la moitie des coeurs. S'il
+#  tombe, Machi Tool reste debout et dit pourquoi ; s'il ne sert plus, il
+#  s'en va, et sa memoire revient VRAIMENT au systeme — ce qu'un modele
+#  decharge a l'interieur d'un processus Python ne garantit pas.
+# ---------------------------------------------------------------------
+
+DICTEE_ENFANT_ARG = "--moteur-dictee"
+DICTEE_MEMOIRE_MIN_MO = 1500        # en dessous, charger 1 Go gelerait le PC
+DICTEE_DEMARRAGE_S = 90             # l'exe se decompresse avant de repondre
+DICTEE_REPONSE_S = 300              # premier chargement + transcription
+_MOTEUR = {"proc": None, "sock": None, "vu": 0.0}
+
+
+class DicteeImpossible(RuntimeError):
+    """Une raison qu'on peut dire telle quelle a la personne."""
+
+
+def memoire_libre_mo():
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def _envoyer_trame(s, octets):
+    s.sendall(struct.pack(">I", len(octets)) + octets)
+
+
+def _recevoir_trame(s, plafond=DICTEE_MAX_OCTETS + 4096):
+    def exactement(n):
+        buf = bytearray()
+        while len(buf) < n:
+            bout = s.recv(min(1 << 20, n - len(buf)))
+            if not bout:
+                raise ConnectionError("connexion fermee")
+            buf += bout
+        return bytes(buf)
+    n = struct.unpack(">I", exactement(4))[0]
+    if n > plafond:
+        raise ValueError("trame trop longue")
+    return exactement(n)
+
+
+def _commande_moteur(port, secret):
+    if FIGE:
+        return [sys.executable, DICTEE_ENFANT_ARG, str(port), secret]
+    return [sys.executable, os.path.abspath(__file__), DICTEE_ENFANT_ARG, str(port), secret]
+
+
+def _arreter_moteur():
+    sock, proc = _MOTEUR["sock"], _MOTEUR["proc"]
+    _MOTEUR.update(sock=None, proc=None)
+    if sock is not None:
+        try:
+            _envoyer_trame(sock, b"")                 # « c'est fini »
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+atexit.register(_arreter_moteur)
+
+
+def _moteur_vivant():
+    """La connexion au moteur, en le lancant s'il le faut."""
+    proc = _MOTEUR["proc"]
+    if proc is not None and proc.poll() is None and _MOTEUR["sock"] is not None:
+        return _MOTEUR["sock"]
+    _arreter_moteur()
+    libre = memoire_libre_mo()
+    if libre is not None and libre < DICTEE_MEMOIRE_MIN_MO:
+        raise DicteeImpossible(
+            "pas assez de memoire libre pour la dictee (%d Mo, il en faut %d) — "
+            "ferme des applications ; Handy garde peut-etre le meme modele ouvert"
+            % (libre, DICTEE_MEMOIRE_MIN_MO))
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(DICTEE_DEMARRAGE_S)
+        secret = secrets.token_hex(16)
+        kw = {}
+        if os.name == "nt":
+            kw["creationflags"] = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                   | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+        # Ses erreurs, et la pile d'un plantage natif, vont au meme journal.
+        sortie = _JOURNAL if _JOURNAL is not None else None
+        proc = subprocess.Popen(_commande_moteur(srv.getsockname()[1], secret),
+                                stdin=subprocess.DEVNULL, stdout=sortie, stderr=sortie, **kw)
+        try:
+            sock, _ = srv.accept()
+        except socket.timeout:
+            proc.kill()
+            raise DicteeImpossible("le moteur de dictee n'a pas demarre")
+        sock.settimeout(DICTEE_REPONSE_S)
+        try:
+            ok = secrets.compare_digest(_recevoir_trame(sock, 64), secret.encode())
+        except Exception:
+            ok = False
+        if not ok:
+            sock.close()
+            proc.kill()
+            raise DicteeImpossible("le moteur de dictee n'a pas repondu comme prevu")
+    finally:
+        srv.close()
+    _MOTEUR.update(proc=proc, sock=sock, vu=time.time())
+    return sock
+
+
+def entete_wav(octets):
+    """(canaux, frequence, echantillons, largeur) — sans numpy, sans rien charger."""
+    with wave.open(io.BytesIO(octets)) as w:
+        return w.getnchannels(), w.getframerate(), w.getnframes(), w.getsampwidth()
+
+
+def transcrire(octets):
     """Le texte dit dans ce WAV. Le son ne touche jamais le disque."""
     if etat_dictee()["etat"] != "pret":
         raise RuntimeError("le modele de dictee n'est pas pret")
-    son, frequence = son_depuis_wav(octets)
+    try:
+        _, frequence, n, largeur = entete_wav(octets)
+    except (wave.Error, EOFError) as e:
+        raise ValueError("WAV illisible (%s)" % e)
+    if largeur != 2:
+        raise ValueError("WAV 16 bits attendu")
     if frequence not in (8000, 16000, 22050, 24000, 32000, 44100, 48000):
         raise ValueError("frequence non prise en charge : %s" % frequence)
-    if len(son) < frequence * 0.2:
+    if n < frequence * 0.2:
         return ""                                   # un clic, pas une phrase
     with _DICTEE_VERROU:
-        if DICTEE["modele"] is None:
-            DICTEE["modele"] = (charger or _charger_modele_dictee)()
-        DICTEE["vu"] = time.time()
-        texte = DICTEE["modele"].recognize(son, sample_rate=frequence)
+        sock = _moteur_vivant()
+        try:
+            _envoyer_trame(sock, octets)
+            reponse = json.loads(_recevoir_trame(sock).decode("utf-8"))
+        except (OSError, ConnectionError, ValueError):
+            proc = _MOTEUR["proc"]
+            code = proc.poll() if proc is not None else None
+            _arreter_moteur()
+            libre = memoire_libre_mo()
+            conseil = (" — il ne restait que %d Mo de memoire libre" % libre
+                       if libre is not None and libre < 3 * DICTEE_MEMOIRE_MIN_MO else "")
+            print("Dictee : le moteur s'est arrete (code %s)" % code)
+            raise DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription%s. "
+                                   "Machi Tool, lui, tourne toujours." % conseil)
+        _MOTEUR["vu"] = time.time()
     _programmer_dechargement()
-    return str(texte or "").strip()
+    if "erreur" in reponse:
+        raise DicteeImpossible("le moteur de dictee a echoue : %s" % reponse["erreur"])
+    return str(reponse.get("texte") or "").strip()
+
+
+def moteur_dictee_enfant(port, secret, charger=None):
+    """Ce que fait le processus du moteur : attendre un son, rendre un texte.
+
+    Il s'en va de lui-meme quand Machi Tool ferme la connexion, disparait, ou
+    l'oublie plus longtemps que DICTEE_DECHARGER_S."""
+    if os.name != "nt":
+        try:
+            os.nice(10)
+        except Exception:
+            pass
+    s = socket.create_connection(("127.0.0.1", int(port)), timeout=30)
+    _envoyer_trame(s, str(secret).encode())
+    s.settimeout(DICTEE_DECHARGER_S + 60)
+    modele = None
+    try:
+        while True:
+            try:
+                wav = _recevoir_trame(s)
+            except (OSError, ConnectionError, ValueError):
+                break
+            if not wav:
+                break
+            try:
+                if modele is None:
+                    modele = (charger or _charger_modele_dictee)()
+                son, frequence = son_depuis_wav(wav)
+                reponse = {"texte": str(modele.recognize(son, sample_rate=frequence) or "").strip()}
+            except Exception as e:
+                reponse = {"erreur": "%s : %s" % (type(e).__name__, str(e)[:200])}
+            wav = None
+            _envoyer_trame(s, json.dumps(reponse).encode("utf-8"))
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 _DICTEE_MINUTEUR = [None]
@@ -3971,11 +4181,12 @@ def _programmer_dechargement():
 
 
 def decharger_dictee_si_oubliee(maintenant=None):
-    """Un moteur de 1 Go ne reste pas en memoire pour une dictee par jour."""
+    """Un moteur de 1 Go ne reste pas en memoire pour une dictee par jour :
+    on arrete son processus, et le systeme recupere tout."""
     maintenant = time.time() if maintenant is None else maintenant
     with _DICTEE_VERROU:
-        if DICTEE["modele"] is not None and maintenant - DICTEE["vu"] > DICTEE_DECHARGER_S:
-            DICTEE["modele"] = None
+        if _MOTEUR["proc"] is not None and maintenant - _MOTEUR["vu"] > DICTEE_DECHARGER_S:
+            _arreter_moteur()
             return True
     return False
 
@@ -4079,9 +4290,11 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
             texte = transcrire(octets)
         except ValueError as e:
             return self.repondre(400, {"erreur": str(e)[:200]})
+        except DicteeImpossible as e:
+            return self.repondre(503, {"erreur": str(e)[:300]})
         except Exception as e:
             print("Dictee : transcription impossible (%s)" % type(e).__name__)
-            return self.repondre(500, {"erreur": "transcription impossible"})
+            return self.repondre(500, {"erreur": "transcription impossible (%s)" % type(e).__name__})
         finally:
             octets = None                          # le son ne survit pas a la requete
         # Le texte n'est PAS journalise : c'est ce que la personne vient de dire.
@@ -8502,6 +8715,12 @@ def rapporter_plantage(e):
 
 
 if __name__ == "__main__":
+    # Le processus du moteur de dictee : ni icone, ni installation, ni verrou
+    # d'instance unique — il attend un son et rend un texte, rien d'autre.
+    if DICTEE_ENFANT_ARG in sys.argv:
+        _i = sys.argv.index(DICTEE_ENFANT_ARG)
+        moteur_dictee_enfant(sys.argv[_i + 1], sys.argv[_i + 2])
+        sys.exit(0)
     try:
         main()
     except SystemExit:

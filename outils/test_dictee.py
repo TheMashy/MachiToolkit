@@ -31,6 +31,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import wave
 
@@ -94,7 +95,7 @@ class Dictee(unittest.TestCase):
         self.m = charger_module(self.tmp)
         self.m.DOSSIER = os.path.join(self.tmp, "machi")
         os.makedirs(self.m.DOSSIER)
-        self.m.DICTEE.update(etat="absent", progres=0.0, source=None, message="", modele=None, vu=0.0)
+        self.m.DICTEE.update(etat="absent", progres=0.0, source=None, message="")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -160,46 +161,168 @@ class Dictee(unittest.TestCase):
         self.assertFalse(self.m.dossier_complet(self.m.dossier_dictee()))
         self.assertNotEqual(self.m.etat_dictee()["etat"], "pret")
 
-    # ---------- le son ----------
-
-    @unittest.skipUnless(NUMPY, "numpy absent")
-    def test_le_son_devient_du_texte_et_le_modele_ne_se_charge_qu_une_fois(self):
-        self.poser_handy()
-        self.m.preparer_dictee()
-        faux = FauxModele()
-        charges = []
-        charger = lambda: charges.append(1) or faux
-        self.assertEqual(self.m.transcrire(wav(1.0), charger=charger), "je rentre du boulot")
-        self.assertEqual(self.m.transcrire(wav(2.0), charger=charger), "je rentre du boulot")
-        self.assertEqual(len(charges), 1, "le modele de 1 Go rechargerait a chaque phrase")
-        self.assertEqual(faux.appels[0], (16000, 16000))
-
-    @unittest.skipUnless(NUMPY, "numpy absent")
-    def test_la_stereo_devient_mono_et_un_clic_ne_reveille_rien(self):
-        self.poser_handy()
-        self.m.preparer_dictee()
-        faux = FauxModele()
-        self.m.transcrire(wav(1.0, canaux=2), charger=lambda: faux)
-        self.assertEqual(faux.appels[0][0], 16000)
-        self.m.DICTEE["modele"] = None
-        self.assertEqual(self.m.transcrire(wav(0.05), charger=lambda: 1 / 0), "")
-
-    @unittest.skipUnless(NUMPY, "numpy absent")
-    def test_un_wav_8_bits_est_refuse(self):
-        self.poser_handy()
-        self.m.preparer_dictee()
-        with self.assertRaises(ValueError):
-            self.m.transcrire(wav(1.0, largeur=1), charger=lambda: FauxModele())
-
     def test_pas_pret_pas_de_transcription(self):
         with self.assertRaises(RuntimeError):
-            self.m.transcrire(wav(1.0), charger=lambda: FauxModele())
+            self.m.transcrire(wav(1.0))
 
-    def test_le_moteur_quitte_la_memoire_quand_on_l_oublie(self):
-        self.m.DICTEE.update(modele=FauxModele(), vu=1000.0)
-        self.assertFalse(self.m.decharger_dictee_si_oubliee(1000.0 + 60))
-        self.assertTrue(self.m.decharger_dictee_si_oubliee(1000.0 + self.m.DICTEE_DECHARGER_S + 1))
-        self.assertIsNone(self.m.DICTEE["modele"])
+
+# Un faux moteur, lance comme le vrai : un processus a part, qui se connecte a
+# Machi Tool et rend un texte. FAUX_MOURIR le fait tomber en pleine phrase,
+# FAUX_SECRET lui fait donner un mauvais secret.
+FAUX_ENFANT = r"""
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("mt_enfant", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+class Faux:
+    def recognize(self, son, sample_rate=16000):
+        if os.environ.get("FAUX_MOURIR"):
+            os._exit(3)
+        return "%s|%d|%d|%d" % (os.environ.get("FAUX_TEXTE", "bonjour"), len(son), sample_rate, os.getpid())
+secret = os.environ.get("FAUX_SECRET") or sys.argv[3]
+m.moteur_dictee_enfant(sys.argv[2], secret, charger=lambda: Faux())
+"""
+
+
+class MoteurAPart(unittest.TestCase):
+    """Le moteur dans son propre processus : s'il tombe, Machi Tool reste."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        os.environ["APPDATA"] = os.path.join(self.tmp, "appdata")
+        self.m = charger_module(self.tmp)
+        self.m.DOSSIER = os.path.join(self.tmp, "machi")
+        d = self.m.dossier_dictee()
+        os.makedirs(d)
+        for nom in self.m.DICTEE_FICHIERS:
+            with open(os.path.join(d, nom), "wb") as f:
+                f.write(b"x")
+        self.m.DICTEE.update(etat="pret")
+        self.script = os.path.join(self.tmp, "faux_moteur.py")
+        with open(self.script, "w", encoding="utf-8") as f:
+            f.write(FAUX_ENFANT)
+        self.lances = []
+        self.vraie_commande = self.m._commande_moteur
+        def commande(port, secret):
+            self.lances.append(port)
+            return [sys.executable, self.script, os.path.join(RACINE, "machi_tool.py"), str(port), secret]
+        self.m._commande_moteur = commande
+        self.m.memoire_libre_mo = lambda: 8000
+        for k in ("FAUX_MOURIR", "FAUX_SECRET", "FAUX_TEXTE"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.m._arreter_moteur()
+        for k in ("FAUX_MOURIR", "FAUX_SECRET", "FAUX_TEXTE"):
+            os.environ.pop(k, None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_texte_vient_d_un_autre_processus_lance_une_seule_fois(self):
+        texte, n, freq, pid = self.m.transcrire(wav(1.0)).split("|")
+        self.assertEqual((texte, int(n), int(freq)), ("bonjour", 16000, 16000))
+        self.assertNotEqual(int(pid), os.getpid(), "le moteur tourne DANS Machi Tool")
+        pid2 = self.m.transcrire(wav(2.0)).split("|")[3]
+        self.assertEqual(pid, pid2, "un nouveau moteur a chaque phrase : 1 Go recharge a chaque fois")
+        self.assertEqual(len(self.lances), 1)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_stereo_devient_mono(self):
+        self.assertEqual(self.m.transcrire(wav(1.0, canaux=2)).split("|")[1], "16000")
+
+    def test_un_wav_8_bits_ou_illisible_est_refuse_sans_lancer_le_moteur(self):
+        with self.assertRaises(ValueError):
+            self.m.transcrire(wav(1.0, largeur=1))
+        with self.assertRaises(ValueError):
+            self.m.transcrire(b"pas du tout un wav")
+        self.assertEqual(self.lances, [])
+
+    def test_un_clic_ne_reveille_rien(self):
+        self.assertEqual(self.m.transcrire(wav(0.05)), "")
+        self.assertEqual(self.lances, [])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_si_le_moteur_tombe_machi_tool_reste_debout_et_le_dit(self):
+        os.environ["FAUX_MOURIR"] = "1"
+        with self.assertRaises(self.m.DicteeImpossible) as e:
+            self.m.transcrire(wav(1.0))
+        self.assertIn("tourne toujours", str(e.exception))
+        self.assertIsNone(self.m._MOTEUR["proc"])
+        # ...et la phrase suivante relance un moteur neuf.
+        os.environ.pop("FAUX_MOURIR")
+        self.assertTrue(self.m.transcrire(wav(1.0)).startswith("bonjour|"))
+        self.assertEqual(len(self.lances), 2)
+
+    def test_pas_assez_de_memoire_on_ne_lance_rien(self):
+        self.m.memoire_libre_mo = lambda: 600
+        with self.assertRaises(self.m.DicteeImpossible) as e:
+            self.m.transcrire(wav(1.0))
+        self.assertIn("600 Mo", str(e.exception))
+        self.assertIn("Handy", str(e.exception))
+        self.assertEqual(self.lances, [], "le moteur a ete lance malgre le manque de memoire")
+
+    def test_un_imposteur_sans_le_secret_est_refuse(self):
+        os.environ["FAUX_SECRET"] = "0" * 32
+        with self.assertRaises(self.m.DicteeImpossible):
+            self.m.transcrire(wav(1.0))
+        self.assertIsNone(self.m._MOTEUR["sock"])
+
+    def test_un_moteur_qui_ne_demarre_pas_ne_bloque_pas_pour_toujours(self):
+        self.m.DICTEE_DEMARRAGE_S = 1
+        self.m._commande_moteur = lambda port, secret: [sys.executable, "-c", "import time; time.sleep(30)"]
+        with self.assertRaises(self.m.DicteeImpossible) as e:
+            self.m.transcrire(wav(1.0))
+        self.assertIn("pas demarre", str(e.exception))
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_oublie_le_moteur_s_en_va_et_rend_sa_memoire(self):
+        self.m.transcrire(wav(1.0))
+        proc = self.m._MOTEUR["proc"]
+        self.assertFalse(self.m.decharger_dictee_si_oubliee(time.time() + 60))
+        self.assertTrue(self.m.decharger_dictee_si_oubliee(time.time() + self.m.DICTEE_DECHARGER_S + 1))
+        self.assertIsNotNone(proc.wait(timeout=10), "le processus du moteur ne s'est pas arrete")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_vrai_point_d_entree_lance_le_moteur_et_rien_d_autre(self):
+        """Machi Tool relance avec --moteur-dictee ne doit pas ouvrir une
+        seconde icone : il repond au son. Sans modele ici, il repond une
+        erreur — la preuve qu'il a bien tourne comme moteur."""
+        self.m._commande_moteur = self.vraie_commande
+        self.m.DICTEE_DEMARRAGE_S = 30
+        with self.assertRaises(self.m.DicteeImpossible) as e:
+            self.m.transcrire(wav(1.0))
+        self.assertIn("a echoue", str(e.exception), str(e.exception))
+
+
+try:
+    import onnxruntime  # noqa: F401
+    ONNX = True
+except Exception:
+    ONNX = False
+
+
+class Discretion(unittest.TestCase):
+    """Par defaut onnxruntime prend TOUS les coeurs : le PC gelait pendant la
+    dictee. La moitie, et pas d'arene gardee apres usage."""
+
+    @unittest.skipUnless(ONNX, "onnxruntime absent")
+    def test_le_moteur_ne_prend_que_la_moitie_des_coeurs(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            m = charger_module(tmp)
+            vus = {}
+            import onnx_asr
+            vrai = onnx_asr.load_model
+            onnx_asr.load_model = lambda *a, **k: vus.update(k) or "modele"
+            try:
+                m._charger_modele_dictee()
+            finally:
+                onnx_asr.load_model = vrai
+            o = vus["sess_options"]
+            self.assertLessEqual(o.intra_op_num_threads, max(1, (os.cpu_count() or 2) // 2))
+            self.assertGreaterEqual(o.intra_op_num_threads, 1)
+            self.assertFalse(o.enable_cpu_mem_arena)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class Rapidite(unittest.TestCase):
@@ -227,7 +350,7 @@ class Route(unittest.TestCase):
         self.m = charger_module(self.tmp)
         self.m.DOSSIER = os.path.join(self.tmp, "machi")
         os.makedirs(self.m.DOSSIER)
-        self.m.DICTEE.update(etat="absent", progres=0.0, source=None, message="", modele=None, vu=0.0)
+        self.m.DICTEE.update(etat="absent", progres=0.0, source=None, message="")
         self.m.CFG.clear()
         self.m.CFG.update({"api_origines": ["https://site.example"], "api_jeton": "jeton-local",
                            "pont_cle": "cle-du-pont"})
@@ -237,6 +360,9 @@ class Route(unittest.TestCase):
         self.port = self.serveur.server_address[1]
 
     def tearDown(self):
+        self.m._arreter_moteur()
+        os.environ.pop("FAUX_TEXTE", None)
+        os.environ.pop("FAUX_MOURIR", None)
         self.serveur.shutdown()
         self.serveur.server_close()
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -260,7 +386,14 @@ class Route(unittest.TestCase):
         for nom in self.m.DICTEE_FICHIERS:
             with open(os.path.join(d, nom), "wb") as f:
                 f.write(b"x")
-        self.m.DICTEE.update(etat="pret", modele=FauxModele(texte), vu=0.0)
+        self.m.DICTEE.update(etat="pret")
+        script = os.path.join(self.tmp, "faux_moteur.py")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(FAUX_ENFANT)
+        os.environ["FAUX_TEXTE"] = texte
+        self.m.memoire_libre_mo = lambda: 8000
+        self.m._commande_moteur = lambda port, secret: [
+            sys.executable, script, os.path.join(RACINE, "machi_tool.py"), str(port), secret]
 
     def test_sans_la_cle_rien(self):
         self.assertEqual(self.appel("GET", "/dictee", cle=None)[0], 401)
@@ -297,7 +430,8 @@ class Route(unittest.TestCase):
             journal = sys.stdout.getvalue()
         finally:
             sys.stdout = sortie
-        self.assertEqual((code, rep), (200, {"texte": "une phrase tres privee"}))
+        self.assertEqual(code, 200)
+        self.assertEqual(rep["texte"].split("|")[0], "une phrase tres privee")
         self.assertEqual(sorted(os.walk(self.tmp)), avant, "la dictee a ecrit quelque chose sur le disque")
         self.assertNotIn("privee", journal)
 
@@ -305,6 +439,15 @@ class Route(unittest.TestCase):
         self.m.preparer_dictee = lambda ouvrir=None: None
         code, etat = self.appel("POST", "/dictee/preparer")
         self.assertEqual(code, 202)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_un_moteur_qui_tombe_se_dit_en_clair_et_la_passerelle_repond_encore(self):
+        self.rendre_pret()
+        os.environ["FAUX_MOURIR"] = "1"
+        code, rep = self.appel("POST", "/dictee", wav(1.0))
+        self.assertEqual(code, 503)
+        self.assertIn("tourne toujours", rep["erreur"])
+        self.assertEqual(self.appel("GET", "/dictee")[0], 200, "la passerelle ne repond plus")
 
     def test_une_version_sans_moteur_le_dit(self):
         self.m.dictee_possible = lambda: False
