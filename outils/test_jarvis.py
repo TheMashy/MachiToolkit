@@ -638,7 +638,7 @@ class DansMachiTool(unittest.TestCase):
                                                       "parler_a_jarvis", "jouer_son", "sauver_config",
                                                       "prechauffer_dictee", "apprendre_a_voix_haute",
                                                       "gabarits_jarvis", "envoyer_voix", "voix_prete",
-                                                      "envoyer_oreille")}
+                                                      "envoyer_oreille", "VOIX")}
         m.jouer_son = lambda g: None
         m.sauver_config = lambda cfg: True
         m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
@@ -896,6 +896,87 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue(m.CFG["jarvis_astuce_voix"])
         self.phrase("Hey Jarvis.")
         self.assertEqual(self.dit[-1], "Yes?")
+
+    def _jarvis_parle(self):
+        """Jarvis repond a voix haute (sa voix neuronale), puis on lui coupe la
+        parole pendant sa deuxieme phrase."""
+        m = self.m
+        voix, oreille = [], []
+        m.envoyer_voix = lambda o: voix.append(o) or True
+        m.envoyer_oreille = lambda o: oreille.append(o) or True
+        m.voix_prete = lambda cle=None: True
+        m.prechauffer_dictee = lambda: None
+        m.VOIX = m.Voix()
+        m.CFG["jarvis_voix"] = True
+        m.dire("Good evening. All systems are operational. Your calendar is clear.", langue="en")
+        ident = voix[-1]["id"]
+        self.assertEqual(m.JARVIS["etat"], "parle")
+        m.traiter_evenement({"evt": "coupure"})
+        self.assertEqual(voix[-1], {"cmd": "taire"})
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        # la voix s'est tue au milieu de la deuxieme phrase, et le dit
+        m.VOIX.fini(ident, True, "All systems are operational. Your calendar is clear.")
+        return voix, oreille
+
+    def test_coupe_pour_rien_il_reprend_sa_phrase(self):
+        """Un clavier, une porte : l'oreille coupe, puis personne ne parle.
+        Jarvis reprend a la phrase coupee -- et termine comme avant."""
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        m.traiter_evenement({"evt": "vide", "apres_coupure": True})
+        self.assertEqual(voix[-1]["cmd"], "dire")
+        self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.")
+        self.assertEqual(voix[-1]["cle"], "en")
+        self.assertEqual(m.JARVIS["etat"], "parle")
+        m.VOIX.fini(voix[-1]["id"], False)
+        self.assertEqual(m.JARVIS["etat"], "attente", "la fin d'avant : il a fini de parler")
+        n = len(voix)
+        m.traiter_evenement({"evt": "vide", "apres_coupure": True})
+        self.assertEqual(len(voix), n, "on ne reprend qu'une fois")
+
+    def test_coupe_avec_une_suite_en_attente_il_reprend_celle_qui_sonnait(self):
+        m = self.m
+        voix, oreille = [], []
+        m.envoyer_voix = lambda o: voix.append(o) or True
+        m.envoyer_oreille = lambda o: oreille.append(o) or True
+        m.voix_prete = lambda cle=None: True
+        m.prechauffer_dictee = lambda: None
+        m.VOIX = m.Voix()
+        m.CFG["jarvis_voix"] = True
+        m.dire("First answer. Still the first one.", langue="en")
+        m.dire("A second one, waiting its turn.", langue="en")
+        premier = voix[0]["id"]
+        m.traiter_evenement({"evt": "coupure"})
+        self.assertEqual(m.VOIX.reprise["id"], premier, "celle qui sonnait, pas celle qui attendait")
+        self.assertEqual(m.VOIX.en_cours, {}, "la voix a jete celle qui attendait : rien ne traine")
+        m.VOIX.fini(premier, True, "Still the first one.")
+        m.traiter_evenement({"evt": "vide", "apres_coupure": True})
+        self.assertEqual(voix[-1]["texte"], "Still the first one.")
+
+    def test_coupe_par_un_bruit_sans_mots_il_reprend_aussi(self):
+        """La phrase d'apres la coupure n'avait pas de mots (le micro a entendu
+        quelque chose) : l'oreille apprend que c'etait de l'echo, il reprend."""
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        m.transcrire = lambda octets: ""
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        self.assertIn({"cmd": "fausse_coupure"}, oreille)
+        self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.")
+
+    def test_coupe_pour_de_vrai_il_ecoute_et_ne_reprend_pas(self):
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        m.transcrire = lambda octets: "What time is it?"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        self.assertNotIn({"cmd": "fausse_coupure"}, oreille)
+        self.assertIsNone(m.VOIX.reprise)
+        textes = [v.get("texte", "") for v in voix if v.get("cmd") == "dire"]
+        self.assertNotIn("All systems are operational. Your calendar is clear.", textes)
+        self.assertTrue(textes[-1].startswith("It's"), textes[-1])
+        # une phrase sans mots, MAIS pas apres une coupure : « Yes? », comme avant
+        m.transcrire = lambda octets: ""
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(voix[-1]["texte"], "Yes?")
 
     def test_une_voix_par_langue(self):
         """L'anglais a Kokoro, le francais a Piper ; sans la voix anglaise, la
@@ -1207,7 +1288,9 @@ class ProcessusReel(unittest.TestCase):
             self.assertIn("attente", etats)
             self.assertIn("ecoute", etats)
             self.assertEqual(len(m._JARVIS_TRAVAIL), 1)
-            with wave.open(io.BytesIO(base64.b64decode(m._JARVIS_TRAVAIL[0]))) as w:
+            wav64, apres_coupure = m._JARVIS_TRAVAIL[0]
+            self.assertFalse(apres_coupure, "reveille par son nom, pas apres une coupure")
+            with wave.open(io.BytesIO(base64.b64decode(wav64))) as w:
                 self.assertGreater(w.getnframes() / 16000.0, 1.5)
             m.arreter_oreille()
         finally:
@@ -1244,6 +1327,45 @@ class FauxHautParleur:
         self.morceaux.append(len(data))
         if self.couper_apres and len(self.morceaux) >= self.couper_apres:
             self.test.bouche.couper.set()
+
+
+class SyntheseFactice:
+    """Une seconde de son par phrase : la Bouche sans Piper, au dixieme pres."""
+    frequence, langue = 16000, "fr"
+
+    def __init__(self):
+        self.lues = []
+
+    def phrases(self, texte, lenteur=1.0, **kw):
+        self.lues.append(texte)
+        yield (np.sin(np.arange(16000) / 5.0) * 8000).astype(np.int16)
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class ReprendreOuIlEnEtait(unittest.TestCase):
+    """Coupe pour rien, Jarvis reprend sa phrase : la voix dit ce qui restait,
+    a partir de la phrase qui se disait -- pas celle d'apres, pas le debut."""
+
+    def test_coupee_en_route_elle_dit_ce_qui_restait(self):
+        syn = SyntheseFactice()
+        # une phrase = 10 dixiemes de son + 2 de silence : coupee au 3e de la deuxieme
+        hp, evts = FauxHautParleur(self, couper_apres=12 + 3), []
+        self.bouche = J.Bouche(syn, evts.append, hp)
+        self.bouche.dire(9, "Bonjour. Tous les systemes sont operationnels. Autre chose ?")
+        self.assertEqual([e["evt"] for e in evts], ["debut", "fini"])
+        self.assertTrue(evts[-1]["coupe"])
+        self.assertEqual(evts[-1]["reste"], "Tous les systemes sont operationnels. Autre chose ?")
+        self.assertEqual(len(hp.morceaux), 15)
+        evts.clear()
+        self.bouche = J.Bouche(syn, evts.append, FauxHautParleur())
+        self.bouche.dire(10, "Bonjour. Au revoir.")
+        self.assertEqual(evts[-1], {"evt": "fini", "id": 10, "coupe": False}, "rien a reprendre quand il a fini")
+        self.assertEqual(syn.lues[-2:], ["Bonjour.", "Au revoir."], "une phrase a la fois")
+
+    def test_les_phrases(self):
+        self.assertEqual(J.decouper_phrases("Good evening. All systems go! Is 3.5 enough? Yes\u2026 Fine"),
+                         ["Good evening.", "All systems go!", "Is 3.5 enough?", "Yes\u2026", "Fine"])
+        self.assertEqual(J.decouper_phrases(""), [])
 
 
 @unittest.skipUnless(PIPER, "JARVIS_PIPER_DOSSIER / JARVIS_PIPER_VOIX absents")
@@ -1287,8 +1409,10 @@ class VoixEnMemoire(unittest.TestCase):
         evts.clear()
         self.bouche = J.Bouche(self.syn, evts.append, hp2)
         self.bouche.dire(8, "Une tres longue phrase. " * 12)
-        self.assertEqual(evts[-1], {"evt": "fini", "id": 8, "coupe": True})
+        self.assertEqual({k: v for k, v in evts[-1].items() if k != "reste"}, {"evt": "fini", "id": 8, "coupe": True})
         self.assertLessEqual(len(hp2.morceaux), 4)
+        # coupee au premier dixieme de seconde : tout reste a dire, depuis la phrase coupee
+        self.assertEqual(evts[-1]["reste"], " ".join(["Une tres longue phrase."] * 12))
 
     def test_le_processus_de_la_voix(self):
         srv = socket.socket()
@@ -1343,6 +1467,383 @@ class VoixEnMemoire(unittest.TestCase):
             self.assertFalse(m.voix_prete())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ======================================================================
+#  LA DOUBLE TRANSMISSION : ON LUI COUPE LA PAROLE
+# ======================================================================
+
+def _rir(rng, rt60, d0_ms=6):
+    """Une piece : le son direct, puis une queue qui decroit de 60 dB en rt60."""
+    n = int(16000 * min(1.2, rt60 * 1.3))
+    t = np.arange(n) / 16000.0
+    h = rng.standard_normal(n) * np.exp(-6.9 * t / rt60) * 0.35
+    d0 = int(d0_ms * 16)
+    h[:d0] = 0
+    h[d0] += 1.0
+    return h / np.sqrt((h ** 2).sum())
+
+
+def _conv(a, b):
+    n = len(a) + len(b) - 1
+    N = 1 << (n - 1).bit_length()
+    return np.fft.irfft(np.fft.rfft(a, N) * np.fft.rfft(b, N), N)[:n]
+
+
+class PieceSimulee:
+    """Des haut-parleurs, une piece, un micro : ce que joue Jarvis revient,
+    en retard, reverbere, plus ou moins fort -- et la personne parle, ou pas."""
+
+    def __init__(self, graine, latence, rt60, echo_db):
+        self.rng = np.random.default_rng(graine)
+        self.h = _rir(self.rng, rt60)
+        self.lat = int(latence * 16000)
+        self.echo_db = echo_db
+        self.t = 100.0                      # l'horloge : elle ne recule jamais
+
+    def signaux(self, ref, voix=None, debut_voix=1.5, ser_db=6.0, musique=None, volume_db=0.0, en_plus=None):
+        """(reference, micro, voix seule) en float, et l'instant ou la voix commence.
+        `volume_db` : le volume monte -- l'echo grossit, pas la reference (le
+        loopback est pris avant le volume). `en_plus` : un autre bruit de la
+        piece, deja au micro (un clavier)."""
+        ref = ref.astype(np.float64)
+        if musique is not None:
+            ref = ref + musique[:len(ref)]
+        db = self.echo_db + volume_db
+        echo = _conv(ref, self.h)
+        echo = echo / max(np.sqrt(np.mean(echo[:len(ref)] ** 2)), 1e-9) * 10 ** (db / 20)
+        mic = np.zeros(len(ref) + self.lat + len(self.h))
+        mic[self.lat:self.lat + len(echo)] += echo
+        seule = np.zeros(len(mic))
+        if voix is not None:
+            v = voix / 32768.0
+            v = v / np.sqrt(np.mean(v[np.abs(v) > 0.01] ** 2)) * 10 ** ((db + ser_db) / 20)
+            s = int(debut_voix * 16000)
+            e = min(len(mic), s + len(v))
+            seule[s:e] = v[:e - s]
+            mic += seule
+        if en_plus is not None:
+            n = min(len(mic), len(en_plus))
+            mic[:n] += en_plus[:n]
+        mic += self.rng.standard_normal(len(mic)) * 10 ** (-62 / 20)
+        return ref, mic, seule, (debut_voix if voix is not None else 0.0)
+
+    def passage(self, c, ref, **kw):
+        """Joue une reponse ; rend l'instant de la coupure, compte depuis le debut
+        de la voix (depuis le debut tout court sans voix), ou None. L'oreille
+        desarme quand la voix dit « fini » : un quart de seconde apres son
+        dernier son (le silence de fin de phrase, et le son qui s'ecoule)."""
+        ref, mic, _, t_voix = self.signaux(ref, **kw)
+        self.t += 30.0
+        c.armer(self.t)
+        coupe = None
+        for i in range(0, min(len(mic) - J.TRAME, len(ref) + 4000), J.TRAME):
+            t_fin = self.t + (i + J.TRAME) / 16000.0
+            bloc = ref[i:i + J.TRAME]
+            if len(bloc) == J.TRAME:
+                c.reference(bloc.astype(np.float32), t_fin + self.rng.uniform(-0.01, 0.01))
+            if c.micro(mic[i:i + J.TRAME].astype(np.float32), t_fin):
+                coupe = (t_fin - self.t) - t_voix
+                break
+        c.desarmer()
+        return coupe
+
+
+def frappe_de_test(n, rng, h, crete_db, toc_hz=300.0):
+    """Quelqu'un tape pendant qu'il parle : 4 a 9 touches par seconde, appui et
+    relachement, des pauses ; chaque touche un claquement clair et le « toc » du
+    clavier -- LE MEME pour toutes ses touches, a 5 % pres --, dans la piece."""
+    x = np.zeros(n)
+    t = np.arange(400) / 16000.0
+    f = np.fft.rfftfreq(400, 1 / 16000.0)
+    crete, cadence, instant = 10 ** (crete_db / 20), rng.uniform(4, 9), rng.uniform(0.0, 0.3)
+    while instant < n / 16000.0 - 0.05:
+        for dt, force in ((0.0, 1.0), (rng.uniform(0.04, 0.11), rng.uniform(0.4, 0.8))):
+            i = int((instant + dt) * 16000)
+            if i >= n:
+                break
+            b = rng.standard_normal(400) * np.exp(-t / rng.uniform(0.002, 0.008))
+            b = np.fft.irfft(np.fft.rfft(b) * (f > rng.uniform(600, 2000)), 400)
+            b += np.sin(2 * np.pi * toc_hz * rng.uniform(0.95, 1.05) * t) * np.exp(-t / 0.015) * np.max(np.abs(b))
+            b *= crete * force / max(np.max(np.abs(b)), 1e-9)
+            e = min(n, i + 400)
+            x[i:e] += b[:e - i]
+        instant += rng.gamma(2.0, 1.0 / (2.0 * cadence))
+        if rng.random() < 0.08:
+            instant += rng.uniform(0.3, 1.2)
+    return _conv(x, h)[:n]
+
+
+class FauxLoopback:
+    erreur = None
+
+    def __init__(self):
+        from collections import deque
+        self.blocs, self.demarre, self.arrete = deque(), 0, 0
+
+    def demarrer(self):
+        self.demarre += 1
+
+    def arreter(self):
+        self.arrete += 1
+
+
+def musique_de_test(n, graine=9):
+    """Des accords qui changent toutes les demi-secondes, et une percussion
+    tous les quarts : ce qui passe dans les haut-parleurs pendant qu'il parle."""
+    rng = np.random.default_rng(graine)
+    t = np.arange(n) / 16000.0
+    accords = ((220, 277, 330), (196, 247, 294), (175, 220, 262), (247, 311, 370))
+    m = np.zeros(n)
+    for k in range(int(n / 8000) + 1):
+        sel = (t >= k * 0.5) & (t < (k + 1) * 0.5)
+        for f in accords[k % len(accords)]:
+            m[sel] += np.sin(2 * np.pi * f * t[sel])
+    for k in range(int(n / 4000) + 1):
+        a = k * 4000
+        b = min(n, a + 1600)
+        m[a:b] += rng.standard_normal(b - a) * np.exp(-np.arange(b - a) / 300.0) * 2.0
+    return m / np.sqrt(np.mean(m ** 2)) * 0.05
+
+
+@unittest.skipUnless(NUMPY and ESPEAK, "numpy ou espeak-ng absents")
+class DoubleTransmission(unittest.TestCase):
+    """« Une discussion a double transmission, comme les modeles de ChatGPT,
+    pour pouvoir couper la parole. » Jarvis ne se coupe pas sur sa propre voix
+    revenue par les haut-parleurs, ni sur la musique ; la personne qui parle
+    par-dessus le coupe -- dans quatre pieces : proche et seche, loin et
+    reverberante, discrete, forte."""
+
+    PIECES = ((1, 0.03, 0.25, -24.0), (2, 0.12, 0.6, -14.0), (3, 0.07, 0.4, -30.0), (4, 0.15, 0.75, -18.0))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.jarvis = [dire(t, voix="en-gb+m3", vitesse=165) / 32768.0 for t in (
+            "Good evening. All systems are operational, and your calendar is clear for the rest of the day.",
+            "The download is at sixty percent. At this rate it should finish in about four minutes.",
+            "Certainly. A binary search halves the list at every step, so a million items take twenty steps.",
+            "I'm afraid the printer is offline again. It may simply need to be switched off and on.")]
+        cls.voix = [dire(t, voix=v) for t, v in (
+            ("Attends, stop, mets plutôt un minuteur de dix minutes.", "fr+f3"),
+            ("No, wait, I meant the other printer upstairs.", "en-us+f2"),
+            ("Non, je voulais dire la lumière du salon.", "fr+m1"))]
+
+    def test_sa_propre_voix_ne_le_coupe_pas(self):
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            p.passage(c, self.jarvis[0])          # la premiere reponse : il apprend la piece
+            self.assertTrue(c.pret(), "il a appris la piece %d" % graine)
+            for ref in self.jarvis[1:]:
+                self.assertIsNone(p.passage(c, ref), "coupe sur sa propre voix (piece %d)" % graine)
+
+    def test_parler_par_dessus_le_coupe(self):
+        """A 10 dB au-dessus de l'echo : on hausse le ton pour couper quelqu'un.
+        Plus bas, la simulation en entend huit sur dix -- et « Jarvis ! » reste la."""
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            p.passage(c, self.jarvis[0])
+            for k, voix in enumerate(self.voix):
+                d = p.passage(c, self.jarvis[1 + k], voix=voix, ser_db=10.0)
+                self.assertIsNotNone(d, "pas coupe (piece %d, voix %d)" % (graine, k))
+                self.assertTrue(0.0 <= d < 1.5, "coupe a %.2f s (piece %d, voix %d)" % (d, graine, k))
+
+    def test_la_musique_ne_le_coupe_pas(self):
+        """Elle est dans la reference (le loopback prend TOUT ce qui sort) :
+        elle revient dans le micro, et elle est expliquee."""
+        for graine, lat, rt, db in self.PIECES[:2]:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            m = musique_de_test(16000 * 12, graine)
+            p.passage(c, self.jarvis[0], musique=m)
+            for ref in self.jarvis[1:]:
+                self.assertIsNone(p.passage(c, ref, musique=m), "coupe sur la musique (piece %d)" % graine)
+
+    def test_au_casque_il_coupe_vite(self):
+        p, c = PieceSimulee(5, 0.05, 0.3, -95.0), J.Coupure()
+        p.passage(c, self.jarvis[0])
+        d = p.passage(c, self.jarvis[1], voix=self.voix[0], ser_db=70.0)
+        self.assertIsNotNone(d)
+        self.assertLess(d, 0.6, "sans echo, la voix se voit tout de suite")
+
+    def test_l_oreille_coupe_et_ecoute(self):
+        """De bout en bout dans l'oreille : Jarvis parle (« parole »), la
+        reference arrive par le loopback, la personne parle par-dessus --
+        « coupure », puis sa phrase part comme une autre."""
+        sorties, horloge = [], {"t": 500.0}
+        lb = FauxLoopback()
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, lb, horloge=lambda: horloge["t"])
+        o.niveau_vu = float("inf")
+        p = PieceSimulee(2, 0.08, 0.5, -20.0)
+
+        def jouer(ref, voix=None):
+            ref, mic, seule, _ = p.signaux(ref, voix=voix, ser_db=8.0)
+            o.commande({"cmd": "parole", "actif": True})
+            coupe_a = None
+            for i in range(0, len(mic) - J.TRAME, J.TRAME):
+                horloge["t"] += J.TRAME / 16000.0
+                if coupe_a is None:
+                    bloc = ref[i:i + J.TRAME]
+                    if len(bloc) == J.TRAME:
+                        lb.blocs.append((horloge["t"], bloc.astype(np.float32)))
+                    x = mic[i:i + J.TRAME]
+                else:
+                    # il s'est tu : il ne reste que la personne et la piece
+                    x = seule[i:i + J.TRAME] + p.rng.standard_normal(J.TRAME) * 10 ** (-62 / 20)
+                o.trame(np.clip(x * 32768, -32768, 32767).astype(np.int16))
+                if coupe_a is None and any(e["evt"] == "coupure" for e in sorties):
+                    coupe_a = i
+            for _ in range(30):                   # puis le calme : la phrase se termine
+                horloge["t"] += J.TRAME / 16000.0
+                o.trame((p.rng.standard_normal(J.TRAME) * 20).astype(np.int16))
+            o.commande({"cmd": "parole", "actif": False})
+            return coupe_a
+        self.assertIsNone(jouer(self.jarvis[0]), "la premiere reponse : il apprend, il ne coupe pas")
+        self.assertIsNone(jouer(self.jarvis[1]))
+        self.assertEqual(sorties, [], "sa propre voix ne fait rien sortir")
+        self.assertIsNotNone(jouer(self.jarvis[2], voix=self.voix[1]))
+        evts = [e["evt"] for e in sorties]
+        self.assertEqual(evts, ["coupure", "phrase"])
+        wav = base64.b64decode(sorties[1]["wav"])
+        with wave.open(io.BytesIO(wav)) as w:
+            self.assertGreater(w.getnframes() / 16000.0, 1.5, "la phrase de la personne, entiere")
+        self.assertGreaterEqual(lb.demarre, 3)
+        self.assertGreaterEqual(lb.arrete, 3, "la reference se referme apres chaque reponse")
+        self.assertFalse(o.parole)
+
+    def test_il_apprend_la_piece_et_pas_le_bruit(self):
+        """Ce qu'il predit, c'est l'echo de la piece : le gain et le retard. La
+        toute premiere trame apprise etait un debut de mot presque muet face au
+        bruit du micro -- elle donnait a la prise zero un poids de 3000, et deux
+        reponses plus tard il predisait l'echo cent fois trop fort, a retard nul."""
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            # comme Kokoro : la reponse commence par un souffle presque muet,
+            # bien sous le bruit du micro
+            souffle = np.random.default_rng(graine).standard_normal(1600) * 10 ** (-110 / 20)
+            p.passage(c, np.concatenate([souffle, self.jarvis[0]]))
+            p.passage(c, self.jarvis[1])
+            vrai = 10 ** (db / 10) / np.mean(self.jarvis[1] ** 2)
+            gain = float(np.median(c.w.sum(axis=1)))
+            self.assertTrue(vrai / 2 < gain < vrai * 2, "piece %d : gain %.3g, vrai %.3g" % (graine, gain, vrai))
+            prise = float(np.median(np.argmax(c.w, axis=1)))
+            self.assertTrue(lat / 0.02 - 1 <= prise <= lat / 0.02 + 3,
+                            "piece %d : l'echo a %.0f ms, pas a la prise %.0f" % (graine, lat * 1000, prise))
+
+    def test_on_monte_le_volume_entre_deux_reponses(self):
+        """Le loopback est pris avant le volume : 10 dB de plus, seul l'echo
+        grossit. Il le mesure au debut de la reponse -- et on le coupe encore."""
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            p.passage(c, self.jarvis[0])
+            self.assertIsNone(p.passage(c, self.jarvis[1]))
+            for ref in self.jarvis[2:]:
+                self.assertIsNone(p.passage(c, ref, volume_db=10.0), "piece %d, +10 dB" % graine)
+            d = p.passage(c, self.jarvis[1], volume_db=10.0, voix=self.voix[1], ser_db=10.0)
+            self.assertIsNotNone(d, "piece %d : plus fort, on le coupe encore" % graine)
+
+    def test_taper_au_clavier_ne_le_coupe_pas(self):
+        """Un clavier, l'echo ne l'explique pas non plus. Mais il ne VIBRE pas --
+        son « toc » s'eteint en quelques millisecondes, une voix tient sa
+        hauteur -- et il est plus bas qu'une voix qui coupe la parole."""
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            p.passage(c, self.jarvis[0])
+            for k, ref in enumerate(self.jarvis[1:]):
+                touches = frappe_de_test(len(ref) + p.lat + len(p.h), np.random.default_rng(10 * graine + k),
+                                         p.h, db + 3.0, toc_hz=180.0 + 60 * k)
+                self.assertIsNone(p.passage(c, ref, en_plus=touches), "piece %d, reponse %d" % (graine, k + 1))
+            # et quelqu'un qui parle en tapant le coupe toujours
+            touches = frappe_de_test(len(self.jarvis[1]) + p.lat + len(p.h), np.random.default_rng(graine),
+                                     p.h, db + 3.0)
+            self.assertIsNotNone(p.passage(c, self.jarvis[1], en_plus=touches, voix=self.voix[0], ser_db=10.0))
+
+    def test_une_voix_tient_sa_hauteur(self):
+        c = J.Coupure()
+        t = np.arange(640) / 16000.0
+        voyelle = sum(np.sin(2 * np.pi * 125 * k * t) / k for k in range(1, 12))
+        v, lag = c._voisement(voyelle)
+        self.assertGreater(v, 0.8)
+        self.assertEqual(round(16000 / lag), 125)
+        clic = np.zeros(640)
+        clic[100:140] = np.random.default_rng(1).standard_normal(40)
+        self.assertLess(c._voisement(clic)[0], 0.5, "un claquement n'a pas de hauteur")
+        # quatre trames de suite a la meme hauteur ; une qui saute repart de un
+        c.nette = voyelle
+        for _ in range(4):
+            c._suivre_la_hauteur(True)
+        self.assertEqual((c.suite_voisee, c.voisee_max), (4, 4))
+        c.nette = sum(np.sin(2 * np.pi * 190 * k * t) / k for k in range(1, 8))
+        c._suivre_la_hauteur(True)
+        self.assertEqual(c.suite_voisee, 1)
+
+    def test_coupe_pour_rien_il_apprend_ce_qu_il_avait_mis_de_cote(self):
+        p, c = PieceSimulee(2, 0.12, 0.6, -14.0), J.Coupure()
+        p.passage(c, self.jarvis[0])
+        ref, mic, _, _ = p.signaux(self.jarvis[1])
+        p.t += 30.0
+        c.armer(p.t)
+        for i in range(0, 1280 * 30, 1280):
+            c.reference(ref[i:i + 1280].astype(np.float32), p.t + (i + 1280) / 16000.0)
+            c.micro(mic[i:i + 1280].astype(np.float32), p.t + (i + 1280) / 16000.0)
+        c.desarmer(garder=False)                   # « coupe » : ce qui attendait est mis de cote
+        mis_de_cote, avant = len(c.de_cote), c.appris
+        self.assertGreater(mis_de_cote, 50)
+        c.fausse_coupure()                         # personne n'a parle : c'etait de l'echo
+        self.assertEqual(c.appris - avant, mis_de_cote, "tout ce qui etait de cote s'apprend")
+        self.assertEqual(c.de_cote, [])
+        c.armer(p.t + 60)
+        self.assertEqual(c.de_cote, [], "une nouvelle reponse oublie ce qui restait de cote")
+
+    def test_l_oreille_dit_quand_personne_n_a_parle_apres_la_coupure(self):
+        sorties = []
+
+        class CoupureQuiCoupe:
+            def __init__(s):
+                s.appels = []
+
+            def armer(s, t):
+                s.appels.append("armer")
+
+            def desarmer(s, garder=True):
+                s.appels.append("desarmer")
+
+            def reference(s, x, t):
+                pass
+
+            def micro(s, x, t):
+                return True
+
+            def pret(s):
+                return True
+
+            def fausse_coupure(s):
+                s.appels.append("fausse_coupure")
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, FauxLoopback())
+        o.niveau_vu = float("inf")
+        o.coupure = CoupureQuiCoupe()
+        o.commande({"cmd": "parole", "actif": True})
+        silence = np.zeros(J.TRAME, dtype=np.int16)
+        o.trame(silence)
+        self.assertEqual(sorties, [{"evt": "coupure"}])
+        for _ in range(int(2.0 / J.TRAME_S)):
+            o.trame(silence)
+        self.assertEqual(sorties[-1], {"evt": "vide", "apres_coupure": True},
+                         "une seconde et demie sans personne : c'etait pour rien")
+        self.assertIn("fausse_coupure", o.coupure.appels, "et ce qui etait de cote s'apprend")
+        o.coupure.appels.clear()
+        o.commande({"cmd": "fausse_coupure"})     # Machi Tool : la phrase n'avait pas de mots
+        self.assertEqual(o.coupure.appels, ["fausse_coupure"])
+        o.commande({"cmd": "ecouter", "attente": 0.5})
+        for _ in range(int(1.0 / J.TRAME_S)):
+            o.trame(silence)
+        self.assertEqual(sorties[-1], {"evt": "vide"}, "une ecoute ordinaire n'est pas une coupure")
+
+    def test_sans_reference_seul_le_mot_d_eveil_le_coupe(self):
+        sorties = []
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, None)
+        o.niveau_vu = float("inf")
+        o.commande({"cmd": "parole", "actif": True})
+        self.assertFalse(o.parole)
+        self.assertEqual(o.etat_coupure(), "sans reference")
 
 
 KOKORO_DOSSIER = os.environ.get("JARVIS_KOKORO_DOSSIER", "")   # kokoro-v1.0.onnx et voices-v1.0.bin

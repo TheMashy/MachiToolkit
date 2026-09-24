@@ -1159,6 +1159,14 @@ class Synthese:
             yield self.phrase(ph, lenteur, **kw)
 
 
+_FIN_DE_PHRASE = re.compile(r"(?<=[.!?\u2026])\s+")
+
+
+def decouper_phrases(texte):
+    """Le texte en phrases -- pour reprendre la ou on lui a coupe la parole."""
+    return [p.strip() for p in _FIN_DE_PHRASE.split(str(texte or "")) if p.strip()]
+
+
 def texte_pour_piper(texte, langue="fr"):
     """Une seule ligne (piper lit ligne par ligne) et des nombres qui se disent.
     « 18h30 » est francais : en anglais, espeak lit « 18:30 » tout seul."""
@@ -1314,6 +1322,455 @@ class SyntheseKokoro:
 
 
 # ======================================================================
+#  LA DOUBLE TRANSMISSION -- LUI COUPER LA PAROLE
+#
+#  « Il faut que ce soit une discussion a double transmission, comme les
+#  modeles de ChatGPT, pour pouvoir couper la parole. » Pendant que Jarvis
+#  parle, l'oreille ecoute toujours ; si la personne parle PAR-DESSUS, il se
+#  tait et l'ecoute.
+#
+#  LE PIEGE, C'EST SA PROPRE VOIX : le micro entend les haut-parleurs. On
+#  garde donc ce que les haut-parleurs jouent -- la REFERENCE, le loopback de
+#  Windows, le son qui sort, musique comprise -- et on apprend, bande par
+#  bande, comment il revient dans le micro : un petit filtre sur les
+#  puissances (NLMS, 30 prises de 20 ms = 600 ms : le retard et l'echo de la
+#  piece). Ce que l'echo n'explique pas, c'est peut-etre la personne.
+#
+#  LA MARGE EST MESUREE, PAS DEVINEE. Pendant que Jarvis parle seul, on releve
+#  de combien l'echo depasse ce que le filtre en predit, et la marge de chaque
+#  bande est le 99e centile de cet ecart. Une marge fixe coupait pour rien :
+#  l'echo d'une piece fluctue au hasard autour de ce qu'on en attend.
+#
+#  PEUT-ETRE, parce qu'un clavier non plus, l'echo ne l'explique pas. Ce qui
+#  depasse ne compte que si c'est une VOIX : aussi forte que lui a 10 dB pres
+#  (on hausse le ton pour couper quelqu'un), et qui VIBRE -- une hauteur tenue
+#  sur 80 ms, mesuree sur le micro dont on a retire Jarvis ; le « toc » d'une
+#  touche s'eteint en quelques millisecondes. Et s'il coupe pour rien quand
+#  meme, personne ne parle ensuite : il reprend sa phrase.
+#
+#  MESURE, en simulation : 240 pieces tirees au sort (retard 10 a 150 ms,
+#  reverberation 0,15 a 0,8 s, niveaux, bruit ; les deux horloges qui trainent
+#  et arrivent par rafales ; Jarvis par Kokoro, la personne par huit voix
+#  francaises et anglaises), quatre reponses chacune :
+#    - sa propre voix : aucune coupure pour rien en 960 reponses ; avec le
+#      volume monte de 10 dB entre deux reponses, une ;
+#    - quelqu'un qui parle par-dessus, de 3 dB sous l'echo a 12 dB au-dessus :
+#      entendu 221 fois sur 240, en une demi-seconde (mediane) ; des la
+#      premiere seconde de sa reponse, 212 ; de 0 a 10 dB SOUS l'echo (un
+#      portable, les haut-parleurs contre le micro), deux fois sur trois ;
+#    - taper au clavier pendant qu'il parle : 1,4 % des reponses coupees pour
+#      rien -- 7 % avec un clavier dont toutes les touches sonnent a la meme
+#      hauteur, tape vite. Il reprend alors sa phrase.
+#  Et « Jarvis ! » par-dessus le coupe toujours, par le mot d'eveil.
+#
+#  CE QUI NE CHANGE PAS : la reference ne sert qu'a ca, en memoire et en
+#  puissances par bande ; elle n'est ni transcrite, ni gardee, ni envoyee, et
+#  on ne l'ouvre que pendant que Jarvis parle.
+# ======================================================================
+
+COUPURE_SF = 320                   # une sous-trame : 20 ms a 16 kHz
+COUPURE_PAS = COUPURE_SF / float(FREQ)
+_COUPURE_NFFT = 512
+_COUPURE_BORNES = (150, 250, 350, 450, 570, 700, 840, 1000, 1170, 1370, 1600, 1850, 2150, 2500, 2900,
+                   3400, 4000, 4800, 5800, 7000)
+_COUPURE_BANDES = []
+
+
+def _bandes_coupure():
+    if not _COUPURE_BANDES:
+        import numpy as np
+        f = np.fft.rfftfreq(_COUPURE_NFFT, 1.0 / FREQ)
+        _COUPURE_BANDES.extend((int(np.searchsorted(f, _COUPURE_BORNES[i])),
+                                int(np.searchsorted(f, _COUPURE_BORNES[i + 1])))
+                               for i in range(len(_COUPURE_BORNES) - 1))
+    return _COUPURE_BANDES
+
+
+class _HorlogeDeFlux:
+    """DATER UN FLUX PAR SON RANG ET PAS PAR SON ARRIVEE. Un bloc arrive quand
+    le systeme et le fil le veulent -- a 10 ou 20 ms pres --, mais il a ete
+    capte a la cadence de l'horloge du son. Un flux continu est donc date par
+    le temps qu'il a deja fourni, depuis une origine qui est la mediane des
+    arrivees recentes : la gigue disparait. Mesure : avec la date d'arrivee,
+    dans une piece seche, l'echo suit la reference a la milliseconde et dix
+    millisecondes d'erreur suffisaient a rendre la coupure sourde. Un trou (le
+    loopback se tait quand rien ne joue) remet l'origine a zero."""
+
+    def __init__(self):
+        self.fourni = 0.0
+        self.origines = deque(maxlen=48)
+        self.derniere = None
+
+    def dater(self, t_arrivee, duree):
+        if self.derniere is not None and (t_arrivee - self.derniere > duree + 0.25
+                                          or t_arrivee < self.derniere - 0.25):
+            self.fourni = 0.0
+            self.origines.clear()
+        self.derniere = t_arrivee
+        self.fourni += duree
+        self.origines.append(t_arrivee - self.fourni)
+        o = sorted(self.origines)
+        return o[len(o) // 2] + self.fourni
+
+
+class Coupure:
+    """Decide, 20 ms par 20 ms, si la personne parle par-dessus Jarvis.
+
+    `reference(x, t_fin)` : un bloc de ce que jouent les haut-parleurs ;
+    `micro(x, t_fin)` : une trame du micro -- rend True quand il faut couper.
+    Les deux en float32 a 16 kHz, dates a leur FIN par la meme horloge. Ce
+    qu'il a appris de la piece reste d'une reponse a l'autre : la premiere
+    reponse lui sert a l'apprendre."""
+
+    def __init__(self, seuil=0.35, part=0.3, n_on=6, fenetre=9, niveau_min=1e-5, prises=30, mu=0.25,
+                 appris_min=50, centile=99.0, marge_min=2.0, marge_max=60.0, rapide=3, fort=0.65,
+                 regul=0.03, rodage=10, volume=True, vol_rodage=15, vol_attente=1.5, vol_centile=70.0,
+                 niv_rel=10.0, vois_suite=4, vois_seuil=0.5):
+        import numpy as np
+        self.np = np
+        self.bandes = _bandes_coupure()
+        self.nb = len(self.bandes)
+        self.fen = np.hanning(COUPURE_SF).astype(np.float32)
+        self.seuil, self.part, self.n_on, self.niveau_min = seuil, part, n_on, niveau_min
+        self.L, self.mu, self.appris_min = prises, mu, appris_min
+        self.centile, self.marge_min, self.marge_max = centile, marge_min, marge_max
+        self.rapide, self.fort = rapide, fort
+        self.w = np.zeros((self.nb, prises))
+        # LE FILTRE SE REGLE SUR LES CRETES DE LA REFERENCE, pas sur sa moyenne :
+        # la toute premiere trame apprise etait un debut de mot presque muet
+        # (1e-13) face au bruit du micro, et diviser par presque rien donnait a
+        # la prise zero un poids de 3000 -- deux reponses plus tard il en
+        # restait 10 a 180 au lieu de 0,1. L'echo predit etait cent fois trop
+        # fort pendant qu'il parle : sourd sur ses syllabes, il n'entendait la
+        # personne que dans ses silences. Et les dix premieres trames ne font
+        # que prendre la mesure de la reference (`rodage`).
+        self.regul, self.rodage = regul, rodage
+        self.norme_crete = np.zeros(self.nb)
+        self.vus = 0
+        self.marges = np.full(self.nb, 3.0)
+        self.erreurs = deque(maxlen=400)       # 8 s de « echo / prediction », Jarvis seul
+        self.n_erreurs = 0
+        self.calibree = False
+        # LE VOLUME QU'ON MONTE ENTRE DEUX REPONSES. Le loopback est pris avant
+        # le volume : seul l'echo grossit, et le filtre -- qui apprend avec
+        # 1,5 s de retard -- le predit trop faible. Mesure : 6 dB de plus, une
+        # reponse sur six coupee pour rien ; 10 dB, presque toutes. Or au debut
+        # d'une reponse on l'ecoute : passe le premier mot (`vol_rodage` trames,
+        # ou le filtre annonce de l'echo qui n'est pas encore arrive), une
+        # demi-seconde de « micro / echo predit », bande par bande, dit de
+        # combien il a grossi (le 70e centile : ni les attaques de mots, qui
+        # tirent vers le bas, ni quelqu'un qui parlerait deja). La prediction
+        # est montee d'autant pour toute la reponse -- jamais baissee. Pas de
+        # decision avant cette mesure, sauf sans echo du tout (casque) : alors
+        # au bout de `vol_attente`.
+        self.volume, self.vol_rodage, self.vol_attente, self.vol_centile = volume, vol_rodage, vol_attente, vol_centile
+        self.gains = []
+        self.g_vol = 1.0
+        self.vol_vus = self.vol_trames = 0
+        self.vol_fait = False
+        # ET SI ELLE COUPE POUR RIEN QUAND MEME, elle ne doit pas recommencer a
+        # la reponse suivante : une coupure met de cote ce qu'elle allait
+        # apprendre (la voix de la personne y est, peut-etre) ; si personne n'a
+        # parle ensuite (`fausse_coupure`), c'etait de l'echo, et il s'apprend.
+        self.de_cote = []
+        # UNE VOIX, PAS UN CLAVIER -- voir l'en-tete. `niv_rel` : de combien de
+        # dB la voix peut etre plus basse que l'echo habituel ; `vois_suite` :
+        # combien de trames de 20 ms elle doit tenir sa hauteur.
+        self.niv_rel, self.vois_suite, self.vois_seuil = niv_rel, vois_suite, vois_seuil
+        self.echo_typ = deque(maxlen=100)      # 2 s de « combien d'echo quand il parle »
+        self.suite_voisee, self.lag_prec, self.voisee_max = 0, 0, 0
+        f = np.fft.rfftfreq(_COUPURE_NFFT, 1.0 / FREQ)
+        self.bande_du_bin = np.clip(np.searchsorted([b for _, b in self.bandes], np.arange(len(f)), side="right"),
+                                    0, self.nb - 1)
+        self.fen_rac = np.sqrt(np.hanning(COUPURE_SF + 1)[:COUPURE_SF])
+        self.ola = np.zeros(COUPURE_SF)
+        self.entree = np.zeros(COUPURE_SF // 2)
+        self.nette = np.zeros(2 * COUPURE_SF)  # les 40 dernieres ms du micro, sans Jarvis
+        self.grille = {}                       # la reference, rangee par tranche de 20 ms
+        self.dernier = None
+        self.passe_M = deque(maxlen=100)       # 2 s de micro : le bruit de fond est leur minimum
+        self.passe_ms = deque(maxlen=100)
+        self.bruit = np.full(self.nb, 1e-12)
+        self.bruit_ms = 1e-12
+        self.hist = deque(maxlen=fenetre)
+        self.suite_forte = 0
+        self.arme = False
+        self.t_arme = 0.0
+        self.appris = 0
+        self.horloge_ref = _HorlogeDeFlux()
+        self.horloge_micro = _HorlogeDeFlux()
+        # APPRENDRE AVEC DU RETARD. Les trames d'avant la decision contiennent
+        # deja la voix de la personne : apprises tout de suite, elles entraient
+        # dans l'echo et les marges, et chaque interruption rendait la suivante
+        # plus difficile (mesure : trois coupures, et des marges au plafond).
+        # Elles attendent donc 1,5 s ; une coupure les met de cote, une fin
+        # normale les garde.
+        self.retard = 1.5
+        self.en_attente = deque()
+
+    def _puissances(self, x):
+        np = self.np
+        X = np.fft.rfft(x * self.fen, _COUPURE_NFFT)
+        p = (X.real ** 2 + X.imag ** 2) / float(COUPURE_SF * COUPURE_SF)
+        return np.array([p[a:b].sum() for a, b in self.bandes])
+
+    def _sans_echo(self, s, M, E):
+        """Ce que le micro entend MOINS Jarvis : chaque bande attenuee de ce que
+        l'echo predit y prend (jusqu'a sa marge), en fenetres de 20 ms qui se
+        chevauchent de moitie pour que le son reste un son (10 ms de retard).
+        Sans ca, la voix de Jarvis dans le micro « tenait sa hauteur » a la
+        place de la personne."""
+        np = self.np
+        g = np.clip(1.0 - self.marges * E / np.maximum(M, 1e-20), 0.0, 1.0)[self.bande_du_bin]
+        x = np.concatenate([self.entree, s.astype(np.float64)])
+        pas = COUPURE_SF // 2
+        sortie = np.zeros(COUPURE_SF)
+        for k in range(2):
+            trame = x[k * pas:k * pas + COUPURE_SF] * self.fen_rac
+            self.ola += np.fft.irfft(np.fft.rfft(trame, _COUPURE_NFFT) * g, _COUPURE_NFFT)[:COUPURE_SF] * self.fen_rac
+            sortie[k * pas:(k + 1) * pas] = self.ola[:pas]
+            self.ola = np.concatenate([self.ola[pas:], np.zeros(pas)])
+        self.entree = x[-pas:]
+        return sortie
+
+    def _voisement(self, x):
+        """La voix qui vibre : la meilleure autocorrelation entre 80 et 400 Hz
+        sur 40 ms, et a quel retard (la hauteur). Un claquement n'en a pas."""
+        np = self.np
+        x = x - float(np.mean(x))
+        n = len(x)
+        r = np.fft.irfft(np.abs(np.fft.rfft(x, 2 * n)) ** 2)[:n]
+        if r[0] <= 0:
+            return 0.0, 0
+        tau = np.arange(40, 201)
+        v = r[tau] / r[0] * n / (n - tau)
+        i = int(np.argmax(v))
+        return float(v[i]), int(tau[i])
+
+    def _suivre_la_hauteur(self, parle):
+        """Combien de trames de suite ce qui depasse vibre, a la meme hauteur
+        (a 20 % pres, ou a l'octave : l'autocorrelation trouve parfois le
+        double de la periode) : une voix tient la sienne ; le « toc » d'un
+        clavier s'eteint en quelques millisecondes."""
+        v, lag = self._voisement(self.nette) if parle else (0.0, 0)
+        if parle and v >= self.vois_seuil:
+            tenue = self.suite_voisee > 0 and any(abs(lag * f - self.lag_prec) <= 0.2 * self.lag_prec
+                                                  for f in (1.0, 2.0, 0.5))
+            self.suite_voisee = self.suite_voisee + 1 if tenue else 1
+        else:
+            self.suite_voisee = 0
+        self.lag_prec = lag
+        self.voisee_max = max(self.voisee_max, self.suite_voisee)
+
+    def reference(self, x, t_fin):
+        n = len(x) // COUPURE_SF
+        t_fin = self.horloge_ref.dater(t_fin, n * COUPURE_PAS)
+        for i in range(n):
+            t = t_fin - (n - i - 1) * COUPURE_PAS
+            if self.dernier is not None and t < self.dernier - 1.0:
+                self.grille.clear()            # l'horloge a recule : on repart de zero
+            self.dernier = t
+            self.grille[int(round(t / COUPURE_PAS))] = self._puissances(x[i * COUPURE_SF:(i + 1) * COUPURE_SF])
+        plus_vieux = int(round(t_fin / COUPURE_PAS)) - self.L - 50
+        for k in [k for k in self.grille if k < plus_vieux]:
+            del self.grille[k]
+
+    def armer(self, t):
+        self.arme, self.t_arme = True, t
+        self.hist.clear()
+        self.suite_forte = 0
+        self.suite_voisee = self.voisee_max = 0
+        self.gains = []
+        self.g_vol = 1.0
+        self.vol_vus = self.vol_trames = 0
+        self.vol_fait = False
+        self.de_cote = []
+
+    def desarmer(self, garder=True):
+        """Il a fini de parler (garder) -- ou on vient de lui couper la parole,
+        et ce qui attendait contient peut-etre la voix de la personne : mis de
+        cote, jusqu'a savoir (`fausse_coupure`)."""
+        self.arme = False
+        self.hist.clear()
+        self.suite_forte = 0
+        if garder:
+            self._apprendre_jusqua(float("inf"))
+        else:
+            self.de_cote = list(self.en_attente)
+            self.en_attente.clear()
+
+    def fausse_coupure(self):
+        """Personne n'a parle apres la coupure : ce qui attendait etait de
+        l'echo -- au nouveau volume, peut-etre. Il s'apprend."""
+        for _, M, E, X, forme in self.de_cote:
+            self._apprendre(M, E, X, forme)
+        self.de_cote = []
+
+    def pret(self):
+        return self.appris >= self.appris_min and self.calibree
+
+    def _apprendre(self, M, E, X, forme):
+        """`E` est l'echo que le filtre predisait AU MOMENT de la trame -- celui
+        sur lequel on a decide. Les marges se mesurent donc sur lui, mais
+        seulement s'il sortait d'un filtre deja forme (`forme`) : avec le
+        retard, les premieres predictions venaient d'un filtre vide ou en
+        pleine transitoire, et les marges tombaient au plancher."""
+        np = self.np
+        if forme:
+            ok = (E > 2.0 * self.bruit) & (M > 2.0 * self.bruit)
+            self.erreurs.append(np.where(ok, M / np.maximum(E, 1e-20), np.nan))
+            self.n_erreurs += 1
+            if self.n_erreurs >= 40 and self.n_erreurs % 10 == 0:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    q = np.nanpercentile(np.array(self.erreurs), self.centile, axis=0)
+                self.marges = np.clip(np.where(np.isnan(q), self.marge_max, q), self.marge_min, self.marge_max)
+                self.calibree = True
+        norme = np.einsum("bk,bk->b", X, X)
+        self.norme_crete = np.maximum(norme, 0.999 * self.norme_crete)
+        self.vus += 1
+        if self.vus <= self.rodage:
+            return
+        err = M - np.einsum("bk,bk->b", self.w, X)
+        self.w += self.mu * (err / (norme + self.regul * self.norme_crete + 1e-30))[:, None] * X
+        np.maximum(self.w, 0.0, out=self.w)
+        self.appris += 1
+
+    def _apprendre_jusqua(self, t):
+        while self.en_attente and self.en_attente[0][0] <= t:
+            _, M, E, X, forme = self.en_attente.popleft()
+            self._apprendre(M, E, X, forme)
+
+    def _mesurer_le_volume(self, M, E, X):
+        """Voir `volume` : rend la prediction corrigee, et si on peut decider."""
+        np = self.np
+        if X.sum() > 1e-14:
+            self.vol_vus += 1
+        if self.vol_vus > self.vol_rodage and not self.vol_fait:
+            ok = (E > 4.0 * self.bruit) & (M > 4.0 * self.bruit)
+            self.gains.extend(np.log(M[ok] / E[ok]).tolist())
+            self.vol_trames += 1
+            if len(self.gains) >= 150 or self.vol_trames >= 25:
+                self.vol_fait = True
+                if len(self.gains) >= 30:
+                    self.g_vol = max(1.0, float(np.exp(np.percentile(self.gains, self.vol_centile))))
+        return E * self.g_vol, self.vol_fait
+
+    def micro(self, x, t_fin):
+        np = self.np
+        n = len(x) // COUPURE_SF
+        t_fin = self.horloge_micro.dater(t_fin, n * COUPURE_PAS)
+        coupe = False
+        for i in range(n):
+            t = t_fin - (n - i - 1) * COUPURE_PAS
+            s = x[i * COUPURE_SF:(i + 1) * COUPURE_SF]
+            M = self._puissances(s)
+            ms = float(np.mean(s.astype(np.float64) ** 2))
+            self.passe_M.append(M)
+            self.passe_ms.append(ms)
+            if len(self.passe_M) >= 10:
+                self.bruit = np.min(np.array(self.passe_M), axis=0) * 1.5
+                self.bruit_ms = min(self.passe_ms) * 1.5
+            k = int(round(t / COUPURE_PAS))
+            X = np.zeros((self.nb, self.L))
+            for j in range(self.L):
+                P = self.grille.get(k - j)
+                if P is not None:
+                    X[:, j] = P
+            E = np.einsum("bk,bk->b", self.w, X)      # l'echo que la piece devrait rendre
+            sur = True
+            if self.volume:
+                E, mesure = self._mesurer_le_volume(M, E, X)
+                sur = mesure or t - self.t_arme > self.vol_attente
+            if E.sum() > 4.0 * self.bruit.sum():
+                self.echo_typ.append(float(E.sum()))
+            if self.vois_suite:
+                self.nette = np.concatenate([self.nette[COUPURE_SF:], self._sans_echo(s, M, E)])
+            parle = False
+            if self.arme and self.pret() and sur:
+                limite = self.marges * E + 2.0 * self.bruit
+                exces = np.maximum(0.0, M - limite)
+                score = exces.sum() / max(M.sum(), 1e-15)
+                part = (M > limite)[:15].mean()       # 150 Hz - 4 kHz : la voix
+                parle = (score > self.seuil and part >= self.part
+                         and score * ms > max(self.niveau_min, 6.0 * self.bruit_ms))
+                # aussi forte que lui, a `niv_rel` dB pres
+                if parle and self.niv_rel is not None and self.echo_typ:
+                    parle = exces.sum() >= float(np.median(self.echo_typ)) * 10 ** (-self.niv_rel / 10.0)
+                if self.vois_suite:
+                    self._suivre_la_hauteur(parle)
+                self.hist.append(parle)
+                # la voie rapide : nettement au-dessus de l'echo, trois fois de suite
+                self.suite_forte = self.suite_forte + 1 if (parle and score > self.fort and part >= 0.5) else 0
+                une_voix = not self.vois_suite or self.voisee_max >= self.vois_suite
+                if ((sum(self.hist) >= self.n_on or (self.rapide and self.suite_forte >= self.rapide))
+                        and t - self.t_arme > 0.2 and une_voix):
+                    coupe = True
+                if not any(self.hist):
+                    self.voisee_max = 0
+            # APPRENDRE, quand Jarvis parle et que la personne se tait -- avec
+            # du retard, voir `retard`
+            if not parle and X.sum() > 1e-14:
+                self.en_attente.append((t, M, E, X, self.appris >= self.appris_min))
+            self._apprendre_jusqua(t - self.retard)
+            if coupe:
+                break
+        if coupe:
+            self.desarmer(garder=False)
+        return coupe
+
+
+def haut_parleurs_windows():
+    """Ce que jouent les haut-parleurs par defaut (le loopback de WASAPI),
+    en 16 kHz mono, par blocs de 20 ms."""
+    import soundcard as sc
+    hp = sc.default_speaker()
+    return sc.get_microphone(id=str(hp.name), include_loopback=True).recorder(
+        samplerate=FREQ, channels=1, blocksize=COUPURE_SF)
+
+
+class Loopback:
+    """La reference, dans son fil, OUVERTE SEULEMENT PENDANT QUE JARVIS PARLE.
+    `ouvrir()` rend un gestionnaire de contexte qui a `record(numframes)`."""
+
+    def __init__(self, ouvrir=None, horloge=None):
+        self.ouvrir = ouvrir or haut_parleurs_windows
+        self.horloge = horloge or time.perf_counter
+        self.blocs = deque(maxlen=400)
+        self.actif = threading.Event()
+        self.fil = None
+        self.erreur = None
+
+    def demarrer(self):
+        self.actif.set()
+        if self.fil is None or not self.fil.is_alive():
+            self.fil = threading.Thread(target=self._tourner, daemon=True)
+            self.fil.start()
+
+    def arreter(self):
+        self.actif.clear()
+
+    def _tourner(self):
+        import numpy as np
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.ole32.CoInitializeEx(None, 0)     # COM, dans ce fil aussi
+            except Exception:
+                pass
+        try:
+            with self.ouvrir() as rec:
+                while self.actif.is_set():
+                    b = rec.record(numframes=COUPURE_SF)
+                    t = self.horloge()
+                    mono = b[:, 0] if getattr(b, "ndim", 1) > 1 else b
+                    self.blocs.append((t, np.asarray(mono, dtype=np.float32)))
+        except Exception as e:
+            self.erreur = "%s : %s" % (type(e).__name__, str(e)[:120])
+
+
+# ======================================================================
 #  L'OREILLE -- LE PROCESSUS QUI TIENT LE MICRO
 #
 #  A part, comme le moteur de la dictee : s'il tombe (micro debranche,
@@ -1370,16 +1827,55 @@ class Oreille:
     `sortie(evenement)` recoit ce qui doit partir vers Machi Tool ;
     `jouer(genre)` joue un son."""
 
-    def __init__(self, empreintes, sortie, jouer_son=None):
+    def __init__(self, empreintes, sortie, jouer_son=None, loopback=None, horloge=None):
         self.e = empreintes
         self.sortie = sortie
         self.jouer = jouer_son or (lambda g: None)
-        self.reglages = {"gabarits": [], "sensibilite": 0.5, "hey": True, "son": True}
+        self.reglages = {"gabarits": [], "sensibilite": 0.5, "hey": True, "son": True, "couper": True}
         self.det = Detecteur(empreintes)
         self.etat = "veille"
         self.phrase = None
         self.appris = None
         self.niveau_vu = 0.0
+        # LA DOUBLE TRANSMISSION : pendant que Jarvis parle, on ecoute s'il se
+        # fait couper -- voir `Coupure`. Sans reference, il n'y a que le mot d'eveil.
+        self.loopback = loopback
+        self.horloge = horloge or time.perf_counter
+        self.coupure = None
+        self.parole = False
+        self.apres_coupure = False
+
+    def _arreter_parole(self):
+        self.parole = False
+        if self.coupure is not None:
+            self.coupure.desarmer()
+        if self.loopback is not None:
+            self.loopback.arreter()
+
+    def _coupe(self, x):
+        """Jarvis parle : la personne vient-elle de lui couper la parole ?"""
+        import numpy as np
+        c = self.coupure
+        if c is None or self.loopback is None:
+            return False
+        while True:
+            try:
+                t_b, b = self.loopback.blocs.popleft()
+            except IndexError:
+                break
+            c.reference(b, t_b)
+        return c.micro(np.asarray(x, dtype=np.float32) / 32768.0, self.horloge())
+
+    def etat_coupure(self):
+        if not self.reglages.get("couper", True):
+            return "coupee"
+        if self.loopback is None:
+            return "sans reference"
+        if self.loopback.erreur:
+            return "reference impossible : " + self.loopback.erreur
+        if self.coupure is None or not self.coupure.pret():
+            return "apprend la piece"
+        return "prete"
 
     def configurer(self, r):
         self.reglages.update({k: v for k, v in r.items() if k != "cmd"})
@@ -1397,8 +1893,25 @@ class Oreille:
             self.phrase = Phrase(self.det.parle, attente=float(c.get("attente", 5.0)),
                                  ignorer=float(c.get("ignorer", 0.35)))
             self.etat = "phrase"
+            self.apres_coupure = False
+        elif cmd == "fausse_coupure":
+            # La phrase d'apres la coupure etait vide de mots (Machi Tool l'a
+            # transcrite) : c'etait de l'echo, qui s'apprend.
+            if self.coupure is not None:
+                self.coupure.fausse_coupure()
         elif cmd == "annuler":  # l'oreille : on laisse tomber ce qu'on ecoutait
             self.phrase, self.appris, self.etat = None, None, "veille"
+        elif cmd == "parole":
+            # Jarvis commence ou finit de parler (le processus de la voix le dit)
+            if c.get("actif") and self.reglages.get("couper", True) and self.loopback is not None:
+                if self.coupure is None:
+                    self.coupure = Coupure()
+                self.loopback.blocs.clear()
+                self.loopback.demarrer()
+                self.coupure.armer(self.horloge())
+                self.parole = True
+            else:
+                self._arreter_parole()
         elif cmd == "apprendre":
             # PAS DE BIP ICI : la fenetre du modele couvre 775 ms, un bip juste
             # avant le mot entrerait dans le gabarit -- et il n'y est jamais
@@ -1411,6 +1924,7 @@ class Oreille:
         rms = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
         ev = self.det.trame(x, chercher=(self.etat == "veille"))
         if ev is not None:
+            self._arreter_parole()
             if self.reglages.get("son", True):
                 self.jouer("eveil")
             avant = self.det.son_d_avant()
@@ -1419,17 +1933,34 @@ class Oreille:
             # mais elle ne fait pas partie de la fenetre d'apres-carillon non plus.
             self.phrase.morceaux.append(np.asarray(x, dtype=np.int16))
             self.etat = "phrase"
+            self.apres_coupure = False
             self.sortie({"evt": "reveil", "par": ev[0], "score": round(float(ev[1]), 4)})
+            return
+        if self.parole and self.etat == "veille" and self._coupe(x):
+            # ON LUI COUPE LA PAROLE : il se tait (Machi Tool s'en charge), et la
+            # phrase commence un peu AVANT la decision -- la voix y etait deja.
+            # Si personne ne parle dans la seconde et demie, c'etait pour rien :
+            # « vide », et Jarvis reprend sa phrase.
+            self._arreter_parole()
+            self.sortie({"evt": "coupure"})
+            avant = self.det.son_d_avant()
+            self.phrase = Phrase(self.det.parle, avant=avant[-int(0.6 * FREQ):], attente=1.5, ignorer=0.0)
+            self.etat = "phrase"
+            self.apres_coupure = True
             return
         if self.etat == "phrase" and self.phrase is not None:
             fin = self.phrase.trame(x, rms)
-            if fin == "fini":
-                wav = self.phrase.wav()
+            if fin in ("fini", "vide"):
+                apres, self.apres_coupure = self.apres_coupure, False
+                ev = {"evt": "vide"}
+                if fin == "fini":
+                    ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii")}
+                elif apres and self.coupure is not None:
+                    self.coupure.fausse_coupure()      # personne n'a parle : c'etait de l'echo
+                if apres:
+                    ev["apres_coupure"] = True
                 self.phrase, self.etat = None, "veille"
-                self.sortie({"evt": "phrase", "wav": base64.b64encode(wav).decode("ascii")})
-            elif fin == "vide":
-                self.phrase, self.etat = None, "veille"
-                self.sortie({"evt": "vide"})
+                self.sortie(ev)
         elif self.etat == "apprendre" and self.appris is not None:
             a = self.appris
             a["emps"].append(self.det.emps[-1])
@@ -1456,10 +1987,10 @@ class Oreille:
         if now - self.niveau_vu >= 1.0:
             self.niveau_vu = now
             db = 20 * math.log10(max(rms, 1.0) / 32768.0)
-            self.sortie({"evt": "niveau", "db": round(db, 1), "etat": self.etat})
+            self.sortie({"evt": "niveau", "db": round(db, 1), "etat": self.etat, "coupure": self.etat_coupure()})
 
 
-def oreille_enfant(port, secret, dossier, source=None, jouer_son=None):
+def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=None):
     """Le processus de l'oreille. S'en va quand Machi Tool ferme la connexion."""
     if os.name != "nt":
         try:
@@ -1493,8 +2024,13 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None):
         except Exception:
             vivant.clear()
 
+    # La reference pour lui couper la parole : ce que jouent les haut-parleurs,
+    # ouverte seulement pendant qu'il parle (Windows ; ailleurs, le mot d'eveil
+    # seul le coupe).
+    if loopback is None and source is None and os.name == "nt":
+        loopback = Loopback()
     try:
-        oreille = Oreille(Empreintes(dossier), sortie, jouer_son or jouer)
+        oreille = Oreille(Empreintes(dossier), sortie, jouer_son or jouer, loopback)
     except Exception as e:
         sortie({"evt": "erreur", "message": "modeles illisibles : %s" % str(e)[:160]})
         return
@@ -1520,6 +2056,8 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None):
                 if not vivant.is_set():
                     break
                 time.sleep(0.1)
+    if loopback is not None:
+        loopback.arreter()
     try:
         s.close()
     except Exception:
@@ -1562,25 +2100,33 @@ class Bouche:
         return next(iter(self.syns.values()))
 
     def dire(self, ident, texte, lenteur=1.0, cle=None):
+        """Phrase par phrase : si on lui coupe la parole, « fini » dit ce qui
+        restait (`reste`, a partir de la phrase coupee) -- et s'il s'avere que
+        personne n'avait parle, Jarvis reprend la."""
         import numpy as np
         syn = self.syns.get(cle) or self.syn
+        langue = getattr(syn, "langue", "fr")
         self.couper.clear()
         file_ = queue.Queue(maxsize=3)
         fin = object()
+        phrases = decouper_phrases(texte) or [texte]
 
         def produire():
             try:
-                for son in syn.phrases(texte_pour_piper(texte, getattr(syn, "langue", "fr")), lenteur):
+                for k, bout in enumerate(phrases):
+                    for son in syn.phrases(texte_pour_piper(bout, langue), lenteur):
+                        if self.couper.is_set():
+                            break
+                        file_.put((k, son))
                     if self.couper.is_set():
                         break
-                    file_.put(son)
             except Exception as e:
                 file_.put(e)
             file_.put(fin)
 
         threading.Thread(target=produire, daemon=True).start()
         pas = syn.frequence // 10
-        coupe, premiere = False, True
+        coupe, premiere, en_cours = False, True, 0
         with self.lecteur(syn.frequence) as hp:
             while True:
                 son = file_.get()
@@ -1589,6 +2135,7 @@ class Bouche:
                 if isinstance(son, Exception):
                     self.sortie({"evt": "erreur", "message": "synthese : %s" % str(son)[:160]})
                     break
+                en_cours, son = son
                 if premiere:
                     self.sortie({"evt": "debut", "id": ident})
                     premiere = False
@@ -1606,7 +2153,10 @@ class Bouche:
                 file_.get_nowait()
             except queue.Empty:
                 break
-        self.sortie({"evt": "fini", "id": ident, "coupe": coupe})
+        ev = {"evt": "fini", "id": ident, "coupe": coupe}
+        if coupe:
+            ev["reste"] = " ".join(phrases[en_cours:])
+        self.sortie(ev)
 
 
 def voix_enfant(port, secret, lecteur=None):

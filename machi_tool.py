@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.30.0"
+VERSION = "1.31.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -350,6 +350,10 @@ CONFIG_DEFAUT = {
     "jarvis_appellation": "",         # comment Jarvis vous appelle ; vide = ni Monsieur ni Madame
     "jarvis_debit": 0,                # voix de Windows : -10 .. 10
     "jarvis_suite": True,             # apres sa reponse, il ecoute encore 5 s sans mot d'eveil
+    # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
+    # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
+    # personne ne parlait (un clavier, une porte), il reprend sa phrase.
+    "jarvis_couper": True,
     # Raccourcis a soi : [{"dit": "ouvre spotify", "ouvre": "spotify:"}] -- une
     # phrase, et ce qu'elle ouvre (programme, dossier ou adresse).
     "jarvis_raccourcis": [],
@@ -4766,13 +4770,17 @@ def _lire_voix(sock):
         if ev is None:
             break
         quoi = ev.get("evt")
-        if quoi == "pret":
+        if quoi == "debut":
+            # IL PARLE : l'oreille guette qu'on lui coupe la parole
+            envoyer_oreille({"cmd": "parole", "actif": True})
+        elif quoi == "pret":
             _VOIX_ENFANT["pretes"].add(str(ev.get("cle") or "fr"))
             _VOIX_ENFANT.update(pret=True, echecs=0)
             if ev.get("cle") == "en":
                 KOKORO.update(etat="pret", message="")
         elif quoi == "fini":
-            VOIX.fini(ev.get("id"), bool(ev.get("coupe")))
+            envoyer_oreille({"cmd": "parole", "actif": False})
+            VOIX.fini(ev.get("id"), bool(ev.get("coupe")), ev.get("reste"))
         elif quoi == "erreur":
             print("Jarvis : voix : %s" % str(ev.get("message"))[:200])
             # La voix anglaise n'a pas pu se charger : on le DIT, au lieu de
@@ -4808,6 +4816,8 @@ class Voix:
         self.sapi = None
         self.disponible = os.name == "nt"      # la voix de Windows
         self.attentes = {}
+        self.en_cours = {}          # ident -> (texte, fin, langue) : ce qu'il est en train de dire
+        self.reprise = None         # ce qu'on lui a coupe, s'il faut le reprendre
         self.n = 0
 
     def peut_parler(self):
@@ -4829,11 +4839,13 @@ class Voix:
             self.n += 1
             ident = self.n
             self.attentes[ident] = fin
+            self.en_cours[ident] = (texte, fin, langue)
             self.parle = True
             if envoyer_voix({"cmd": "dire", "id": ident, "texte": texte, "cle": cle,
                              "lenteur": float(CFG.get("jarvis_lenteur", 0.95))}):
                 return
             self.attentes.pop(ident, None)
+            self.en_cours.pop(ident, None)
         if not self.disponible:
             if fin:
                 fin()
@@ -4844,7 +4856,10 @@ class Voix:
             self.fil = threading.Thread(target=self._tourner, daemon=True)
             self.fil.start()
 
-    def fini(self, ident, coupe):
+    def fini(self, ident, coupe, reste=None):
+        self.en_cours.pop(ident, None)
+        if coupe and reste and self.reprise and self.reprise["id"] == ident:
+            self.reprise["texte"] = reste       # a partir de la phrase coupee
         fin = self.attentes.pop(ident, None)
         if not self.attentes:
             self.parle = False
@@ -4858,6 +4873,7 @@ class Voix:
         """La voix est tombee en pleine phrase : on ne laisse pas la suite
         (la guirlande, l'ecoute d'apres) attendre une fin qui ne viendra pas."""
         attentes, self.attentes = self.attentes, {}
+        self.en_cours, self.reprise = {}, None
         self.parle = False
         for fin in attentes.values():
             if fin:
@@ -4866,12 +4882,34 @@ class Voix:
                 except Exception:
                     pass
 
-    def taire(self):
+    def taire(self, garder=False):
+        """Il se tait. `garder` : on vient de lui couper la parole -- on garde
+        ce qu'il disait, pour le reprendre si personne ne parlait en fait."""
+        self.reprise = None
+        if garder and self.en_cours:
+            # la voix dit ses textes dans l'ordre : celui qui sonne est le plus
+            # ancien ; ceux qui attendaient, « taire » les jette (sans « fini »)
+            ident = min(self.en_cours)
+            texte, fin, langue = self.en_cours[ident]
+            self.reprise = {"id": ident, "texte": texte, "fin": fin, "langue": langue, "t": time.time()}
+        self.en_cours.clear()
         self.file.clear()
         self.attentes.clear()
         envoyer_voix({"cmd": "taire"})
         self.couper.set()
         self.parle = False
+
+    def reprendre(self):
+        """Reprend ce qu'on lui a coupe (a partir de la phrase coupee), avec la
+        meme suite qu'avant -- l'ecoute d'apres, la guirlande."""
+        r, self.reprise = self.reprise, None
+        if not r or not r.get("texte") or time.time() - r["t"] > 30.0:
+            return False
+        self.dire(r["texte"], r["fin"], r["langue"])
+        return True
+
+    def oublier_reprise(self):
+        self.reprise = None
 
     # Les voix de Windows a essayer, par langue : l'anglais britannique d'abord
     # (809), puis l'americain (409) ; le francais (40C).
@@ -4919,12 +4957,14 @@ class Voix:
                 self.couper.clear()
                 self.parle = True
                 dit = True
+                envoyer_oreille({"cmd": "parole", "actif": True})
                 try:
                     dit = self._sapi(texte, langue)
                 except Exception as e:
                     print("Jarvis : voix de Windows impossible (%s)" % type(e).__name__)
                 finally:
                     self.parle = False
+                    envoyer_oreille({"cmd": "parole", "actif": False})
                 if fin and dit:
                     try:
                         fin()
@@ -4951,7 +4991,8 @@ def config_oreille(cfg):
     return {"cmd": "config", "gabarits": gabarits_jarvis(),
             "sensibilite": float(cfg.get("jarvis_sensibilite", 0.5)),
             "hey": bool(cfg.get("jarvis_hey", True)),
-            "son": bool(cfg.get("jarvis_son", True))}
+            "son": bool(cfg.get("jarvis_son", True)),
+            "couper": bool(cfg.get("jarvis_couper", True))}
 
 
 def envoyer_oreille(objet):
@@ -5073,6 +5114,15 @@ def traiter_evenement(ev):
         JARVIS.update(etat="attente", message=message_attente())
     elif quoi == "niveau":
         JARVIS["db"] = ev.get("db")
+        JARVIS["coupure"] = ev.get("coupure")
+    elif quoi == "coupure":
+        # ON LUI COUPE LA PAROLE : il se tait net, et l'oreille ecoute deja la
+        # suite -- elle fera une phrase comme une autre.
+        print("Jarvis : on lui coupe la parole")
+        VOIX.taire(garder=True)
+        poser_led("ecoute")
+        JARVIS.update(etat="ecoute", message="Je vous ecoute.")
+        threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "reveil":
         print("Jarvis : eveil (%s)" % ev.get("par"))
         VOIX.taire()
@@ -5088,11 +5138,15 @@ def traiter_evenement(ev):
         # premiere phrase apres un long silence ne paie pas son chargement.
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "vide":
+        # Personne n'a parle apres la coupure (un clavier, une porte) : il
+        # reprend sa phrase -- l'oreille, elle, a deja appris que c'etait de l'echo.
+        if ev.get("apres_coupure") and reprendre_apres_coupure():
+            return
         if JARVIS["etat"] == "ecoute":
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
     elif quoi == "phrase":
-        _JARVIS_TRAVAIL.append(ev.get("wav") or "")
+        _JARVIS_TRAVAIL.append((ev.get("wav") or "", bool(ev.get("apres_coupure"))))
         _JARVIS_TRAVAIL_SIGNAL.set()
     elif quoi == "gabarit":
         _GABARIT_RECU["evt"] = ev
@@ -5100,6 +5154,20 @@ def traiter_evenement(ev):
     elif quoi == "erreur":
         print("Jarvis : %s" % str(ev.get("message"))[:200])
         JARVIS.update(etat="erreur", message=str(ev.get("message") or "")[:200])
+
+
+def reprendre_apres_coupure():
+    """On lui avait coupe la parole pour rien : il reprend ou il en etait."""
+    if not VOIX.reprise:
+        return False
+    print("Jarvis : coupe pour rien, il reprend")
+    poser_led("parle")
+    JARVIS.update(etat="parle", message="Je reprends.")
+    if VOIX.reprendre():
+        return True
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+    return False
 
 
 def message_attente():
@@ -5185,9 +5253,9 @@ def fil_jarvis_travail(cfg):
         _JARVIS_TRAVAIL_SIGNAL.wait(1.0)
         _JARVIS_TRAVAIL_SIGNAL.clear()
         while _JARVIS_TRAVAIL:
-            wav64 = _JARVIS_TRAVAIL.pop(0)
+            wav64, apres_coupure = _JARVIS_TRAVAIL.pop(0)
             try:
-                traiter_phrase(wav64, cfg)
+                traiter_phrase(wav64, cfg, apres_coupure)
             except Exception as e:
                 print("Jarvis : phrase non traitee (%s)" % type(e).__name__)
                 signaler_erreur("Quelque chose a raté de mon côté.")
@@ -5401,7 +5469,7 @@ def signaler_erreur(texte):
                   langue_du_mode())
 
 
-def traiter_phrase(wav64, cfg):
+def traiter_phrase(wav64, cfg, apres_coupure=False):
     poser_led("comprend")
     JARVIS.update(etat="comprend", message="Je transcris...")
     L = langue_du_mode(cfg)
@@ -5421,6 +5489,15 @@ def traiter_phrase(wav64, cfg):
     finally:
         octets = None
     texte = _jv.retirer_mot_eveil(texte)
+    if apres_coupure:
+        if not texte:
+            # Le micro a entendu quelque chose, mais pas des mots : c'etait
+            # pour rien. L'oreille l'apprend, et il reprend sa phrase.
+            envoyer_oreille({"cmd": "fausse_coupure"})
+            if reprendre_apres_coupure():
+                return
+        else:
+            VOIX.oublier_reprise()
     if not texte:
         # « Jarvis. » tout court : il attend la suite -- et, UNE fois, s'il
         # a ete reveille par « Hey Jarvis » sans connaitre la voix, il dit
@@ -8276,6 +8353,10 @@ class Panneau:
                                 "il parle ; vert c'est fait, rouge c'est rate"),
                 ("jarvis_suite", "Apres sa reponse, il ecoute encore 5 secondes sans qu'on "
                                  "redise « Jarvis »"),
+                ("jarvis_couper", "Lui couper la parole : parler par-dessus, aussi fort que lui, "
+                                  "le fait taire et il t'ecoute ; si ce n'etait qu'un bruit, il "
+                                  "reprend sa phrase (il apprend l'echo de tes haut-parleurs "
+                                  "pendant sa premiere reponse)"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
@@ -8316,7 +8397,7 @@ class Panneau:
     def regler_jarvis(self, cle):
         self.cfg[cle] = bool(self.vars_jarvis[cle].get())
         sauver_config(self.cfg)
-        if cle in ("jarvis_son", "jarvis_hey"):
+        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper"):
             envoyer_oreille(config_oreille(self.cfg))
         if cle == "jarvis_leds" and not self.cfg[cle]:
             poser_led(None)
@@ -8372,6 +8453,8 @@ class Panneau:
         details.append("transcription : " + {"pret": "prete", "preparation": "preparation %d %%" % (d["progres"] * 100),
                                              "absent": "pas encore installee", "erreur": "erreur"}.get(d["etat"], d["etat"]))
         details.append("voix apprise" if gabarits_jarvis() else "voix pas encore apprise")
+        if JARVIS.get("coupure") and etat != "eteint":
+            details.append("couper la parole : " + str(JARVIS["coupure"]))
         n = len(JARVIS.get("minuteurs") or [])
         if n:
             details.append("%d minuteur(s)" % n)
