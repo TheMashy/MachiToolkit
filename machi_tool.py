@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.47.1"
+VERSION = "1.47.2"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5774,6 +5774,11 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
                 return
         else:
             VOIX.oublier_reprise()
+    if not texte and _jv.renvoi(brut):
+        # « Degage, Jarvis » : le nom vient APRES, et tout ce qui le precede est
+        # coupe -- il ne restait rien, et il repondait « Oui ? ».
+        print("Jarvis : renvoye")
+        return terminer_conversation()
     if not texte and JARVIS.get("mode") != "psy" and _jv.adieu(brut):
         # « Bonne nuit, Jarvis » : le nom vient APRES l'au revoir, et tout ce
         # qui precede le mot d'eveil est coupe -- mais la phrase entiere n'est
@@ -7195,6 +7200,16 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1):
     reponse = str(donnees.get("texte") or "").strip()
     if not reponse:
         return signaler_erreur(phrase("sans_reponse", L))
+    if donnees.get("fin"):
+        # CONGEDIE, POUR DE BON : il dit sa formule, puis n'ecoute plus -- il
+        # disait « je m'efface » et restait a l'ecoute.
+        print("Jarvis : congedie")
+        JARVIS["historique"] = (JARVIS["historique"] + [
+            {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+        clore_historique(cfg)
+        JARVIS["attente_code"] = None
+        envoyer_oreille({"cmd": "annuler"})
+        return dire(reponse, suite=False, langue=L)
     if donnees.get("mode") == "psy":
         # Grave : c'est le compagnon qui a repondu, et on reste avec lui. Et
         # a l'au revoir, Jarvis se taira : `psy_grave`.

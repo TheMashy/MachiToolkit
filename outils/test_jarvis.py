@@ -1881,6 +1881,35 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.JARVIS["reponse_affichee"], "Il fait 21 degrés à Lyon.")
         self.assertTrue(m.CONFIG_DEFAUT["jarvis_panneau"])
 
+    def test_oust_degage_casse_toi_il_part(self):
+        # « Quand je dis oust, degage, casse-toi... il dit "oui" ou "je m'efface", mais reste. »
+        m = self.m
+        ordres = []
+        vrais = (m.oreille_vivante, m._en_fond)
+        self.addCleanup(lambda: (setattr(m, "oreille_vivante", vrais[0]), setattr(m, "_en_fond", vrais[1])))
+        m.oreille_vivante, m._en_fond = (lambda: True), (lambda f: None)
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        vus = self.espions()
+        for dit in ("Oust !", "Dégage, Jarvis", "dégage jarvis", "Jarvis, casse-toi", "fous-moi la paix",
+                    "laisse-moi tranquille", "tu peux disposer", "vas-y dégage"):
+            ordres.clear()
+            m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}]
+            self.phrase(dit)
+            self.assertIn({"cmd": "annuler"}, ordres, dit)
+            self.assertNotIn("ecouter", [o.get("cmd") for o in ordres], dit + " : il n'ecoute plus")
+            self.assertEqual(m.JARVIS["historique"], [], dit)
+        self.assertEqual(vus["jarvis"], [], "rien de tout ca ne part au modele")
+        self.assertNotIn("Oui ?", self.dit)
+        # ce que Machi Tool ne reconnait pas : le modele se retire, et il part vraiment
+        m.parler_a_jarvis = vrai_parler = self._origines["parler_a_jarvis"]
+        envoyes, _ = self.mains([{"texte": "Je me retire.", "mode": "jarvis", "fin": True}], code_actif=False)
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        ordres.clear()
+        self.phrase("Jarvis, va donc jouer ailleurs, veux-tu")
+        self.assertEqual(self.dit[-1], "Je me retire.")
+        self.assertIn({"cmd": "annuler"}, ordres)
+        self.assertNotIn("ecouter", [o.get("cmd") for o in ordres], "« je m'efface » et il reste : plus jamais")
+
     def test_jarvis_montre_l_agenda(self):
         # « L'agenda de Machi Tool pourra etre visible et montre par Jarvis (fenetre qui s'ouvre). »
         m = self.m

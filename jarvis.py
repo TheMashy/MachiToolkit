@@ -754,22 +754,34 @@ _FIN_EN = re.compile(
 # comme elle l'entend -- « part », « par » -- et « degage » parfois en deux
 # mots ; une phrase faite de ce seul mot ne peut vouloir dire que ca.
 _RENVOI = re.compile(
-    r"^(?:(?:allez|aller|bon|ben|bah|hop|allez hop|ok|okay|non|oh|eh|jarvis|mais|maintenant|"
-    r"alright|okay|now|just|come on|oh|jarvis)\s+)*"
+    r"^(?:(?:allez|aller|bon|ben|bah|hop|allez hop|ok|okay|non|oh|eh|jarvis|mais|maintenant|c'est bon|"
+    r"merci|vas y|va y|allez vas y|bon ben|non mais|alright|okay|now|just|come on|oh|jarvis|thanks)\s+)*"
     r"(?:degage[sz]?|degager|de gage|des gages|"
-    r"pars|part|par|repars|repart|re pars|re part|re par|vas y pars|va t'en|va t en|vas t'en|"
-    r"casse toi|barre toi|tire toi|fous le camp|fiche le camp|file|ouste|disparais|du balai|"
+    r"pars|part|par|repars|repart|re pars|re part|re par|vas y pars|va t'en|va t en|vas t'en|allez vous en|"
+    r"casse toi|barre toi|tire toi|fous le camp|fiche le camp|foutez le camp|file|filez|ouste?|disparais|"
+    r"du balai|du vent|dehors|zou|rompez|bouge|va voir ailleurs|"
+    r"(?:fous|fiche|foutez|fichez) moi la paix|laisse moi(?: tranquille| en paix| seul)?|laissez moi(?: tranquille)?|"
+    r"lache moi(?: la grappe)?|ta gueule|ferme la|la ferme|"
+    r"(?:tu peux|vous pouvez) (?:partir|disposer|te retirer|vous retirer|t'en aller|vous en aller)|"
     r"stop|stop stop|arrete tout|"
-    r"get away|go away|get lost|get out|leave|leave now|scram|beat it|begone|buzz off|"
-    r"off you go|piss off|shoo)"
+    r"get away|go away|get lost|get out|leave|leave now|leave me alone|scram|beat it|begone|buzz off|"
+    r"off you go|piss off|shoo|shut up|you may go|you can go|dismissed)"
     r"(?:\s+(?:jarvis|maintenant|tout de suite|merci|s'il te plait|stp|now|please|thanks|"
-    r"right now|then|alors|allez|toi|d'ici|from here|la))*$")
+    r"right now|then|alors|allez|toi|d'ici|from here|la|hein))*$")
+
+
+def sans_nom(texte):
+    """La phrase sans le mot d'eveil, ou qu'il soit : « degage Jarvis » comme
+    « Jarvis, degage »."""
+    mots = normaliser(texte).replace("-", " ").split()
+    return " ".join(m for m in mots if not _EVEIL.match(m) and m not in ("hey", "he", "eh"))
 
 
 def renvoi(texte):
-    """« Degage », « pars », « get away », « stop », « re-pars » : il part."""
-    t = normaliser(texte).replace("-", " ").strip(" '")
-    return bool(t) and len(t.split()) <= 6 and bool(_RENVOI.match(t))
+    """« Degage », « oust », « casse-toi », « pars », « get away »... : il part.
+    Le nom peut venir avant ou apres."""
+    t = sans_nom(texte).strip(" '")
+    return bool(t) and len(t.split()) <= 7 and bool(_RENVOI.match(t))
 
 
 # L'AU REVOIR. « Jarvis devrait pouvoir s'eteindre lorsqu'il repond "a bientot
