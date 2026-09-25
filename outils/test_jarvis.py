@@ -1291,6 +1291,25 @@ class Alignement(unittest.TestCase):
         autre = J.normer(np.random.default_rng(2).normal(size=(12, 96)))
         self.assertGreater(J.distance_gabarit(g, autre), 0.5)
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_noyau_d_une_voix(self):
+        # ce que la capture montrait : trois « Jarvis » a 0,14 l'un de l'autre,
+        # et tout etait jete (la limite etait 0,12)
+        rng = np.random.default_rng(8)
+        base = rng.normal(size=(9, 96))
+        bruit = lambda e: (base + rng.normal(scale=e, size=base.shape)).tolist()
+        vrais = [bruit(0.45) for _ in range(5)]
+        coh = J.coherence(vrais[:3])
+        self.assertGreater(coh, 0.12, "aussi ecartes que sur la capture")
+        gardes, c, ecartes = J.choisir_gabarits(vrais, 5)
+        self.assertEqual((len(gardes), ecartes), (5, 0))
+        self.assertLessEqual(c, J.NOYAU_REJET)
+        # un intrus parmi les normaux : ecarte, pas tout jeter
+        gardes, _, ecartes = J.choisir_gabarits(vrais[:4] + [rng.normal(size=(9, 96)).tolist()], 5)
+        self.assertEqual((len(gardes), ecartes), (4, 1))
+        self.assertEqual(J.choisir_gabarits([rng.normal(size=(9, 96)).tolist() for _ in range(5)], 5)[0], None)
+        self.assertEqual(J.choisir_gabarits(vrais[:2], 5)[0], None, "moins de trois : rien a comparer")
+
     def test_seuils(self):
         self.assertAlmostEqual(J.seuil_gabarit(0.5), 0.05)
         self.assertLess(J.seuil_gabarit(0), J.seuil_gabarit(1))
@@ -1510,32 +1529,42 @@ class DansMachiTool(unittest.TestCase):
         cfg = m.config_oreille(m.CFG)
         self.assertEqual((len(cfg["gabarits"]), cfg["auto"]), (2, False))
 
-    def test_six_fois_sur_des_tons_differents(self):
-        # « que je puisse l'appeler avec beaucoup de tons differents » : trois
-        # fois a plat, puis la question, plus fort, plus bas
+    def test_huit_fois_sur_des_tons_differents(self):
+        # « que je puisse l'appeler avec beaucoup de tons differents » et « plus
+        # de tolerance, plus de tests » : cinq fois normalement, puis la
+        # question, plus fort, plus bas
         rng = np.random.default_rng(3)
         base = rng.normal(size=(8, 96))
         proche = lambda e: (base + rng.normal(scale=e, size=base.shape)).tolist()
-        tons = [proche(0.3), proche(0.3), proche(0.3), proche(0.5), proche(0.5), proche(0.5)]
-        ok, consignes, gardes = self.apprentissage(tons)
+        essais = [proche(0.3) for _ in range(5)] + [proche(0.5), proche(0.5), proche(0.5)]
+        ok, consignes, gardes = self.apprentissage(essais)
+        self.assertTrue(ok)
+        self.assertEqual(len(gardes), 8)
+        self.assertEqual(len(consignes), 8)
+        self.assertIn("question", consignes[5])
+        self.assertIn("fort", consignes[6])
+        self.assertIn("bas", consignes[7])
+        self.assertIn("Appris (8 facons)", self.m.JARVIS["apprentissage"]["message"])
+        # UN ESSAI RATE (une toux, une porte) parmi les normaux : on ne jette plus
+        # tout -- il est ecarte, le reste est garde
+        autre = rng.normal(size=(8, 96)).tolist()
+        ok, _, gardes = self.apprentissage([proche(0.3), autre, proche(0.3), proche(0.3), proche(0.3),
+                                            proche(0.5), rng.normal(size=(8, 96)).tolist(), proche(0.5)])
         self.assertTrue(ok)
         self.assertEqual(len(gardes), 6)
-        self.assertEqual(len(consignes), 6)
-        self.assertIn("question", consignes[3])
-        self.assertIn("fort", consignes[4])
-        self.assertIn("bas", consignes[5])
-        # Un ton qui est un autre mot (un raclement) : on garde les autres, sans tout refaire.
-        autre = rng.normal(size=(8, 96)).tolist()
-        ok, _, gardes = self.apprentissage([proche(0.3), proche(0.3), proche(0.3), proche(0.5), autre, proche(0.5)])
-        self.assertTrue(ok)
-        self.assertEqual(len(gardes), 5)
+        self.assertIn("2 essais ecartes", self.m.JARVIS["apprentissage"]["message"])
+        # que du bruit : la, on refait
+        ok, _, _ = self.apprentissage([rng.normal(size=(8, 96)).tolist() for _ in range(8)])
+        self.assertFalse(ok)
+        self.assertIn("ne se ressemblent pas du tout", self.m.JARVIS["apprentissage"]["message"])
         # « Ajouter une facon » : une de plus, avec les autres ; pas un autre mot.
+        self.apprentissage(essais)
         ok, _, gardes = self.apprentissage([proche(0.5)], total=1, ajouter=True)
         self.assertTrue(ok)
-        self.assertEqual(len(gardes), 6)
+        self.assertEqual(len(gardes), 9)
         ok, _, gardes = self.apprentissage([rng.normal(size=(8, 96)).tolist()], total=1, ajouter=True)
         self.assertFalse(ok)
-        self.assertEqual(len(gardes), 6)
+        self.assertEqual(len(gardes), 9)
 
     def test_sa_voix_francaise_par_kokoro_sinon_piper(self):
         m = self.m

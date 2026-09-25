@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.51.0"
+VERSION = "1.52.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5561,10 +5561,10 @@ _PHRASES = {
     "rappel": ("Je vous rappelle : %s.", "A reminder: %s."),
     "minuteur_fini": ("Le minuteur de %s est terminé.", "Your timer for %s is up."),
     "apprendre": ("Très bien. Chaque fois que la guirlande s'allume, dites mon nom, comme vous "
-                  "m'appellerez. Six fois : trois normalement, puis comme une question, plus fort, "
+                  "m'appellerez. Huit fois : cinq normalement, puis comme une question, plus fort, "
                   "et plus bas. L'écran vous guide.",
                   "Very well. Each time the lights come on, say my name, the way you'll call me. "
-                  "Six times: three normally, then as a question, louder, and softer. The screen "
+                  "Eight times: five normally, then as a question, louder, and softer. The screen "
                   "will guide you."),
     "appris": ("C'est noté. Mon nom suffit, désormais.", "Noted. My name alone will do from now on."),
     "pas_appris": ("Je n'ai pas réussi à retenir votre voix. Nous réessaierons au calme.",
@@ -7534,22 +7534,22 @@ def apprendre_a_voix_haute(cfg):
     return ok
 
 
-GABARITS_PLAFOND = 10         # au-dela, chaque mot entendu coute trop a comparer
-# « L'APPELER AVEC BEAUCOUP DE TONS DIFFERENTS. » Trois fois a plat (qui
-# fondent la voix), puis les tons qui s'en ecartent le plus : la question, de
-# loin et fort, bas et en passant. Chacun peut s'ecarter des trois premiers --
-# pas au point d'etre un autre mot.
+GABARITS_PLAFOND = 12         # au-dela, chaque mot entendu coute trop a comparer
+# « L'APPELER AVEC BEAUCOUP DE TONS DIFFERENTS », et « plus de tests pour que
+# ma voix soit reconnue le plus justement possible ». Cinq fois normalement
+# (le noyau de la voix : voir choisir_gabarits dans jarvis.py), puis les tons
+# qui s'en ecartent le plus : la question, de loin et fort, bas et en passant.
 TONS_APPRENTISSAGE = (
-    None, None, None,
+    None, None, None, None, None,
     "Comme une question : « Jarvis ? »",
     "Plus fort, comme depuis l'autre bout de la piece : « JARVIS ! »",
     "Plus bas, en passant, comme dans une phrase : « ...jarvis... »",
 )
-TON_ECART_MAX = 0.2
+N_NORMAUX = sum(1 for t in TONS_APPRENTISSAGE if t is None)
 
 
-def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=12, ajouter=False):
-    """« Jarvis », six fois, dit par la personne -- trois fois a plat, puis
+def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False):
+    """« Jarvis », huit fois, dit par la personne -- cinq fois a plat, puis
     sur les tons de TONS_APPRENTISSAGE : « Jarvis ? » monte et traine, et trois
     « Jarvis » dits a plat ne le reconnaissaient pas (voir GABARIT_SAUT dans
     jarvis.py) ; fort ou bas, c'est la meme chose. A lancer dans un fil.
@@ -7598,7 +7598,7 @@ def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=12, ajouter=False):
         deja = gabarits_jarvis()
         # Une facon de plus, mais du meme mot : loin de toutes celles apprises,
         # c'est un autre mot (ou un bruit), et il se reveillerait dessus.
-        if deja and min(_jv.distance_gabarit(_jv.normer(g), _jv.normer(appris[0])) for g in deja) > 0.16:
+        if deja and min(_jv.distance_gabarit(_jv.normer(g), _jv.normer(appris[0])) for g in deja) > _jv.ESSAI_ECART_MAX:
             poser_led("erreur", 1.2)
             JARVIS["apprentissage"].update(
                 fini=True, message="Ca ne ressemble a aucune des facons apprises. Reessaie, "
@@ -7607,28 +7607,25 @@ def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=12, ajouter=False):
         appris = (deja + appris)[-GABARITS_PLAFOND:]
         sauver_gabarits(appris, garder_auto=True)
     else:
-        # Les trois « Jarvis » a plat se ressemblent ; la question, un peu moins
-        # -- elle a le droit, mais pas d'etre un autre mot. Ratee, on garde les
-        # trois plutot que de tout refaire.
-        plats = appris[:3]
-        ecart = _jv.coherence(plats)
-        if ecart > 0.12:
+        # le plus grand groupe coherent des essais normaux, puis tout essai
+        # assez proche de lui (voir choisir_gabarits) : un essai rate ne fait
+        # plus tout jeter
+        gardes, ecart, ecartes = _jv.choisir_gabarits(appris, min(N_NORMAUX, total))
+        if gardes is None:
             poser_led("erreur", 1.2)
             JARVIS["apprentissage"].update(
-                fini=True, message="Les trois premiers ne se ressemblent pas assez (%.2f). Reessaie, "
-                                   "en disant chaque fois « Jarvis » de la meme facon." % ecart)
+                fini=True, message="Tes « Jarvis » ne se ressemblent pas du tout (%.2f) : le micro "
+                                   "entend-il bien ta voix ? Rapproche-toi et reessaie au calme." % ecart)
             return False
-        # chaque ton garde a part : trop loin des trois premiers, il n'etait
-        # probablement pas « Jarvis » (un bruit, un raclement) -- on s'en passe
-        tons = [t for t in appris[3:]
-                if min(_jv.distance_gabarit(_jv.normer(g), _jv.normer(t)) for g in plats) <= TON_ECART_MAX]
-        appris = plats + tons
+        appris = gardes[:GABARITS_PLAFOND]
         sauver_gabarits(appris)
     envoyer_oreille(config_oreille(CFG))
     poser_led("fait", 1.2)
     jouer_son("fait")
-    JARVIS["apprentissage"].update(n=total, fini=True,
-                                   message="Appris. Dis « Jarvis » pour essayer.")
+    fin = "Appris (%d facons%s). Dis « Jarvis » pour essayer." % (
+        len(appris), "" if ajouter or not ecartes else ", %d essai%s ecarte%s : du bruit" % (
+            ecartes, "s" if ecartes > 1 else "", "s" if ecartes > 1 else ""))
+    JARVIS["apprentissage"].update(n=total, fini=True, message=fin)
     JARVIS["message"] = message_attente()
     return True
 
@@ -10827,8 +10824,8 @@ class Panneau:
         self.separateur(f, 12, 8)
         self.titre(f, "ta voix").pack(fill="x", pady=(0, 4))
         self.texte(f, "« Hey Jarvis » marche tout de suite, dit a l'anglaise. Pour que "
-                      "« Jarvis » tout seul marche, avec ton accent, dis-le six fois ici, "
-                      "quand la guirlande s'allume : trois fois normalement, puis comme une question, "
+                      "« Jarvis » tout seul marche, avec ton accent, dis-le huit fois ici, "
+                      "quand la guirlande s'allume : cinq fois normalement, puis comme une question, "
                       "plus fort, et plus bas -- l'ecran te guide. Une facon de l'appeler ne passe "
                       "pas ? « Ajouter une facon » l'apprend en plus ; et s'il te rate de peu puis "
                       "t'entend a la deuxieme, il garde seul la facon ratee (voir plus bas). On garde "

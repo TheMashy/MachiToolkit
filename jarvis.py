@@ -375,6 +375,48 @@ def coherence(gabarits):
     return pire
 
 
+# « PLUS DE TOLERANCE, PLUS DE TESTS, POUR QUE MA VOIX SOIT RECONNUE LE PLUS
+# JUSTEMENT POSSIBLE. » Les trois premiers « Jarvis » devaient s'ecarter de
+# moins de 0,12 -- une limite calee sur une voix de synthese ; un vrai micro,
+# une vraie voix donnaient 0,14, et TOUT l'apprentissage etait jete. Mieux :
+# plusieurs « Jarvis » normaux, dont on garde le plus grand groupe coherent
+# (le NOYAU) ; puis chaque essai -- normal ou sur un autre ton -- assez proche
+# du noyau est garde aussi. On n'echoue que si meme les trois plus proches sont
+# loin l'un de l'autre : ce n'est alors pas le meme mot (ou le micro n'entend
+# que du bruit).
+NOYAU_COHERENCE = 0.18        # le noyau : ses essais s'ecartent de moins de ca
+NOYAU_REJET = 0.26            # meme les trois plus proches au-dela : on refait
+ESSAI_ECART_MAX = 0.24        # un essai plus loin que ca de tout le noyau : un bruit
+
+
+def choisir_gabarits(essais, n_normaux):
+    """Parmi les essais (les `n_normaux` premiers dits normalement), ceux
+    qu'on garde. Rend (gardes, coherence du noyau, nombre d'ecartes), ou
+    (None, coherence, 0) si meme les trois plus proches ne se ressemblent pas."""
+    from itertools import combinations
+    normes = [normer(e) for e in essais]
+    idx = list(range(min(n_normaux, len(essais))))
+    if len(idx) < 3:
+        return None, 9.0, 0
+    d = {}
+    for a, b in combinations(idx, 2):
+        d[a, b] = d[b, a] = distance_gabarit(normes[a], normes[b])
+    coh = lambda grp: max(d[a, b] for a, b in combinations(grp, 2))
+    noyau, c_noyau = None, 9.0
+    for taille in range(len(idx), 2, -1):
+        groupes = sorted(((coh(g), g) for g in combinations(idx, taille)), key=lambda x: x[0])
+        if groupes and (groupes[0][0] <= NOYAU_COHERENCE or taille == 3):
+            c_noyau, noyau = groupes[0]
+            break
+    if noyau is None or c_noyau > NOYAU_REJET:
+        return None, c_noyau, 0
+    gardes = []
+    for i, e in enumerate(essais):
+        if i in noyau or min(distance_gabarit(normes[j], normes[i]) for j in noyau) <= ESSAI_ECART_MAX:
+            gardes.append(e)
+    return gardes, c_noyau, len(essais) - len(gardes)
+
+
 # ======================================================================
 #  LA FIN DE PHRASE
 # ======================================================================
