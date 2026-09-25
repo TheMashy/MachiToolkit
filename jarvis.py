@@ -828,7 +828,9 @@ _VERS_PSY_VERBE = re.compile(
     r"(?:therapist|therapy|psych|psy)\s+mode|(?:therapist|psych)\s+mode)\b")
 _APOSTROPHE_PSY = re.compile(r"^\s*(?:psychologue|psy|th[eé]rapeute|therapist)\s*[,:;.!?\u2026]", re.I)
 _VERS_NOTES_PSY = re.compile(r"^(?:mes\s+|les\s+|my\s+)?(?:notes?\s+(?:psy|psychologue|de psy)|"
-                             r"(?:psych|psy|therapy|therapist)\s+notes?)\b")
+                             r"(?:psych|psy|therapy|therapist)\s+notes?|"
+                             r"(?:une\s+|a\s+)?notes?\s+(?:pour|au|a|for)\s+(?:le\s+|la\s+|mon\s+|ma\s+|my\s+|the\s+)?"
+                             r"(?:psy|psychologue|therapist|therapy))\b")
 # UNE NOTE, SI ON LA DEMANDE : « note que... », « prends une note », « take a
 # note » -- pas « notes de frais » ni « noter les courses ».
 _VERS_NOTES = re.compile(
@@ -860,6 +862,16 @@ def _apres(texte, n_mots):
     mots = [m for m in str(texte).split() if normaliser(m)]
     reste = " ".join(mots[n_mots:])
     return re.sub(r"^[\s,.;:!?\u2026-]+", "", reste).strip()
+
+
+def note_a_ecrire(texte):
+    """« Note que... », « prends une note », « ecris une note » -- mais pas
+    « note pour le psy » ni « notes psy ». Avec ses mains ouvertes, Jarvis
+    l'ecrit lui-meme (et la depose chez le psychologue, sauf une liste de
+    courses ou une petite note pratique) ; mains fermees, elle part au
+    psychologue comme avant."""
+    t = normaliser(texte).strip(" -'")
+    return bool(t) and bool(_VERS_NOTES.match(t)) and not _VERS_NOTES_PSY.match(t) and not _VERS_PSY_VERBE.match(t)
 
 
 def changement_de_mode(texte):
@@ -2561,6 +2573,86 @@ _SAUTES = {"appdata", "node_modules", ".git", "$recycle.bin", "windows", "progra
            "program files (x86)", "programdata", "system volume information", "__pycache__"}
 
 
+# ECRIRE : DES FICHIERS NEUFS, DES NOTES. « Est-ce possible que Jarvis puisse
+# ecrire dans un bloc-notes, ou creer des fichiers ? » Oui, prudemment :
+#   - un fichier NEUF, jamais par-dessus un fichier qui existe (« (2) ») ;
+#   - du texte seulement (.txt, .md, .csv...) : jamais un script ni un
+#     programme -- « ouvre-le » ne doit jamais lancer ce que le modele a ecrit ;
+#   - ses notes vont dans SON dossier, et c'est la seule chose qu'il complete.
+
+EXTENSIONS_TEXTE = {".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".html", ".css", ".yaml", ".yml",
+                    ".log", ".ini", ".rtf", ".srt"}
+ECRIT_MAX = 200_000                      # caracteres
+
+
+def nom_sur(nom, defaut="Note"):
+    """Un nom de fichier que Windows accepte : sans \\ / : * ? " < > |, pas trop long."""
+    n = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", str(nom or "")).strip(" .")
+    n = re.sub(r"\s+", " ", n)[:80].strip(" .")
+    if n.upper().split(".")[0] in ("CON", "PRN", "AUX", "NUL", "COM1", "LPT1"):
+        n = "_" + n
+    return n or defaut
+
+
+def chemin_libre(chemin):
+    """Le chemin, ou « nom (2).ext », « nom (3).ext »... s'il est pris."""
+    if not os.path.exists(chemin):
+        return chemin
+    base, ext = os.path.splitext(chemin)
+    for i in range(2, 1000):
+        c = "%s (%d)%s" % (base, i, ext)
+        if not os.path.exists(c):
+            return c
+    raise FileExistsError("trop de fichiers de ce nom : %s" % chemin)
+
+
+def _texte_a_ecrire(contenu):
+    t = str(contenu if contenu is not None else "")
+    if len(t) > ECRIT_MAX:
+        raise ValueError("trop long (%d caracteres, %d au plus)" % (len(t), ECRIT_MAX))
+    return t.replace("\r\n", "\n").replace("\n", "\r\n") if os.name == "nt" else t
+
+
+def preparer_fichier(chemin, contenu, protegees=()):
+    """Ce qu'il faudra ecrire pour un fichier texte NEUF : (chemin libre,
+    texte, encodage). N'ecrit rien -- ce module ne touche pas au disque
+    (l'oreille en depend) : machi_tool.py ecrit."""
+    ext = os.path.splitext(chemin)[1].lower()
+    if not ext:
+        chemin, ext = chemin + ".txt", ".txt"
+    if ext not in EXTENSIONS_TEXTE:
+        raise PermissionError("seulement des fichiers texte (%s), pas « %s »"
+                              % (" ".join(sorted(EXTENSIONS_TEXTE)), ext))
+    dossier = os.path.dirname(chemin) or "."
+    chemin = os.path.join(dossier, nom_sur(os.path.splitext(os.path.basename(chemin))[0]) + ext)
+    if chemin_protege(chemin, protegees):
+        raise PermissionError("dossier du systeme : on n'y ecrit rien (%s)" % dossier)
+    return (chemin_libre(chemin), _texte_a_ecrire(contenu),
+            "utf-8-sig" if ext in (".txt", ".csv", ".tsv") else "utf-8")
+
+
+def preparer_note(dossier, texte, titre="", ajouter_a="", maintenant=None):
+    """Ce qu'il faudra ecrire pour une note : neuve (titre, sinon la date), ou
+    ajoutee a la fin d'une note deja la. Rend (chemin, texte, mode "x" ou
+    "a", encodage)."""
+    t = time.localtime(time.time() if maintenant is None else maintenant)
+    if not str(texte or "").strip():
+        raise ValueError("rien a ecrire")
+    if ajouter_a:
+        notes = [f for f in (os.listdir(dossier) if os.path.isdir(dossier) else [])
+                 if f.lower().endswith((".txt", ".md"))]
+        trouves = choisir(ajouter_a, notes, nom=lambda f: os.path.splitext(f)[0], seuil=40)
+        if not trouves:
+            raise LookupError("aucune note ne s'appelle « %s » (il y a : %s)"
+                              % (ajouter_a, ", ".join(os.path.splitext(f)[0] for f in sorted(notes)[:15]) or "aucune"))
+        return (os.path.join(dossier, trouves[0]),
+                _texte_a_ecrire("\n\n-- %s --\n%s\n" % (time.strftime("%d/%m/%Y %H:%M", t), str(texte).strip())),
+                "a", "utf-8")
+    nom = nom_sur(titre, defaut="Note du %s" % time.strftime("%Y-%m-%d %Hh%M", t))
+    chemin, contenu, encodage = preparer_fichier(os.path.join(dossier, nom + ".txt"), str(texte).strip() + "\n")
+    return chemin, contenu, "x", encodage
+
+
 # LA RECHERCHE QU'ON AFFINE. « J'ai 523 fichiers qui mentionnent unit » --
 # « rajoute stage » -- « j'en ai 3 » -- « ouvre-les ». Les criteres : des mots
 # (tous, dans le chemin sous le dossier de depart : le nom du fichier ou de ses
@@ -2781,31 +2873,25 @@ def fichiers_historique(env=None):
 
 
 def lire_historique(genre, chemin, depuis, plafond=50000):
-    """[(url, titre, quand)] depuis `depuis` (secondes, epoque Unix). Le
-    navigateur tient le fichier ouvert : on lit une copie, dans un dossier
-    temporaire efface en sortant."""
-    import shutil
+    """[(url, titre, quand)] depuis `depuis` (secondes, epoque Unix), lu en
+    lecture seule. Machi Tool lui passe une copie du fichier (le navigateur
+    tient l'original) : ce module-ci n'ecrit rien sur le disque."""
     import sqlite3
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="machi-") as d:
-        copie = os.path.join(d, "h.sqlite")
-        shutil.copyfile(chemin, copie)
-        if os.path.isfile(chemin + "-wal"):
-            shutil.copyfile(chemin + "-wal", copie + "-wal")
-        con = sqlite3.connect(copie)
-        try:
-            if genre == "chromium":
-                lignes = con.execute(
-                    "SELECT url, title, last_visit_time FROM urls WHERE last_visit_time >= ? "
-                    "ORDER BY last_visit_time DESC LIMIT ?",
-                    (int((depuis + _EPOQUE_CHROME) * 1000000), plafond)).fetchall()
-                return [(u, t or "", q / 1e6 - _EPOQUE_CHROME) for u, t, q in lignes]
+    from urllib.parse import quote
+    con = sqlite3.connect("file:%s?mode=ro" % quote(os.path.abspath(chemin).replace(os.sep, "/")), uri=True)
+    try:
+        if genre == "chromium":
             lignes = con.execute(
-                "SELECT url, title, last_visit_date FROM moz_places WHERE last_visit_date >= ? "
-                "ORDER BY last_visit_date DESC LIMIT ?", (int(depuis * 1000000), plafond)).fetchall()
-            return [(u, t or "", q / 1e6) for u, t, q in lignes]
-        finally:
-            con.close()
+                "SELECT url, title, last_visit_time FROM urls WHERE last_visit_time >= ? "
+                "ORDER BY last_visit_time DESC LIMIT ?",
+                (int((depuis + _EPOQUE_CHROME) * 1000000), plafond)).fetchall()
+            return [(u, t or "", q / 1e6 - _EPOQUE_CHROME) for u, t, q in lignes]
+        lignes = con.execute(
+            "SELECT url, title, last_visit_date FROM moz_places WHERE last_visit_date >= ? "
+            "ORDER BY last_visit_date DESC LIMIT ?", (int(depuis * 1000000), plafond)).fetchall()
+        return [(u, t or "", q / 1e6) for u, t, q in lignes]
+    finally:
+        con.close()
 
 
 _PARAM_SECRET = re.compile(r"token|session|sess|auth|code|key|sig|secret|pass|pwd|ticket|otp|jwt", re.I)
@@ -2834,7 +2920,7 @@ def _quand(t, maintenant):
     return time.strftime("%d/%m/%Y", time.localtime(t))
 
 
-def chercher_historique(recherche, fichiers, jours=90, plafond=10, maintenant=None):
+def chercher_historique(recherche, fichiers, jours=90, plafond=10, maintenant=None, lire=None):
     """Les pages dont le titre ou l'adresse contient tous les mots (ou tous
     sauf un, a defaut), les plus recentes d'abord. Rend un texte pour Jarvis."""
     mots = _mots(recherche)
@@ -2848,7 +2934,7 @@ def chercher_historique(recherche, fichiers, jours=90, plafond=10, maintenant=No
     trouves, lus, rates = {}, [], []
     for nav, genre, chemin in fichiers:
         try:
-            lignes = lire_historique(genre, chemin, depuis)
+            lignes = (lire or lire_historique)(genre, chemin, depuis)
         except Exception:
             rates.append(nav)
             continue

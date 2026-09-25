@@ -964,8 +964,10 @@ class CeQuiNeSeFaitPas(unittest.TestCase):
         src = self.lire("jarvis.py")
         # `wave.open(tampon, "wb")` ecrit dans la memoire ; `open(...)` tout court
         # ecrirait un fichier.
-        self.assertNotRegex(src, r"(?<![\w.])open\([^)]*['\"][wa]b?['\"]")
+        self.assertNotRegex(src, r"(?<![\w.])open\([^)]*['\"][wax]b?['\"]")
         self.assertNotIn("tofile(", src)
+        for ecrit in ("shutil.copy", ".write_text(", ".write_bytes("):
+            self.assertNotIn(ecrit, src, ecrit)
 
 
 # ======================================================================
@@ -1429,6 +1431,80 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("http(s)", ex({"action": "ouvrir", "url": "file:///C:/x"})["erreur"])
         self.assertEqual(len(recu), n, "une adresse refusee ne part pas a Chrome")
         self.assertIn("Aucun onglet", ex({"action": "fermer", "cible": "twitch"})["erreur"])
+
+    def test_ecrire_des_fichiers_neufs_et_des_notes(self):
+        # « Est-ce possible que Jarvis puisse ecrire dans un bloc-notes, ou creer des fichiers ? »
+        d = tempfile.mkdtemp()
+        try:
+            c = self.m.creer_fichier(os.path.join(d, "courses"), "pain\nlait")
+            self.assertEqual(os.path.basename(c), "courses.txt", "sans extension : du texte")
+            self.assertIn("lait", open(c, encoding="utf-8-sig").read())
+            c2 = self.m.creer_fichier(os.path.join(d, "courses.txt"), "autre chose")
+            self.assertEqual(os.path.basename(c2), "courses (2).txt")
+            self.assertIn("pain", open(c, encoding="utf-8-sig").read(), "jamais par-dessus un fichier existant")
+            for ext in (".bat", ".cmd", ".ps1", ".vbs", ".js", ".py", ".exe", ".lnk", ".reg", ".hta", ".scr", ".url"):
+                with self.assertRaises(PermissionError, msg=ext):
+                    self.m.creer_fichier(os.path.join(d, "x" + ext), "echo")
+            self.assertEqual(sorted(os.listdir(d)), ["courses (2).txt", "courses.txt"], "aucun script n'a ete ecrit")
+            self.assertEqual(os.path.basename(self.m.creer_fichier(os.path.join(d, 'a:b*c?.md'), "# t")), "a b c.md")
+            with self.assertRaises(PermissionError):
+                self.m.creer_fichier(os.path.join(d, "Windows", "x.txt"), "x", [os.path.join(d, "Windows")])
+            with self.assertRaises(ValueError):
+                self.m.creer_fichier(os.path.join(d, "gros.txt"), "x" * (J.ECRIT_MAX + 1))
+            notes = os.path.join(d, "Notes de Jarvis")
+            n1, neuve = self.m.ecrire_note(notes, "Appeler le garagiste.", "Idées de la semaine")
+            self.assertTrue(neuve)
+            self.assertEqual(os.path.basename(n1), "Idées de la semaine.txt")
+            n2, neuve = self.m.ecrire_note(notes, "Acheter des ampoules.", ajouter_a="idees semaine")
+            self.assertFalse(neuve)
+            self.assertEqual(n1, n2)
+            contenu = open(n1, encoding="utf-8-sig").read()
+            self.assertLess(contenu.index("garagiste"), contenu.index("ampoules"), "ajoute a la fin")
+            n3, _ = self.m.ecrire_note(notes, "Sans titre.", maintenant=time.mktime((2026, 9, 25, 14, 30, 0, 0, 0, -1)))
+            self.assertEqual(os.path.basename(n3), "Note du 2026-09-25 14h30.txt")
+            with self.assertRaisesRegex(LookupError, "Idées de la semaine"):
+                self.m.ecrire_note(notes, "x", ajouter_a="liste de noel")
+            with self.assertRaises(ValueError):
+                self.m.ecrire_note(notes, "   ")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_note_que_passe_par_jarvis_si_ses_mains_sont_ouvertes(self):
+        # « Rajoute bien le mode ecrire une note, qui fait que Jarvis envoie une
+        # note au psychologue automatiquement. »
+        vus = self.espions()
+        self.m.CFG["jarvis_pc"] = True
+        self.phrase("Jarvis, note que je me suis senti fier de ma présentation")
+        self.assertEqual(vus["psy"], [])
+        self.assertEqual(vus["jarvis"], ["note que je me suis senti fier de ma présentation"])
+        self.assertEqual(self.m.JARVIS["mode"], "jarvis")
+        self.phrase("Jarvis, note pour le psy : j'ai bien dormi")
+        self.assertEqual(len(vus["psy"]), 1, "« note pour le psy » : directement au psychologue")
+        for t in ("note que j'ai rendez-vous", "prends une note", "écris une note"):
+            self.assertTrue(J.note_a_ecrire(t), t)
+        for t in ("notes psy", "note pour le psy : ça va", "je note que ça va mieux"):
+            self.assertFalse(J.note_a_ecrire(t), t)
+
+    def test_une_note_dans_le_bloc_notes(self):
+        m = self.m
+        ouverts = []
+        vrai = getattr(os, "startfile", None)
+        os.startfile = ouverts.append
+        self.addCleanup(lambda: setattr(os, "startfile", vrai) if vrai else delattr(os, "startfile"))
+        envoyes, maison = self.mains([self.outil("ecrire_note", {"texte": "Rappeler Paul.", "titre": "A faire"}),
+                                      {"texte": "C'est noté.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, note que je dois rappeler Paul")
+        note = os.path.join(maison, "Documents", "Notes de Jarvis", "A faire.txt")
+        self.assertTrue(os.path.isfile(note))
+        self.assertEqual(ouverts, [note], "la note s'ouvre dans le bloc-notes")
+        self.assertIn("Note ecrite", envoyes[1]["resultats"][0]["texte"])
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        r = ex("creer_fichier", {"chemin": "Documents\\liste.csv", "contenu": "a;b"})
+        self.assertIn("liste.csv", r["texte"])
+        self.assertIn("PermissionError", ex("creer_fichier", {"chemin": "Documents\\x.bat", "contenu": "del *"})["erreur"])
+        self.assertFalse(os.path.exists(os.path.join(maison, "Documents", "x.bat")))
+        m.CFG["jarvis_pc"] = False
+        self.assertIn("fermees", ex("ecrire_note", {"texte": "x"})["erreur"])
 
     def test_youtube_sans_passer_par_le_modele(self):
         m = self.m

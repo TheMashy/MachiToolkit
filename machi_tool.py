@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.42.0"
+VERSION = "1.43.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5723,6 +5723,8 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
             return quitter_psy(cfg)
         return terminer_conversation()
     changement = _jv.changement_de_mode(texte)
+    if changement and JARVIS.get("mode") != "psy" and cfg.get("jarvis_pc") and _jv.note_a_ecrire(texte):
+        changement = None        # « note que... » : Jarvis l'ecrit lui-meme (et la passe au psy)
     if (changement is None and JARVIS.get("propose_psy")
             and _jv.normaliser(texte).replace("-", " ").strip(" '") in _OUI):
         changement = ("psy", "")
@@ -5928,6 +5930,38 @@ def ouvrir_spotify(recherche):
         webbrowser.open("https://open.spotify.com/search/" + urllib.parse.quote(q) if q
                         else "https://open.spotify.com")
         return "Spotify ouvert dans le navigateur" + (" sur « %s »." % q if q else ".")
+
+
+def creer_fichier(chemin, contenu, protegees=()):
+    """Un fichier texte NEUF (jarvis.preparer_fichier dit ou et quoi). Rend
+    le chemin reellement ecrit."""
+    ch, texte, encodage = _jv.preparer_fichier(chemin, contenu, protegees)
+    os.makedirs(os.path.dirname(ch) or ".", exist_ok=True)
+    with open(ch, "x", encoding=encodage, newline="") as f:
+        f.write(texte)
+    return ch
+
+
+def ecrire_note(dossier, texte, titre="", ajouter_a="", maintenant=None):
+    """Une note dans le dossier de Jarvis. Rend (chemin, neuve)."""
+    ch, contenu, mode, encodage = _jv.preparer_note(dossier, texte, titre, ajouter_a, maintenant)
+    os.makedirs(dossier, exist_ok=True)
+    with open(ch, mode, encoding=encodage, newline="") as f:
+        f.write(contenu)
+    return ch, mode == "x"
+
+
+def lire_historique_copie(genre, chemin, depuis):
+    """Le navigateur tient son historique ouvert : on en lit une copie, dans
+    un dossier temporaire efface en sortant."""
+    import shutil
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="machi-") as d:
+        copie = os.path.join(d, "h.sqlite")
+        shutil.copyfile(chemin, copie)
+        if os.path.isfile(chemin + "-wal"):
+            shutil.copyfile(chemin + "-wal", copie + "-wal")
+        return _jv.lire_historique(genre, copie, depuis)
 
 
 def chemin_chrome():
@@ -6685,7 +6719,7 @@ def executer_outil(outil, cfg):
             if not cfg.get("jarvis_historique"):
                 return {"id": ident, "erreur": "L'historique du navigateur n'est pas permis dans Machi Tool."}
             return {"id": ident, "texte": _jv.chercher_historique(
-                e.get("recherche"), _jv.fichiers_historique(), e.get("jours") or 90)}
+                e.get("recherche"), _jv.fichiers_historique(), e.get("jours") or 90, lire=lire_historique_copie)}
         if nom == "musique":
             return {"id": ident, "texte": touche_media(e.get("action"))}
         if nom == "spotify":
@@ -6736,6 +6770,18 @@ def executer_outil(outil, cfg):
             for chemin, _, _ in choisis[:OUVRIR_MAX]:
                 os.startfile(chemin)
             return {"id": ident, "texte": "Ouverts : %s." % " ; ".join(os.path.basename(c) for c, _, _ in choisis[:OUVRIR_MAX])}
+        if nom == "creer_fichier":
+            ch = creer_fichier(_jv.resoudre_chemin(e.get("chemin"), bases), e.get("contenu"), dossiers_proteges())
+            if e.get("ouvrir"):
+                os.startfile(ch)
+            return {"id": ident, "texte": "Cree : %s" % ch}
+        if nom == "ecrire_note":
+            dossier = os.path.join(bases.get("documents") or os.path.join(bases["home"], "Documents"),
+                                   "Notes de Jarvis")
+            ch, neuve = ecrire_note(dossier, e.get("texte"), e.get("titre") or "", e.get("ajouter_a") or "")
+            if e.get("ouvrir", True):
+                os.startfile(ch)
+            return {"id": ident, "texte": ("Note ecrite : %s" if neuve else "Ajoute a la note : %s") % ch}
         if nom == "creer_dossier":
             ch = _jv.resoudre_chemin(e.get("chemin"), bases)
             return {"id": ident, "texte": _jv.creer_dossier(ch, dossiers_proteges())}
@@ -9688,9 +9734,11 @@ class Panneau:
                       "ouvrir Spotify sur une recherche, ouvrir une recherche Google, un lien ou une "
                       "video YouTube dans Chrome, lancer une appli ou un jeu Steam, gerer les fenetres "
                       "(premier plan, reduire, agrandir, fermer), regler le son (general ou d'une appli) "
-                      "et la luminosite, verrouiller le PC ou le mettre en veille, parcourir tes dossiers, chercher un fichier, "
+                      "et la luminosite, verrouiller le PC ou le mettre en veille, ecrire une note (dans "
+                      "Documents > Notes de Jarvis) ou creer un fichier texte neuf, parcourir tes dossiers, chercher un fichier, "
                       "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
-                      "deplacer, ni renommer. Il agit directement, sans code : quiconque l'appelle dans "
+                      "deplacer, ni renommer, ni modifier un fichier existant (sauf completer ses notes), "
+                      "ni ecrire un script ou un programme. Il agit directement, sans code : quiconque l'appelle dans "
                       "la piece peut lui demander tes dossiers. Si tu preferes, coche le code d'acces "
                       "plus bas : il le demandera a voix haute avant les dossiers, les fichiers et "
                       "l'ecran. Les noms de dossiers et les captures partent a BrainDebugger et a "
@@ -9807,8 +9855,11 @@ class Panneau:
         self.texte(f, "Deux modes. JARVIS (orange) : le majordome du PC, a la maniere d'Iron Man "
                       "-- Sonnet, effort bas, rien dans ton journal. PSYCHOLOGUE (bleu) : le "
                       "compagnon de BrainDebugger, avec ton journal ; dis « psychologue », "
-                      "« notes psy » ou « note que... » (« therapist », « take a note ») pour y "
-                      "passer. Pour revenir : « Jarvis ? Re ! », « mode Jarvis », ou simplement "
+                      "« notes psy » ou « note pour le psy » (« therapist », « take a note ») pour y "
+                      "passer. « Note que... » : avec ses mains ouvertes, Jarvis l'ecrit dans ses notes "
+                      "(Documents > Notes de Jarvis) et, sauf une liste de courses ou une petite note "
+                      "pratique, la depose aussi au carnet du psychologue ; mains fermees, elle part "
+                      "directement au psychologue. Pour revenir : « Jarvis ? Re ! », « mode Jarvis », ou simplement "
                       "le rappeler -- il se reveille toujours en mode Jarvis. « Au revoir » au "
                       "psychologue : retour au majordome, qui se tait si c'etait lourd, ou dit "
                       "un mot leger. Un message grave part toujours au compagnon. « Non rien », "
