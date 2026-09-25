@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.50.0"
+VERSION = "1.51.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -6234,7 +6234,7 @@ def lancer_appli(nom):
     if len({c for _, c, _ in trouves}) > 1:
         return "Plusieurs correspondent, lequel ? " + " ; ".join(n for n, _, _ in trouves[:6])
     n, cible, genre = trouves[0]
-    os.startfile(cible)
+    startfile_sur(cible)
     return ("Jeu lance par Steam : %s." if genre == "jeu" else "Lance : %s.") % n
 
 
@@ -6407,7 +6407,11 @@ def lister_sons():
     return "En ce moment : " + ", ".join("%s %s" % (k, v) for k, v in vus.items()) + "."
 
 
-# --- LE PC : VERROUILLER, VEILLE, LUMINOSITE ----------------------------
+# --- LE PC : VERROUILLER, LUMINOSITE ------------------------------------
+# « Qu'il ne puisse pas eteindre, redemarrer ou mettre en veille l'ordinateur,
+# ni fermer la session » : il n'y a pas de fonction pour ca, et
+# `startfile_sur` refuse ce qui le ferait par la bande (voir
+# touche_a_l_alimentation dans jarvis.py). Verrouiller ne ferme rien.
 
 def verrouiller_pc():
     import ctypes
@@ -6415,14 +6419,12 @@ def verrouiller_pc():
     return "PC verrouille."
 
 
-def mettre_en_veille(delai=8.0):
-    """Dans quelques secondes : le temps que Jarvis dise au revoir."""
-    import ctypes
-
-    def dormir():
-        ctypes.WinDLL("powrprof").SetSuspendState(False, False, False)
-    threading.Timer(delai, dormir).start()
-    return "Mise en veille dans %d secondes." % int(delai)
+def startfile_sur(chemin):
+    """os.startfile, sauf ce qui eteindrait, redemarrerait, mettrait en veille
+    le PC ou fermerait la session."""
+    if _jv.touche_a_l_alimentation(chemin):
+        raise PermissionError(_jv.REFUS_ALIMENTATION)
+    os.startfile(chemin)
 
 
 def _dxva2():
@@ -7068,8 +7070,8 @@ def executer_outil(outil, cfg):
             a = e.get("action")
             if a == "verrouiller":
                 return {"id": ident, "texte": verrouiller_pc()}
-            if a == "veille":
-                return {"id": ident, "texte": mettre_en_veille()}
+            if a in ("veille", "eteindre", "redemarrer", "deconnecter", "fermer_session", "hibernation"):
+                return {"id": ident, "erreur": _jv.REFUS_ALIMENTATION}
             if a == "luminosite":
                 return {"id": ident, "texte": regler_luminosite(e.get("sens") or "regler", e.get("niveau"))}
             return {"id": ident, "erreur": "action inconnue : %s" % a}
@@ -7156,19 +7158,24 @@ def executer_outil(outil, cfg):
             else:
                 choisis = res
             for chemin, _, _ in choisis[:OUVRIR_MAX]:
-                os.startfile(chemin)
+                if _jv.touche_a_l_alimentation(chemin):
+                    return {"id": ident, "erreur": _jv.REFUS_ALIMENTATION}
+            for chemin, _, _ in choisis[:OUVRIR_MAX]:
+                startfile_sur(chemin)
             return {"id": ident, "texte": "Ouverts : %s." % " ; ".join(os.path.basename(c) for c, _, _ in choisis[:OUVRIR_MAX])}
         if nom == "creer_fichier":
+            if _jv.touche_a_l_alimentation(e.get("chemin") or "", e.get("contenu") or ""):
+                return {"id": ident, "erreur": _jv.REFUS_ALIMENTATION}
             ch = creer_fichier(_jv.resoudre_chemin(e.get("chemin"), bases), e.get("contenu"), dossiers_proteges())
             if e.get("ouvrir"):
-                os.startfile(ch)
+                startfile_sur(ch)
             return {"id": ident, "texte": "Cree : %s" % ch}
         if nom == "ecrire_note":
             dossier = os.path.join(bases.get("documents") or os.path.join(bases["home"], "Documents"),
                                    "Notes de Jarvis")
             ch, neuve = ecrire_note(dossier, e.get("texte"), e.get("titre") or "", e.get("ajouter_a") or "")
             if e.get("ouvrir", True):
-                os.startfile(ch)
+                startfile_sur(ch)
             return {"id": ident, "texte": ("Note ecrite : %s" if neuve else "Ajoute a la note : %s") % ch}
         if nom == "creer_dossier":
             ch = _jv.resoudre_chemin(e.get("chemin"), bases)
@@ -7177,7 +7184,9 @@ def executer_outil(outil, cfg):
             ch = _jv.resoudre_chemin(e.get("chemin"), bases)
             if not os.path.exists(ch):
                 return {"id": ident, "erreur": "Rien a cet endroit : %s" % ch}
-            os.startfile(ch)
+            if _jv.touche_a_l_alimentation(ch):
+                return {"id": ident, "erreur": _jv.REFUS_ALIMENTATION}
+            startfile_sur(ch)
             return {"id": ident, "texte": "Ouvert : %s" % ch}
         return {"id": ident, "erreur": "outil inconnu : %s" % nom}
     except Exception as ex:
@@ -7307,13 +7316,18 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1):
         envoyer_oreille({"cmd": "annuler"})
         return dire(reponse, suite=False, langue=L)
     if donnees.get("mode") == "psy":
-        # Grave : c'est le compagnon qui a repondu, et on reste avec lui. Et
-        # a l'au revoir, Jarvis se taira : `psy_grave`.
-        print("Jarvis : bascule en mode psychologue")
-        JARVIS["historique"] = []          # grave : cette conversation-la, on ne la resume pas
+        # C'est le compagnon qui a repondu, et on reste avec lui : parce que
+        # c'etait grave (a l'au revoir, Jarvis se taira : `psy_grave`), ou
+        # parce que Jarvis a compris qu'on voulait le psychologue (« demande »).
+        grave = donnees.get("raison") != "demande"
+        print("Jarvis : bascule en mode psychologue (%s)" % ("grave" if grave else "demande"))
+        if grave:
+            JARVIS["historique"] = []      # grave : cette conversation-la, on ne la resume pas
+        else:
+            clore_historique(cfg)
         poser_mode("psy")
-        JARVIS.update(psy_grave=True, psy_echange=[{"role": "user", "texte": texte},
-                                                   {"role": "assistant", "texte": reponse}])
+        JARVIS.update(psy_grave=grave, psy_echange=[{"role": "user", "texte": texte},
+                                                    {"role": "assistant", "texte": reponse}])
         JARVIS["vu"] = time.time()
         return dire(reponse, suite=True, langue="fr")
     JARVIS["historique"] = (JARVIS["historique"] + [
@@ -7466,7 +7480,7 @@ def executer_commande(a, cfg, maintenant=None):
     if quoi == "ouvrir":
         cible = a["cible"]
         if os.name == "nt":
-            os.startfile(cible)
+            startfile_sur(cible)
         else:
             import webbrowser
             webbrowser.open(cible)
@@ -10886,11 +10900,12 @@ class Panneau:
                       "ouvrir Spotify sur une recherche, ouvrir une recherche Google, un lien ou une "
                       "video YouTube dans Chrome, lancer une appli ou un jeu Steam, gerer les fenetres "
                       "(premier plan, reduire, agrandir, fermer), regler le son (general ou d'une appli) "
-                      "et la luminosite, verrouiller le PC ou le mettre en veille, ecrire une note (dans "
+                      "et la luminosite, verrouiller le PC, ecrire une note (dans "
                       "Documents > Notes de Jarvis) ou creer un fichier texte neuf, parcourir tes dossiers, chercher un fichier, "
                       "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
                       "deplacer, ni renommer, ni modifier un fichier existant (sauf completer ses notes), "
-                      "ni ecrire un script ou un programme. Il agit directement, sans code : quiconque l'appelle dans "
+                      "ni ecrire un script ou un programme ; ni eteindre, ni redemarrer, ni mettre en "
+                      "veille le PC, ni fermer ta session. Il agit directement, sans code : quiconque l'appelle dans "
                       "la piece peut lui demander tes dossiers. Si tu preferes, coche le code d'acces "
                       "plus bas : il le demandera a voix haute avant les dossiers, les fichiers et "
                       "l'ecran. Les noms de dossiers et les captures partent a BrainDebugger et a "

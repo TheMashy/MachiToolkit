@@ -567,6 +567,18 @@ class SesMains(unittest.TestCase):
         self.assertEqual(J.plus_jours("2026-12-30", 3), "2027-01-02")
         self.assertEqual(J.teinte_rendez_vous("Dentiste"), J.teinte_rendez_vous("dentiste"))
 
+    def test_rien_qui_eteigne_le_pc(self):
+        for chemin in ("C:\\Windows\\System32\\shutdown.exe", "logoff.exe", "tsdiscon", "rundll32.exe",
+                       "SlideToShutDown.exe", "psshutdown64.exe"):
+            self.assertTrue(J.touche_a_l_alimentation(chemin), chemin)
+        for chemin, contenu in (("a.bat", "shutdown -r -t 0"), ("a.ps1", "Restart-Computer"),
+                                ("a.vbs", "ExitWindowsEx"), ("a.cmd", "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"),
+                                ("a.bat", "logoff"), ("a.ps1", "Stop-Computer")):
+            self.assertTrue(J.touche_a_l_alimentation(chemin, contenu), (chemin, contenu))
+        for chemin, contenu in (("notes.txt", "shutdown"), ("a.bat", "echo bonjour"), ("a.md", "logoff")):
+            self.assertFalse(J.touche_a_l_alimentation(chemin, contenu), (chemin, contenu))
+        self.assertFalse(J.touche_a_l_alimentation("C:\\Program Files\\Discord\\Discord.exe"))
+
     def test_poser_un_rappel_a_la_main(self):
         a = "2026-09-25"                                    # un vendredi
         for tape, attendu in (("", a), ("demain", "2026-09-26"), ("Après-demain", "2026-09-27"), ("+3", "2026-09-28"),
@@ -1433,6 +1445,39 @@ class DansMachiTool(unittest.TestCase):
         return ok, consignes, m.gabarits_jarvis()
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_jamais_eteindre_redemarrer_mettre_en_veille_ni_fermer_la_session(self):
+        m = self.m
+        m.CFG["jarvis_pc"] = True
+        ouverts = []
+        avait = hasattr(m.os, "startfile")
+        vrai = getattr(m.os, "startfile", None)
+        m.os.startfile = ouverts.append
+        self.addCleanup(lambda: setattr(m.os, "startfile", vrai) if avait else delattr(m.os, "startfile"))
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        for a in ("veille", "eteindre", "redemarrer", "deconnecter"):
+            self.assertIn("ni fermer la session", ex("pc", {"action": a})["erreur"], a)
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        bat = os.path.join(d, "dodo.bat")
+        with open(bat, "w") as f:
+            f.write("@echo off\r\nshutdown /s /t 0\r\n")
+        texte = os.path.join(d, "liste.txt")
+        with open(texte, "w") as f:
+            f.write("shutdown, c'est le titre d'un film")
+        self.assertIn("ni fermer la session", ex("ouvrir", {"chemin": bat})["erreur"])
+        self.assertIn("Ouvert", ex("ouvrir", {"chemin": texte})["texte"], "un texte qui en parle s'ouvre")
+        r = ex("creer_fichier", {"chemin": os.path.join(d, "eteins.ps1"), "contenu": "Stop-Computer -Force"})
+        self.assertIn("ni fermer la session", r["erreur"])
+        self.assertFalse(os.path.exists(os.path.join(d, "eteins.ps1")), "et le script n'est pas ecrit")
+        vraies = m.applis_installees
+        self.addCleanup(lambda: setattr(m, "applis_installees", vraies))
+        m.applis_installees = lambda frais=False: [("Arreter le PC", r"C:\Windows\System32\shutdown.exe", "appli")]
+        self.assertIn("ni fermer la session", ex("lancer_appli", {"nom": "arreter le PC"})["erreur"])
+        self.assertEqual(ouverts, [texte], "rien d'autre n'a ete lance")
+        src = open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8").read()
+        for appel in ("SetSuspendState", "ExitWindowsEx", "InitiateSystemShutdown", "mettre_en_veille", "Stop-Computer"):
+            self.assertNotIn(appel, src, appel)
+
     def test_l_etalonnage_au_fil_de_l_eau(self):
         m = self.m
         m.envoyer_oreille = lambda c: self.envoye.append(c)
@@ -1554,6 +1599,20 @@ class DansMachiTool(unittest.TestCase):
                 "suite": [{"role": "user", "content": "x"},
                           {"role": "assistant", "content": [{"type": "tool_use", "id": ident, "name": nom,
                                                              "input": entree}]}]}
+
+    def test_il_comprend_qu_on_veut_le_psychologue(self):
+        # « s'il comprend que c'est ce que je veux » : BrainDebugger a passe la
+        # phrase au compagnon ; on reste en mode psy -- sans le silence du grave
+        self.mains([{"texte": "Je t'écoute. Qu'est-ce qui s'est passé ?", "mode": "psy", "raison": "demande"}])
+        self.phrase("Jarvis, j'ai eu une journée horrible, j'ai besoin d'en parler")
+        self.assertEqual(self.m.JARVIS["mode"], "psy")
+        self.assertFalse(self.m.JARVIS["psy_grave"])
+        self.assertEqual(self.m.JARVIS["psy_echange"][-1]["texte"], "Je t'écoute. Qu'est-ce qui s'est passé ?")
+        # le grave, lui, garde son silence a l'au revoir
+        self.m.poser_mode("jarvis")
+        self.mains([{"texte": "Je suis là.", "mode": "psy", "raison": "grave"}])
+        self.phrase("Jarvis, je n'en peux plus")
+        self.assertTrue(self.m.JARVIS["psy_grave"])
 
     def test_ses_mains_demandent_le_code_a_voix_haute(self):
         # « Lorsqu'il doit interagir il demande un code d'acces a l'oral avant

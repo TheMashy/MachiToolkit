@@ -3954,6 +3954,54 @@ def teinte_rendez_vous(libelle):
     return _TEINTES_AGENDA[zlib.crc32(normaliser(str(libelle)).encode("utf-8")) % len(_TEINTES_AGENDA)]
 
 
+# --- l'alimentation du PC : jamais ---------------------------------------
+#
+# « Fais en sorte que Jarvis ne puisse pas eteindre, redemarrer ou mettre en
+# veille l'ordinateur, ni fermer la session. » Il n'a aucun outil pour ca ; et
+# il ne passe pas non plus par la bande : lancer shutdown.exe, ouvrir un
+# script ou un raccourci qui le fait, en ecrire un. Verrouiller reste permis
+# (la session reste ouverte, tout reprend au deverrouillage).
+
+_ALIMENTATION_EXES = {"shutdown", "logoff", "tsdiscon", "psshutdown", "psshutdown64", "slidetoshutdown",
+                      "shutdownux", "rundll32", "wlrmdr", "powercfg", "sleep", "nircmd", "nircmdc"}
+_ALIMENTATION_TEXTE = re.compile(
+    r"shutdown|log\s*off|logoff|tsdiscon|restart-computer|stop-computer|suspend-computer|setsuspendstate|"
+    r"exitwindows|initiatesystemshutdown|win32shutdown|powrprof|rundll32|hibernat|standby|"
+    r"disconnect-user|reboot|powercfg\s*/h|psshutdown|nircmd", re.I)
+_EXTENSIONS_QUI_S_EXECUTENT = {".bat", ".cmd", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+                               ".hta", ".lnk", ".url", ".reg", ".scr", ".pif", ".msc", ".cpl", ".appref-ms",
+                               ".exe", ".com", ".py", ".pyw"}
+
+
+def _texte_de_fichier(chemin, limite=2_000_000):
+    try:
+        with open(chemin, "rb") as f:
+            b = f.read(limite)
+    except OSError:
+        return ""
+    # un raccourci garde sa cible en ANSI ou en UTF-16 : on lit les deux
+    return b.decode("latin-1", "replace") + "\n" + b.decode("utf-16-le", "replace")
+
+
+def touche_a_l_alimentation(chemin, contenu=None):
+    """Vrai si lancer/ouvrir `chemin` (ou y ecrire `contenu`) pourrait
+    eteindre, redemarrer, mettre en veille le PC ou fermer la session."""
+    base, ext = os.path.splitext(re.split(r"[\\/]", str(chemin or ""))[-1].lower())
+    if base in _ALIMENTATION_EXES:
+        return True
+    if ext not in _EXTENSIONS_QUI_S_EXECUTENT:
+        return False
+    if contenu is not None:
+        return bool(_ALIMENTATION_TEXTE.search(str(contenu)))
+    if ext in (".exe", ".com"):
+        return False                      # un programme : jugé par son nom, au-dessus
+    return bool(_ALIMENTATION_TEXTE.search(_texte_de_fichier(chemin)))
+
+
+REFUS_ALIMENTATION = ("Refuse : je ne peux ni eteindre, ni redemarrer, ni mettre en veille le PC, ni fermer "
+                      "la session.")
+
+
 # --------------------------- LE SON, APPLI PAR APPLI -----------------------
 #
 # « Il faudrait que Jarvis puisse mettre le son de differentes applications de
