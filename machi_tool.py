@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.59.0"
+VERSION = "1.60.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -362,6 +362,11 @@ CONFIG_DEFAUT = {
     # SES SOUVENIRS DE VOS CONVERSATIONS : une phrase par conversation en mode
     # Jarvis, ecrite a la fin de celle-ci. Jamais le mode psychologue.
     "jarvis_souvenirs": [],
+    # SES TACHES DE FOND ET TES PROJETS : ce que tu ecris de tes projets (et ce
+    # qu'il y note pour toi) part avec ses taches et ses reflexions ; une tache
+    # prete, il l'annonce a voix haute quand il n'est pas occupe.
+    "jarvis_projets": "",
+    "jarvis_annoncer_taches": True,
     # L'HISTORIQUE DU NAVIGATEUR, pour retrouver une video ou un lien : lu sur
     # le poste a la demande ; seules les pages qui correspondent partent.
     "jarvis_historique": False,
@@ -6270,7 +6275,8 @@ def parler_au_compagnon(texte, cfg):
 
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
                     "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets", "temperatures",
-                    "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda"}
+                    "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda",
+                    "lancer_tache", "taches", "noter_projet"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -7160,6 +7166,13 @@ def diagnostic_spotify(cfg):
     return ("OK. " if ok else "") + texte
 
 
+def ouvrir_uri_spotify(uri):
+    """Le morceau ouvert directement dans l'application (« spotify:track:... »)."""
+    if not str(uri or "").startswith("spotify:"):
+        raise ValueError("adresse Spotify invalide")
+    os.startfile(uri)
+
+
 def ouvrir_appli_spotify():
     try:
         os.startfile("spotify:")
@@ -7302,6 +7315,15 @@ def executer_outil(outil, cfg):
         # sans les mains sur le PC (« il a tous les droits au niveau de l'application »)
         if nom in ("lumiere", "routine_lumiere", "reglages_machi"):
             return {"id": ident, "texte": outil_application(nom, e, cfg)}
+        # SES TACHES DE FOND ET TES PROJETS : a lui aussi, sans les mains sur le PC
+        if nom == "lancer_tache":
+            return {"id": ident, "texte": lancer_tache_de_fond(e, cfg)}
+        if nom == "taches":
+            return {"id": ident, "texte": outil_taches(e, cfg)}
+        if nom == "noter_projet":
+            cfg["jarvis_projets"] = _jv.ajouter_note_projet(cfg.get("jarvis_projets"), e.get("projet"), e.get("note"))
+            sauver_config(cfg)
+            return {"id": ident, "texte": "Note dans les projets : %s -- %s" % (e.get("projet"), e.get("note"))}
         if not cfg.get("jarvis_pc"):
             return {"id": ident, "erreur": "Les mains de Jarvis sur le PC sont fermees (Machi Tool > Reglages > Jarvis)."}
         if nom == "rechercher_google":
@@ -7352,7 +7374,8 @@ def executer_outil(outil, cfg):
             sp = spotify_de(cfg)
             if nom == "spotify_jouer":
                 return {"id": ident, "texte": sp.jouer(e.get("recherche"), e.get("genre") or "titre",
-                                                       bool(e.get("file")), ouvrir_appli_spotify)}
+                                                       bool(e.get("file")), ouvrir_appli_spotify,
+                                                       ouvrir_uri=ouvrir_uri_spotify)}
             if nom == "spotify_en_cours":
                 c = sp.en_cours()
                 return {"id": ident, "texte": ("%s : « %s » de %s." % ("En lecture" if c["lecture"] else "En pause",
@@ -7449,7 +7472,14 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": "Ouvert : %s" % ch}
         return {"id": ident, "erreur": "outil inconnu : %s" % nom}
     except Exception as ex:
-        return {"id": ident, "erreur": "%s : %s" % (type(ex).__name__, str(ex)[:300])}
+        erreur = str(ex)[:300] if isinstance(ex, (_jv.ErreurSpotify, ValueError, LookupError, RuntimeError)) \
+            else "%s : %s" % (type(ex).__name__, str(ex)[:300])
+        # « Spotify fait de la resistance » ne disait pas POURQUOI : la cause
+        # exacte va au journal, et sous « Spotify » dans la page Jarvis
+        print("Jarvis : l'outil %s a echoue -- %s" % (nom, erreur))
+        if str(nom).startswith("spotify"):
+            JARVIS["spotify_message"] = "Derniere erreur (%s) : %s" % (time.strftime("%H:%M"), erreur)
+        return {"id": ident, "erreur": erreur}
 
 
 def outils_de_jarvis(etat, cfg):
@@ -7578,6 +7608,174 @@ def outil_application(nom, e, cfg):
     raise ValueError("outil inconnu : %s" % nom)
 
 
+# ---------- ses taches de fond ----------
+# « Que Jarvis puisse accomplir des taches (rechercher des choses sur le
+# cote ?). » Jarvis (l'outil `lancer_tache`) demande ; on la lance chez
+# BrainDebugger, qui la fait tourner sans nous (Claude, le web, la reflexion).
+# Un fil vient voir ou elle en est ; finie, le texte complet est range dans
+# jarvis/taches/ (un .md qu'on ouvre d'un clic), et Jarvis l'annonce a voix
+# haute des qu'il n'est pas occupe. Rien de tout cela n'entre dans le journal.
+
+TACHE_SONDE_S = 6
+TACHE_ABANDON_S = 20 * 60
+TACHES_VERROU = threading.Lock()
+TACHES_PRETES = []            # les taches finies pas encore annoncees
+
+
+def _fichier_taches():
+    return os.path.join(dossier_jarvis(), "taches.json")
+
+
+def lire_taches():
+    try:
+        with open(_fichier_taches(), encoding="utf-8") as f:
+            return [t for t in (json.load(f) or []) if isinstance(t, dict)]
+    except Exception:
+        return []
+
+
+def _ecrire_taches(taches):
+    os.makedirs(dossier_jarvis(), exist_ok=True)
+    chemin = _fichier_taches()
+    with open(chemin + ".part", "w", encoding="utf-8") as f:
+        json.dump(_jv.taches_recentes(taches)[:_jv.TACHES_GARDEES], f, ensure_ascii=False)
+    os.replace(chemin + ".part", chemin)
+
+
+def maj_tache(ident, **champs):
+    """Met a jour une tache (ou l'ajoute) ; rend la tache a jour."""
+    with TACHES_VERROU:
+        taches = lire_taches()
+        for t in taches:
+            if t.get("id") == ident:
+                t.update(champs)
+                break
+        else:
+            t = dict(champs, id=ident)
+            taches.append(t)
+        _ecrire_taches(taches)
+        return dict(t)
+
+
+def lancer_tache_de_fond(e, cfg, suivre=True):
+    """La tache part chez BrainDebugger ; un fil la suit. Rend ce que Jarvis
+    doit savoir (il le dit en une phrase)."""
+    demande = str(e.get("demande") or "").strip()
+    if not demande:
+        raise ValueError("demande vide")
+    genre = e.get("genre") if e.get("genre") in ("recherche", "reflexion") else "recherche"
+    titre = _jv.titre_tache(e.get("titre"), demande)
+    try:
+        r = _requete_bd("/api/machitool/tache",
+                        {"demande": demande[:8000], "genre": genre, "titre": titre, "langue": langue_jarvis(cfg),
+                         "projets": str(cfg.get("jarvis_projets") or "")[:_jv.PROJETS_MAX]}, cfg, 30)
+    except urllib.error.HTTPError as ex:
+        if ex.code == 404:
+            raise RuntimeError("BrainDebugger ne connait pas encore les taches de fond : il faut le redeployer.")
+        raise RuntimeError(_detail_http(ex) or "BrainDebugger a refuse la tache (%d)." % ex.code)
+    t = maj_tache(r["id"], titre=titre, genre=genre, demande=demande[:2000], etat="en_cours", debut=time.time())
+    print("Jarvis : tache de fond lancee (%s)" % genre)
+    if suivre:
+        threading.Thread(target=suivre_tache, args=(t["id"], cfg), daemon=True).start()
+    return "Tache lancee : « %s ». Machi Tool previendra quand elle sera prete (quelques minutes)." % titre
+
+
+def suivre_tache(ident, cfg, dormir=time.sleep, horloge=time.time):
+    """Vient voir ou en est la tache, jusqu'a ce qu'elle finisse. Un reseau
+    qui tousse ne l'arrete pas ; un serveur qui l'a oubliee (redemarre), si."""
+    debut = horloge()
+    while True:
+        dormir(TACHE_SONDE_S)
+        try:
+            r = _requete_bd("/api/machitool/tache?id=" + urllib.parse.quote(ident), None, cfg, 30)
+        except urllib.error.HTTPError as ex:
+            if ex.code in (404, 401):
+                return terminer_tache(ident, {"etat": "erreur", "erreur": _detail_http(ex) or "tache perdue"})
+            r = {}
+        except Exception:
+            r = {}
+        if r.get("etat") in ("fini", "erreur"):
+            try:
+                return terminer_tache(ident, r)
+            except Exception as ex:             # un disque plein : dit, pas « en cours » pour toujours
+                print("Jarvis : tache de fond impossible a ranger (%s)" % ex)
+                return terminer_tache(ident, {"etat": "erreur", "erreur": "rangement impossible : %s" % ex})
+        if horloge() - debut > TACHE_ABANDON_S:
+            return terminer_tache(ident, {"etat": "erreur", "erreur": "trop longue : abandonnee"})
+
+
+def terminer_tache(ident, r):
+    """Range le resultat, et le met dans la file des annonces."""
+    champs = {"etat": r.get("etat"), "fin": time.time()}
+    if r.get("etat") == "fini":
+        avant = next((t for t in lire_taches() if t.get("id") == ident), {})
+        dossier = os.path.join(dossier_jarvis(), "taches")
+        os.makedirs(dossier, exist_ok=True)
+        chemin = os.path.join(dossier, _jv.nom_fichier_tache(avant.get("titre"), avant.get("debut") or time.time()))
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write("# %s\n\n> %s\n\n%s\n" % (avant.get("titre") or "Tache", " ".join(str(avant.get("demande") or "")
+                                                                                     .split())[:600],
+                                             str(r.get("texte") or "")))
+        champs.update(resume=str(r.get("resume") or "")[:600], fichier=chemin)
+    else:
+        champs["erreur"] = str(r.get("erreur") or "")[:300]
+    t = maj_tache(ident, **champs)
+    print("Jarvis : tache de fond %s" % t.get("etat"))
+    TACHES_PRETES.append(t)
+    poser_led("fait" if t.get("etat") == "fini" else "erreur", 1.2)
+    notifier = JARVIS_CROCHETS.get("notifier")
+    if notifier:
+        notifier("Jarvis", _jv.pour_la_voix(_jv.annonce_tache(t, langue_jarvis(CFG)), 240))
+    return t
+
+
+def annoncer_taches(cfg):
+    """Depuis la boucle de la guirlande : une tache prete, et Jarvis libre (pas
+    en train d'ecouter, de reflechir ou de parler, pas chez le psychologue) ->
+    il l'annonce, et ecoute un instant la suite (« lis-la moi »)."""
+    if not TACHES_PRETES:
+        return None
+    if not (cfg.get("jarvis_actif") and cfg.get("jarvis_annoncer_taches", True)):
+        TACHES_PRETES.clear()               # la notification a suffi
+        return None
+    if JARVIS.get("etat") not in ("attente", None) or JARVIS.get("mode") == "psy":
+        return None
+    t = TACHES_PRETES.pop(0)
+    texte = _jv.annonce_tache(t, langue_jarvis(cfg))
+    dire(texte, suite=True, langue=langue_jarvis(cfg))
+    return texte
+
+
+def reprendre_taches(cfg):
+    """Au demarrage : les taches encore en cours sont suivies de nouveau
+    (BrainDebugger les garde quelques heures)."""
+    for t in lire_taches():
+        if t.get("etat") == "en_cours" and t.get("id"):
+            if time.time() - float(t.get("debut") or 0) > TACHE_ABANDON_S:
+                maj_tache(t["id"], etat="erreur", erreur="interrompue")
+            else:
+                threading.Thread(target=suivre_tache, args=(t["id"], cfg), daemon=True).start()
+
+
+def outil_taches(e, cfg):
+    taches = _jv.taches_recentes(lire_taches())
+    L = langue_jarvis(cfg)
+    if e.get("action") != "lire":
+        return _jv.lister_taches(taches, langue=L)
+    n = int(e.get("numero") or 1)
+    if not 1 <= n <= len(taches):
+        raise LookupError("Il n'y a pas de tache numero %d (%d en tout)." % (n, len(taches)))
+    t = taches[n - 1]
+    if t.get("etat") != "fini":
+        return _jv.lister_taches([t], langue=L)
+    try:
+        with open(t["fichier"], encoding="utf-8") as f:
+            texte = f.read()
+    except Exception:
+        texte = t.get("resume") or ""
+    return "%s\n\n%s" % (t.get("titre") or "", texte[:6000])
+
+
 def capacites_jarvis(cfg):
     """Ce que Jarvis peut faire ici, dit a BrainDebugger a chaque question :
     ses mains, ses yeux, l'historique -- et ce qu'il retient de toi."""
@@ -7590,6 +7788,8 @@ def capacites_jarvis(cfg):
             # Machi Tool lui-meme : la guirlande, ses routines, les reglages
             "application": True, "routines": _jv.resume_routines(cfg.get("routines_lumiere") or []),
             "souvenirs": souvenirs_a_envoyer(cfg),
+            # ses taches de fond, et le contexte de tes projets
+            "taches": True, "projets": str(cfg.get("jarvis_projets") or "")[:_jv.PROJETS_MAX],
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
 
@@ -8555,6 +8755,7 @@ async def une_session(cfg):
                 # courte, voulue, elle se joue par-dessus.
                 try:
                     veiller_routines(cfg, contexte)
+                    annoncer_taches(cfg)
                 except Exception as e:
                     print("Routines : %s" % e)
                 anim = couleur_de_l_animation()
@@ -11242,6 +11443,37 @@ class Panneau:
         self.texte(ligne, "« mets-moi dentiste jeudi a 14 h », « qu'est-ce que j'ai demain ? »", BRUME, 8,
                    largeur=380).pack(side="left", padx=(10, 0))
 
+        # SES TACHES DE FOND : « rechercher des choses sur le cote »
+        self.separateur(f, 12, 8)
+        self.titre(f, "ses taches de fond").pack(fill="x", pady=(0, 4))
+        self.texte(f, "« Jarvis, fais une recherche sur... », « reflechis a mon idee de... » : ca tourne a cote "
+                      "pendant que tu fais autre chose (Claude, le web, tes projets), et il te previent quand "
+                      "c'est pret. « Qu'as-tu trouve ? » pour qu'il te le resume.", BRUME, 8,
+                   largeur=500).pack(fill="x")
+        self.boite_taches = tk.Frame(f, bg=NUIT)
+        self.boite_taches.pack(fill="x", pady=(4, 0))
+        self._taches_peintes = None
+        self.remplir_taches()
+        self.var_annoncer = tk.IntVar(value=1 if self.cfg.get("jarvis_annoncer_taches", True) else 0)
+        self.case(f, "L'annoncer a voix haute quand c'est pret (sinon : une notification)", self.var_annoncer,
+                  self.regler_annonce).pack(fill="x", pady=(4, 0))
+
+        f = self.repli(page, "tes projets")
+        self.texte(f, "Quelques lignes par projet : ce que c'est, ou tu en es, ce qui coince. Jarvis s'en sert "
+                      "pour reflechir avec toi, et y note ce que tu lui demandes de retenir (« Jarvis, note pour "
+                      "Irontide que... »). Ca part avec ses taches et ses reflexions ; rien de ton journal.",
+                   BRUME, 8, largeur=500).pack(fill="x")
+        self.zone_projets = tk.Text(f, height=9, bg=ENCRE, fg=CRAIE, relief="flat", bd=8, wrap="word",
+                                    font=(self.f_ui, 9), highlightthickness=0, insertbackground=CRAIE)
+        self.zone_projets.insert("1.0", str(self.cfg.get("jarvis_projets") or ""))
+        self.zone_projets.pack(fill="x", pady=(6, 0))
+        self._projets_peints = str(self.cfg.get("jarvis_projets") or "")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.bouton(ligne, "Enregistrer", self.enregistrer_projets, compact=True).pack(side="left")
+        self.txt_projets = self.texte(ligne, "", BRUME, 8, largeur=380)
+        self.txt_projets.pack(side="left", padx=(10, 0))
+
         f = self.repli(page, "le micro")
         self.texte(f, "Celui qu'il ecoute ; le niveau s'affiche en haut (« micro -40 dB ») et doit monter quand "
                       "tu parles.", BRUME, 8, largeur=500).pack(fill="x")
@@ -11581,6 +11813,57 @@ class Panneau:
         self.bouton(self.boite_preferences, "Tout oublier", lambda: self.oublier_preference(None),
                     compact=True).pack(anchor="w", pady=(6, 0))
 
+    def remplir_taches(self):
+        """Les dernieres taches : ou elles en sont, et le texte complet d'un clic."""
+        tk = self.tk
+        taches = _jv.taches_recentes(lire_taches())[:5]
+        for w in self.boite_taches.winfo_children():
+            w.destroy()
+        if not taches:
+            self.texte(self.boite_taches, "Aucune pour l'instant.", BRUME, 8).pack(fill="x")
+            return
+        for t in taches:
+            ligne = tk.Frame(self.boite_taches, bg=NUIT)
+            ligne.pack(fill="x", pady=(3, 0))
+            etat = t.get("etat")
+            marque = {"en_cours": ("\u25CC  en cours", ETOILE), "fini": ("\u25CF  prete", VIF),
+                      "erreur": ("\u2715  echouee", ALERTE)}.get(etat, (str(etat), BRUME))
+            etiquette = self.texte(ligne, marque[0], marque[1], 8)
+            etiquette.configure(width=11, anchor="w", justify="left")
+            etiquette.pack(side="left", anchor="n")
+            bloc = tk.Frame(ligne, bg=NUIT)
+            bloc.pack(side="left", fill="x", expand=True, padx=(6, 0))
+            self.texte(bloc, t.get("titre") or "?", CRAIE, 9, largeur=330).pack(fill="x")
+            dessous = t.get("resume") if etat == "fini" else t.get("erreur") if etat == "erreur" else \
+                ("recherche" if t.get("genre") != "reflexion" else "reflexion") + \
+                " -- depuis %d min" % max(0, (time.time() - float(t.get("debut") or time.time())) // 60)
+            if dessous:
+                self.texte(bloc, str(dessous)[:220], BRUME, 8, largeur=330).pack(fill="x")
+            if etat == "fini" and t.get("fichier"):
+                self.bouton(ligne, "Ouvrir", lambda c=t["fichier"]: self.ouvrir_tache(c),
+                            compact=True).pack(side="right", anchor="n")
+
+    def ouvrir_tache(self, chemin):
+        try:
+            startfile_sur(chemin)
+        except Exception as e:
+            print("Tache : ouverture impossible (%s)" % e)
+
+    def regler_annonce(self):
+        self.cfg["jarvis_annoncer_taches"] = bool(self.var_annoncer.get())
+        sauver_config(self.cfg)
+
+    def enregistrer_projets(self):
+        texte = self.zone_projets.get("1.0", "end").strip()
+        if len(texte) > _jv.PROJETS_MAX:
+            self.txt_projets.configure(text="Trop long : %d signes au plus (%d)." % (_jv.PROJETS_MAX, len(texte)),
+                                       fg=ALERTE)
+            return
+        self.cfg["jarvis_projets"] = texte + ("\n" if texte else "")
+        self._projets_peints = self.cfg["jarvis_projets"]
+        sauver_config(self.cfg)
+        self.txt_projets.configure(text="Enregistre (%d signes)." % len(texte), fg=BRUME)
+
     def oublier_routines(self):
         self.cfg["routines_lumiere"] = []
         sauver_config(self.cfg)
@@ -11730,6 +12013,19 @@ class Panneau:
                 etat_sp += "  " + JARVIS["spotify_message"]
             if self.txt_spotify.cget("text") != etat_sp:
                 self.txt_spotify.configure(text=etat_sp)
+        if hasattr(self, "boite_taches"):
+            sig = tuple((t.get("id"), t.get("etat"), int((time.time() - float(t.get("debut") or 0)) // 60))
+                        for t in _jv.taches_recentes(lire_taches())[:5])
+            if sig != self._taches_peintes:
+                self._taches_peintes = sig
+                self.remplir_taches()
+        if hasattr(self, "zone_projets"):
+            # Jarvis vient d'y noter quelque chose : on le montre, si tu n'es pas en train d'ecrire
+            projets = str(self.cfg.get("jarvis_projets") or "")
+            if projets != self._projets_peints and self.zone_projets.focus_get() is not self.zone_projets:
+                self._projets_peints = projets
+                self.zone_projets.delete("1.0", "end")
+                self.zone_projets.insert("1.0", projets)
         prefs = tuple(self.cfg.get("jarvis_preferences") or [])
         if getattr(self, "_prefs_peintes", None) != prefs and hasattr(self, "boite_preferences"):
             self._prefs_peintes = prefs          # Jarvis vient d'en retenir ou d'en oublier une
@@ -13338,6 +13634,7 @@ def lancer():
     JARVIS_CROCHETS["notifier"] = notifier
     JARVIS_CROCHETS["ouvrir_panneau"] = lambda: demande_ouverture.set()
     sans_faute("Jarvis", demarrer_jarvis, CFG)
+    sans_faute("Taches de Jarvis", reprendre_taches, CFG)
 
     def basculer_jarvis(*_):
         CFG["jarvis_actif"] = not CFG.get("jarvis_actif", False)
