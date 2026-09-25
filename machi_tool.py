@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.41.0"
+VERSION = "1.42.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5394,6 +5394,11 @@ _PHRASES = {
     "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
     "code_refuse": ("Accès refusé.", "Access denied."),
     "verrouille": ("Accès verrouillé.", "Access locked."),
+    "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
+                      "My hands on the PC are closed: Settings, Jarvis."),
+    "youtube_video": ("C'est parti.", "Here you go."),
+    "youtube_resultats": ("Je vous ai ouvert les résultats sur YouTube.", "I've opened the YouTube results."),
+    "youtube_rate": ("YouTube ne répond pas.", "YouTube isn't answering."),
     "oui": ("Oui ?", "Yes?"),
     "mode_psy": ("Mode psychologue. Je vous écoute.", None),
     "mode_jarvis": ("Mode Jarvis. À votre service.", "At your service."),
@@ -6291,6 +6296,13 @@ def _domaine(url):
         return ""
 
 
+def nom_onglet(o):
+    """Ce a quoi on reconnait un onglet : son titre, son site, sa famille
+    (« ferme les Reddit »)."""
+    d = _domaine(o.get("url", ""))
+    return "%s %s %s" % (o.get("titre") or "", d, _jv.site_de(d))
+
+
 def agir_onglets(action, cible="", url="", recherche="", tous=False):
     """Ce que Jarvis demande aux onglets. Rend un texte pour lui."""
     if action == "ouvrir":
@@ -6302,14 +6314,19 @@ def agir_onglets(action, cible="", url="", recherche="", tous=False):
     onglets = commande_onglets("lister").get("onglets") or []
     onglets = [o for o in onglets if isinstance(o, dict) and "id" in o]
     if action == "lister":
-        if not onglets:
-            return "Aucun onglet ouvert."
-        return "%d onglets : %s" % (len(onglets), " ; ".join(
-            "%d. %s (%s)%s%s" % (i, (o.get("titre") or "")[:80], _domaine(o.get("url", "")),
-                                  " -- actif" if o.get("actif") else "", " -- joue du son" if o.get("son") else "")
-            for i, o in enumerate(onglets[:40], 1)))
-    trouves = _jv.choisir(cible, onglets, nom=lambda o: (o.get("titre") or "") + " " + _domaine(o.get("url", "")),
-                          seuil=40)
+        return liste_onglets(onglets) or "Aucun onglet ouvert."
+    if action in ("fermer_gauche", "fermer_droite", "garder"):
+        gardes = None
+        if action == "garder" and cible:
+            gardes = _jv.choisir(cible, onglets, nom=nom_onglet, seuil=40, tous=True)
+            if not gardes:
+                raise LookupError("Aucun onglet ne correspond a « %s » : je n'en ferme aucun." % cible)
+        ids = _jv.onglets_a_fermer(onglets, action, gardes)
+        if not ids:
+            return "Rien a fermer."
+        commande_onglets("fermer", ids=ids)
+        return "%d onglet%s ferme%s." % (len(ids), "s" if len(ids) > 1 else "", "s" if len(ids) > 1 else "")
+    trouves = _jv.choisir(cible, onglets, nom=nom_onglet, seuil=40, tous=tous)
     if not trouves:
         raise LookupError("Aucun onglet ne correspond a « %s »." % cible)
     vises = trouves[:20] if tous else trouves[:1]
@@ -6327,11 +6344,40 @@ def agir_onglets(action, cible="", url="", recherche="", tous=False):
     raise ValueError("action inconnue : %s" % action)
 
 
+def liste_onglets(onglets, par_famille=12, titre_max=80):
+    """Les onglets rangés par site : « 9 onglets. YouTube (2) : « ... » ; ...
+    Reddit (1) : ... » -- titres et domaines, jamais l'adresse entiere."""
+    if not onglets:
+        return ""
+    bouts = []
+    for famille, liste in _jv.ranger_onglets(onglets, domaine=lambda o: _domaine(o.get("url", ""))):
+        items = ["« %s »%s%s%s" % ((o.get("titre") or "")[:titre_max],
+                                   "" if famille not in ("Autres", "Mails") else " (%s)" % _domaine(o.get("url", "")),
+                                   " -- affiche" if o.get("actif") else "", " -- joue du son" if o.get("son") else "")
+                 for o in liste[:par_famille]]
+        reste = len(liste) - par_famille
+        bouts.append("%s (%d) : %s%s" % (famille, len(liste), " ; ".join(items),
+                                        " ; et %d autres" % reste if reste > 0 else ""))
+    return "%d onglets. %s" % (len(onglets), " | ".join(bouts))
+
+
+def onglets_du_moment():
+    """La liste rangée, pour chaque question a Jarvis -- si l'extension est
+    branchee et repond vite. Sinon rien : on ne fait pas attendre Jarvis."""
+    if not extension_branchee():
+        return ""
+    try:
+        onglets = commande_onglets("lister", delai=1.5).get("onglets") or []
+    except Exception:
+        return ""
+    return liste_onglets([o for o in onglets if isinstance(o, dict)], par_famille=6, titre_max=60)
+
+
 EXTENSION_MANIFESTE = {
     "manifest_version": 3,
     "name": "Machi Tool - les onglets pour Jarvis",
     "description": "Laisse Jarvis (Machi Tool, sur ce PC) lister, ouvrir, afficher, couper et fermer des onglets.",
-    "version": "1.0",
+    "version": "1.1",
     "permissions": ["tabs", "alarms"],
     "host_permissions": ["http://127.0.0.1/*"],
     "background": {"service_worker": "fond.js"},
@@ -6349,8 +6395,12 @@ let enCours = false;
 async function executer(c) {
   if (c.action === 'lister') {
     const t = await chrome.tabs.query({});
+    let courante = null;
+    try { courante = (await chrome.windows.getLastFocused()).id; } catch (e) {}
     return { onglets: t.map(o => ({ id: o.id, titre: o.title || '', url: o.url || '', actif: !!o.active,
-                                    son: !!o.audible, muet: !!(o.mutedInfo && o.mutedInfo.muted) })) };
+                                    son: !!o.audible, muet: !!(o.mutedInfo && o.mutedInfo.muted),
+                                    position: o.index, epingle: !!o.pinned,
+                                    fenetre_courante: o.windowId === courante })) };
   }
   if (c.action === 'ouvrir') {
     if (!/^https?:\/\//.test(String(c.url || ''))) throw new Error('adresse refusee');
@@ -6843,7 +6893,8 @@ def parler_a_jarvis(texte, cfg):
     try:
         donnees = _requete_bd("/api/machitool/jarvis",
                               dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
-                                    "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
+                                    "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
+                                    "onglets_ouverts": onglets_du_moment() if cfg.get("jarvis_pc") else ""},
                                    **capacites_jarvis(cfg)), cfg, 180)
     except urllib.error.HTTPError as e:
         detail = _detail_http(e)
@@ -6894,6 +6945,15 @@ def executer_commande(a, cfg, maintenant=None):
     if quoi == "silence":
         VOIX.taire()
         return None
+    if quoi == "youtube":
+        if not cfg.get("jarvis_pc"):
+            return phrase("mains_fermees", langue_jarvis(cfg))
+        try:
+            fait = ouvrir_youtube(a.get("recherche"))
+        except Exception as e:
+            print("Jarvis : YouTube impossible (%s)" % type(e).__name__)
+            return phrase("youtube_rate", langue_jarvis(cfg))
+        return phrase("youtube_video" if fait.startswith("Video") else "youtube_resultats", langue_jarvis(cfg))
     if quoi in ("annuler", "fin"):
         return None
     if quoi == "dormir":

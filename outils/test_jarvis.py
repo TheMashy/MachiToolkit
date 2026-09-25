@@ -492,6 +492,22 @@ class SesMains(unittest.TestCase):
         with self.assertRaises(J.ErreurSpotify):
             J.Spotify.echanger_code("CID", "CODE", verif, http=lambda *a: (400, {"error": "invalid_grant"}))
 
+    def test_youtube_se_comprend_ici(self):
+        for dit, q in (("Mets Get Lucky sur YouTube", "get lucky"), ("mets-moi la vidéo de Squeezie sur YouTube.", "squeezie"),
+                       ("lance du lo-fi sur youtube", "lo fi"), ("YouTube daft punk around the world", "daft punk around the world"),
+                       ("play get lucky on youtube", "get lucky")):
+            self.assertEqual(J.comprendre(dit), {"action": "youtube", "recherche": q}, dit)
+        for dit in ("j'ai vu une vidéo sur YouTube hier", "c'est quoi youtube premium ?", "tu connais youtube"):
+            self.assertNotEqual((J.comprendre(dit) or {}).get("action"), "youtube", dit)
+
+    def test_les_onglets_ranges_par_site(self):
+        for d, f in (("www.youtube.com", "YouTube"), ("m.youtube.com", "YouTube"), ("music.youtube.com", "Musique"),
+                     ("old.reddit.com", "Reddit"), ("instagram.com", "Instagram"), ("x.com", "X"),
+                     ("mail.google.com", "Mails"), ("docs.google.com", "Autres"), ("notyoutube.com", "Autres")):
+            self.assertEqual(J.site_de(d), f, d)
+        rang = J.ranger_onglets([{"domaine": "docs.python.org"}, {"domaine": "reddit.com"}, {"domaine": "youtube.com"}])
+        self.assertEqual([f for f, _ in rang], ["YouTube", "Reddit", "Autres"])
+
     def test_la_recherche_qu_on_affine(self):
         # « J'ai 523 ... possedant la mention », « rajoute la mention stage »,
         # « j'ai 3 ... de stages », « parfait, ouvre-les » -- pour les fichiers.
@@ -998,6 +1014,7 @@ class DansMachiTool(unittest.TestCase):
                         mode_vu=0.0, historique=[], vu=0.0, propose_psy=False,
                         psy_echange=[], psy_grave=False, reveil_par=None,
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0)
+        m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
         m.JARVIS_CROCHETS["notifier"] = lambda t, x: self.dit.append(x)
@@ -1396,9 +1413,9 @@ class DansMachiTool(unittest.TestCase):
         time.sleep(0.3)
         self.assertTrue(m.capacites_jarvis(m.CFG)["onglets"], "l'extension demande : elle est branchee")
         l = ex({"action": "lister"})["texte"]
-        self.assertIn("3 onglets", l)
-        self.assertIn("(youtube.com) -- joue du son", l)
-        self.assertIn("mail.google.com", l)
+        self.assertTrue(l.startswith("3 onglets. YouTube (2) : « Lo-fi beats - YouTube » -- joue du son"), l)
+        self.assertIn("| Mails (1) : « Boîte de réception » (mail.google.com)", l)
+        self.assertTrue(m.onglets_du_moment().startswith("3 onglets. YouTube (2) : « Lo-fi beats"))
         self.assertNotIn("#inbox", l, "vers Jarvis : le domaine, pas l'adresse")
         self.assertIn("Ferme", ex({"action": "fermer", "cible": "youtube", "tous": True})["texte"])
         self.assertEqual(sorted(recu[-1]["ids"]), [11, 12])
@@ -1412,6 +1429,61 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("http(s)", ex({"action": "ouvrir", "url": "file:///C:/x"})["erreur"])
         self.assertEqual(len(recu), n, "une adresse refusee ne part pas a Chrome")
         self.assertIn("Aucun onglet", ex({"action": "fermer", "cible": "twitch"})["erreur"])
+
+    def test_youtube_sans_passer_par_le_modele(self):
+        m = self.m
+        ouvertes = []
+        vrai = m.ouvrir_youtube
+        self.addCleanup(lambda: setattr(m, "ouvrir_youtube", vrai))
+        m.ouvrir_youtube = lambda q: ouvertes.append(q) or "Video ouverte dans Chrome : « x »."
+        envoyes, _ = self.mains([], code_actif=False)
+        self.phrase("Jarvis, mets-moi Get Lucky sur YouTube")
+        self.assertEqual(ouvertes, ["get lucky"])
+        self.assertEqual(envoyes, [], "rien ne part au modele")
+        self.assertEqual(self.dit[-1], "C'est parti.")
+        m.CFG["jarvis_pc"] = False
+        self.phrase("Jarvis, lance la vidéo de chat qui joue du piano sur YouTube")
+        self.assertEqual(len(ouvertes), 1, "mains fermees : rien ne s'ouvre")
+        self.assertIn("fermées", self.dit[-1])
+
+    def test_ferme_a_gauche_a_droite_garde(self):
+        m = self.m
+        envoyes, _ = self.mains([], code_actif=False)
+        onglets = [
+            {"id": 1, "titre": "Epingle", "url": "https://a.fr", "position": 0, "epingle": True, "fenetre_courante": True},
+            {"id": 2, "titre": "Reddit Unity", "url": "https://www.reddit.com/r/unity3d", "position": 1, "fenetre_courante": True},
+            {"id": 3, "titre": "Doc Python", "url": "https://docs.python.org", "position": 2, "actif": True, "fenetre_courante": True},
+            {"id": 4, "titre": "Lo-fi - YouTube", "url": "https://www.youtube.com/watch?v=a", "position": 3, "fenetre_courante": True},
+            {"id": 5, "titre": "Vaporwave - YouTube", "url": "https://www.youtube.com/watch?v=b", "position": 4, "fenetre_courante": True},
+            {"id": 6, "titre": "Autre fenetre", "url": "https://b.fr", "position": 0, "actif": True, "fenetre_courante": False}]
+        a_fermer = lambda action, gardes=None: sorted(J.onglets_a_fermer(onglets, action, gardes))
+        self.assertEqual(a_fermer("fermer_gauche"), [2], "jamais l'epingle, jamais l'autre fenetre")
+        self.assertEqual(a_fermer("fermer_droite"), [4, 5])
+        self.assertEqual(a_fermer("garder"), [2, 4, 5], "garde cet onglet")
+        self.assertEqual(a_fermer("garder", [onglets[3], onglets[4]]), [2, 3])
+        fermes, arret = [], threading.Event()
+
+        def extension():
+            while not arret.is_set():
+                c = m.prochaine_commande_onglets(0.2)
+                if c is None:
+                    continue
+                if c["action"] == "fermer":
+                    fermes.append(sorted(c["ids"]))
+                m.resultat_onglets({"id": c["id"], "onglets": onglets} if c["action"] == "lister"
+                                   else {"id": c["id"], "texte": "fait"})
+        t = threading.Thread(target=extension, daemon=True)
+        t.start()
+        self.addCleanup(lambda: (arret.set(), t.join(2)))
+        time.sleep(0.3)
+        ex = lambda e: m.executer_outil({"id": "x", "nom": "onglets", "entree": e}, m.CFG)
+        self.assertEqual(ex({"action": "garder", "cible": "youtube"})["texte"], "2 onglets fermes.")
+        self.assertEqual(fermes[-1], [2, 3])
+        n = len(fermes)
+        self.assertIn("je n'en ferme aucun", ex({"action": "garder", "cible": "twitch"})["erreur"])
+        self.assertEqual(len(fermes), n, "rien ne correspond : rien n'est ferme")
+        ex({"action": "fermer_droite"})
+        self.assertEqual(fermes[-1], [4, 5])
 
     def test_l_extension_et_ses_routes(self):
         m = self.m

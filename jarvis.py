@@ -1001,6 +1001,17 @@ def comprendre(texte, raccourcis=()):
                 r"|^(?:lock|lock (?:it|access|everything|up))$", t):
         return {"action": "verrouiller"}
 
+    # « Mets Get Lucky sur YouTube » : ici, sans passer par le modele -- plus
+    # vite, et il ne peut pas se tromper d'outil.
+    m = re.match(r"^(?:mets?|lance|joue|passe|ouvre|cherche|trouve)(?: moi)?(?: (?:la|une|le|un) "
+                 r"(?:video|musique|chanson|clip|morceau))?(?: de| du| des)? (.+?) sur (?:youtube|you tube)$"
+                 r"|^(?:youtube|you tube) (.+)$"
+                 r"|^(?:play|put on|open|search)(?: me)? (.+?) on (?:youtube|you tube)$", t.replace("-", " "))
+    if m:
+        q = next(g for g in m.groups() if g).strip()
+        if q and len(q.split()) <= 14:
+            return {"action": "youtube", "recherche": q}
+
     en = _comprendre_en(t, mots)
     if en:
         return en
@@ -2981,9 +2992,12 @@ def score_nom(demande, nom):
     return int(60 * commun / len(md)) if commun else 0
 
 
-def choisir(demande, elements, nom=lambda e: e[0], seuil=45):
-    """Les elements qui correspondent le mieux (ex aequo compris), ou []."""
+def choisir(demande, elements, nom=lambda e: e[0], seuil=45, tous=False):
+    """Les elements qui correspondent le mieux (ex aequo compris), ou [].
+    `tous` : tous ceux qui passent le seuil, les meilleurs d'abord."""
     notes = [(score_nom(demande, nom(e)), e) for e in elements]
+    if tous:
+        return [e for s, e in sorted(notes, key=lambda x: -x[0]) if s >= seuil]
     meilleur = max((s for s, _ in notes), default=0)
     if meilleur < seuil:
         return []
@@ -3005,6 +3019,64 @@ def nouveau_niveau(actuel, action, niveau=None, pas=10):
     else:
         raise ValueError("action inconnue : %s" % action)
     return int(round(max(0.0, min(100.0, v))))
+
+
+_SITES = (
+    ("YouTube", ("youtube.com", "youtu.be")),
+    ("Musique", ("open.spotify.com", "soundcloud.com", "deezer.com", "music.apple.com", "bandcamp.com")),
+    ("Reddit", ("reddit.com", "redd.it")),
+    ("Instagram", ("instagram.com",)),
+    ("TikTok", ("tiktok.com",)),
+    ("X", ("x.com", "twitter.com")),
+    ("Facebook", ("facebook.com", "messenger.com")),
+    ("Twitch", ("twitch.tv",)),
+    ("Discord", ("discord.com",)),
+    ("Mails", ("mail.google.com", "outlook.live.com", "outlook.office.com", "outlook.office365.com")),
+)
+
+
+def site_de(domaine):
+    """La famille d'un onglet : YouTube, Reddit, Instagram... ou « Autres »."""
+    d = str(domaine or "").lower().removeprefix("www.").removeprefix("m.")
+    if d == "music.youtube.com":
+        return "Musique"
+    for nom, domaines in _SITES:
+        if any(d == x or d.endswith("." + x) for x in domaines):
+            return nom
+    return "Autres"
+
+
+def ranger_onglets(onglets, domaine=lambda o: o.get("domaine", "")):
+    """[(famille, [onglets])] dans l'ordre de _SITES, « Autres » a la fin."""
+    ordre = [n for n, _ in _SITES] + ["Autres"]
+    rangs = {}
+    for o in onglets:
+        rangs.setdefault(site_de(domaine(o)), []).append(o)
+    return [(n, rangs[n]) for n in ordre if n in rangs]
+
+
+def onglets_a_fermer(onglets, action, gardes=None):
+    """Les onglets a fermer pour « ferme a gauche / a droite » (de l'onglet
+    affiche) et « garde que ceux-la / garde celui-ci », dans la fenetre du
+    moment. Jamais un onglet epingle. `gardes` : ceux a garder (sinon
+    l'onglet affiche)."""
+    if not onglets:
+        return []
+    fen = [o for o in onglets if o.get("fenetre_courante")] or onglets
+    actif = next((o for o in fen if o.get("actif")), None)
+    ferme = [o for o in fen if not o.get("epingle")]
+    if action in ("fermer_gauche", "fermer_droite"):
+        if actif is None or actif.get("position") is None:
+            return []
+        p = actif["position"]
+        return [o["id"] for o in ferme if (o.get("position", p) < p if action == "fermer_gauche"
+                                           else o.get("position", p) > p)]
+    if action == "garder":
+        garde = {o["id"] for o in (gardes if gardes is not None else ([actif] if actif else []))}
+        if not garde:
+            return []
+        return [o["id"] for o in ferme if o["id"] not in garde]
+    raise ValueError("action inconnue : %s" % action)
 
 
 def premiere_video_youtube(html):
