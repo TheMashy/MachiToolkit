@@ -40,6 +40,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import unittest
 import wave
 import zipfile
@@ -360,6 +361,133 @@ class SesMains(unittest.TestCase):
         self.assertEqual(J.adresse_google("chat & piano"), "https://www.google.com/search?q=chat+%26+piano")
         with self.assertRaises(ValueError):
             J.adresse_google("  ")
+
+    def test_applis_et_jeux_steam(self):
+        d = tempfile.mkdtemp()
+        try:
+            steam, autre = os.path.join(d, "Steam"), os.path.join(d, "D", "SteamLibrary")
+            for x in (os.path.join(steam, "steamapps"), os.path.join(autre, "steamapps")):
+                os.makedirs(x)
+            open(os.path.join(steam, "steamapps", "libraryfolders.vdf"), "w").write(
+                '"libraryfolders"\n{\n "0"\n {\n  "path"  "%s"\n }\n "1"\n {\n  "path"  "%s"\n }\n}\n'
+                % (steam.replace("\\", "\\\\"), autre.replace("\\", "\\\\")))
+            acf = lambda ident, nom: '"AppState"\n{\n\t"appid"\t\t"%s"\n\t"name"\t\t"%s"\n}\n' % (ident, nom)
+            open(os.path.join(steam, "steamapps", "appmanifest_1245620.acf"), "w").write(acf(1245620, "ELDEN RING"))
+            open(os.path.join(autre, "steamapps", "appmanifest_228980.acf"), "w").write(
+                acf(228980, "Steamworks Common Redistributables"))
+            open(os.path.join(autre, "steamapps", "appmanifest_730.acf"), "w").write(acf(730, "Counter-Strike 2"))
+            jeux = J.jeux_steam(steam)
+            self.assertEqual(sorted(jeux), [("Counter-Strike 2", "steam://rungameid/730", "jeu"),
+                                            ("ELDEN RING", "steam://rungameid/1245620", "jeu")])
+            menu = os.path.join(d, "Menu")
+            os.makedirs(os.path.join(menu, "Discord Inc"))
+            for f in ("Discord Inc/Discord.lnk", "Discord Inc/Uninstall Discord.lnk", "OBS Studio.lnk",
+                      "Lisez-moi.lnk", "notes.txt", "Visual Studio Code.lnk"):
+                open(os.path.join(menu, f), "w").close()
+            applis = J.raccourcis_menu([menu, menu])
+            self.assertEqual(sorted(n for n, _, _ in applis), ["Discord", "OBS Studio", "Visual Studio Code"])
+            tout = jeux + applis
+            self.assertEqual(J.choisir("Elden Ring", tout)[0][0], "ELDEN RING")
+            self.assertEqual(J.choisir("le jeu elden ring", tout)[0][0], "ELDEN RING")
+            self.assertEqual(J.choisir("discord", tout)[0][0], "Discord")
+            self.assertEqual(J.choisir("counter strike", tout)[0][0], "Counter-Strike 2")
+            self.assertEqual(J.choisir("vs code", tout), [])
+            self.assertEqual(J.choisir("visual studio", tout)[0][0], "Visual Studio Code")
+            self.assertEqual(J.choisir("photoshop", tout), [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_les_niveaux(self):
+        self.assertEqual(J.nouveau_niveau(40, "regler", 75), 75)
+        self.assertEqual(J.nouveau_niveau(40.4, "monter"), 50)
+        self.assertEqual(J.nouveau_niveau(95, "monter", 20), 100)
+        self.assertEqual(J.nouveau_niveau(5, "baisser"), 0)
+        with self.assertRaises(ValueError):
+            J.nouveau_niveau(5, "regler")
+
+    def test_premiere_video_youtube(self):
+        page = ('var ytInitialData = {"contents":[{"adSlotRenderer":{"videoId":"PUBLICITE01"}},'
+                '{"channelRenderer":{"title":{"simpleText":"Daft Punk"}}},'
+                '{"videoRenderer":{"videoId":"5NV6Rdv1a3I","thumbnail":{},"title":{"runs":[{"text":'
+                '"Daft Punk - Get Lucky (Official Audio) ft. Pharrell Williams, Nile Rodgers \\u0026 more"}]}}},'
+                '{"videoRenderer":{"videoId":"h5EofwRzit0"}}]};')
+        self.assertEqual(J.premiere_video_youtube(page),
+                         ("5NV6Rdv1a3I", "Daft Punk - Get Lucky (Official Audio) ft. Pharrell Williams, Nile Rodgers & more"))
+        self.assertIsNone(J.premiere_video_youtube("<html>consent.youtube.com</html>"))
+
+    def test_spotify_par_son_api(self):
+        appels, sauves = [], []
+        etat = {"appareils": [], "ouvert": False, "play": 204}
+
+        def http(methode, url, entetes=None, corps=None):
+            appels.append((methode, url, corps))
+            if url.endswith("/api/token"):
+                self.assertIn(b"grant_type=refresh_token", corps)
+                return 200, {"access_token": "A%d" % len(appels), "expires_in": 3600, "refresh_token": "R2"}
+            self.assertTrue(entetes["Authorization"].startswith("Bearer A"))
+            if "/me/player/devices" in url:
+                return 200, {"devices": etat["appareils"]}
+            if "/me/playlists" in url:
+                return 200, {"items": [None, {"name": "Sport du matin", "uri": "spotify:playlist:SPORT"}]}
+            if "/search" in url:
+                if "type=track" in url:
+                    return 200, {"tracks": {"items": [{"name": "Get Lucky", "uri": "spotify:track:GL",
+                                                       "artists": [{"name": "Daft Punk"}]}]}}
+                if "type=playlist" in url:
+                    return 200, {"playlists": {"items": [None, {"name": "Chill", "uri": "spotify:playlist:CH"}]}}
+                return 200, {"albums": {"items": []}}
+            if "/me/player/play" in url:
+                return etat["play"], None
+            if "/me/player/queue" in url:
+                return 204, None
+            if "/currently-playing" in url:
+                return 200, {"is_playing": True, "item": {"id": "GL", "uri": "spotify:track:GL", "name": "Get Lucky",
+                                                          "artists": [{"name": "Daft Punk"}]}}
+            if "/me/tracks" in url:
+                return 404, None
+            if "/me/library" in url:
+                return 204, None
+            return 500, None
+
+        def ouvrir():
+            etat["ouvert"] = True
+            etat["appareils"] = [{"id": "PC", "name": "BUREAU", "type": "Computer", "is_active": False}]
+        sp = J.Spotify("CID", "R1", http=http, sauver=sauves.append, dormir=lambda s: None)
+        self.assertEqual(sp.jouer("get lucky", ouvrir_appli=ouvrir), "Lecture : « Get Lucky » de Daft Punk, sur BUREAU.")
+        self.assertTrue(etat["ouvert"], "Spotify ferme : il l'ouvre, puis attend l'appareil")
+        self.assertEqual(sauves, ["R2"], "le nouveau jeton de renouvellement est garde")
+        play = [a for a in appels if "/me/player/play" in a[1]][-1]
+        self.assertIn("device_id=PC", play[1])
+        self.assertEqual(play[2], {"uris": ["spotify:track:GL"]})
+        self.assertIn("ta playlist « Sport du matin »", sp.jouer("sport", "playlist"))
+        self.assertEqual([a for a in appels if "/me/player/play" in a[1]][-1][2], {"context_uri": "spotify:playlist:SPORT"})
+        self.assertIn("« Chill »", sp.jouer("chill", "playlist"))
+        self.assertIn("file", sp.jouer("get lucky", file=True))
+        with self.assertRaises(J.ErreurSpotify):
+            sp.jouer("chill", "playlist", file=True)
+        with self.assertRaisesRegex(J.ErreurSpotify, "Rien trouve"):
+            sp.jouer("xyz", "album")
+        self.assertIn("likes", sp.aimer())
+        etat["play"] = 403
+        with self.assertRaisesRegex(J.ErreurSpotify, "Premium"):
+            sp.jouer("get lucky")
+        etat["appareils"] = []
+        with self.assertRaisesRegex(J.ErreurSpotify, "ouvert nulle part"):
+            sp.jouer("get lucky")
+        self.assertEqual(sum(1 for a in appels if a[1].endswith("/api/token")), 1, "un seul jeton par heure")
+
+    def test_spotify_connexion_pkce(self):
+        import hashlib as h
+        verif, defi = J.pkce_paire()
+        self.assertTrue(43 <= len(verif) <= 128)
+        self.assertEqual(defi, base64.urlsafe_b64encode(h.sha256(verif.encode()).digest()).rstrip(b"=").decode())
+        url = J.spotify_url_autorisation("CID", defi, "ETAT")
+        self.assertIn("redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback", url)
+        self.assertIn("code_challenge_method=S256", url)
+        self.assertIn("user-modify-playback-state", urllib.parse.unquote_plus(url))
+        self.assertNotIn(verif, url, "le verificateur ne part pas avec l'autorisation")
+        with self.assertRaises(J.ErreurSpotify):
+            J.Spotify.echanger_code("CID", "CODE", verif, http=lambda *a: (400, {"error": "invalid_grant"}))
 
     def test_verrouille(self):
         for t in ("verrouille", "Ferme l'accès.", "lock"):
@@ -1109,6 +1237,31 @@ class DansMachiTool(unittest.TestCase):
         m.CFG["jarvis_historique"] = False
         r = m.executer_outil({"id": "x", "nom": "chercher_historique", "entree": {"recherche": "chat"}}, m.CFG)
         self.assertIn("pas permis", r["erreur"])
+
+    def test_le_pc_entier_sans_code(self):
+        # « J'aimerais avoir un compagnon qui peut interagir le plus possible avec mon PC. »
+        m = self.m
+        lances = []
+        vrai = getattr(os, "startfile", None)
+        os.startfile = lances.append
+        self.addCleanup(lambda: setattr(os, "startfile", vrai) if vrai else delattr(os, "startfile"))
+        m._APPLIS.update(liste=[("ELDEN RING", "steam://rungameid/1245620", "jeu"),
+                                ("Discord", "C:/Menu/Discord.lnk", "appli")], quand=time.time())
+        envoyes, _ = self.mains([self.outil("lancer_appli", {"nom": "elden ring"}),
+                                 {"texte": "Bon courage.", "mode": "jarvis"}])
+        self.phrase("Jarvis, lance Elden Ring")
+        self.assertEqual(lances, ["steam://rungameid/1245620"])
+        self.assertNotIn("Code d'accès ?", self.dit, "lancer une appli ne demande pas de code")
+        self.assertIn("Steam", envoyes[1]["resultats"][0]["texte"])
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        self.assertIn("Aucune appli", ex("lancer_appli", {"nom": "photoshop"})["erreur"])
+        self.assertIn("pas connecte", ex("spotify_jouer", {"recherche": "get lucky"})["erreur"])
+        self.assertFalse(envoyes[0]["spotify"])
+        m.CFG.update(spotify_client_id="CID", spotify_refresh="R1")
+        self.assertTrue(m.capacites_jarvis(m.CFG)["spotify"])
+        m.CFG["jarvis_pc"] = False
+        self.assertFalse(m.capacites_jarvis(m.CFG)["spotify"], "sans les mains, pas de Spotify")
+        self.assertIn("fermees", ex("son", {"action": "couper"})["erreur"])
 
     def test_presque_reconnu_et_le_micro_de_l_apprentissage(self):
         m = self.m

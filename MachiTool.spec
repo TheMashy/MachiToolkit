@@ -35,8 +35,11 @@ hiddenimports += ['jarvis', 'winsound', 'pythoncom', 'win32com.client']
 # (preprocessors/data/nemo128.onnx pour Parakeet) — des DONNEES, que
 # PyInstaller ne voit pas seul. Sans elles, l'exe compile et la dictee plante
 # a la premiere phrase.
+# Le son de chaque appli (« baisse Discord ») : pycaw, sur comtypes. Et
+# win32con pour les fenetres de Jarvis.
+hiddenimports += ['win32con']
 for paquet in ('bleak', 'winrt', 'mss', 'soundcard', 'cffi', 'numpy',
-               'onnxruntime', 'onnx_asr'):
+               'onnxruntime', 'onnx_asr', 'pycaw', 'comtypes'):
     try:
         d, b, h = collect_all(paquet)
     except Exception as e:

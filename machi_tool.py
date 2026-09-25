@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.37.0"
+VERSION = "1.38.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -359,6 +359,10 @@ CONFIG_DEFAUT = {
     # L'HISTORIQUE DU NAVIGATEUR, pour retrouver une video ou un lien : lu sur
     # le poste a la demande ; seules les pages qui correspondent partent.
     "jarvis_historique": False,
+    # SPOTIFY, par l'API officielle : le Client ID d'une app developpeur de la
+    # personne, et le jeton de renouvellement que Spotify donne a la connexion.
+    "spotify_client_id": "",
+    "spotify_refresh": "",
     "jarvis_code_sel": "",
     "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
     "jarvis_voix_kokoro": "jarvis",   # sa voix anglaise, voir VOIX_KOKORO dans jarvis.py
@@ -5779,7 +5783,9 @@ def parler_au_compagnon(texte, cfg):
 # ni transcrite dans un journal, ni envoyee, ni ecrite nulle part. Juste, les
 # mains restent ouvertes dix minutes ; trois faux, elles se ferment cinq.
 
-OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier"}
+OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
+                    "lancer_appli", "fenetre", "son", "pc", "youtube",
+                    "spotify_jouer", "spotify_en_cours", "spotify_aimer"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -5905,6 +5911,387 @@ def ouvrir_dans_chrome(url):
     return "le navigateur"
 
 
+# --- APPLIS ET JEUX ----------------------------------------------------
+# « Lance Discord », « lance Elden Ring » : le menu Demarrer (les raccourcis
+# qu'on y voit) et les jeux Steam installes. Relus toutes les cinq minutes.
+
+_APPLIS = {"liste": [], "quand": 0.0}
+
+
+def racine_steam():
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
+                p = winreg.QueryValueEx(k, "SteamPath")[0]
+                if p and os.path.isdir(p):
+                    return os.path.normpath(p)
+        except Exception:
+            pass
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        p = os.path.join(base or "", "Steam")
+        if base and os.path.isdir(p):
+            return p
+    return None
+
+
+def applis_installees(frais=False):
+    if frais or not _APPLIS["liste"] or time.time() - _APPLIS["quand"] > 300:
+        menus = [os.path.join(os.environ[v], "Microsoft", "Windows", "Start Menu", "Programs")
+                 for v in ("APPDATA", "ProgramData") if os.environ.get(v)]
+        _APPLIS["liste"] = _jv.jeux_steam(racine_steam()) + _jv.raccourcis_menu(menus)
+        _APPLIS["quand"] = time.time()
+    return _APPLIS["liste"]
+
+
+def lancer_appli(nom):
+    trouves = _jv.choisir(nom, applis_installees())
+    if not trouves:
+        trouves = _jv.choisir(nom, applis_installees(frais=True))
+    if not trouves:
+        raise LookupError("Aucune appli ni aucun jeu installe ne s'appelle « %s »." % nom)
+    if len({c for _, c, _ in trouves}) > 1:
+        return "Plusieurs correspondent, lequel ? " + " ; ".join(n for n, _, _ in trouves[:6])
+    n, cible, genre = trouves[0]
+    os.startfile(cible)
+    return ("Jeu lance par Steam : %s." if genre == "jeu" else "Lance : %s.") % n
+
+
+# --- FENETRES ----------------------------------------------------------
+# Par les fonctions de Windows (ShowWindow, SetForegroundWindow, WM_CLOSE) :
+# rien n'est clique ni tape. « Fermer » demande poliment : l'appli peut
+# proposer d'enregistrer.
+
+def fenetres_ouvertes():
+    """[(hwnd, titre, processus)] des fenetres visibles de la barre des taches."""
+    import ctypes
+    import win32gui
+    import win32process
+    import psutil
+    dwm = ctypes.WinDLL("dwmapi")
+    out = []
+
+    def voir(h, _):
+        if not win32gui.IsWindowVisible(h) or win32gui.GetWindow(h, 4):     # GW_OWNER
+            return True
+        titre = win32gui.GetWindowText(h)
+        if not titre or titre in ("Program Manager", "Machi Tool"):
+            return True
+        cache = ctypes.c_int(0)
+        dwm.DwmGetWindowAttribute(h, 14, ctypes.byref(cache), ctypes.sizeof(cache))   # DWMWA_CLOAKED
+        if cache.value:
+            return True
+        try:
+            proc = psutil.Process(win32process.GetWindowThreadProcessId(h)[1]).name()
+        except Exception:
+            proc = ""
+        out.append((h, titre, proc))
+        return True
+    win32gui.EnumWindows(voir, None)
+    return out
+
+
+def agir_fenetre(action, cible="", tout=False):
+    import win32gui
+    import win32con
+    fen = fenetres_ouvertes()
+    if action == "lister":
+        if not fen:
+            return "Aucune fenetre ouverte."
+        return "%d fenetres : %s" % (len(fen), " ; ".join("%s (%s)" % (t[:80], p.replace(".exe", ""))
+                                                         for _, t, p in fen[:25]))
+    if tout and action == "reduire":
+        for h, _, _ in fen:
+            win32gui.ShowWindow(h, win32con.SW_MINIMIZE)
+        return "Toutes les fenetres sont reduites."
+    trouves = _jv.choisir(cible, fen, nom=lambda f: f[1] + " " + f[2].replace(".exe", ""), seuil=40)
+    if not trouves:
+        raise LookupError("Aucune fenetre ouverte ne correspond a « %s »." % cible)
+    h, titre, _ = trouves[0]
+    if action == "premier_plan":
+        if win32gui.IsIconic(h):
+            win32gui.ShowWindow(h, win32con.SW_RESTORE)
+        try:
+            win32gui.SetForegroundWindow(h)
+        except Exception:
+            # Windows refuse parfois de donner le premier plan a qui ne l'a pas :
+            # reduire puis restaurer, c'est l'y mettre sans rien simuler.
+            win32gui.ShowWindow(h, win32con.SW_MINIMIZE)
+            win32gui.ShowWindow(h, win32con.SW_RESTORE)
+        return "Au premier plan : %s." % titre
+    geste = {"reduire": win32con.SW_MINIMIZE, "agrandir": win32con.SW_MAXIMIZE,
+             "restaurer": win32con.SW_RESTORE}.get(action)
+    if geste is not None:
+        win32gui.ShowWindow(h, geste)
+        return {"reduire": "Reduite", "agrandir": "Agrandie", "restaurer": "Restauree"}[action] + " : %s." % titre
+    if action == "fermer":
+        win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+        return "Fermeture demandee : %s (elle peut proposer d'enregistrer)." % titre
+    raise ValueError("action inconnue : %s" % action)
+
+
+# --- LE SON ------------------------------------------------------------
+# Le volume general, ou celui d'une appli (« baisse Discord ») : le melangeur
+# de Windows, par pycaw.
+
+def _volume_general():
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    haut_parleurs = AudioUtilities.GetSpeakers()
+    ev = getattr(haut_parleurs, "EndpointVolume", None)
+    if ev is not None:
+        return ev
+    from comtypes import CLSCTX_ALL
+    from ctypes import cast, POINTER
+    return cast(haut_parleurs.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None), POINTER(IAudioEndpointVolume))
+
+
+def regler_son(action, appli="", niveau=None):
+    if os.name != "nt":
+        raise OSError("le volume ne se regle que sous Windows")
+    if not appli:
+        v = _volume_general()
+        if action in ("couper", "remettre"):
+            v.SetMute(1 if action == "couper" else 0, None)
+            return "Son coupe." if action == "couper" else "Son remis."
+        n = _jv.nouveau_niveau(v.GetMasterVolumeLevelScalar() * 100, action, niveau)
+        v.SetMasterVolumeLevelScalar(n / 100.0, None)
+        v.SetMute(0, None)
+        return "Volume a %d %%." % n
+    from pycaw.pycaw import AudioUtilities
+    sessions = [s for s in AudioUtilities.GetAllSessions() if s.Process]
+    trouves = _jv.choisir(appli, sessions, nom=lambda s: s.Process.name().replace(".exe", ""), seuil=40)
+    if not trouves:
+        ouvertes = sorted({s.Process.name().replace(".exe", "") for s in sessions})
+        raise LookupError("Aucune appli qui fait du son ne s'appelle « %s » (en ce moment : %s)."
+                          % (appli, ", ".join(ouvertes) or "aucune"))
+    nom = trouves[0].Process.name().replace(".exe", "")
+    for s in trouves:
+        vol = s.SimpleAudioVolume
+        if action in ("couper", "remettre"):
+            vol.SetMute(1 if action == "couper" else 0, None)
+        else:
+            n = _jv.nouveau_niveau(vol.GetMasterVolume() * 100, action, niveau)
+            vol.SetMasterVolume(n / 100.0, None)
+            vol.SetMute(0, None)
+    if action in ("couper", "remettre"):
+        return ("Son de %s coupe." if action == "couper" else "Son de %s remis.") % nom
+    return "Volume de %s a %d %%." % (nom, n)
+
+
+# --- LE PC : VERROUILLER, VEILLE, LUMINOSITE ----------------------------
+
+def verrouiller_pc():
+    import ctypes
+    ctypes.WinDLL("user32").LockWorkStation()
+    return "PC verrouille."
+
+
+def mettre_en_veille(delai=8.0):
+    """Dans quelques secondes : le temps que Jarvis dise au revoir."""
+    import ctypes
+
+    def dormir():
+        ctypes.WinDLL("powrprof").SetSuspendState(False, False, False)
+    threading.Timer(delai, dormir).start()
+    return "Mise en veille dans %d secondes." % int(delai)
+
+
+def _dxva2():
+    """dxva2, avec ses types : sans eux, ctypes passerait les handles en entier
+    32 bits, et un handle 64 bits serait tronque."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITEUR(ctypes.Structure):
+        _fields_ = [("h", wintypes.HANDLE), ("nom", wintypes.WCHAR * 128)]
+    d = ctypes.WinDLL("dxva2")
+    P = ctypes.POINTER
+    d.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HMONITOR, P(wintypes.DWORD)]
+    d.GetPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HMONITOR, wintypes.DWORD, P(MONITEUR)]
+    d.GetMonitorBrightness.argtypes = [wintypes.HANDLE, P(wintypes.DWORD), P(wintypes.DWORD), P(wintypes.DWORD)]
+    d.SetMonitorBrightness.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    d.DestroyPhysicalMonitors.argtypes = [wintypes.DWORD, P(MONITEUR)]
+    return d, MONITEUR
+
+
+def luminosites():
+    """Les ecrans qui se reglent par le cable (DDC/CI) : ([(handle physique,
+    mini, actuel, maxi)], tableaux a rendre a DestroyPhysicalMonitors)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32")
+    dxva2, MONITEUR = _dxva2()
+    hmons = []
+    Rappel = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                                ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    rappel = Rappel(lambda hm, hdc, r, lp: hmons.append(hm) or True)
+    user32.EnumDisplayMonitors(None, None, rappel, 0)
+    ecrans, tableaux = [], []
+    for hm in hmons:
+        n = wintypes.DWORD()
+        if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hm, ctypes.byref(n)) or not n.value:
+            continue
+        tab = (MONITEUR * n.value)()
+        if not dxva2.GetPhysicalMonitorsFromHMONITOR(hm, n.value, tab):
+            continue
+        tableaux.append((n.value, tab))
+        for m in tab:
+            mini, cour, maxi = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
+            if dxva2.GetMonitorBrightness(m.h, ctypes.byref(mini), ctypes.byref(cour), ctypes.byref(maxi)):
+                ecrans.append((m.h, mini.value, cour.value, maxi.value))
+    return ecrans, tableaux
+
+
+def regler_luminosite(action, niveau=None):
+    """Tous les ecrans : par le cable (DDC/CI) pour les ecrans externes, par
+    Windows (WMI) pour celui d'un portable."""
+    if os.name != "nt":
+        raise OSError("la luminosite ne se regle que sous Windows")
+    dxva2, _ = _dxva2()
+    ecrans, tableaux = luminosites()
+    faits = []
+    try:
+        for h, mini, cour, maxi in ecrans:
+            pct = 100.0 * (cour - mini) / max(1, maxi - mini)
+            n = _jv.nouveau_niveau(pct, action, niveau)
+            if dxva2.SetMonitorBrightness(h, int(round(mini + (maxi - mini) * n / 100.0))):
+                faits.append(n)
+    finally:
+        for n, tab in tableaux:
+            dxva2.DestroyPhysicalMonitors(n, tab)
+    if faits:
+        return "Luminosite a %d %% (%d ecran%s)." % (faits[0], len(faits), "s" if len(faits) > 1 else "")
+    if action != "regler":
+        raise OSError("Aucun ecran ne dit sa luminosite : donne un niveau precis, par exemple 50 %.")
+    r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods) | "
+                        "Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{Timeout=1;Brightness=%d}"
+                        % _jv.nouveau_niveau(0, "regler", niveau)],
+                       capture_output=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode != 0:
+        raise OSError("Ces ecrans ne se reglent pas depuis Windows (DDC/CI coupe dans le menu de l'ecran ?).")
+    return "Luminosite a %d %%." % _jv.nouveau_niveau(0, "regler", niveau)
+
+
+# --- YOUTUBE -----------------------------------------------------------
+
+def ouvrir_youtube(recherche):
+    """La premiere video pour cette recherche, ouverte dans Chrome : elle se
+    lance toute seule. A defaut, la page des resultats."""
+    q = " ".join(str(recherche or "").split())[:200]
+    if not q:
+        raise ValueError("rien a chercher")
+    resultats = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+    video = None
+    try:
+        req = urllib.request.Request(resultats, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/126.0 Safari/537.36",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8", "Cookie": "SOCS=CAI; CONSENT=YES+"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            video = _jv.premiere_video_youtube(r.read(3_000_000).decode("utf-8", "replace"))
+    except Exception:
+        video = None
+    if video:
+        ou = ouvrir_dans_chrome("https://www.youtube.com/watch?v=" + video[0])
+        return "Video ouverte dans %s : « %s »." % (ou, video[1] or q)
+    ou = ouvrir_dans_chrome(resultats)
+    return "Resultats YouTube ouverts dans %s (la video n'a pas pu etre choisie seule)." % ou
+
+
+# --- SPOTIFY -----------------------------------------------------------
+
+_SPOTIFY = {"client": None, "cle": None, "connexion": None}
+
+
+def spotify_connecte(cfg):
+    return bool(str(cfg.get("spotify_client_id") or "").strip() and cfg.get("spotify_refresh"))
+
+
+def spotify_de(cfg):
+    cle = (str(cfg.get("spotify_client_id") or "").strip(), cfg.get("spotify_refresh"))
+    if _SPOTIFY["cle"] != cle or _SPOTIFY["client"] is None:
+        def sauver(refresh):
+            cfg["spotify_refresh"] = refresh
+            _SPOTIFY["cle"] = (cle[0], refresh)
+            sauver_config(cfg)
+        _SPOTIFY["client"], _SPOTIFY["cle"] = _jv.Spotify(cle[0], cle[1], sauver=sauver), cle
+    return _SPOTIFY["client"]
+
+
+def ouvrir_appli_spotify():
+    try:
+        os.startfile("spotify:")
+    except Exception:
+        pass
+
+
+def connecter_spotify(cfg, rappel=None, delai=180):
+    """Ouvre la page de connexion de Spotify dans le navigateur et attend son
+    retour sur 127.0.0.1:8765, une fois. `rappel(message)` dit ou on en est."""
+    import http.server
+    client_id = str(cfg.get("spotify_client_id") or "").strip()
+    if not client_id:
+        raise ValueError("Colle d'abord le Client ID de ton app Spotify.")
+    verif, defi = _jv.pkce_paire()
+    etat = os.urandom(12).hex()
+    fini = threading.Event()
+    rappel = rappel or (lambda m: None)
+
+    class Retour(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            q = dict(urllib.parse.parse_qsl(u.query))
+            if u.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            ok, message = False, "Spotify n'a pas ete connecte."
+            if q.get("state") != etat:
+                message = "Reponse inattendue : recommence depuis Machi Tool."
+            elif q.get("error"):
+                message = "Connexion refusee sur Spotify (%s)." % q["error"]
+            else:
+                try:
+                    r = _jv.Spotify.echanger_code(client_id, q.get("code", ""), verif)
+                    cfg["spotify_refresh"] = r["refresh_token"]
+                    sauver_config(cfg)
+                    _SPOTIFY["client"] = None
+                    ok, message = True, "Spotify est connecte a Machi Tool. Tu peux fermer cet onglet."
+                except Exception as e:
+                    message = str(e)
+            corps = ("<!doctype html><meta charset=utf-8><title>Machi Tool</title>"
+                     "<body style='font:16px system-ui;padding:40px'>%s</body>" % message).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(corps)
+            rappel(message)
+            if ok or q.get("error"):
+                fini.set()
+
+    serveur = http.server.HTTPServer(("127.0.0.1", _jv.SPOTIFY_PORT), Retour)
+    serveur.timeout = 1.0
+
+    def servir():
+        limite = time.time() + delai
+        try:
+            while not fini.is_set() and time.time() < limite:
+                serveur.handle_request()
+            if not fini.is_set():
+                rappel("Pas de retour de Spotify : recommence.")
+        finally:
+            serveur.server_close()
+            _SPOTIFY["connexion"] = None
+    _SPOTIFY["connexion"] = threading.Thread(target=servir, daemon=True)
+    _SPOTIFY["connexion"].start()
+    ouvrir_dans_chrome(_jv.spotify_url_autorisation(client_id, defi, etat))
+    rappel("Connecte-toi a Spotify dans le navigateur...")
+
+
 def capturer_ecran(numero):
     """UNE capture de l'ecran 1 ou 2, en memoire, reduite (1280 px de large au
     plus) et en JPEG : rendue en base64 pour Jarvis, jamais ecrite sur le
@@ -5956,6 +6343,38 @@ def executer_outil(outil, cfg):
                     return {"id": ident, "erreur": "Le presse-papiers n'a pas pu etre rempli."}
                 return {"id": ident, "texte": "Lien copie dans le presse-papiers."}
             return {"id": ident, "texte": "Ouvert dans %s." % ouvrir_dans_chrome(url)}
+        if nom == "lancer_appli":
+            return {"id": ident, "texte": lancer_appli(e.get("nom"))}
+        if nom == "fenetre":
+            return {"id": ident, "texte": agir_fenetre(e.get("action") or "lister", e.get("cible") or "",
+                                                       bool(e.get("tout")))}
+        if nom == "son":
+            return {"id": ident, "texte": regler_son(e.get("action"), e.get("appli") or "", e.get("niveau"))}
+        if nom == "pc":
+            a = e.get("action")
+            if a == "verrouiller":
+                return {"id": ident, "texte": verrouiller_pc()}
+            if a == "veille":
+                return {"id": ident, "texte": mettre_en_veille()}
+            if a == "luminosite":
+                return {"id": ident, "texte": regler_luminosite(e.get("sens") or "regler", e.get("niveau"))}
+            return {"id": ident, "erreur": "action inconnue : %s" % a}
+        if nom == "youtube":
+            return {"id": ident, "texte": ouvrir_youtube(e.get("recherche"))}
+        if nom.startswith("spotify_"):
+            if not spotify_connecte(cfg):
+                return {"id": ident, "erreur": "Spotify n'est pas connecte a Machi Tool (Reglages > Jarvis > Spotify)."}
+            sp = spotify_de(cfg)
+            if nom == "spotify_jouer":
+                return {"id": ident, "texte": sp.jouer(e.get("recherche"), e.get("genre") or "titre",
+                                                       bool(e.get("file")), ouvrir_appli_spotify)}
+            if nom == "spotify_en_cours":
+                c = sp.en_cours()
+                return {"id": ident, "texte": ("%s : « %s » de %s." % ("En lecture" if c["lecture"] else "En pause",
+                                                                       c["titre"], c["artistes"])) if c
+                        else "Rien ne joue sur Spotify."}
+            if nom == "spotify_aimer":
+                return {"id": ident, "texte": sp.aimer()}
         if nom == "chercher_historique":
             if not cfg.get("jarvis_historique"):
                 return {"id": ident, "erreur": "L'historique du navigateur n'est pas permis dans Machi Tool."}
@@ -6043,6 +6462,7 @@ def capacites_jarvis(cfg):
     pc = bool(cfg.get("jarvis_pc"))
     return {"outils": pc, "ecran": pc and bool(cfg.get("jarvis_ecran")),
             "navigation": pc and bool(cfg.get("jarvis_historique")),
+            "spotify": pc and spotify_connecte(cfg),
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
 
@@ -8884,8 +9304,10 @@ class Panneau:
         self.separateur(f, 12, 8)
         self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
         self.texte(f, "Ouvert, Jarvis peut piloter la musique (lecture, pause, piste suivante, volume), "
-                      "ouvrir Spotify sur une recherche, ouvrir une recherche Google ou un lien dans "
-                      "Chrome, parcourir tes dossiers, chercher un fichier, "
+                      "ouvrir Spotify sur une recherche, ouvrir une recherche Google, un lien ou une "
+                      "video YouTube dans Chrome, lancer une appli ou un jeu Steam, gerer les fenetres "
+                      "(premier plan, reduire, agrandir, fermer), regler le son (general ou d'une appli) "
+                      "et la luminosite, verrouiller le PC ou le mettre en veille, parcourir tes dossiers, chercher un fichier, "
                       "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
                       "deplacer, ni renommer. Il agit directement, sans code : quiconque l'appelle dans "
                       "la piece peut lui demander tes dossiers. Si tu preferes, coche le code d'acces "
@@ -8919,6 +9341,25 @@ class Panneau:
         self.txt_code = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_code.pack(fill="x", pady=(4, 0))
         self.afficher_code()
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "spotify").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Pour qu'il lance exactement le titre, l'album ou la playlist demande (« mets ma "
+                      "playlist Sport », « ajoute Get Lucky a la file », « like ce titre »). Il faut "
+                      "Spotify Premium. Une fois : sur developer.spotify.com/dashboard, « Create app », "
+                      "Redirect URI : http://127.0.0.1:%d/callback, coche « Web API », enregistre ; "
+                      "copie le Client ID ici, puis « Connecter ». Le jeton de Spotify reste sur ce PC. "
+                      "Sans Spotify connecte, il passe par YouTube." % _jv.SPOTIFY_PORT,
+                   BRUME, 8, largeur=500).pack(fill="x")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.texte(ligne, "Client ID", CRAIE, 9).pack(side="left")
+        self.champ_spotify = self.champ(ligne, self.cfg.get("spotify_client_id", ""), 34)
+        self.champ_spotify.pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Connecter", self.connecter_spotify, compact=True).pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Deconnecter", self.deconnecter_spotify, compact=True).pack(side="left", padx=(8, 0))
+        self.txt_spotify = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_spotify.pack(fill="x", pady=(4, 0))
 
         self.separateur(f, 12, 8)
         self.titre(f, "ce qu'il retient de toi").pack(fill="x", pady=(0, 4))
@@ -9009,6 +9450,20 @@ class Panneau:
         oublier_voix()
         JARVIS["apprentissage"] = {"n": 0, "total": 4, "fini": True,
                                    "message": "Oublie. Seul « Hey Jarvis » le reveille."}
+
+    def connecter_spotify(self):
+        self.cfg["spotify_client_id"] = self.champ_spotify.get().strip()
+        sauver_config(self.cfg)
+        try:
+            connecter_spotify(self.cfg, rappel=lambda m: JARVIS.__setitem__("spotify_message", m))
+        except Exception as e:
+            JARVIS["spotify_message"] = str(e)
+
+    def deconnecter_spotify(self):
+        self.cfg["spotify_refresh"] = ""
+        sauver_config(self.cfg)
+        _SPOTIFY["client"] = None
+        JARVIS["spotify_message"] = "Deconnecte."
 
     def remplir_preferences(self):
         """Une ligne par preference, avec son bouton « Oublier » ; relue a
@@ -9138,6 +9593,12 @@ class Panneau:
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)
         details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
+        if hasattr(self, "txt_spotify"):
+            etat_sp = ("Connecte." if spotify_connecte(self.cfg) else "Pas connecte.")
+            if JARVIS.get("spotify_message"):
+                etat_sp += "  " + JARVIS["spotify_message"]
+            if self.txt_spotify.cget("text") != etat_sp:
+                self.txt_spotify.configure(text=etat_sp)
         prefs = tuple(self.cfg.get("jarvis_preferences") or [])
         if getattr(self, "_prefs_peintes", None) != prefs and hasattr(self, "boite_preferences"):
             self._prefs_peintes = prefs          # Jarvis vient d'en retenir ou d'en oublier une

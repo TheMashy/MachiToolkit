@@ -2790,3 +2790,340 @@ def adresse_google(recherche):
     if not q:
         raise ValueError("rien a chercher")
     return "https://www.google.com/search?q=" + quote_plus(q)
+
+
+# ======================================================================
+#   LE PC EN ENTIER : APPLIS, JEUX, FENETRES, SON, YOUTUBE, SPOTIFY
+# ======================================================================
+#
+# « J'aimerais avoir un compagnon qui peut interagir le plus possible avec
+# mon PC. » Sans souris ni clavier simules : par Windows et par les
+# applications elles-memes. Ici, ce qui se teste sans Windows ; les appels au
+# systeme sont dans machi_tool.py.
+
+_MOTS_APPLI_VIDES = _MOTS_VIDES | frozenset("jeu jeux appli application logiciel programme app game".split())
+_RACCOURCIS_IGNORES = re.compile(
+    r"uninstall|d[eé]sinstall|readme|lisez|help|aide|manual|manuel|license|licence|website|site web|"
+    r"release notes|documentation|support|report a bug", re.I)
+_STEAM_IGNORES = re.compile(r"redistributable|steamworks|proton|steam linux runtime|directx|vcredist", re.I)
+
+
+def _chaines_vdf(texte):
+    """Les paires « "cle" "valeur" » d'un fichier Valve (acf, vdf), dans l'ordre."""
+    return [(k.lower(), v.replace("\\\\", "\\"))
+            for k, v in re.findall(r'"([^"]+)"\s+"((?:[^"\\]|\\.)*)"', texte)]
+
+
+def jeux_steam(racine):
+    """[(nom, "steam://rungameid/ID", "jeu")] pour chaque jeu installe, dans
+    toutes les bibliotheques Steam."""
+    if not racine or not os.path.isdir(racine):
+        return []
+    biblis = [racine]
+    try:
+        with open(os.path.join(racine, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+            biblis += [v for k, v in _chaines_vdf(f.read()) if k == "path"]
+    except OSError:
+        pass
+    vus, jeux = set(), []
+    for b in biblis:
+        dossier = os.path.join(b, "steamapps")
+        if os.path.normcase(os.path.abspath(dossier)) in vus or not os.path.isdir(dossier):
+            continue
+        vus.add(os.path.normcase(os.path.abspath(dossier)))
+        for f in sorted(os.listdir(dossier)):
+            if not (f.startswith("appmanifest_") and f.endswith(".acf")):
+                continue
+            try:
+                with open(os.path.join(dossier, f), encoding="utf-8", errors="replace") as fh:
+                    paires = dict(_chaines_vdf(fh.read()))
+            except OSError:
+                continue
+            nom, ident = paires.get("name", ""), paires.get("appid", "")
+            if nom and ident.isdigit() and not _STEAM_IGNORES.search(nom):
+                jeux.append((nom, "steam://rungameid/" + ident, "jeu"))
+    return jeux
+
+
+def raccourcis_menu(dossiers):
+    """[(nom, chemin du raccourci, "appli")] du menu Demarrer, sans les
+    desinstalleurs ni les « lisez-moi »."""
+    out, vus = [], set()
+    for d in dossiers:
+        if not d or not os.path.isdir(d):
+            continue
+        for racine, _, fichiers in os.walk(d):
+            for f in sorted(fichiers):
+                base, ext = os.path.splitext(f)
+                if ext.lower() not in (".lnk", ".url") or _RACCOURCIS_IGNORES.search(base):
+                    continue
+                if normaliser(base) in vus:
+                    continue
+                vus.add(normaliser(base))
+                out.append((base, os.path.join(racine, f), "appli"))
+    return out
+
+
+def _mots_appli(texte):
+    return [m for m in re.sub(r"['_-]", " ", normaliser(texte)).split() if m not in _MOTS_APPLI_VIDES]
+
+
+def score_nom(demande, nom):
+    """0 a 100 : a quel point `nom` est ce qu'on a demande."""
+    d, n = " ".join(_mots_appli(demande)), " ".join(_mots_appli(nom))
+    if not d or not n:
+        return 0
+    if d == n:
+        return 100
+    if len(d) >= 3 and (" " + d + " ") in (" " + n + " "):
+        return 90 - min(20, len(n) - len(d))
+    if len(d) >= 4 and d in n.replace(" ", ""):
+        return 75 - min(20, len(n) - len(d))
+    md, mn = set(d.split()), set(n.split())
+    commun = len(md & mn)
+    return int(60 * commun / len(md)) if commun else 0
+
+
+def choisir(demande, elements, nom=lambda e: e[0], seuil=45):
+    """Les elements qui correspondent le mieux (ex aequo compris), ou []."""
+    notes = [(score_nom(demande, nom(e)), e) for e in elements]
+    meilleur = max((s for s, _ in notes), default=0)
+    if meilleur < seuil:
+        return []
+    return [e for s, e in notes if s == meilleur]
+
+
+def nouveau_niveau(actuel, action, niveau=None, pas=10):
+    """Le volume (ou la luminosite) apres « regler », « monter », « baisser »,
+    de 0 a 100."""
+    actuel = float(actuel)
+    if action == "regler":
+        if niveau is None:
+            raise ValueError("quel niveau ?")
+        v = float(niveau)
+    elif action == "monter":
+        v = actuel + (float(niveau) if niveau else pas)
+    elif action == "baisser":
+        v = actuel - (float(niveau) if niveau else pas)
+    else:
+        raise ValueError("action inconnue : %s" % action)
+    return int(round(max(0.0, min(100.0, v))))
+
+
+def premiere_video_youtube(html):
+    """(identifiant, titre) de la premiere video d'une page de resultats
+    YouTube -- pas une publicite, pas une chaine. None sinon."""
+    m = re.search(r'"videoRenderer":\{"videoId":"([A-Za-z0-9_-]{11})"', html or "")
+    if not m:
+        return None
+    titre = ""
+    t = re.search(r'"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"', html[m.end():m.end() + 6000])
+    if t:
+        try:
+            titre = json.loads('"' + t.group(1) + '"')
+        except ValueError:
+            titre = t.group(1)
+    return m.group(1), titre
+
+
+# --------------------------- SPOTIFY -----------------------------------
+#
+# L'API officielle, avec le compte de la personne : elle cree une app
+# developpeur Spotify (gratuite), colle son Client ID dans Machi Tool, et se
+# connecte une fois (PKCE : pas de secret a garder). Le jeton de
+# renouvellement reste dans la config, sur le PC. Lancer la lecture demande
+# Spotify Premium -- c'est une regle de Spotify.
+
+SPOTIFY_PORT = 8765
+SPOTIFY_RETOUR = "http://127.0.0.1:%d/callback" % SPOTIFY_PORT
+SPOTIFY_PORTEES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
+                   "user-library-modify user-library-read playlist-read-private")
+_SPOTIFY_API = "https://api.spotify.com/v1"
+_SPOTIFY_COMPTES = "https://accounts.spotify.com"
+
+
+def _b64url(octets):
+    return base64.urlsafe_b64encode(octets).rstrip(b"=").decode("ascii")
+
+
+def pkce_paire():
+    """(verificateur, defi) : le defi part avec l'autorisation, le
+    verificateur avec l'echange du code."""
+    verif = _b64url(os.urandom(64))
+    return verif, _b64url(hashlib.sha256(verif.encode("ascii")).digest())
+
+
+def spotify_url_autorisation(client_id, defi, etat):
+    from urllib.parse import urlencode
+    return _SPOTIFY_COMPTES + "/authorize?" + urlencode({
+        "client_id": client_id, "response_type": "code", "redirect_uri": SPOTIFY_RETOUR,
+        "code_challenge_method": "S256", "code_challenge": defi, "scope": SPOTIFY_PORTEES, "state": etat})
+
+
+def http_json(methode, url, entetes=None, corps=None, delai=10):
+    """(statut, reponse JSON ou None). `corps` : un dict (JSON) ou des octets."""
+    import urllib.request
+    import urllib.error
+    donnees = None
+    entetes = dict(entetes or {})
+    if isinstance(corps, dict):
+        donnees = json.dumps(corps).encode("utf-8")
+        entetes.setdefault("Content-Type", "application/json")
+    elif corps is not None:
+        donnees = corps
+    req = urllib.request.Request(url, data=donnees, headers=entetes, method=methode)
+    try:
+        with urllib.request.urlopen(req, timeout=delai) as r:
+            brut = r.read()
+            statut = r.status
+    except urllib.error.HTTPError as e:
+        brut, statut = e.read(), e.code
+    try:
+        return statut, (json.loads(brut.decode("utf-8")) if brut else None)
+    except ValueError:
+        return statut, None
+
+
+class ErreurSpotify(Exception):
+    pass
+
+
+class Spotify:
+    """Le compte Spotify de la personne, par l'API Web. `http` et `dormir` se
+    remplacent dans les tests ; `sauver(refresh)` garde un nouveau jeton de
+    renouvellement quand Spotify en donne un."""
+
+    def __init__(self, client_id, refresh, http=http_json, sauver=None, dormir=time.sleep):
+        self.client_id, self.refresh = client_id, refresh
+        self.http, self.sauver, self.dormir = http, sauver, dormir
+        self.acces, self.expire = None, 0.0
+
+    @staticmethod
+    def echanger_code(client_id, code, verif, http=http_json):
+        from urllib.parse import urlencode
+        statut, r = http("POST", _SPOTIFY_COMPTES + "/api/token",
+                         {"Content-Type": "application/x-www-form-urlencoded"},
+                         urlencode({"grant_type": "authorization_code", "code": code,
+                                    "redirect_uri": SPOTIFY_RETOUR, "client_id": client_id,
+                                    "code_verifier": verif}).encode("ascii"))
+        if statut != 200 or not (r or {}).get("refresh_token"):
+            raise ErreurSpotify("Spotify a refuse la connexion (%s)." % ((r or {}).get("error_description")
+                                                                       or (r or {}).get("error") or statut))
+        return r
+
+    def jeton(self):
+        if self.acces and time.time() < self.expire - 60:
+            return self.acces
+        from urllib.parse import urlencode
+        statut, r = self.http("POST", _SPOTIFY_COMPTES + "/api/token",
+                              {"Content-Type": "application/x-www-form-urlencoded"},
+                              urlencode({"grant_type": "refresh_token", "refresh_token": self.refresh,
+                                         "client_id": self.client_id}).encode("ascii"))
+        if statut != 200 or not (r or {}).get("access_token"):
+            raise ErreurSpotify("La connexion a Spotify a expire : reconnecte-le dans Machi Tool "
+                                "(Reglages > Jarvis > Spotify).")
+        self.acces, self.expire = r["access_token"], time.time() + float(r.get("expires_in") or 3600)
+        if r.get("refresh_token") and r["refresh_token"] != self.refresh:
+            self.refresh = r["refresh_token"]
+            if self.sauver:
+                self.sauver(self.refresh)
+        return self.acces
+
+    def api(self, methode, chemin, params=None, corps=None):
+        from urllib.parse import urlencode
+        url = _SPOTIFY_API + chemin + ("?" + urlencode(params) if params else "")
+        for essai in (0, 1):
+            statut, r = self.http(methode, url, {"Authorization": "Bearer " + self.jeton()}, corps)
+            if statut == 401 and not essai:
+                self.acces = None
+                continue
+            return statut, r
+        return statut, r
+
+    def appareil(self):
+        statut, r = self.api("GET", "/me/player/devices")
+        appareils = [a for a in (r or {}).get("devices") or [] if a and not a.get("is_restricted")]
+        if not appareils:
+            return None
+        for cle in (lambda a: a.get("is_active"), lambda a: a.get("type") == "Computer", lambda a: True):
+            for a in appareils:
+                if cle(a):
+                    return a
+        return None
+
+    def attendre_appareil(self, ouvrir_appli=None, secondes=8):
+        a = self.appareil()
+        if a or not ouvrir_appli:
+            return a
+        ouvrir_appli()
+        for _ in range(int(secondes)):
+            self.dormir(1.0)
+            a = self.appareil()
+            if a:
+                return a
+        return None
+
+    def chercher(self, recherche, genre):
+        """(uri, nom a dire, est_un_contexte)."""
+        q = " ".join(str(recherche or "").split())
+        if not q:
+            raise ErreurSpotify("Que faut-il mettre ?")
+        if genre == "playlist":
+            statut, r = self.api("GET", "/me/playlists", {"limit": 50})
+            miennes = [p for p in (r or {}).get("items") or [] if p]
+            trouvees = choisir(q, miennes, nom=lambda p: p.get("name") or "")
+            if trouvees:
+                return trouvees[0]["uri"], "ta playlist « %s »" % trouvees[0]["name"], True
+        type_ = {"titre": "track", "album": "album", "artiste": "artist", "playlist": "playlist"}.get(genre, "track")
+        statut, r = self.api("GET", "/search", {"q": q, "type": type_, "limit": 5, "market": "from_token"})
+        items = [i for i in ((r or {}).get(type_ + "s") or {}).get("items") or [] if i]
+        if not items:
+            raise ErreurSpotify("Rien trouve sur Spotify pour « %s »." % q)
+        i = items[0]
+        if type_ == "track":
+            return i["uri"], "« %s » de %s" % (i.get("name"), ", ".join(a.get("name", "") for a in i.get("artists") or [])), False
+        if type_ == "album":
+            return i["uri"], "l'album « %s » de %s" % (i.get("name"), ", ".join(a.get("name", "") for a in i.get("artists") or [])), True
+        if type_ == "artist":
+            return i["uri"], i.get("name", ""), True
+        return i["uri"], "la playlist « %s »" % i.get("name"), True
+
+    def jouer(self, recherche, genre="titre", file=False, ouvrir_appli=None):
+        uri, dit, contexte = self.chercher(recherche, genre)
+        a = self.attendre_appareil(ouvrir_appli)
+        if not a:
+            raise ErreurSpotify("Spotify n'est ouvert nulle part : ouvre l'application, puis redemande.")
+        if file:
+            if contexte:
+                raise ErreurSpotify("On ne peut mettre dans la file qu'un titre, pas un album ni une playlist.")
+            statut, r = self.api("POST", "/me/player/queue", {"uri": uri, "device_id": a["id"]})
+            fait = "Ajoute a la file : %s." % dit
+        else:
+            statut, r = self.api("PUT", "/me/player/play", {"device_id": a["id"]},
+                                 {"context_uri": uri} if contexte else {"uris": [uri]})
+            fait = "Lecture : %s, sur %s." % (dit, a.get("name") or "Spotify")
+        if statut == 403:
+            raise ErreurSpotify("Spotify refuse : lancer la lecture a distance demande un compte Premium.")
+        if statut not in (200, 202, 204):
+            raise ErreurSpotify("Spotify a repondu %s." % (((r or {}).get("error") or {}).get("message") or statut))
+        return fait
+
+    def en_cours(self):
+        statut, r = self.api("GET", "/me/player/currently-playing")
+        item = (r or {}).get("item") if statut == 200 else None
+        if not item:
+            return None
+        artistes = ", ".join(a.get("name", "") for a in item.get("artists") or [])
+        return {"id": item.get("id"), "uri": item.get("uri"), "titre": item.get("name"),
+                "artistes": artistes, "lecture": bool((r or {}).get("is_playing"))}
+
+    def aimer(self):
+        c = self.en_cours()
+        if not c or not c.get("id"):
+            raise ErreurSpotify("Rien ne joue sur Spotify.")
+        statut, _ = self.api("PUT", "/me/tracks", {"ids": c["id"]})
+        if statut in (404, 410):
+            statut, _ = self.api("PUT", "/me/library", {"uris": c["uri"]})
+        if statut not in (200, 201, 204):
+            raise ErreurSpotify("Spotify n'a pas pu l'ajouter aux titres likes (%s)." % statut)
+        return "Ajoute a tes titres likes : « %s » de %s." % (c["titre"], c["artistes"])

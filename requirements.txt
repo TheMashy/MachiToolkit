@@ -8,6 +8,8 @@ mss
 numpy
 soundcard
 pywin32; sys_platform == "win32"
+# Jarvis regle le volume de chaque appli : le melangeur de Windows.
+pycaw; sys_platform == "win32"
 # La dictee locale (le moteur de Handy : Parakeet V3 en ONNX). Le modele,
 # lui, n'est pas dans l'exe : repris de Handy ou telecharge a la demande.
 onnxruntime
