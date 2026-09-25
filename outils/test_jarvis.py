@@ -579,6 +579,35 @@ class SesMains(unittest.TestCase):
             self.assertFalse(J.touche_a_l_alimentation(chemin, contenu), (chemin, contenu))
         self.assertFalse(J.touche_a_l_alimentation("C:\\Program Files\\Discord\\Discord.exe"))
 
+    def test_les_animations_de_lumiere(self):
+        e = J.etapes_propres([{"couleur": "#FF0000", "duree": 1, "effet": "fondu"},
+                              {"couleur": "#0000FF", "duree": 1, "effet": "clignote"},
+                              {"duree": 1, "effet": "arc_en_ciel"}, {"couleur": "n'importe", "duree": 1},
+                              {"couleur": "vert", "duree": 99, "luminosite": 7}])
+        self.assertEqual([x["effet"] for x in e], ["fondu", "clignote", "arc_en_ciel", "fixe"])
+        self.assertEqual((e[3]["duree"], e[3]["luminosite"]), (30.0, 1.0), "bornees")
+        r = lambda t: tuple(round(c) for c in J.couleur_animation(e, t))
+        self.assertEqual(r(0.0), (0, 0, 0), "le premier fondu part du noir")
+        self.assertEqual(r(0.5), (128, 0, 0))
+        self.assertEqual(r(1.0), (0, 0, 255))
+        self.assertEqual(r(1.3), (0, 0, 0), "clignote : eteint un quart de seconde sur deux")
+        self.assertEqual(r(2.0), (255, 0, 0), "l'arc-en-ciel commence au rouge")
+        self.assertIsNone(J.couleur_animation(e, 33.1))
+        self.assertIsNone(J.couleur_animation([], 0))
+        self.assertEqual(J.couleur_lue("#f80"), "#FF8800")
+        self.assertEqual(J.couleur_lue("eteint"), "#000000")
+        self.assertIsNone(J.couleur_lue("plaid"))
+        with self.assertRaises(ValueError):
+            J.routine_propre({"nom": "x", "declencheur": {"type": "evenement", "valeur": "anniversaire"},
+                              "etapes": [{"couleur": "rouge"}]})
+        with self.assertRaises(ValueError):
+            J.routine_propre({"nom": "x", "declencheur": {"type": "phrase", "valeur": "ok"}, "etapes": [{"couleur": "rouge"}]})
+        r0 = J.routine_propre({"nom": "Salut", "declencheur": {"type": "evenement", "valeur": "au revoir"},
+                               "etapes": [{"couleur": "rose"}], "chance": 3})
+        self.assertEqual((r0["declencheur"]["valeur"], r0["chance"]), ("au_revoir", 1.0))
+        liste = J.ranger_routine([], r0)
+        self.assertEqual(len(J.ranger_routine(liste, dict(r0, replique="Ciao"))), 1, "meme nom : remplacee")
+
     def test_poser_un_rappel_a_la_main(self):
         a = "2026-09-25"                                    # un vendredi
         for tape, attendu in (("", a), ("demain", "2026-09-26"), ("Après-demain", "2026-09-27"), ("+3", "2026-09-28"),
@@ -2791,12 +2820,115 @@ class DansMachiTool(unittest.TestCase):
         self.assertIsNone(m.couleur_jarvis(m.CFG, maintenant=time.time() + 2))
         self.assertIsNone(m.JARVIS["led"])
 
+    def test_jarvis_maitre_de_l_application(self):
+        # « Jarvis a tous les droits au niveau de l'application : il peut
+        # controler et rajouter des petites sous-routines de lumieres, avec des
+        # habitudes / running gags. »
+        m = self.m
+        vrais = (m.dire, m.transcrire)
+
+        def remettre():
+            m.dire, m.transcrire = vrais
+            m.ANIMATION["etapes"] = []
+            m.ROUTINES_VUES["dernieres"].clear()
+            m.ETAT["forcage"] = None
+            m.CFG["jarvis_actif"] = False
+        self.addCleanup(remettre)
+        m.CFG["jarvis_pc"] = False               # l'application, pas le PC : sans ses mains
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        self.assertIn("#FF7A00", ex("lumiere", {"action": "couleur", "couleur": "orange"})["texte"])
+        self.assertEqual(m.ETAT["forcage"]["couleur"], (255, 122, 0))
+        ex("lumiere", {"action": "normale"})
+        self.assertIsNone(m.ETAT["forcage"])
+        r = ex("lumiere", {"action": "animation", "etapes": [{"couleur": "rouge", "duree": 0.5, "effet": "clignote"},
+                                                            {"couleur": "bleu", "duree": 0.5, "effet": "fondu"}],
+                           "repetitions": 2})
+        self.assertIn("Animation lancee", r["texte"])
+        t0 = m.ANIMATION["t0"]
+        self.assertEqual(tuple(round(c) for c in m.couleur_de_l_animation(t0)), (255, 26, 26))
+        self.assertIsNone(m.couleur_de_l_animation(t0 + 2.1), "finie")
+        self.assertIn("erreur", ex("lumiere", {"action": "animation", "etapes": [{"couleur": "pas une couleur"}]}))
+        # une routine : habitude du soir, qui tient sa couleur
+        r = ex("routine_lumiere", {"action": "creer", "nom": "Bonne nuit",
+                                   "declencheur": {"type": "phrase", "valeur": "je vais me coucher"},
+                                   "etapes": [{"couleur": "ambre", "duree": 3, "effet": "fondu", "luminosite": 0.3}],
+                                   "tenir": True, "replique": "Je tamise, monsieur. Bonne nuit."})
+        self.assertIn("Routine gardee", r["texte"])
+        self.assertTrue(m.CFG["routines_lumiere"][0]["par_jarvis"])
+        self.assertIn("Bonne nuit", ex("routine_lumiere", {"action": "lister"})["texte"])
+        self.assertIn("erreur", ex("routine_lumiere", {"action": "creer", "nom": "x",
+                                                      "declencheur": {"type": "heure", "valeur": "27h"},
+                                                      "etapes": [{"couleur": "bleu"}]}))
+        dits = []
+        m.dire = lambda texte, **k: dits.append(texte)
+        m.transcrire = lambda o: "Bon, je vais me coucher"
+        m.traiter_phrase(base64.b64encode(b"RIFF").decode(), m.CFG)
+        self.assertEqual(dits, ["Je tamise, monsieur. Bonne nuit."], "la replique, sans passer par BrainDebugger")
+        self.assertEqual(m.ANIMATION["nom"], "Bonne nuit")
+        self.assertIsNone(m.couleur_de_l_animation(m.ANIMATION["t0"] + 5))
+        self.assertEqual(m.ETAT["forcage"]["couleur"], (76, 53, 0), "la couleur du soir reste, tamisee")
+        # un running gag : quand League s'ouvre, une fois sur deux, pas plus d'une fois par heure
+        ex("routine_lumiere", {"action": "creer", "nom": "Encore League",
+                               "declencheur": {"type": "appli", "valeur": "League of Legends"},
+                               "etapes": [{"couleur": "rouge", "duree": 1, "effet": "pulse"}], "repetitions": 3,
+                               "chance": 0.5, "pause_min": 60, "replique": "Encore, monsieur ?"})
+        m.CFG["jarvis_actif"] = True
+        m.JARVIS["etat"] = "attente"
+        dits.clear()
+        t = time.time()
+        self.assertIsNone(m.declencher_routines("appli", "League of Legends (TM) Client", m.CFG, t, alea=0.9),
+                          "pas cette fois : la chance")
+        self.assertEqual(m.declencher_routines("appli", "League of Legends (TM) Client", m.CFG, t, alea=0.1)["nom"],
+                         "Encore League")
+        self.assertEqual(dits, ["Encore, monsieur ?"])
+        self.assertIsNone(m.declencher_routines("appli", "League of Legends", m.CFG, t + 600, alea=0.1),
+                          "dix minutes apres : trop tot")
+        self.assertIsNotNone(m.declencher_routines("appli", "League of Legends", m.CFG, t + 3700, alea=0.1))
+        # a l'heure, les jours dits
+        ex("routine_lumiere", {"action": "creer", "nom": "Pause", "declencheur": {"type": "heure", "valeur": "16h",
+                                                                                "jours": ["lundi", "fri"]},
+                               "etapes": [{"couleur": "vert", "duree": 2, "effet": "respire"}]})
+        lundi16 = time.struct_time((2026, 9, 28, 16, 0, 0, 0, 271, -1))
+        mardi16 = time.struct_time((2026, 9, 29, 16, 0, 0, 1, 272, -1))
+        self.assertEqual(m.declencher_routines("heure", lundi16, m.CFG, t)["nom"], "Pause")
+        self.assertIsNone(m.declencher_routines("heure", mardi16, m.CFG, t + 99999))
+        self.assertIn("desactivee", ex("routine_lumiere", {"action": "desactiver", "nom": "pause"})["texte"])
+        self.assertIn("supprimee", ex("routine_lumiere", {"action": "supprimer", "nom": "Encore League"})["texte"])
+        self.assertEqual([r["nom"] for r in m.CFG["routines_lumiere"]], ["Bonne nuit", "Pause"])
+        # les reglages de l'application
+        self.assertIn("mode = ", ex("reglages_machi", {"action": "lire", "cle": "mode"})["texte"])
+        self.assertNotIn("pont_cle", ex("reglages_machi", {"action": "lire"})["texte"])
+        self.assertIn("veille_minutes = 10", ex("reglages_machi", {"action": "changer", "cle": "veille_minutes",
+                                                                   "valeur": "10"})["texte"])
+        self.assertEqual(m.CFG["veille_minutes"], 10)
+        self.assertIn("reaction_processeur = False", ex("reglages_machi", {"action": "changer",
+                                                                           "cle": "reaction_processeur",
+                                                                           "valeur": "non"})["texte"])
+        for interdit in ("pont_cle", "jarvis_pc", "jarvis_ecran", "api_origines", "maj_installation_auto"):
+            self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": interdit, "valeur": "1"}), interdit)
+        self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": "son_bande", "valeur": "fort"}))
+        r = ex("reglages_machi", {"action": "couleur_appli", "nom": "Discord", "couleur": "vert"})
+        # Discord vit dans la regle « Discussion » (avec Slack, Teams...) : il a la sienne, en tete
+        self.assertIn("Nouvelle regle : Discord en #22E052", r["texte"])
+        r = ex("reglages_machi", {"action": "couleur_appli", "nom": "discord", "couleur": "cyan"})
+        self.assertIn("Discord passe en #00D5FF", r["texte"])
+        r = ex("reglages_machi", {"action": "couleur_appli", "nom": "Elden Ring", "couleur": "#aa3300",
+                                  "mots": ["eldenring"]})
+        self.assertEqual(m.CFG["regles"][0], {"nom": "Elden Ring", "couleur": "#AA3300", "mots": ["eldenring"]},
+                         "une regle neuve passe en tete")
+        cap = m.capacites_jarvis(m.CFG)
+        self.assertTrue(cap["application"])
+        self.assertIn("Bonne nuit", cap["routines"])
+
     def test_la_boucle_des_leds_consulte_jarvis_avant_le_reste(self):
         with open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8") as f:
             src = f.read()
         corps = src[src.index("async def une_session"):src.index("async def superviseur")]
         self.assertLess(corps.index("couleur_jarvis(cfg)"), corps.index('if mode == "son":'))
-        self.assertIn('inactif = (mode != "jarvis"', corps)
+        self.assertIn('inactif = (mode not in ("jarvis", "routine")', corps)
+        # ses animations passent par-dessus Jarvis, avant le son et l'ecran
+        self.assertLess(corps.index("couleur_jarvis(cfg)"), corps.index("couleur_de_l_animation()"))
+        self.assertLess(corps.index("couleur_de_l_animation()"), corps.index('if mode == "son":'))
 
     def test_les_modeles_du_mot_d_eveil(self):
         m = self.m

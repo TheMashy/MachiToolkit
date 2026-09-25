@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.52.0"
+VERSION = "1.53.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -396,6 +396,10 @@ CONFIG_DEFAUT = {
     # phrase, et ce qu'elle ouvre (programme, dossier ou adresse).
     "jarvis_raccourcis": [],
     "jarvis_couleurs": {},            # {"pense": "#FF00AA"} pour changer une couleur d'etat
+    # SES ROUTINES DE LUMIERE : des habitudes et des running gags qu'il pose
+    # lui-meme (voir routine_propre dans jarvis.py) -- un declencheur, une
+    # petite animation, une replique.
+    "routines_lumiere": [],
 
     # Mises a jour depuis les publications GitHub du depot.
     "config_version": 5,              # sert aux migrations, voir charger_config
@@ -4581,6 +4585,79 @@ def oublier_voix():
     envoyer_oreille(config_oreille(CFG))
 
 
+# ---------- ses animations et ses routines de lumiere ----------
+# « Jarvis a tous les droits au niveau de l'application : il peut controler et
+# rajouter des petites sous-routines de lumieres, avec des habitudes / running
+# gags. » Une animation joue PAR-DESSUS tout (elle est courte et voulue) ;
+# « tenir » laisse sa derniere couleur, comme une couleur choisie a la main.
+
+ANIMATION = {"etapes": [], "t0": 0.0, "repetitions": 1, "nom": "", "tenir": False}
+ROUTINES_VUES = {"dernieres": {}, "minute": "", "contexte": "", "demarrage": False}
+
+
+def jouer_animation(etapes, repetitions=1, nom="Jarvis", tenir=False):
+    etapes = _jv.etapes_propres(etapes)
+    if not etapes:
+        raise ValueError("Aucune etape de lumiere lisible.")
+    ANIMATION.update(etapes=etapes, t0=time.time(), repetitions=max(1, min(int(repetitions or 1), 20)),
+                     nom=str(nom)[:40], tenir=bool(tenir))
+    return _jv.duree_animation(etapes, ANIMATION["repetitions"])
+
+
+def couleur_de_l_animation(maintenant=None):
+    """La couleur de l'animation en cours (deja dosee), ou None."""
+    if not ANIMATION["etapes"]:
+        return None
+    t = (time.time() if maintenant is None else maintenant) - ANIMATION["t0"]
+    c = _jv.couleur_animation(ANIMATION["etapes"], t, ANIMATION["repetitions"])
+    if c is None:
+        fin = ANIMATION["etapes"][-1]
+        if ANIMATION["tenir"]:
+            couleur = tuple(int(round(v * fin["luminosite"])) for v in hex_vers_rgb(fin["couleur"]))
+            ETAT["forcage"] = {"couleur": couleur, "nom": "%s (Jarvis)" % ANIMATION["nom"], "manuel": True,
+                               "expire": 0}
+        ANIMATION["etapes"] = []
+    return c
+
+
+def declencher_routines(genre, valeur, cfg, maintenant=None, alea=None):
+    """Joue la premiere routine que ceci declenche (et que sa chance et sa pause
+    laissent passer) ; dit sa replique si Jarvis peut parler. Rend la routine, ou None."""
+    t = time.time() if maintenant is None else maintenant
+    for r in _jv.routines_declenchees(cfg.get("routines_lumiere") or [], genre, valeur):
+        derniere = ROUTINES_VUES["dernieres"].get(r["nom"], 0.0)
+        if not _jv.peut_jouer(r, derniere, t, random.random() if alea is None else alea):
+            continue
+        ROUTINES_VUES["dernieres"][r["nom"]] = t
+        try:
+            jouer_animation(r["etapes"], r.get("repetitions", 1), r["nom"], r.get("tenir"))
+        except ValueError:
+            continue
+        print("Jarvis : routine « %s » (%s)" % (r["nom"], genre))
+        if r.get("replique") and genre != "phrase" and cfg.get("jarvis_actif") \
+                and JARVIS.get("etat") in ("attente", "eteint", None):
+            dire(r["replique"], suite=False, langue=langue_jarvis(cfg))
+        return r
+    return None
+
+
+def veiller_routines(cfg, contexte, maintenant=None):
+    """Depuis la boucle de la guirlande : l'heure (une fois par minute) et
+    l'appli au premier plan (quand elle change)."""
+    t = time.time() if maintenant is None else maintenant
+    if not ROUTINES_VUES["demarrage"]:
+        ROUTINES_VUES["demarrage"] = True
+        declencher_routines("evenement", "demarrage", cfg, t)
+    lt = time.localtime(t)
+    minute = time.strftime("%Y-%m-%d %H:%M", lt)
+    if minute != ROUTINES_VUES["minute"]:
+        ROUTINES_VUES["minute"] = minute
+        declencher_routines("heure", lt, cfg, t)
+    if contexte and contexte != ROUTINES_VUES["contexte"]:
+        ROUTINES_VUES["contexte"] = contexte
+        declencher_routines("appli", contexte, cfg, t)
+
+
 # ---------- la guirlande ----------
 
 def poser_led(etat, duree=None):
@@ -5326,6 +5403,7 @@ def traiter_evenement(ev):
         JARVIS["reveil_par"] = ev.get("par")
         poser_mode("jarvis")
         poser_led("ecoute")
+        declencher_routines("evenement", "reveil", CFG)
         JARVIS.update(etat="ecoute", message="Je vous ecoute.")
         # Le moteur de transcription se reveille PENDANT qu'on parle : sa
         # premiere phrase apres un long silence ne paie pas son chargement.
@@ -5662,6 +5740,7 @@ def terminer_conversation():
     poser_led(None)
     JARVIS.update(etat="attente", message=message_attente())
     jouer_son("fin")
+    declencher_routines("evenement", "au_revoir", CFG)
 
 
 _ADIEUX = {
@@ -5911,6 +5990,13 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         texte = reste
     L = langue_du_mode(cfg)
     JARVIS["vu"] = time.time()
+    # SES ROUTINES : « je vais me coucher » -> la lumiere du soir. Avec une
+    # replique, c'est tout (un running gag se suffit) ; sans, la phrase suit
+    # son chemin.
+    if mode_courant() != "psy":
+        r = declencher_routines("phrase", texte, cfg)
+        if r and r.get("replique"):
+            return dire(r["replique"], suite=False, langue=langue_jarvis(cfg))
     action = _jv.comprendre(texte, cfg.get("jarvis_raccourcis") or [])
     if action:
         print("Jarvis : commande %s" % action["action"])
@@ -7043,6 +7129,10 @@ def executer_outil(outil, cfg):
             cfg["jarvis_preferences"] = reste
             sauver_config(cfg)
             return {"id": ident, "texte": "Oublie : %s" % " ; ".join(retirees)}
+        # MACHI TOOL LUI-MEME : la guirlande, ses routines, les reglages -- a lui,
+        # sans les mains sur le PC (« il a tous les droits au niveau de l'application »)
+        if nom in ("lumiere", "routine_lumiere", "reglages_machi"):
+            return {"id": ident, "texte": outil_application(nom, e, cfg)}
         if not cfg.get("jarvis_pc"):
             return {"id": ident, "erreur": "Les mains de Jarvis sur le PC sont fermees (Machi Tool > Reglages > Jarvis)."}
         if nom == "rechercher_google":
@@ -7239,6 +7329,86 @@ def repondre_au_code(texte, cfg):
     return dire(phrase("code_faux", L), suite=True, langue=L)
 
 
+def outil_application(nom, e, cfg):
+    """La guirlande, les routines de lumiere, les reglages de Machi Tool. Rend
+    le texte du resultat ; ValueError/LookupError disent ce qui ne va pas."""
+    a = e.get("action")
+    if nom == "lumiere":
+        if a == "couleur":
+            c = _jv.couleur_lue(e.get("couleur"))
+            if not c:
+                raise ValueError("Couleur illisible : %s" % e.get("couleur"))
+            ETAT["forcage"] = {"couleur": hex_vers_rgb(c), "nom": "%s (Jarvis)" % c, "manuel": True, "expire": 0}
+            return "Guirlande en %s." % c
+        if a == "eteindre":
+            ETAT["forcage"] = {"couleur": (0, 0, 0), "nom": "Eteinte (Jarvis)", "manuel": True, "expire": 0}
+            return "Guirlande eteinte."
+        if a == "normale":
+            ANIMATION["etapes"] = []
+            f = ETAT.get("forcage")
+            if f and f.get("manuel"):
+                ETAT["forcage"] = None
+            ETAT["pause"] = False
+            return "La guirlande reprend son mode (%s)." % cfg.get("mode", "applications")
+        if a == "animation":
+            d = jouer_animation(e.get("etapes"), e.get("repetitions", 1), "Jarvis", bool(e.get("tenir")))
+            return "Animation lancee (%.0f s)." % d
+        if a == "mode":
+            m = _jv.valeur_reglage("mode", CONFIG_DEFAUT, e.get("mode"))
+            executer_commande({"action": "mode", "mode": m}, cfg)
+            return "La guirlande suit maintenant : %s." % m
+        raise ValueError("action inconnue : %s" % a)
+    if nom == "routine_lumiere":
+        routines = [r for r in cfg.get("routines_lumiere") or [] if isinstance(r, dict)]
+        if a == "lister":
+            return _jv.resume_routines(routines) or "Aucune routine pour l'instant."
+        if a == "creer":
+            r = _jv.routine_propre(e, par_jarvis=True)
+            cfg["routines_lumiere"] = _jv.ranger_routine(routines, r)
+            sauver_config(cfg)
+            return "Routine gardee : " + _jv.decrire_routine(r)
+        i = _jv.trouver_routine(routines, e.get("nom") or "")
+        if i is None:
+            raise LookupError("Aucune routine ne s'appelle « %s »." % (e.get("nom") or ""))
+        r = routines[i]
+        if a == "supprimer":
+            cfg["routines_lumiere"] = routines[:i] + routines[i + 1:]
+            sauver_config(cfg)
+            return "Routine supprimee : %s." % r["nom"]
+        if a in ("activer", "desactiver"):
+            r["actif"] = a == "activer"
+            cfg["routines_lumiere"] = routines
+            sauver_config(cfg)
+            return "Routine %s : %s." % ("activee" if r["actif"] else "desactivee", r["nom"])
+        if a == "essayer":
+            d = jouer_animation(r["etapes"], r.get("repetitions", 1), r["nom"], r.get("tenir"))
+            return "Routine jouee (%.0f s) : %s." % (d, r["nom"])
+        raise ValueError("action inconnue : %s" % a)
+    if nom == "reglages_machi":
+        if a == "lire":
+            return _jv.lire_reglages(cfg, CONFIG_DEFAUT, e.get("cle") or "")
+        if a == "couleur_appli":
+            cfg["regles"], texte = _jv.poser_couleur_appli(cfg.get("regles"), e.get("nom"), e.get("couleur"),
+                                                           e.get("mots"))
+            sauver_config(cfg)
+            return texte
+        if a == "changer":
+            cle = str(e.get("cle") or "").strip()
+            if not _jv.reglage_modifiable(cle, CONFIG_DEFAUT):
+                raise ValueError("« %s » n'est pas un reglage que je peux changer." % cle)
+            v = _jv.valeur_reglage(cle, CONFIG_DEFAUT, e.get("valeur"))
+            if cle == "mode":
+                executer_commande({"action": "mode", "mode": v}, cfg)
+            else:
+                cfg[cle] = v
+                sauver_config(cfg)
+            if cle.startswith("jarvis_"):
+                envoyer_oreille(config_oreille(cfg))
+            return "%s = %s." % (cle, v)
+        raise ValueError("action inconnue : %s" % a)
+    raise ValueError("outil inconnu : %s" % nom)
+
+
 def capacites_jarvis(cfg):
     """Ce que Jarvis peut faire ici, dit a BrainDebugger a chaque question :
     ses mains, ses yeux, l'historique -- et ce qu'il retient de toi."""
@@ -7248,6 +7418,8 @@ def capacites_jarvis(cfg):
             "spotify": pc and spotify_connecte(cfg),
             "onglets": pc and extension_branchee(),
             "fenetre_agenda": pc,
+            # Machi Tool lui-meme : la guirlande, ses routines, les reglages
+            "application": True, "routines": _jv.resume_routines(cfg.get("routines_lumiere") or []),
             "souvenirs": souvenirs_a_envoyer(cfg),
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
@@ -8169,6 +8341,18 @@ async def une_session(cfg):
                     nom = "Jarvis \u00b7 " + str(JARVIS.get("led"))
                     mode = "jarvis"
                     douceur = 0.5
+                # ...sauf une de SES animations (une routine, un running gag) :
+                # courte, voulue, elle se joue par-dessus.
+                try:
+                    veiller_routines(cfg, contexte)
+                except Exception as e:
+                    print("Routines : %s" % e)
+                anim = couleur_de_l_animation()
+                if anim is not None:
+                    rc, vc, bc = anim
+                    nom = "Routine \u00b7 " + ANIMATION["nom"]
+                    mode = "routine"
+                    douceur = 1.0
 
                 if mode == "son":
                     if AUDIO["actif"]:
@@ -8225,10 +8409,12 @@ async def une_session(cfg):
 
                 ETAT["regle"] = nom
 
-                inactif = (mode != "jarvis" and
+                inactif = (mode not in ("jarvis", "routine") and
                            secondes_inactivite() > float(cfg.get("veille_minutes", 6)) * 60)
                 if mode == "jarvis":
                     gain = gain_jarvis
+                elif mode == "routine":
+                    gain = 1.0                 # l'animation est deja dosee
                 elif inactif:
                     rc, vc, bc = hex_vers_rgb(cfg.get("couleur_veille", "#3B1F0B"))
                     gain = float(cfg.get("veille_luminosite", 0.18))
@@ -10996,6 +11182,15 @@ class Panneau:
         self.bouton(ligne, "Oublier les conversations", self.oublier_souvenirs, compact=True).pack(side="left")
         self.txt_souvenirs = self.texte(ligne, "", BRUME, 8, largeur=360)
         self.txt_souvenirs.pack(side="left", padx=(10, 0))
+        self.texte(f, "Ses routines de lumiere : des habitudes et des running gags qu'il pose lui-meme (« quand "
+                      "je dis bonne nuit, tamise en ambre », « a 23 h 30 », « quand League of Legends s'ouvre »). "
+                      "Demande-lui de les changer, ou efface-les ici.",
+                   BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(4, 0))
+        self.bouton(ligne, "Effacer ses routines", self.oublier_routines, compact=True).pack(side="left")
+        self.txt_routines = self.texte(ligne, "", BRUME, 8, largeur=360)
+        self.txt_routines.pack(side="left", padx=(10, 0))
 
         self.separateur(f, 12, 8)
         self.titre(f, "ce qu'il fait").pack(fill="x", pady=(0, 4))
@@ -11135,6 +11330,10 @@ class Panneau:
         self.bouton(self.boite_preferences, "Tout oublier", lambda: self.oublier_preference(None),
                     compact=True).pack(anchor="w", pady=(6, 0))
 
+    def oublier_routines(self):
+        self.cfg["routines_lumiere"] = []
+        sauver_config(self.cfg)
+
     def oublier_souvenirs(self):
         self.cfg["jarvis_souvenirs"] = []
         sauver_config(self.cfg)
@@ -11255,6 +11454,12 @@ class Panneau:
                 len(sv), "s" if len(sv) > 1 else "", sv[-1].get("texte", "")[:90]) if sv else "Aucune pour l'instant.")
             if self.txt_souvenirs.cget("text") != etat_sv:
                 self.txt_souvenirs.configure(text=etat_sv)
+        if hasattr(self, "txt_routines"):
+            rt = [r for r in self.cfg.get("routines_lumiere") or [] if isinstance(r, dict)]
+            etat_rt = ("\n".join(_jv.decrire_routine(r)[:140] for r in rt[:8]) + (
+                "\n... et %d autres" % (len(rt) - 8) if len(rt) > 8 else "")) if rt else "Aucune pour l'instant."
+            if self.txt_routines.cget("text") != etat_rt:
+                self.txt_routines.configure(text=etat_rt)
         if hasattr(self, "txt_onglets"):
             etat_on = "Branchee." if extension_branchee() else (JARVIS.get("onglets_message") or "Pas branchee.")
             if self.txt_onglets.cget("text") != etat_on:

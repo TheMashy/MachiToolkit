@@ -4044,6 +4044,320 @@ REFUS_ALIMENTATION = ("Refuse : je ne peux ni eteindre, ni redemarrer, ni mettre
                       "la session.")
 
 
+# --- Jarvis maitre de Machi Tool : la lumiere, ses routines, les reglages ----
+#
+# « Jarvis a tous les droits au niveau de l'application : il peut controler et
+# rajouter des petites sous-routines de lumieres, avec des habitudes / running
+# gags. » Ici ce qui se calcule : une animation (des etapes de couleur), une
+# routine (un declencheur + une animation + une replique), et quels reglages il
+# peut changer. machi_tool.py les joue sur la guirlande.
+
+EFFETS_LUMIERE = ("fixe", "fondu", "pulse", "clignote", "respire", "arc_en_ciel")
+ANIMATION_ETAPES_MAX = 16
+ANIMATION_DUREE_MAX = 120.0          # une etape : 30 s au plus ; l'animation entiere : 2 min
+ROUTINES_MAX = 24
+DECLENCHEURS_ROUTINE = ("phrase", "heure", "appli", "evenement")
+EVENEMENTS_ROUTINE = ("reveil", "au_revoir", "demarrage")
+JOURS_COURTS = ("lun", "mar", "mer", "jeu", "ven", "sam", "dim")
+
+
+def couleur_lue(c):
+    """« #FF8800 », « ff8800 », « #f80 », « orange », « blue », « eteint » -> « #RRGGBB » (None sinon)."""
+    t = str(c or "").strip()
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", t)
+    if m:
+        return "#" + m.group(1).upper()
+    m = re.fullmatch(r"#?([0-9a-fA-F]{3})", t)
+    if m:
+        return "#" + "".join(x * 2 for x in m.group(1)).upper()
+    n = normaliser(t)
+    if n in ("eteint", "eteinte", "noir", "off", "black", "rien"):
+        return "#000000"
+    nom = _couleur_nommee(n.replace(" ", ""))
+    return COULEURS_NOMMEES[nom] if nom else None
+
+
+def _borne(x, bas, haut, defaut):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return defaut
+    return defaut if v != v else max(bas, min(haut, v))
+
+
+def etapes_propres(etapes):
+    """Les etapes d'une animation, verifiees : couleur lisible, effet connu,
+    duree 0,1 a 30 s, luminosite 0 a 1 ; 16 etapes et 2 minutes au plus."""
+    out, total = [], 0.0
+    for e in (etapes if isinstance(etapes, list) else [])[:ANIMATION_ETAPES_MAX]:
+        if not isinstance(e, dict):
+            continue
+        effet = e.get("effet") if e.get("effet") in EFFETS_LUMIERE else "fixe"
+        couleur = couleur_lue(e.get("couleur")) or ("#FFFFFF" if effet == "arc_en_ciel" else None)
+        if couleur is None:
+            continue
+        duree = _borne(e.get("duree", 1.0), 0.1, 30.0, 1.0)
+        if total + duree > ANIMATION_DUREE_MAX:
+            break
+        out.append({"couleur": couleur, "duree": round(duree, 2), "effet": effet,
+                    "luminosite": round(_borne(e.get("luminosite", 1.0), 0.0, 1.0, 1.0), 2)})
+        total += duree
+    return out
+
+
+def duree_animation(etapes, repetitions=1):
+    return sum(e["duree"] for e in etapes) * max(1, int(repetitions or 1))
+
+
+def couleur_animation(etapes, t, repetitions=1):
+    """(r, v, b) deja dosee (0-255) a l'instant t (s depuis le debut), ou None
+    une fois l'animation finie."""
+    import colorsys
+    if not etapes or t < 0:
+        return None
+    cycle = sum(e["duree"] for e in etapes)
+    reps = max(1, min(int(repetitions or 1), 50))
+    if cycle <= 0 or t >= cycle * reps:
+        return None
+    u = t % cycle
+    i = 0
+    while i < len(etapes) - 1 and u >= etapes[i]["duree"]:
+        u -= etapes[i]["duree"]
+        i += 1
+    e = etapes[i]
+    k = max(0.0, min(1.0, u / e["duree"]))
+    rvb, lum = _hex(e["couleur"]), e["luminosite"]
+    effet = e["effet"]
+    if effet == "fondu":
+        # depuis l'etape d'avant (la derniere, au tour suivant ; le noir, au tout debut)
+        if i > 0 or t >= cycle:
+            p = etapes[i - 1]
+            depart = tuple(c * p["luminosite"] for c in _hex(p["couleur"]))
+        else:
+            depart = (0.0, 0.0, 0.0)
+        return tuple(a + (b * lum - a) * k for a, b in zip(depart, rvb))
+    if effet == "pulse":
+        f = 0.15 + 0.85 * (1.0 - k) ** 2
+    elif effet == "clignote":
+        f = 1.0 if int(u * 4) % 2 == 0 else 0.0
+    elif effet == "respire":
+        f = 0.3 + 0.7 * (0.5 - 0.5 * math.cos(2 * math.pi * k))
+    elif effet == "arc_en_ciel":
+        rvb = tuple(255 * c for c in colorsys.hsv_to_rgb(k, 1.0, 1.0))
+        f = 1.0
+    else:
+        f = 1.0
+    return tuple(c * lum * f for c in rvb)
+
+
+def _jours_lus(jours):
+    out = []
+    for j in jours if isinstance(jours, list) else []:
+        c = normaliser(str(j))[:3]
+        c = {"mon": "lun", "tue": "mar", "wed": "mer", "thu": "jeu", "fri": "ven", "sat": "sam",
+             "sun": "dim"}.get(c, c)
+        if c in JOURS_COURTS and c not in out:
+            out.append(c)
+    return out
+
+
+def routine_propre(r, par_jarvis=False):
+    """Une routine verifiee, ou ValueError avec ce qui ne va pas."""
+    if not isinstance(r, dict):
+        raise ValueError("routine illisible")
+    nom = " ".join(str(r.get("nom") or "").split())[:40]
+    if not nom:
+        raise ValueError("Il faut un nom a la routine.")
+    d = r.get("declencheur") if isinstance(r.get("declencheur"), dict) else {}
+    genre = d.get("type")
+    valeur = " ".join(str(d.get("valeur") or "").split())[:80]
+    if genre not in DECLENCHEURS_ROUTINE:
+        raise ValueError("Declencheur inconnu : phrase, heure, appli ou evenement.")
+    if genre == "heure":
+        valeur = heure_saisie(valeur)
+        if not valeur:
+            raise ValueError("Heure illisible (HH:MM).")
+    elif genre == "evenement":
+        valeur = normaliser(valeur).replace(" ", "_").replace("-", "_")
+        if valeur not in EVENEMENTS_ROUTINE:
+            raise ValueError("Evenement inconnu : reveil, au_revoir ou demarrage.")
+    elif len(normaliser(valeur)) < 3:
+        raise ValueError("Il faut au moins quelques lettres pour reconnaitre « %s »." % genre)
+    etapes = etapes_propres(r.get("etapes"))
+    if not etapes:
+        raise ValueError("Il faut au moins une etape de lumiere lisible (une couleur).")
+    return {"nom": nom, "declencheur": {"type": genre, "valeur": valeur, "jours": _jours_lus(d.get("jours"))},
+            "etapes": etapes, "repetitions": int(_borne(r.get("repetitions", 1), 1, 20, 1)),
+            "tenir": bool(r.get("tenir")), "replique": " ".join(str(r.get("replique") or "").split())[:200],
+            "chance": round(_borne(r.get("chance", 1.0), 0.0, 1.0, 1.0), 2),
+            "pause_min": int(_borne(r.get("pause_min", 0), 0, 1440, 0)),
+            "actif": r.get("actif", True) is not False, "par_jarvis": bool(par_jarvis or r.get("par_jarvis"))}
+
+
+def ranger_routine(routines, r):
+    """La liste avec `r` (qui remplace celle du meme nom) ; ROUTINES_MAX au plus."""
+    cle = normaliser(r["nom"])
+    reste = [x for x in routines or [] if isinstance(x, dict) and normaliser(x.get("nom", "")) != cle]
+    if len(reste) >= ROUTINES_MAX:
+        raise ValueError("Deja %d routines : supprimes-en une d'abord." % ROUTINES_MAX)
+    return reste + [r]
+
+
+def trouver_routine(routines, nom):
+    """L'indice de la routine qui porte ce nom (a peu pres), ou None."""
+    liste = [(str(x.get("nom", "")), i) for i, x in enumerate(routines or []) if isinstance(x, dict)]
+    trouves = choisir(nom, liste, seuil=55)
+    return trouves[0][1] if trouves else None
+
+
+def _texte_contient(texte, motif):
+    return (" %s " % normaliser(motif).replace("-", " ")) in (" %s " % normaliser(texte).replace("-", " "))
+
+
+def routines_declenchees(routines, genre, valeur, maintenant=None):
+    """Les routines actives que ceci declenche. `genre` : « phrase » (valeur :
+    ce qui a ete dit), « appli » (le titre et le processus au premier plan),
+    « heure » (valeur : time.struct_time), « evenement » (son nom)."""
+    out = []
+    for r in routines or []:
+        if not isinstance(r, dict) or not r.get("actif", True):
+            continue
+        d = r.get("declencheur") or {}
+        if d.get("type") != genre:
+            continue
+        if genre == "phrase" and _texte_contient(valeur, d.get("valeur", "")):
+            out.append(r)
+        elif genre == "appli" and normaliser(d.get("valeur", "")) in normaliser(valeur):
+            out.append(r)
+        elif genre == "evenement" and d.get("valeur") == valeur:
+            out.append(r)
+        elif genre == "heure":
+            if "%02d:%02d" % (valeur.tm_hour, valeur.tm_min) == d.get("valeur") and (
+                    not d.get("jours") or JOURS_COURTS[valeur.tm_wday] in d["jours"]):
+                out.append(r)
+    return out
+
+
+def peut_jouer(routine, derniere_fois, maintenant, alea):
+    """Un running gag reste drole : pas plus souvent que `pause_min`, et
+    seulement une fois sur 1/`chance`."""
+    if maintenant - (derniere_fois or 0.0) < routine.get("pause_min", 0) * 60:
+        return False
+    return alea < routine.get("chance", 1.0)
+
+
+def decrire_routine(r):
+    d = r.get("declencheur") or {}
+    quand = {"phrase": "quand tu dis « %s »", "heure": "a %s", "appli": "quand %s passe au premier plan",
+             "evenement": "evenement %s"}.get(d.get("type"), "%s") % d.get("valeur", "")
+    if d.get("jours"):
+        quand += " (" + ", ".join(d["jours"]) + ")"
+    extra = []
+    if r.get("chance", 1.0) < 1:
+        extra.append("%d %% des fois" % round(r["chance"] * 100))
+    if r.get("pause_min"):
+        extra.append("pas plus d'une fois toutes les %d min" % r["pause_min"])
+    if r.get("tenir"):
+        extra.append("la couleur reste")
+    if not r.get("actif", True):
+        extra.append("desactivee")
+    effets = ", ".join("%s %s %gs" % (e["couleur"], e["effet"], e["duree"]) for e in r.get("etapes", [])[:4])
+    return "%s : %s -> %s%s%s" % (r.get("nom"), quand, effets, " ; " + " ; ".join(extra) if extra else "",
+                                  " ; replique : « %s »" % r["replique"] if r.get("replique") else "")
+
+
+def resume_routines(routines):
+    lignes = [decrire_routine(r) for r in routines or [] if isinstance(r, dict)]
+    return "\n".join("- " + l for l in lignes)[:3000]
+
+
+# Les reglages que Jarvis ne touche pas : les cles et les codes, ce qui ouvre
+# la passerelle au reseau, et ce qui decide de ses propres droits (ses mains
+# sur le PC, ses yeux, l'historique) -- sinon les cases a cocher ne voudraient
+# plus rien dire. Les listes ont leurs propres outils.
+REGLAGES_INTERDITS = {
+    "api_jeton", "pont_cle", "spotify_client_id", "spotify_refresh", "onglets_cle", "jarvis_code_sel",
+    "jarvis_code_empreinte", "api_active", "api_port", "api_origines", "pont_site", "adresse",
+    "jarvis_pc", "jarvis_ecran", "jarvis_historique", "jarvis_code_actif", "collecte_active",
+    "collecte_envoi", "collecte_titres_complets", "maj_verifier", "maj_installation_auto", "maj_prereleases",
+    "maj_intervalle_heures", "config_version", "derniere_version", "jarvis_preferences", "jarvis_souvenirs",
+    "routines_lumiere", "jarvis_raccourcis", "regles", "jarvis_astuce_voix", "jarvis_actif",
+}
+REGLAGES_CHOIX = {
+    "mode": ("applications", "ecran", "mixte", "son"),
+    "son_bande": ("graves", "mediums", "aigus", "tout"),
+    "son_palette": ("chaud_froid", "arc", "regle"),
+    "son_cible": ("luminosite", "saturation", "les_deux"),
+    "ecran_cible": ("luminosite", "saturation", "les_deux", "rien"),
+    "jarvis_langue": ("fr", "en"),
+}
+
+
+def reglage_modifiable(cle, defaut):
+    return (cle in defaut and cle not in REGLAGES_INTERDITS
+            and not isinstance(defaut[cle], (list, dict)))
+
+
+def valeur_reglage(cle, defaut, valeur):
+    """La valeur convertie au type du reglage, ou ValueError."""
+    modele = defaut[cle]
+    if cle in REGLAGES_CHOIX:
+        v = normaliser(str(valeur)).replace(" ", "_")
+        if v not in REGLAGES_CHOIX[cle]:
+            raise ValueError("%s : %s" % (cle, " | ".join(REGLAGES_CHOIX[cle])))
+        return v
+    if isinstance(modele, bool):
+        if isinstance(valeur, bool):
+            return valeur
+        v = normaliser(str(valeur))
+        if v in ("true", "oui", "vrai", "1", "on", "yes", "active", "actif"):
+            return True
+        if v in ("false", "non", "faux", "0", "off", "no", "desactive", "inactif"):
+            return False
+        raise ValueError("%s attend oui ou non." % cle)
+    if isinstance(modele, (int, float)):
+        try:
+            v = float(str(valeur).replace(",", "."))
+        except ValueError:
+            raise ValueError("%s attend un nombre." % cle)
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("%s attend un nombre." % cle)
+        return int(round(v)) if isinstance(modele, int) else v
+    if cle.startswith("couleur") or cle.endswith("_couleur"):
+        c = couleur_lue(valeur)
+        if not c:
+            raise ValueError("%s attend une couleur." % cle)
+        return c
+    return " ".join(str(valeur).split())[:200]
+
+
+def lire_reglages(cfg, defaut, filtre=""):
+    f = normaliser(filtre).replace(" ", "_")
+    lignes = ["%s = %s" % (k, cfg.get(k, defaut[k])) for k in sorted(defaut)
+              if reglage_modifiable(k, defaut) and (not f or f in k)]
+    return "\n".join(lignes)[:3500] or "Aucun reglage modifiable ne correspond."
+
+
+def poser_couleur_appli(regles, nom, couleur, mots=None):
+    """Les regles du mode applications avec la couleur de `nom` changee (ou une
+    regle neuve, en tete : la premiere qui correspond gagne). Rend (regles, texte)."""
+    c = couleur_lue(couleur)
+    if not c:
+        raise ValueError("Couleur illisible.")
+    nom = " ".join(str(nom or "").split())[:40]
+    if not nom:
+        raise ValueError("Il faut le nom de l'appli ou du site.")
+    regles = [dict(r) for r in regles or [] if isinstance(r, dict)]
+    for r in regles:
+        if normaliser(r.get("nom", "")) == normaliser(nom):
+            r["couleur"] = c
+            if mots:
+                r["mots"] = [str(m).lower()[:40] for m in mots][:8]
+            return regles, "%s passe en %s." % (r["nom"], c)
+    mots = [str(m).lower()[:40] for m in (mots or [nom])][:8]
+    return [{"nom": nom, "couleur": c, "mots": mots}] + regles, "Nouvelle regle : %s en %s." % (nom, c)
+
+
 # --------------------------- LE SON, APPLI PAR APPLI -----------------------
 #
 # « Il faudrait que Jarvis puisse mettre le son de differentes applications de
