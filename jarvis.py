@@ -4231,50 +4231,46 @@ def cible_boule(etat, mode, regard, zone, maintenant, fx=0.97, fy=0.90, taille=4
 
 # --------------------------- L'ECOUTE QUI S'ADAPTE ----------------------
 #
-# « En fonction de la discussion, fais en sorte que Jarvis puisse prendre plus
-# de temps a se desactiver, ou demande meme au bout d'un moment : je dois me
-# desactiver ? » Apres sa reponse, il ecoute encore -- cinq secondes pour une
-# reponse seche, plus s'il vient de poser une question, plus a mesure que la
-# conversation dure, plus en mode psychologue. Et quand une vraie conversation
-# retombe dans le silence, il demande une fois s'il reste a l'ecoute.
+# Apres sa reponse, il ecoute encore un instant, sans mot d'eveil -- plus
+# s'il vient de poser une question, un peu plus a mesure que la conversation
+# dure, davantage en mode psychologue. « MAKE IT EASIER TO LEAVE JARVIS, IT'S
+# SO TEDIOUS » : la fenetre est courte (4 a 10 s), le silence suffit pour
+# partir -- il ne demande plus « je reste a l'ecoute ? » --, et un simple
+# « ok », « merci », « parfait » clot la conversation (voir `acquittement`).
 
-SUITE_BASE_S = 5.0
-SUITE_MAX_S = 15.0
-_RESTE = re.compile(r"^(?:(?:oui|ouais|ok|okay|yes|yeah)\s*)?(?:reste|restez|continue|continuez|je t'ecoute|"
-                    r"ecoute|j'ai pas fini|attends?|stay|keep listening|go on)\b")
-_VEILLE = re.compile(r"^(?:non|nan|no|nope|c'est bon|ca ira|merci c'est tout|c'est tout|pas besoin|"
-                     r"(?:tu peux )?(?:te |vous )?(?:desactiver?|eteindre|mettre en veille)|desactive toi|"
-                     r"eteins toi|mets toi en veille|va dormir|that's all|you can go)\b")
+SUITE_BASE_S = 4.0
+SUITE_MAX_S = 10.0
+SUITE_PSY_S = 10.0
 
 
 def attente_suite(reponse, echanges=1, mode="jarvis"):
     """Combien de secondes il ecoute encore apres `reponse`."""
     t = SUITE_BASE_S
     if str(reponse or "").rstrip().endswith("?"):
-        t += 7.0                                  # il vient de poser une question
-    t += 1.5 * max(0, int(echanges) - 1)          # la conversation dure
+        t += 5.0                                  # il vient de poser une question
+    t += 1.0 * max(0, int(echanges) - 1)          # la conversation dure
     if mode == "psy":
-        t = max(t, 10.0)
+        return max(SUITE_PSY_S, min(15.0, t))
     return min(SUITE_MAX_S, t)
 
 
-def doit_demander_veille(echanges, deja_demande):
-    """Une vraie conversation (trois echanges et plus) qui retombe : il demande,
-    une fois."""
-    return int(echanges) >= 3 and not deja_demande
+# UN ACQUITTEMENT : « ok », « parfait », « super merci », « got it » -- la
+# reponse lui convient, la conversation est finie. Seulement quand il n'a
+# pas pose de question : « Je le lance ? » -- « ok », c'est un oui.
+_ACQUIT = re.compile(
+    r"^(?:(?:ah|oh|bon|ben|bah|alors|jarvis|well|oh|ah)\s+)*"
+    r"(?:ok|okay|ok ok|d'accord|dac|entendu|compris|ca marche|parfait|super|top|nickel|genial|cool|"
+    r"impec|impeccable|tres bien|c'est parfait|c'est note|note|bien recu|merci beaucoup|merci bien|"
+    r"great|perfect|got it|awesome|nice|cool|alright|all right|sounds good|cheers|noted|brilliant|"
+    r"understood|lovely|fine|good|very good|excellent)"
+    r"(?:\s+(?:merci|merci beaucoup|merci jarvis|jarvis|thanks|thank you|thanks jarvis|c'est tout|"
+    r"c'est bon|ca ira|that's all|then|alors|cool|super|parfait|top))*$")
 
 
-def reponse_veille(texte):
-    """« Je reste a l'ecoute ? » -> "reste", "veille", ou None (c'est une
-    nouvelle question)."""
+def acquittement(texte):
+    """« Ok merci », « parfait », « got it, thanks » : rien a ajouter."""
     t = normaliser(texte).replace("-", " ").strip(" '")
-    if not t:
-        return None
-    if _RESTE.match(t) or t in ("oui", "ouais", "yes", "yeah", "oui reste", "oui s'il te plait"):
-        return "reste"
-    if _VEILLE.match(t):
-        return "veille"
-    return None
+    return bool(t) and len(t.split()) <= 6 and bool(_ACQUIT.match(t))
 
 
 # --------------------------- L'AGENDA -----------------------------------
