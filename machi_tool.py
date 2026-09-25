@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.61.0"
+VERSION = "1.62.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5518,12 +5518,8 @@ def traiter_evenement(ev):
         if ev.get("apres_coupure") and reprendre_apres_coupure():
             return
         if JARVIS["etat"] == "ecoute":
-            if JARVIS.get("suite_active"):
-                JARVIS["suite_active"] = False
-                if JARVIS.get("attend_veille"):
-                    JARVIS["attend_veille"] = False       # toujours rien : il se rendort
-                else:
-                    return silence_apres_suite(CFG)
+            # personne n'a rien ajoute : il se rendort, sans un mot
+            JARVIS["suite_active"] = False
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
     elif quoi == "phrase":
@@ -5770,8 +5766,6 @@ _PHRASES = {
     "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
     "code_refuse": ("Accès refusé.", "Access denied."),
     "verrouille": ("Accès verrouillé.", "Access locked."),
-    "rester": ("Je reste à l'écoute, ou je me mets en veille ?", "Shall I keep listening, or go on standby?"),
-    "j_ecoute": ("Je vous écoute.", "I'm listening."),
     "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
                       "My hands on the PC are closed: Settings, Jarvis."),
     "youtube_video": ("C'est lancé.", "Here you go."),
@@ -5877,7 +5871,6 @@ def clore_historique(cfg=None):
     phrase (en arriere-plan), et on repart de zero."""
     historique = list(JARVIS.get("historique") or [])
     JARVIS["historique"] = []
-    JARVIS["veille_demandee"] = False
     if historique and JARVIS.get("mode", "jarvis") == "jarvis":
         cfg = CFG if cfg is None else cfg
         _en_fond(lambda: resumer_conversation(historique, cfg))
@@ -5997,19 +5990,6 @@ def echanges_en_cours():
     return sum(1 for h in JARVIS.get("historique") or [] if h.get("role") == "user")
 
 
-def silence_apres_suite(cfg):
-    """Personne n'a parle pendant l'ecoute d'apres sa reponse. Une vraie
-    conversation qui retombe : il demande, une fois, s'il reste a l'ecoute.
-    Sinon il se rendort."""
-    if _jv.doit_demander_veille(echanges_en_cours(), JARVIS.get("veille_demandee")):
-        JARVIS.update(veille_demandee=True, attend_veille=True)
-        L = langue_du_mode(cfg)
-        return dire(phrase("rester", L), suite=True, langue=L)
-    JARVIS["attend_veille"] = False
-    poser_led(None)
-    JARVIS.update(etat="attente", message=message_attente())
-
-
 def dire(texte, suite=False, langue=None):
     """Repond : a voix haute si on l'a voulu, sinon en notification. Ensuite,
     s'il y a une suite possible, on ecoute encore un peu -- sans mot d'eveil.
@@ -6079,13 +6059,6 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
     garder_facons(brut)
     texte = _jv.retirer_mot_eveil(texte)
     JARVIS["suite_active"] = False
-    if JARVIS.pop("attend_veille", False):
-        # la reponse a « Je reste a l'ecoute ? »
-        choix = _jv.reponse_veille(texte)
-        if choix == "reste":
-            return dire(phrase("j_ecoute", langue_du_mode(cfg)), suite=True, langue=langue_du_mode(cfg))
-        if choix == "veille":
-            return terminer_conversation()
     att = JARVIS.get("attente_code")
     if att:
         # LA REPONSE A « CODE D'ACCES ? » -- comparee ici, jamais journalisee
@@ -6142,6 +6115,13 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         # un mot ou se tait.)
         print("Jarvis : au revoir")
         return dire_adieu(mot, cfg)
+    if (JARVIS.get("mode") != "psy" and _jv.acquittement(texte)
+            and not str(JARVIS.get("reponse_affichee") or "").rstrip().endswith("?")):
+        # « Ok merci », « parfait » : sa reponse suffisait -- il n'envoie rien
+        # a personne et se rendort (s'il venait de poser une question, « ok »
+        # est un oui : ca part au modele)
+        print("Jarvis : fin de conversation (acquittement)")
+        return terminer_conversation()
     if _jv.fin_de_conversation(texte):
         print("Jarvis : fin de conversation")
         # « Au revoir » au psychologue : retour au majordome, qui se tait si
@@ -10247,9 +10227,9 @@ class Panneau:
 
     # ------------------------------------------------------------------
     #  Le panneau de Jarvis : « le meme qu'ici » -- le contenu Jarvis du
-    #  panneau LED, en haut au milieu de l'ecran, fixe, sans bordure, que les
-    #  clics traversent. Il vit le temps que Jarvis est actif ; sa reponse y
-    #  defile pendant qu'il parle.
+    #  panneau LED, en haut au milieu de l'ecran, fixe, sans bordure. Il vit
+    #  le temps que Jarvis est actif ; sa reponse y defile pendant qu'il
+    #  parle. Un clic dessus le congedie.
 
     def _panneau_creer(self, taille, attribut="fen_led"):
         tk = self.tk
@@ -10257,18 +10237,28 @@ class Panneau:
         f.overrideredirect(True)
         f.configure(bg="#08090C")
         f.attributes("-topmost", True)
-        lab = tk.Label(f, bg="#08090C", bd=0, highlightthickness=0)
+        lab = tk.Label(f, bg="#08090C", bd=0, highlightthickness=0, cursor="hand2")
         lab.pack()
+        # « MAKE IT EASIER TO LEAVE JARVIS » : un clic sur son panneau, et il se tait
+        # et se rendort. Le panneau ne prend jamais le focus (NOACTIVATE) : on
+        # garde la main sur la fenetre ou l'on tapait.
+        lab.bind("<Button-1>", lambda _e: self.congedier_jarvis())
         f.geometry("%dx%d+-10000+-10000" % (taille, taille))
         f.update_idletasks()
         if os.name == "nt":
             import ctypes
             u = ctypes.WinDLL("user32")
             h = int(f.wm_frame(), 16)
-            u.SetWindowLongW(h, -20, u.GetWindowLongW(h, -20) | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
+            u.SetWindowLongW(h, -20, u.GetWindowLongW(h, -20) | 0x00080000 | 0x00000080 | 0x08000000)
         f.withdraw()
         setattr(self, attribut, f)
         setattr(self, attribut + "_image", lab)
+
+    def congedier_jarvis(self):
+        if JARVIS.get("etat") in ("attente", "eteint", None):
+            return
+        print("Jarvis : congedie d'un clic")
+        threading.Thread(target=terminer_conversation, daemon=True).start()
 
     def _panneau_tic(self):
         f = getattr(self, "fen_led", None)
@@ -11637,7 +11627,8 @@ class Panneau:
         self.texte(f, "Deux modes : JARVIS (orange), le majordome du PC ; PSYCHOLOGUE (bleu), le compagnon de "
                       "BrainDebugger, avec ton journal -- « psychologue », ou il y passe seul s'il comprend que "
                       "tu veux parler. Pour revenir : « Jarvis ? Re ! », ou le rappeler. Un message grave part "
-                      "toujours au compagnon. « Non rien », « oublie », « degage » : fin de la conversation.",
+                      "toujours au compagnon. Pour le quitter : ne dis rien (il se rendort en quelques "
+                      "secondes), « ok merci », « parfait », « degage » -- ou un clic sur son panneau.",
                    BRUME, 8, largeur=500).pack(fill="x")
         self.texte(f, "Sans passer par Internet : « allume / eteins la lumiere », « mets la lumiere en bleu », "
                       "« mode ecran / son / applications », « minuteur de 10 minutes », « rappelle-moi dans 20 "

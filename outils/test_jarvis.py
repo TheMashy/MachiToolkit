@@ -409,18 +409,20 @@ class SesMains(unittest.TestCase):
             J.nouveau_niveau(5, "regler")
 
     def test_l_ecoute_s_adapte(self):
-        self.assertEqual(J.attente_suite("Il est 14 h."), 5.0)
-        self.assertEqual(J.attente_suite("Vous voulez que je le lance ?"), 12.0, "il vient de poser une question")
-        self.assertEqual(J.attente_suite("Voila.", echanges=4), 9.5, "la conversation dure")
-        self.assertEqual(J.attente_suite("D'accord ?", echanges=10), 15.0, "15 s au plus")
+        # « make it easier to leave Jarvis » : une fenetre courte
+        self.assertEqual(J.attente_suite("Il est 14 h."), 4.0)
+        self.assertEqual(J.attente_suite("Vous voulez que je le lance ?"), 9.0, "il vient de poser une question")
+        self.assertEqual(J.attente_suite("Voila.", echanges=4), 7.0, "la conversation dure")
+        self.assertEqual(J.attente_suite("D'accord ?", echanges=10), 10.0, "10 s au plus")
         self.assertEqual(J.attente_suite("Je vous entends.", mode="psy"), 10.0)
-        self.assertFalse(J.doit_demander_veille(2, False))
-        self.assertTrue(J.doit_demander_veille(3, False))
-        self.assertFalse(J.doit_demander_veille(5, True), "une fois")
-        for t, attendu in (("oui", "reste"), ("reste", "reste"), ("oui reste là", "reste"), ("continue", "reste"),
-                           ("non", "veille"), ("c'est bon merci", "veille"), ("tu peux te désactiver", "veille"),
-                           ("mets-toi en veille", "veille"), ("quelle heure est-il", None), ("", None)):
-            self.assertEqual(J.reponse_veille(t), attendu, t)
+
+    def test_un_acquittement_clot_la_conversation(self):
+        for t in ("ok", "Ok, merci.", "Parfait, merci Jarvis.", "super", "nickel", "d'accord", "ça marche",
+                  "got it, thanks", "perfect", "sounds good", "très bien merci"):
+            self.assertTrue(J.acquittement(t), t)
+        for t in ("ok lance la musique", "super, et demain ?", "parfait pour le rendez-vous de jeudi",
+                  "quelle heure est-il", ""):
+            self.assertFalse(J.acquittement(t), t)
 
     def test_la_boule_de_jarvis(self):
         # « toujours placee au meme endroit peu importe la resolution de l'ecran »
@@ -2468,31 +2470,21 @@ class DansMachiTool(unittest.TestCase):
         m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}] * 3
         m.dire("Voila ce que j'en pense.", suite=True)
         attente = [o for o in ordres if o.get("cmd") == "ecouter"][-1]["attente"]
-        self.assertEqual(attente, 8.0, "trois echanges : il ecoute plus longtemps")
-        m.traiter_evenement({"evt": "vide"})
-        self.assertEqual(self.dit[-1], "Je reste à l'écoute, ou je me mets en veille ?")
-        self.phrase("non merci")
-        self.assertEqual(vus["jarvis"], [], "« non » ne part pas au modele")
-        self.assertEqual(m.JARVIS["historique"], [], "il se met en veille")
-        # une autre fois : « reste »
-        m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}] * 3
-        m.JARVIS["veille_demandee"] = False
-        m.dire("Autre chose ?", suite=True)
-        m.traiter_evenement({"evt": "vide"})
-        self.phrase("reste")
-        self.assertEqual(self.dit[-1], "Je vous écoute.")
-        # il ne redemande pas dans la meme conversation : au silence suivant, il se rendort
+        self.assertEqual(attente, 6.0, "trois echanges : il ecoute un peu plus longtemps")
+        # « make it easier to leave Jarvis » : le silence suffit -- pas de question
         n = len(self.dit)
         m.traiter_evenement({"evt": "vide"})
-        self.assertEqual(len(self.dit), n)
+        self.assertEqual(len(self.dit), n, "il se rendort sans un mot")
         self.assertEqual(m.JARVIS["etat"], "attente")
-        # une conversation courte : pas de question, il se rendort
-        m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}]
-        m.JARVIS["veille_demandee"] = False
+        # « ok merci » apres une reponse : fini, rien ne part au modele
         m.dire("Il est 14 h.", suite=True)
-        n = len(self.dit)
-        m.traiter_evenement({"evt": "vide"})
-        self.assertEqual(len(self.dit), n)
+        self.phrase("ok merci")
+        self.assertEqual(vus["jarvis"], [], "« ok » ne part pas au modele")
+        self.assertEqual(m.JARVIS["historique"], [], "la conversation est close")
+        # ... mais apres une question, « ok » est un oui
+        m.dire("Je lance la playlist ?", suite=True)
+        self.phrase("ok")
+        self.assertEqual(vus["jarvis"], ["ok"])
 
     def test_il_se_souvient_de_vos_conversations(self):
         # « Il faut que Jarvis se souvienne des anciennes discussions, mais simplement. »
