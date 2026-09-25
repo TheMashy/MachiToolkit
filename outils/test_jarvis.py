@@ -1766,6 +1766,32 @@ class DansMachiTool(unittest.TestCase):
         self.assertNotIn("Code d'accès ?", self.dit, "lire des temperatures ne demande pas de code")
         self.assertIn("RTX 3070, nvidia-smi) : 71 °C, charge 98 %", envoyes[1]["resultats"][0]["texte"])
 
+    def test_il_dit_pourquoi_braindebugger_refuse(self):
+        # « J'ai "BrainDebugger a repondu par une erreur 502" » : la cause, pas le numero.
+        import urllib.error
+        m = self.m
+        vrai = m._requete_bd
+        self.addCleanup(lambda: setattr(m, "_requete_bd", vrai))
+        m.CFG["jarvis_langue"] = "fr"
+        corps = {}
+
+        def refus(chemin, charge, cfg, delai):
+            raise urllib.error.HTTPError(chemin, 502, "Bad Gateway", {}, io.BytesIO(json.dumps(corps).encode()))
+        m._requete_bd = refus
+        corps.update(error="401 authentication_error: invalid x-api-key", raison="cle")
+        self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
+        self.assertIn("refuse la clé API", m.JARVIS["message"])
+        self.assertIn("ANTHROPIC_API_KEY", m.JARVIS["message"])
+        corps.update(error="Your credit balance is too low", raison="credit")
+        self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
+        self.assertEqual(m.JARVIS["message"], "Le crédit de la clé API Claude est épuisé.")
+        corps.update(error="quelque chose d'inattendu", raison="autre")
+        self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502. quelque chose d'inattendu")
+        corps.clear()
+        self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502.", "un 502 de Railway, sans JSON")
+
     def test_jarvis_montre_l_agenda(self):
         # « L'agenda de Machi Tool pourra etre visible et montre par Jarvis (fenetre qui s'ouvre). »
         m = self.m

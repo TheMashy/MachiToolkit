@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.46.0"
+VERSION = "1.46.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5431,6 +5431,14 @@ _PHRASES = {
     "bd_sans_cle": ("BrainDebugger n'a pas de clé Claude pour me faire parler.",
                     "BrainDebugger has no Claude key to let me speak."),
     "bd_erreur": ("BrainDebugger a répondu par une erreur %s.", "BrainDebugger answered with error %s."),
+    "api_cle": ("Anthropic refuse la clé API de BrainDebugger : vérifiez-la dans ses réglages, ou la variable "
+                "ANTHROPIC_API_KEY sur Railway.",
+                "Anthropic is refusing BrainDebugger's API key: check it in its settings, or ANTHROPIC_API_KEY on Railway."),
+    "api_credit": ("Le crédit de la clé API Claude est épuisé.", "The Claude API key has run out of credit."),
+    "api_surcharge": ("Claude est surchargé en ce moment. Réessayez dans un instant.",
+                      "Claude is overloaded right now. Try again in a moment."),
+    "api_limite": ("Trop de demandes à Claude d'un coup. Réessayez dans une minute.",
+                   "Too many requests to Claude at once. Try again in a minute."),
     "bd_injoignable": ("Je n'arrive pas à joindre BrainDebugger.", "I can't reach BrainDebugger."),
     "compagnon_muet": ("Le compagnon n'a rien répondu.", None),
     "sans_reponse": ("Je n'ai rien à répondre à cela, curieusement.", "Curiously, I have nothing to say to that."),
@@ -5841,10 +5849,38 @@ def _cle_presente(cfg):
 
 
 def _detail_http(e):
-    try:
-        return str(json.loads(e.read().decode("utf-8")).get("error") or "")
-    except Exception:
-        return ""
+    return str(_corps_http(e).get("error") or "")
+
+
+def _corps_http(e):
+    """Le JSON d'une reponse d'erreur, lu une fois (la lecture vide le flux)."""
+    if getattr(e, "_corps_lu", None) is None:
+        try:
+            e._corps_lu = json.loads(e.read().decode("utf-8")) or {}
+        except Exception:
+            e._corps_lu = {}
+        if not isinstance(e._corps_lu, dict):
+            e._corps_lu = {}
+    return e._corps_lu
+
+
+def erreur_bd(e, L, pour="jarvis"):
+    """Ce qu'il dit quand BrainDebugger repond une erreur -- la CAUSE, quand on
+    la connait (« BrainDebugger a repondu par une erreur 502 » ne disait pas
+    quoi faire). Le detail va aussi au panneau et au journal."""
+    corps = _corps_http(e)
+    detail, raison = str(corps.get("error") or ""), str(corps.get("raison") or "")
+    if detail:
+        print("Jarvis : BrainDebugger %d -- %s" % (e.code, detail[:200]))
+    if e.code in (401, 403):
+        return phrase("cle_refusee", L)
+    if e.code == 404:
+        return phrase("bd_ancien_psy" if pour == "psy" else "bd_ancien_jarvis", L)
+    if raison in ("cle", "credit", "surcharge", "limite"):
+        return phrase("api_" + raison, L)
+    if "clé API" in detail:
+        return phrase("bd_sans_cle", L)
+    return phrase("bd_erreur", L, e.code) + ((" " + detail[:160]) if detail and L == "fr" else "")
 
 
 def parler_au_compagnon(texte, cfg):
@@ -5857,10 +5893,7 @@ def parler_au_compagnon(texte, cfg):
     try:
         donnees = _requete_bd("/api/machitool/parler", {"texte": texte}, cfg, 180)
     except urllib.error.HTTPError as e:
-        return signaler_erreur(
-            phrase("cle_refusee", "fr") if e.code in (401, 403)
-            else phrase("bd_ancien_psy", "fr") if e.code == 404
-            else phrase("bd_erreur", "fr", e.code))
+        return signaler_erreur(erreur_bd(e, "fr", pour="psy"))
     except Exception:
         return signaler_erreur(phrase("bd_injoignable", "fr"))
     reponse = str((donnees or {}).get("texte") or "").strip()
@@ -7034,7 +7067,7 @@ def continuer_jarvis(etat, resultats, cfg):
                                     "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
                                    **capacites_jarvis(cfg)), cfg, 180)
     except urllib.error.HTTPError as e:
-        return signaler_erreur(phrase("bd_erreur", L, e.code))
+        return signaler_erreur(erreur_bd(e, L))
     except Exception:
         return signaler_erreur(phrase("bd_injoignable", L))
     return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1)
@@ -7111,12 +7144,7 @@ def parler_a_jarvis(texte, cfg):
                                     "onglets_ouverts": onglets_du_moment() if cfg.get("jarvis_pc") else ""},
                                    **capacites_jarvis(cfg)), cfg, 180)
     except urllib.error.HTTPError as e:
-        detail = _detail_http(e)
-        return signaler_erreur(
-            phrase("cle_refusee", L) if e.code in (401, 403)
-            else phrase("bd_ancien_jarvis", L) if e.code == 404
-            else phrase("bd_sans_cle", L) if "clé API" in detail
-            else phrase("bd_erreur", L, e.code))
+        return signaler_erreur(erreur_bd(e, L))
     except Exception:
         return signaler_erreur(phrase("bd_injoignable", L))
     return recevoir_jarvis(texte, donnees, cfg)
