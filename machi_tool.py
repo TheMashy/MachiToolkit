@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.34.0"
+VERSION = "1.35.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -4434,11 +4434,22 @@ def gabarits_jarvis():
         return []
 
 
+def micro_des_gabarits():
+    """Le micro avec lequel la voix a ete apprise ('' si inconnu : avant 1.35)."""
+    try:
+        with open(_fichier_gabarits(), encoding="utf-8") as f:
+            return str(json.load(f).get("micro") or "")
+    except Exception:
+        return ""
+
+
 def sauver_gabarits(gabarits):
     os.makedirs(dossier_jarvis(), exist_ok=True)
     chemin = _fichier_gabarits()
     with open(chemin + ".part", "w", encoding="utf-8") as f:
-        json.dump({"gabarits": gabarits, "appris_le": time.strftime("%Y-%m-%d %H:%M")}, f)
+        # le micro avec lequel on l'a appris : un autre micro entend une autre voix
+        json.dump({"gabarits": gabarits, "appris_le": time.strftime("%Y-%m-%d %H:%M"),
+                   "micro": str(JARVIS.get("micro") or "")}, f)
     os.replace(chemin + ".part", chemin)
 
 
@@ -5168,6 +5179,10 @@ def traiter_evenement(ev):
             JARVIS["micro_absent"] = not ev.get("trouve", True)
             if JARVIS["micro_absent"]:
                 print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
+    elif quoi == "presque":
+        # « Jarvis » passe pres du seuil sans le franchir : on le garde pour
+        # l'afficher, avec de quoi y remedier.
+        JARVIS["presque"] = (float(ev.get("distance") or 0), float(ev.get("seuil") or 0), time.time())
     elif quoi == "niveau":
         JARVIS["db"] = ev.get("db")
         JARVIS["coupure"] = ev.get("coupure")
@@ -5951,7 +5966,7 @@ def continuer_jarvis(etat, resultats, cfg):
         donnees = _requete_bd("/api/machitool/jarvis",
                               {"suite": etat["suite"], "resultats": resultats, "langue": L,
                                "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                               "outils": True, "ecran": bool(cfg.get("jarvis_ecran"))}, cfg, 90)
+                               "outils": True, "ecran": bool(cfg.get("jarvis_ecran"))}, cfg, 180)
     except urllib.error.HTTPError as e:
         return signaler_erreur(phrase("bd_erreur", L, e.code))
     except Exception:
@@ -5959,11 +5974,32 @@ def continuer_jarvis(etat, resultats, cfg):
     return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1)
 
 
+def copier_presse_papiers(texte):
+    """Le texte dans le presse-papiers de Windows (clip.exe, en UTF-16 avec sa
+    marque, pour les accents). Rend False hors de Windows ou en echec."""
+    if os.name != "nt" or not texte:
+        return False
+    try:
+        subprocess.run(["clip"], input=texte.encode("utf-16"), check=True, timeout=5,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+    except Exception:
+        return False
+
+
 def recevoir_jarvis(texte, donnees, cfg, tour=1):
     """Ce que BrainDebugger renvoie : une reponse a dire, le compagnon (grave),
     ou des outils a executer ici."""
     L = langue_jarvis(cfg)
     donnees = donnees or {}
+    if donnees.get("detail"):
+        # CE QUE CLAUDE A REPONDU EN ENTIER, quand Jarvis l'a consulte : il en
+        # dit l'essentiel, le texte complet va dans le presse-papiers.
+        JARVIS["derniere_reponse_complete"] = str(donnees["detail"])
+        if copier_presse_papiers(str(donnees["detail"])):
+            notifier = JARVIS_CROCHETS.get("notifier")
+            if notifier:
+                notifier("Jarvis", "La réponse complète de Claude est dans le presse-papiers.")
     if donnees.get("outils") and cfg.get("jarvis_pc"):
         if tour > OUTILS_TOURS_MAX:
             return signaler_erreur(phrase("sans_reponse", L))
@@ -6006,7 +6042,7 @@ def parler_a_jarvis(texte, cfg):
                                "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
                                "outils": bool(cfg.get("jarvis_pc")),
                                "ecran": bool(cfg.get("jarvis_pc") and cfg.get("jarvis_ecran"))},
-                              cfg, 90)
+                              cfg, 180)
     except urllib.error.HTTPError as e:
         detail = _detail_http(e)
         return signaler_erreur(
@@ -8969,6 +9005,14 @@ class Panneau:
         details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
         if JARVIS.get("db") is not None and etat != "eteint":
             details.append("micro %.0f dB" % JARVIS["db"])
+        pr = JARVIS.get("presque")
+        if pr and time.time() - pr[2] < 120 and etat != "eteint":
+            details.append("« Jarvis » presque reconnu (%.3f pour un seuil de %.3f) : monte la sensibilite, "
+                           "ou reapprends ta voix" % (pr[0], pr[1]))
+        appris_avec, ecoute = micro_des_gabarits(), str(JARVIS.get("micro") or "")
+        if appris_avec and ecoute and appris_avec != ecoute and etat != "eteint":
+            details.append("ta voix a ete apprise avec « %s » et il ecoute « %s » : reapprends-la avec ce micro"
+                           % (appris_avec, ecoute))
         if JARVIS.get("micro_absent") and etat != "eteint":
             details.append("le micro choisi est debranche : j'ecoute celui de Windows")
         d = etat_dictee()

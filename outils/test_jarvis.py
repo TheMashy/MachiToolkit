@@ -211,6 +211,27 @@ class FinEtModes(unittest.TestCase):
             self.assertIsNone(J.changement_de_mode(t), t)
 
 
+@unittest.skipUnless(NUMPY, "numpy absent")
+class PresqueReconnu(unittest.TestCase):
+    """« Il semble avoir oublie mon Jarvis » : quand le mot appris passe pres du
+    seuil sans le franchir, l'oreille le dit -- un nombre, rien d'autre."""
+
+    def test_presque_puis_rien_pendant_trois_secondes(self):
+        sorties = []
+        o = J.Oreille(object(), sorties.append, lambda g: None)
+        o.niveau_vu = float("inf")
+        o.det.seuil = 0.05
+        o.det.trame = lambda x, chercher=True: None
+        for i, d in enumerate((0.2, 0.07, 0.07, 0.07)):
+            o.det.n = 100 + i
+            o.det.plus_proche = d
+            o.trame(np.zeros(J.TRAME, dtype=np.int16))
+        presque = [e for e in sorties if e["evt"] == "presque"]
+        self.assertEqual(len(presque), 1, "une fois, pas a chaque trame")
+        self.assertEqual(presque[0], {"evt": "presque", "distance": 0.07, "seuil": 0.05})
+        self.assertEqual(set(presque[0]), {"evt", "distance", "seuil"}, "un nombre, ni son ni texte")
+
+
 class SesMains(unittest.TestCase):
     """Ce que Jarvis peut faire sur le PC, sans Windows : le code, les
     chemins, les listes, la recherche, les dossiers."""
@@ -938,6 +959,28 @@ class DansMachiTool(unittest.TestCase):
         self.assertFalse(envoyes[0]["outils"])
         self.assertFalse(os.path.exists(os.path.join(maison, "Documents", "Y")))
         self.assertEqual(len(envoyes), 1)
+
+    def test_presque_reconnu_et_le_micro_de_l_apprentissage(self):
+        m = self.m
+        m.traiter_evenement({"evt": "presque", "distance": 0.07, "seuil": 0.05})
+        self.assertEqual(m.JARVIS["presque"][:2], (0.07, 0.05))
+        m.JARVIS["micro"] = "Micro casque"
+        m.sauver_gabarits([[[0.1] * 96] * 6])
+        self.assertEqual(m.micro_des_gabarits(), "Micro casque", "on sait avec quel micro on l'a appris")
+
+    def test_claude_consulte_le_texte_complet_au_presse_papiers(self):
+        copies = []
+        vrai = self.m.copier_presse_papiers
+        self.m.copier_presse_papiers = lambda t: copies.append(t) or True
+        try:
+            with mock_urlopen(self.m, {"texte": "Claude a écrit le script.", "mode": "jarvis",
+                                       "detail": "import os\n# tout le script"}):
+                self.phrase("Jarvis, demande à Claude un script pour renommer mes photos")
+        finally:
+            self.m.copier_presse_papiers = vrai
+        self.assertEqual(copies, ["import os\n# tout le script"])
+        self.assertIn("presse-papiers", " ".join(self.dit))
+        self.assertIn("Claude a écrit le script.", self.dit)
 
     def test_le_micro_choisi_part_a_l_oreille_et_revient(self):
         m = self.m

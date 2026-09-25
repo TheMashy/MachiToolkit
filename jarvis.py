@@ -79,6 +79,7 @@ GABARIT_MAX = 30
 # toutes sous 0,047 ; vingt-neuf mots voisins dits par deux voix, rien sous
 # 0,055 sauf « Marvis » et « jars vides », qui sont presque son nom.
 GABARIT_SAUT = 3
+PRESQUE_FACTEUR = 1.7         # jusqu'ou un mot « presque reconnu » est signale
 FENETRE_FACTEUR = 2.2
 
 # Parole : au-dessus de trois fois le bruit de fond de la piece, et au-dessus
@@ -232,6 +233,7 @@ class Detecteur:
         self.n = 0
         self.repos_jusqua = 0
         self.derniere_parole = -999
+        self.plus_proche = None       # la distance du dernier mot compare, pour « presque »
 
     def parle(self, rms):
         return rms > max(PAROLE_FACTEUR * (self.plancher or PAROLE_MIN), PAROLE_MIN)
@@ -271,11 +273,13 @@ class Detecteur:
             return None
         x_ = np.array(self.emps)
         meilleur = 9.0
+        self.plus_proche = None
         for g in self.gabarits:
             fen = x_[-(int(FENETRE_FACTEUR * len(g)) + 1):]
             if len(fen) < len(g) // 2:
                 continue
             meilleur = min(meilleur, distance_eveil(g, fen))
+        self.plus_proche = meilleur if meilleur < 9.0 else None
         if meilleur <= self.seuil:
             self.repos_jusqua = self.n + 25
             return ("voix", meilleur)
@@ -2077,6 +2081,15 @@ class Oreille:
         import numpy as np
         rms = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
         ev = self.det.trame(x, chercher=(self.etat == "veille"))
+        # « IL SEMBLE AVOIR OUBLIE MON JARVIS » : quand le mot appris passe PRES
+        # du seuil sans le franchir, on le dit -- un NOMBRE, rien d'autre ne
+        # sort d'ici avant l'eveil. Machi Tool l'affiche : monter la
+        # sensibilite, ou reapprendre avec ce micro.
+        d = getattr(self.det, "plus_proche", None)
+        if (ev is None and d is not None and self.etat == "veille" and d < self.det.seuil * PRESQUE_FACTEUR
+                and self.det.n - getattr(self, "_presque_n", -999) > 40):
+            self._presque_n = self.det.n
+            self.sortie({"evt": "presque", "distance": round(float(d), 4), "seuil": round(float(self.det.seuil), 4)})
         if ev is not None:
             self._arreter_parole()
             if self.reglages.get("son", True):
