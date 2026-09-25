@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.47.2"
+VERSION = "1.48.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -9072,7 +9072,7 @@ class Panneau:
     #  clics traversent. Il vit le temps que Jarvis est actif ; sa reponse y
     #  defile pendant qu'il parle.
 
-    def _panneau_creer(self, taille):
+    def _panneau_creer(self, taille, attribut="fen_led"):
         tk = self.tk
         f = tk.Toplevel(self.root)
         f.overrideredirect(True)
@@ -9088,11 +9088,47 @@ class Panneau:
             h = int(f.wm_frame(), 16)
             u.SetWindowLongW(h, -20, u.GetWindowLongW(h, -20) | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
         f.withdraw()
-        self.fen_led, self.fen_led_image = f, lab
+        setattr(self, attribut, f)
+        setattr(self, attribut + "_image", lab)
+
+    def _sous_titres_tic(self, montre, alpha, pas, x_milieu, y_haut):
+        """Sous le panneau, la reponse de Jarvis EN ENTIER, tant qu'il parle."""
+        f = getattr(self, "fen_st", None)
+        st = self.panneau_etat
+        reponse = JARVIS.get("reponse_affichee", "") if montre else ""
+        img = None
+        if reponse:
+            if reponse != st.get("st_texte"):
+                st["st_texte"], st["st_debut"] = reponse, time.time()
+            img = _jv.image_sous_titres(reponse, time.time() - st["st_debut"])
+        if img is None:
+            if f is not None and f.winfo_exists() and f.state() != "withdrawn":
+                f.withdraw()
+            return
+        from PIL import Image, ImageTk
+        dalle = _jv.dalle_led(img, pas)
+        h, l = dalle.shape[0], dalle.shape[1]
+        if f is None or not f.winfo_exists():
+            self._panneau_creer(l, "fen_st")
+            f = self.fen_st
+        photo = ImageTk.PhotoImage(Image.fromarray(dalle))
+        self.fen_st_image.configure(image=photo)
+        self.fen_st_image.image = photo
+        f.geometry("%dx%d+%d+%d" % (l, h, x_milieu - l // 2, y_haut))
+        try:
+            f.attributes("-alpha", 0.96 * alpha)
+        except Exception:
+            pass
+        if f.state() == "withdrawn":
+            f.deiconify()
+            f.attributes("-topmost", True)
 
     def _panneau_tic(self):
         f = getattr(self, "fen_led", None)
-        cache = lambda: f is not None and f.winfo_exists() and f.state() != "withdrawn" and f.withdraw()
+        def cache():
+            for w in (f, getattr(self, "fen_st", None)):
+                if w is not None and w.winfo_exists() and w.state() != "withdrawn":
+                    w.withdraw()
         if not self.cfg.get("jarvis_panneau", True) or not self.cfg.get("jarvis_actif"):
             cache()
             return 500
@@ -9108,23 +9144,23 @@ class Panneau:
         if not montre and (f is None or not f.winfo_exists() or f.state() == "withdrawn"):
             st["alpha"] = 0.0
             return 300
-        pas = max(4, min(9, int(round(5 * getattr(self, "echelle", 1.0)))))
+        pas = max(3, min(8, int(round(4 * getattr(self, "echelle", 1.0)))))
         taille = pas * _jv.LED_N
         if f is None or not f.winfo_exists():
             self._panneau_creer(taille)
             f = self.fen_led
         st["alpha"] = min(1.0, st["alpha"] + 0.2) if montre else max(0.0, st["alpha"] - 0.15)
         if st["alpha"] <= 0.0:
-            f.withdraw()
+            cache()
             return 300
         from PIL import Image, ImageTk
-        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, JARVIS.get("reponse_affichee", "") if etat == "parle" else "",
-                                             JARVIS.get("mode", "jarvis")), pas)
+        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis")), pas)
         photo = ImageTk.PhotoImage(Image.fromarray(img))
         self.fen_led_image.configure(image=photo)
         self.fen_led_image.image = photo
         x0, y0, l, _ = self._boule_zone()
-        f.geometry("%dx%d+%d+%d" % (taille, taille, x0 + (l - taille) // 2, y0 + max(8, int(12 * getattr(self, "echelle", 1.0)))))
+        haut = y0 + max(8, int(12 * getattr(self, "echelle", 1.0)))
+        f.geometry("%dx%d+%d+%d" % (taille, taille, x0 + (l - taille) // 2, haut))
         try:
             f.attributes("-alpha", 0.96 * st["alpha"])
         except Exception:
@@ -9132,6 +9168,7 @@ class Panneau:
         if f.state() == "withdrawn":
             f.deiconify()
             f.attributes("-topmost", True)
+        self._sous_titres_tic(etat == "parle", st["alpha"], max(3, pas - 1), x0 + l // 2, haut + taille + pas)
         return 50
 
     def boule_tic(self):

@@ -492,9 +492,7 @@ class SesMains(unittest.TestCase):
         arc = pense[:44].reshape(-1, 3).astype(int)
         arc = arc[arc.max(axis=1) > 0]
         self.assertTrue(np.all((arc[:, 2] > arc[:, 0]) & (arc[:, 0] > arc[:, 1])), "l'arc, en degrade de violet")
-        parle = J.image_jarvis("parle", 1.0, "Bonjour")
-        parle2 = J.image_jarvis("parle", 2.0, "Bonjour")
-        self.assertFalse(np.array_equal(parle[48:59], parle2[48:59]), "la reponse defile")
+        parle = J.image_jarvis("parle", 1.0)
         self.assertTrue(np.any(np.all(parle[:44] == np.array(C["ambre"], dtype=np.uint8), axis=2)), "les barres")
         muet = J.image_jarvis("parle", 1.0, "")
         self.assertGreater(int((muet[50:57].max(axis=2) > 0).sum()), 40, "SPEAKING sans reponse")
@@ -506,6 +504,28 @@ class SesMains(unittest.TestCase):
         self.assertEqual(dalle.shape, (320, 320, 3))
         self.assertEqual(tuple(dalle[0, 0]), (8, 9, 12), "le fond entre les LED")
         self.assertEqual(tuple(dalle[2, 2]), (18, 20, 26), "une LED eteinte, a peine visible")
+
+    def test_les_sous_titres_montrent_toute_la_reponse(self):
+        # « montre tout le texte lorsque Jarvis repond » : plus de defilement,
+        # la reponse entiere, sur plusieurs lignes, sous le panneau
+        import numpy as np
+        reponse = ("Bien sur monsieur. Votre rendez-vous chez le dentiste est demain a quatorze heures trente, "
+                   "et il fera beau toute la journee a Lyon.")
+        lignes = J.lignes_led(reponse)
+        self.assertGreater(len(lignes), 1)
+        self.assertTrue(all(J.largeur_led(l) <= J.SOUS_TITRES_COLONNES - 2 for l in lignes))
+        self.assertEqual(" ".join(lignes), J.texte_led(reponse), "aucun mot perdu")
+        im = J.image_sous_titres(reponse, 0.0)
+        self.assertEqual(im.shape, (len(lignes) * 9 + 3, J.SOUS_TITRES_COLONNES, 3))
+        self.assertEqual(J.image_sous_titres("", 0.0), None)
+        self.assertEqual(J.lignes_led("A" * 80), ["A" * 26, "A" * 26, "A" * 26, "AA"], "un mot trop long est coupe")
+        # trop long pour tenir : des pages, qui tournent, avec des points
+        long = " ".join(["phrase numero %d assez longue pour remplir" % i for i in range(12)])
+        self.assertGreater(len(J.lignes_led(long)), J.SOUS_TITRES_LIGNES)
+        p1, p2 = J.image_sous_titres(long, 0.0), J.image_sous_titres(long, J.SOUS_TITRES_PAGE_S + 0.1)
+        self.assertEqual(p1.shape, (J.SOUS_TITRES_LIGNES * 9 + 3, J.SOUS_TITRES_COLONNES, 3))
+        self.assertFalse(np.array_equal(p1, p2), "la page suivante")
+        self.assertEqual(J.dalle_led(im, 3).shape, (im.shape[0] * 3, im.shape[1] * 3, 3))
 
     def test_l_agenda_jour_par_jour(self):
         rdv = [{"date": "2026-10-02", "heure": "", "label": "Anniversaire de Paul"},
@@ -794,8 +814,9 @@ class Kokoro(unittest.TestCase):
         self.assertEqual((v[";"], v[" "], v["̃"], v["ᵻ"]), (1, 16, 17, 177))
         self.assertEqual(len(set(v.values())), 114)
         # Le fichier de Kokoro-82M, quand il est la : la table recopiee lui est identique.
-        conf = os.path.join(os.environ.get("JARVIS_KOKORO_DOSSIER", ""), "config.json")
-        if os.path.isfile(conf):
+        dossier = os.environ.get("JARVIS_KOKORO_DOSSIER", "")
+        conf = os.path.join(dossier, "config.json")
+        if dossier and os.path.isfile(conf):
             with open(conf, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["vocab"], v)
 

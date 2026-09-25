@@ -3779,16 +3779,17 @@ def largeur_led(s):
 
 
 class Matrice:
-    """Une image 64 x 64 (numpy), et les gestes de la page : point, bloc,
-    texte, disque, anneau, trait."""
+    """Une image de LED (64 x 64 par defaut, numpy), et les gestes de la page :
+    point, bloc, texte, disque, anneau, trait."""
 
-    def __init__(self):
+    def __init__(self, largeur=LED_N, hauteur=LED_N):
         import numpy as np
-        self.px = np.zeros((LED_N, LED_N, 3), dtype=np.float32)
+        self.l, self.h = largeur, hauteur
+        self.px = np.zeros((hauteur, largeur, 3), dtype=np.float32)
 
     def set(self, x, y, c):
         x, y = int(round(x)), int(round(y))
-        if 0 <= x < LED_N and 0 <= y < LED_N:
+        if 0 <= x < self.l and 0 <= y < self.h:
             self.px[y, x] = c
 
     def bloc(self, x, y, w, h, c):
@@ -3869,17 +3870,61 @@ def image_jarvis(etat, t, reponse="", mode="jarvis"):
         m.trait(21, 26, 28, 33, c, 3)
         m.trait(28, 33, 43, 18, c, 3)
         mot = "DONE"
-    ecrit = texte_led(reponse) if etat == "parle" else ""
-    if ecrit:
-        # la reponse, qui defile sous les barres (24 points par seconde, comme la page)
-        w = largeur_led(ecrit)
-        x = LED_N - int((t * 24) % (w + LED_N + 8))
-        m.texte(ecrit, x, 50, _fois(C["blanc"], 0.9))
-        for i in range(LED_N):
-            m.set(i, 45, (70, 56, 18))
-            m.set(i, 58, (70, 56, 18))
-    else:
-        m.texte(mot, (LED_N - largeur_led(mot)) // 2, 50, _fois(c, 0.85))
+    # « Montre tout le texte » : la reponse entiere va dans les sous-titres,
+    # sous le panneau (image_sous_titres) ; le panneau garde son mot.
+    m.texte(mot, (LED_N - largeur_led(mot)) // 2, 50, _fois(c, 0.85))
+    return np.clip(m.px, 0, 255).astype(np.uint8)
+
+
+SOUS_TITRES_COLONNES = 160
+SOUS_TITRES_LIGNES = 6
+SOUS_TITRES_PAGE_S = 4.5
+
+
+def lignes_led(texte, colonnes=SOUS_TITRES_COLONNES):
+    """Le texte en lignes qui tiennent en `colonnes` points (mot a mot ; un mot
+    trop long est coupe)."""
+    lignes, cur = [], ""
+    for mot in texte_led(texte).split(" "):
+        while largeur_led(mot) > colonnes - 2:
+            n = len(mot)
+            while n > 1 and largeur_led(mot[:n]) > colonnes - 2:
+                n -= 1
+            if cur:
+                lignes.append(cur)
+                cur = ""
+            lignes.append(mot[:n])
+            mot = mot[n:]
+        essai = (cur + " " + mot).strip()
+        if largeur_led(essai) <= colonnes - 2:
+            cur = essai
+        else:
+            lignes.append(cur)
+            cur = mot
+    if cur:
+        lignes.append(cur)
+    return [l for l in lignes if l]
+
+
+def image_sous_titres(texte, t, colonnes=SOUS_TITRES_COLONNES, lignes_max=SOUS_TITRES_LIGNES):
+    """La reponse ENTIERE, en LED, sur plusieurs lignes centrees ; plus longue
+    que `lignes_max`, elle passe de page en page (4,5 s chacune). None si
+    rien a montrer."""
+    import numpy as np
+    lignes = lignes_led(texte, colonnes)
+    if not lignes:
+        return None
+    pages = [lignes[i:i + lignes_max] for i in range(0, len(lignes), lignes_max)]
+    page = pages[int(t / SOUS_TITRES_PAGE_S) % len(pages)] if len(pages) > 1 else pages[0]
+    hauteur = min(len(lignes), lignes_max) * 9 + 3
+    m = Matrice(colonnes, hauteur)
+    for k, ligne in enumerate(page):
+        m.texte(ligne, (colonnes - largeur_led(ligne)) // 2, 2 + k * 9, _fois(LED_COULEURS["blanc"], 0.9))
+    if len(pages) > 1:
+        # ou l'on en est : un point par page, en bas a droite
+        for i in range(len(pages)):
+            m.set(colonnes - 3 - (len(pages) - 1 - i) * 3, hauteur - 1,
+                  LED_COULEURS["ambre"] if pages[i] is page else (70, 56, 18))
     return np.clip(m.px, 0, 255).astype(np.uint8)
 
 
@@ -3893,5 +3938,5 @@ def dalle_led(image, pas=5, eteinte=(18, 20, 26), fond=(8, 9, 12)):
     allume = img.max(axis=2, keepdims=True) > 0
     couleurs = np.where(allume, img, np.array(eteinte, dtype=np.int16)).astype(np.uint8)
     grand = couleurs.repeat(pas, axis=0).repeat(pas, axis=1)
-    masque = np.tile(rond, (LED_N, LED_N))[..., None]
+    masque = np.tile(rond, (image.shape[0], image.shape[1]))[..., None]
     return np.where(masque, grand, np.array(fond, dtype=np.uint8)).astype(np.uint8)
