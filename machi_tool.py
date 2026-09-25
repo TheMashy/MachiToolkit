@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.45.0"
+VERSION = "1.46.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -368,16 +368,11 @@ CONFIG_DEFAUT = {
     # LES ONGLETS DE CHROME : la cle de l'extension de Machi Tool (a part du
     # jeton du serveur local : elle ne sert qu'aux onglets).
     "onglets_cle": "",
-    # GOOGLE AGENDA : l'acces « application de bureau » de la personne (console
-    # Google Cloud) et le jeton de renouvellement de la connexion.
-    "google_client_id": "",
     # LA BOULE DE JARVIS a l'ecran quand il est reveille ; sa place en
     # fractions de l'ecran principal (la meme a toutes les resolutions).
     "jarvis_boule": True,
     "jarvis_boule_x": 0.97,
     "jarvis_boule_y": 0.90,
-    "google_client_secret": "",
-    "google_refresh": "",
     "spotify_refresh": "",
     "jarvis_code_sel": "",
     "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
@@ -5825,8 +5820,8 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
 
 
 def _requete_bd(chemin, charge, cfg, delai):
-    """POST a BrainDebugger avec la cle de la passerelle. Rend le JSON, leve
-    urllib.error.HTTPError ou une erreur reseau."""
+    """POST a BrainDebugger avec la cle de la passerelle (GET si `charge` est
+    None). Rend le JSON, leve urllib.error.HTTPError ou une erreur reseau."""
     base = str(cfg.get("pont_site", "")).strip().rstrip("/")
     cle = str(cfg.get("pont_cle", "")).strip()
     decalage = -(time.altzone if time.localtime().tm_isdst > 0 else time.timezone) // 3600
@@ -5835,7 +5830,7 @@ def _requete_bd(chemin, charge, cfg, delai):
                # Sa journee, pas celle du serveur : un fuseau a heure fixe suffit
                # pour dater MAINTENANT.
                "X-Fuseau": "UTC" if not decalage else "Etc/GMT%+d" % -decalage}
-    corps = json.dumps(charge, ensure_ascii=False).encode("utf-8")
+    corps = None if charge is None else json.dumps(charge, ensure_ascii=False).encode("utf-8")
     requete = urllib.request.Request(base + chemin, data=corps, headers=entetes)
     with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -5890,7 +5885,7 @@ def parler_au_compagnon(texte, cfg):
 
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
                     "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets", "temperatures",
-                    "spotify_jouer", "spotify_en_cours", "spotify_aimer", "agenda_poser"}
+                    "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -6631,6 +6626,18 @@ def lire_temperatures():
                                    _jv.lire_nvidia_smi(sortie_nvidia_smi()), capteurs_wmi())
 
 
+# --- L'AGENDA -----------------------------------------------------------
+
+AGENDA_JOURS = 14
+
+
+def lire_agenda(cfg, jours=AGENDA_JOURS):
+    """Les rendez-vous des prochains jours, depuis BrainDebugger (les reperes
+    « agenda » ; jamais un « psy »)."""
+    return _requete_bd("/api/machitool/agenda?depuis=%s&jours=%d" % (time.strftime("%Y-%m-%d"), int(jours)),
+                       None, cfg, 15)
+
+
 # --- YOUTUBE -----------------------------------------------------------
 
 def ouvrir_youtube(recherche):
@@ -6685,7 +6692,7 @@ def ouvrir_appli_spotify():
 
 
 def attendre_retour_oauth(etat, echanger, rappel, delai=180, service="Spotify"):
-    """Le retour d'une connexion (Spotify, Google) sur 127.0.0.1:8765/callback,
+    """Le retour d'une connexion (Spotify) sur 127.0.0.1:8765/callback,
     une fois : verifie `state`, appelle `echanger(code)` (qui garde le jeton)
     et rend la main. `rappel(message)` dit ou on en est."""
     fini = threading.Event()
@@ -6757,47 +6764,6 @@ def connecter_spotify(cfg, rappel=None, delai=180):
     _SPOTIFY["connexion"] = attendre_retour_oauth(etat, echanger, rappel, delai, "Spotify")
     ouvrir_dans_chrome(_jv.spotify_url_autorisation(client_id, defi, etat))
     rappel("Connecte-toi a Spotify dans le navigateur...")
-
-
-# --- GOOGLE AGENDA -----------------------------------------------------
-# « Est-ce que tu peux lier Google Agenda pour qu'il puisse poser des
-# reperes ? » L'API officielle, avec le compte de la personne : un acces
-# « application de bureau » cree une fois dans la console Google Cloud, une
-# connexion (PKCE), et Jarvis pose des evenements. Il n'en lit ni n'en
-# efface aucun.
-
-_AGENDA = {"client": None, "cle": None}
-
-
-def agenda_connecte(cfg):
-    return bool(str(cfg.get("google_client_id") or "").strip() and cfg.get("google_refresh"))
-
-
-def agenda_de(cfg):
-    cle = (str(cfg.get("google_client_id") or "").strip(), str(cfg.get("google_client_secret") or "").strip(),
-           cfg.get("google_refresh"))
-    if _AGENDA["cle"] != cle or _AGENDA["client"] is None:
-        _AGENDA["client"], _AGENDA["cle"] = _jv.GoogleAgenda(*cle), cle
-    return _AGENDA["client"]
-
-
-def connecter_google(cfg, rappel=None, delai=180):
-    client_id = str(cfg.get("google_client_id") or "").strip()
-    secret = str(cfg.get("google_client_secret") or "").strip()
-    if not client_id or not secret:
-        raise ValueError("Colle d'abord l'ID client et le code secret de ton acces Google (application de bureau).")
-    verif, defi = _jv.pkce_paire()
-    etat = os.urandom(12).hex()
-    rappel = rappel or (lambda m: None)
-
-    def echanger(code):
-        r = _jv.GoogleAgenda.echanger_code(client_id, secret, code, verif)
-        cfg["google_refresh"] = r["refresh_token"]
-        sauver_config(cfg)
-        _AGENDA["client"] = None
-    attendre_retour_oauth(etat, echanger, rappel, delai, "Google Agenda")
-    ouvrir_dans_chrome(_jv.google_url_autorisation(client_id, defi, etat))
-    rappel("Connecte-toi a Google dans le navigateur...")
 
 
 def capturer_ecran(numero):
@@ -6894,12 +6860,10 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": agir_onglets(e.get("action") or "lister", e.get("cible") or "",
                                                        e.get("url") or "", e.get("recherche") or "",
                                                        bool(e.get("tous")))}
-        if nom == "agenda_poser":
-            if not agenda_connecte(cfg):
-                return {"id": ident, "erreur": "Google Agenda n'est pas connecte a Machi Tool (Reglages > Jarvis > Google Agenda)."}
-            return {"id": ident, "texte": agenda_de(cfg).poser(
-                e.get("titre"), e.get("debut"), e.get("fin") or "", e.get("duree_minutes") or 60,
-                e.get("description") or "", e.get("lieu") or "", e.get("rappel_minutes"))}
+        if nom == "montrer_agenda":
+            # la fenetre s'ouvre dans le fil de l'interface, a son prochain passage
+            JARVIS["montrer_agenda"] = time.time()
+            return {"id": ident, "texte": "Agenda ouvert a l'ecran."}
         if nom.startswith("spotify_"):
             if not spotify_connecte(cfg):
                 return {"id": ident, "erreur": "Spotify n'est pas connecte a Machi Tool (Reglages > Jarvis > Spotify)."}
@@ -7053,7 +7017,7 @@ def capacites_jarvis(cfg):
             "navigation": pc and bool(cfg.get("jarvis_historique")),
             "spotify": pc and spotify_connecte(cfg),
             "onglets": pc and extension_branchee(),
-            "agenda": pc and agenda_connecte(cfg),
+            "fenetre_agenda": pc,
             "souvenirs": souvenirs_a_envoyer(cfg),
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
@@ -8870,11 +8834,108 @@ class Panneau:
     #  rien ne se dessine le reste du temps (voir animer() : derriere un
     #  jeu plein ecran, redessiner sans raison peut tuer Tk).
 
+    # ------------------------------------------------------------------
+    #  L'agenda : les rendez-vous des prochains jours, tenus dans
+    #  BrainDebugger. Une fenetre a part, que Jarvis ouvre (« montre-moi mon
+    #  agenda »), comme le menu de l'icone.
+
+    def ouvrir_agenda(self):
+        tk = self.tk
+        f = getattr(self, "fen_agenda", None)
+        if f is not None and f.winfo_exists():
+            f.deiconify()
+            f.lift()
+            f.focus_force()
+            return self.remplir_agenda()
+        f = tk.Toplevel(self.root, bg=NUIT)
+        f.title("Agenda -- Machi Tool")
+        f.geometry("%dx%d" % (self.px(440), self.px(540)))
+        f.minsize(self.px(320), self.px(260))
+        f.attributes("-topmost", True)
+        f.after(1500, lambda: f.winfo_exists() and f.attributes("-topmost", False))
+        self.fen_agenda = f
+        tete = tk.Frame(f, bg=NUIT)
+        tete.pack(fill="x", padx=self.px(18), pady=(self.px(16), self.px(6)))
+        tk.Label(tete, text="Agenda", bg=NUIT, fg=CRAIE, font=(self.f_ui, 15, "bold")).pack(side="left")
+        self.agenda_etat = tk.Label(tete, text="", bg=NUIT, fg=BRUME, font=(self.f_ui, 9))
+        self.agenda_etat.pack(side="left", padx=(self.px(10), 0))
+        self.bouton(tete, "Actualiser", self.remplir_agenda, compact=True).pack(side="right")
+        cadre = tk.Frame(f, bg=NUIT)
+        cadre.pack(fill="both", expand=True, padx=self.px(18), pady=(0, self.px(14)))
+        barre = tk.Scrollbar(cadre)
+        barre.pack(side="right", fill="y")
+        t = tk.Text(cadre, bg=NUIT, fg=CRAIE, relief="flat", bd=0, highlightthickness=0, wrap="word",
+                    font=(self.f_ui, 11), cursor="arrow", yscrollcommand=barre.set, padx=2)
+        t.pack(side="left", fill="both", expand=True)
+        barre.config(command=t.yview)
+        t.tag_configure("jour", font=(self.f_ui, 10, "bold"), foreground=VIF, spacing1=self.px(12), spacing3=self.px(4))
+        t.tag_configure("heure", font=(self.f_mono if hasattr(self, "f_mono") else self.f_ui, 10), foreground=BRUME)
+        t.tag_configure("fin", foreground=BRUME, font=(self.f_ui, 9))
+        t.tag_configure("vide", foreground=BRUME)
+        self.agenda_texte = t
+        pied = tk.Frame(f, bg=NUIT)
+        pied.pack(fill="x", padx=self.px(18), pady=(0, self.px(14)))
+        tk.Label(pied, text="Les rendez-vous se posent dans BrainDebugger (Annee > Reperes > Agenda) ou a Jarvis.",
+                 bg=NUIT, fg=BRUME, font=(self.f_ui, 8), wraplength=self.px(400), justify="left").pack(side="left")
+        self.remplir_agenda()
+
+    def remplir_agenda(self):
+        """Va chercher l'agenda hors du fil de l'interface, puis l'ecrit."""
+        if not getattr(self, "agenda_texte", None) or not self.agenda_texte.winfo_exists():
+            return
+        self.agenda_etat.configure(text="Lecture...")
+        cfg = self.cfg
+
+        def chercher():
+            try:
+                if not _cle_presente(cfg):
+                    raise ValueError("Relie Machi Tool a BrainDebugger (Reglages > le pont) pour voir l'agenda.")
+                r = lire_agenda(cfg)
+                resultat = ("ok", r.get("rendezVous") or [], str(r.get("depuis") or time.strftime("%Y-%m-%d")))
+            except urllib.error.HTTPError as e:
+                resultat = ("erreur", "BrainDebugger a repondu %d%s." % (
+                    e.code, " : mets-le a jour" if e.code == 404 else ""), None)
+            except Exception as e:
+                resultat = ("erreur", str(e) if isinstance(e, ValueError) else "BrainDebugger injoignable.", None)
+            self.root.after(0, lambda: self._ecrire_agenda(*resultat))
+        threading.Thread(target=chercher, daemon=True).start()
+
+    def _ecrire_agenda(self, etat, contenu, aujourdhui):
+        t = getattr(self, "agenda_texte", None)
+        if t is None or not t.winfo_exists():
+            return
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        if etat != "ok":
+            t.insert("end", contenu, "vide")
+            self.agenda_etat.configure(text="")
+        else:
+            jours = _jv.agenda_par_jour(contenu, aujourdhui)
+            if not jours:
+                t.insert("end", "Rien a l'agenda pour les %d prochains jours." % AGENDA_JOURS, "vide")
+            for titre, items in jours:
+                t.insert("end", titre + "\n", "jour")
+                for heure, libelle, fin in items:
+                    t.insert("end", ("%s  " % heure) if heure else "        ", "heure")
+                    t.insert("end", libelle)
+                    if fin:
+                        t.insert("end", "  " + fin, "fin")
+                    t.insert("end", "\n")
+            self.agenda_etat.configure(text="%d prochains jours" % AGENDA_JOURS)
+        t.configure(state="disabled")
+
     BOULE_TAILLE = 44
     BOULE_CLE = "#010203"            # la couleur rendue transparente
 
     def boule_tic(self):
         delai = 400
+        demande = JARVIS.get("montrer_agenda") or 0
+        if demande > getattr(self, "_agenda_montre", 0):
+            self._agenda_montre = demande
+            try:
+                self.ouvrir_agenda()
+            except Exception as e:
+                print("Agenda : fenetre impossible (%s)" % e)
         try:
             delai = self._boule_tic()
         except Exception as e:
@@ -10099,30 +10160,12 @@ class Panneau:
         self.txt_spotify.pack(fill="x", pady=(4, 0))
 
         self.separateur(f, 12, 8)
-        self.titre(f, "google agenda").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Pour qu'il pose des reperes dans ton agenda (« mets-moi dentiste jeudi a 14 h », "
-                      "« bloque vendredi pour le demenagement »). Il en pose ; il n'en lit ni n'en efface "
-                      "aucun. Une fois, sur console.cloud.google.com : cree un projet, active « Google "
-                      "Calendar API », configure l'ecran de consentement (Externe, ajoute ton adresse en "
-                      "utilisateur test, puis « Publier l'application » -- en mode Test, Google coupe la "
-                      "connexion au bout de 7 jours), puis Identifiants > Creer > ID client OAuth > "
-                      "« Application de bureau ». Colle l'ID client et le code secret ici, puis « Connecter ». "
-                      "Le jeton reste sur ce PC.", BRUME, 8, largeur=500).pack(fill="x")
-        ligne = tk.Frame(f, bg=NUIT)
-        ligne.pack(fill="x", pady=(6, 0))
-        self.texte(ligne, "ID client", CRAIE, 9).pack(side="left")
-        self.champ_google_id = self.champ(ligne, self.cfg.get("google_client_id", ""), 30)
-        self.champ_google_id.pack(side="left", padx=(8, 0))
-        ligne = tk.Frame(f, bg=NUIT)
-        ligne.pack(fill="x", pady=(4, 0))
-        self.texte(ligne, "Code secret", CRAIE, 9).pack(side="left")
-        self.champ_google_secret = self.champ(ligne, self.cfg.get("google_client_secret", ""), 26)
-        self.champ_google_secret.configure(show="\u2022")
-        self.champ_google_secret.pack(side="left", padx=(8, 0))
-        self.bouton(ligne, "Connecter", self.connecter_google, compact=True).pack(side="left", padx=(8, 0))
-        self.bouton(ligne, "Deconnecter", self.deconnecter_google, compact=True).pack(side="left", padx=(8, 0))
-        self.txt_google = self.texte(f, "", BRUME, 8, largeur=500)
-        self.txt_google.pack(fill="x", pady=(4, 0))
+        self.titre(f, "agenda").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Tes rendez-vous vivent dans BrainDebugger : les reperes « Agenda » (les « Psy » restent "
+                      "ton journal, Machi Tool et Jarvis ne les voient jamais). « Jarvis, mets-moi dentiste "
+                      "jeudi a 14 h », « qu'est-ce que j'ai demain ? », « montre-moi mon agenda ». Aussi dans "
+                      "le menu de l'icone.", BRUME, 8, largeur=500).pack(fill="x")
+        self.bouton(f, "Ouvrir l'agenda", self.ouvrir_agenda, compact=True).pack(anchor="w", pady=(6, 0))
 
         self.separateur(f, 12, 8)
         self.titre(f, "les onglets de chrome").pack(fill="x", pady=(0, 4))
@@ -10257,21 +10300,6 @@ class Panneau:
             JARVIS["onglets_message"] = "Dossier pret : %s" % dossier
         except Exception as e:
             JARVIS["onglets_message"] = "Impossible : %s" % e
-
-    def connecter_google(self):
-        self.cfg["google_client_id"] = self.champ_google_id.get().strip()
-        self.cfg["google_client_secret"] = self.champ_google_secret.get().strip()
-        sauver_config(self.cfg)
-        try:
-            connecter_google(self.cfg, rappel=lambda m: JARVIS.__setitem__("google_message", m))
-        except Exception as e:
-            JARVIS["google_message"] = str(e)
-
-    def deconnecter_google(self):
-        self.cfg["google_refresh"] = ""
-        sauver_config(self.cfg)
-        _AGENDA["client"] = None
-        JARVIS["google_message"] = "Deconnecte."
 
     def connecter_spotify(self):
         self.cfg["spotify_client_id"] = self.champ_spotify.get().strip()
@@ -10429,12 +10457,6 @@ class Panneau:
             etat_on = "Branchee." if extension_branchee() else (JARVIS.get("onglets_message") or "Pas branchee.")
             if self.txt_onglets.cget("text") != etat_on:
                 self.txt_onglets.configure(text=etat_on)
-        if hasattr(self, "txt_google"):
-            etat_g = ("Connecte." if agenda_connecte(self.cfg) else "Pas connecte.")
-            if JARVIS.get("google_message"):
-                etat_g += "  " + JARVIS["google_message"]
-            if self.txt_google.cget("text") != etat_g:
-                self.txt_google.configure(text=etat_g)
         if hasattr(self, "txt_spotify"):
             etat_sp = ("Connecte." if spotify_connecte(self.cfg) else "Pas connecte.")
             if JARVIS.get("spotify_message"):
@@ -12386,6 +12408,7 @@ def lancer():
         # demander d'ouvrir une fenetre.
         pystray.MenuItem("Jarvis ecoute", basculer_jarvis,
                          checked=lambda i: bool(CFG.get("jarvis_actif", False))),
+        pystray.MenuItem("Agenda", lambda *_: JARVIS.__setitem__("montrer_agenda", time.time())),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(libelle_maj,
                          lambda *_: declencher_maj(

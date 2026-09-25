@@ -3384,128 +3384,6 @@ class Spotify:
         return "Ajoute a tes titres likes : « %s » de %s." % (c["titre"], c["artistes"])
 
 
-# --------------------------- GOOGLE AGENDA ------------------------------
-#
-# « Est-ce que tu peux lier Google Agenda pour qu'il puisse poser des
-# reperes ? » L'API officielle : un acces « application de bureau » que la
-# personne cree dans la console Google Cloud (ID client + code secret), une
-# connexion PKCE sur 127.0.0.1:8765, et une seule permission -- creer et
-# modifier des evenements (calendar.events). Jarvis en POSE ; il n'en lit ni
-# n'en efface aucun.
-
-GOOGLE_PORTEE = "https://www.googleapis.com/auth/calendar.events"
-_GOOGLE_COMPTES = "https://accounts.google.com/o/oauth2/v2/auth"
-_GOOGLE_JETON = "https://oauth2.googleapis.com/token"
-_GOOGLE_AGENDA = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
-
-
-def google_url_autorisation(client_id, defi, etat):
-    from urllib.parse import urlencode
-    return _GOOGLE_COMPTES + "?" + urlencode({
-        "client_id": client_id, "redirect_uri": SPOTIFY_RETOUR, "response_type": "code",
-        "scope": GOOGLE_PORTEE, "code_challenge": defi, "code_challenge_method": "S256", "state": etat,
-        "access_type": "offline", "prompt": "consent"})
-
-
-def moment_google(texte):
-    """« 2026-09-26 » -> toute la journee ; « 2026-09-26T14:00 » -> cette heure-la,
-    a l'heure du PC (avec son decalage). Rend (dict pour l'API, datetime, journee)."""
-    import datetime
-    t = str(texte or "").strip().replace(" ", "T", 1)
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
-        d = datetime.date.fromisoformat(t)
-        return {"date": d.isoformat()}, d, True
-    try:
-        dt = datetime.datetime.fromisoformat(t)
-    except ValueError:
-        raise ValueError("date illisible : « %s » (AAAA-MM-JJ ou AAAA-MM-JJTHH:MM)" % texte)
-    dt = dt.astimezone() if dt.tzinfo is None else dt
-    return {"dateTime": dt.isoformat(timespec="seconds")}, dt, False
-
-
-_JOURS_COURTS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
-
-
-def evenement_google(titre, debut, fin="", duree=60, description="", lieu="", rappel=None):
-    """Le corps d'un evenement pour l'API, et la phrase qui le decrit."""
-    import datetime
-    titre = " ".join(str(titre or "").split())[:200]
-    if not titre:
-        raise ValueError("il faut un titre")
-    d, d_dt, journee = moment_google(debut)
-    if fin:
-        f, f_dt, f_journee = moment_google(fin)
-        if f_journee != journee:
-            raise ValueError("debut et fin : tous deux des jours, ou tous deux des heures")
-        if journee:
-            f = {"date": (f_dt + datetime.timedelta(days=1)).isoformat()}     # la fin est exclue
-        elif f_dt <= d_dt:
-            raise ValueError("la fin est avant le debut")
-    elif journee:
-        f = {"date": (d_dt + datetime.timedelta(days=1)).isoformat()}
-    else:
-        minutes = max(5, min(24 * 60, int(duree or 60)))
-        f_dt = d_dt + datetime.timedelta(minutes=minutes)
-        f = {"dateTime": f_dt.isoformat(timespec="seconds")}
-    corps = {"summary": titre, "start": d, "end": f}
-    if description:
-        corps["description"] = str(description)[:4000]
-    if lieu:
-        corps["location"] = str(lieu)[:300]
-    if rappel is not None:
-        corps["reminders"] = {"useDefault": False,
-                              "overrides": [{"method": "popup", "minutes": max(0, min(40320, int(rappel)))}]}
-    quand = "%s %s" % (_JOURS_COURTS[d_dt.weekday()], d_dt.strftime("%d/%m"))
-    if not journee:
-        quand += " a %s" % d_dt.strftime("%H:%M")
-    return corps, "« %s », %s" % (titre, quand)
-
-
-class GoogleAgenda:
-    """Le Google Agenda de la personne, par l'API. `http` se remplace dans les tests."""
-
-    def __init__(self, client_id, secret, refresh, http=http_json):
-        self.client_id, self.secret, self.refresh, self.http = client_id, secret, refresh, http
-        self.acces, self.expire = None, 0.0
-
-    @staticmethod
-    def echanger_code(client_id, secret, code, verif, http=http_json):
-        from urllib.parse import urlencode
-        statut, r = http("POST", _GOOGLE_JETON, {"Content-Type": "application/x-www-form-urlencoded"},
-                         urlencode({"grant_type": "authorization_code", "code": code, "client_id": client_id,
-                                    "client_secret": secret, "redirect_uri": SPOTIFY_RETOUR,
-                                    "code_verifier": verif}).encode("ascii"))
-        if statut != 200 or not (r or {}).get("refresh_token"):
-            raise ErreurSpotify("Google a refuse la connexion (%s)." % ((r or {}).get("error_description")
-                                                                      or (r or {}).get("error") or statut))
-        return r
-
-    def jeton(self):
-        if self.acces and time.time() < self.expire - 60:
-            return self.acces
-        from urllib.parse import urlencode
-        statut, r = self.http("POST", _GOOGLE_JETON, {"Content-Type": "application/x-www-form-urlencoded"},
-                              urlencode({"grant_type": "refresh_token", "refresh_token": self.refresh,
-                                         "client_id": self.client_id, "client_secret": self.secret}).encode("ascii"))
-        if statut != 200 or not (r or {}).get("access_token"):
-            raise ErreurSpotify("La connexion a Google Agenda a expire : reconnecte-le dans Machi Tool "
-                                "(Reglages > Jarvis > Google Agenda).")
-        self.acces, self.expire = r["access_token"], time.time() + float(r.get("expires_in") or 3600)
-        return self.acces
-
-    def poser(self, titre, debut, fin="", duree=60, description="", lieu="", rappel=None):
-        corps, dit = evenement_google(titre, debut, fin, duree, description, lieu, rappel)
-        for essai in (0, 1):
-            statut, r = self.http("POST", _GOOGLE_AGENDA, {"Authorization": "Bearer " + self.jeton()}, corps)
-            if statut == 401 and not essai:
-                self.acces = None
-                continue
-            break
-        if statut not in (200, 201):
-            raise ErreurSpotify("Google Agenda a repondu %s." % (((r or {}).get("error") or {}).get("message") or statut))
-        return "Repere pose dans Google Agenda : %s." % dit
-
-
 # --------------------------- LES TEMPERATURES ---------------------------
 #
 # « Qu'il puisse avoir acces a Core Temp ou CPU-Z ou au gestionnaire de taches
@@ -3684,3 +3562,44 @@ def reponse_veille(texte):
     if _VEILLE.match(t):
         return "veille"
     return None
+
+
+# --------------------------- L'AGENDA -----------------------------------
+#
+# « Un systeme dans BrainDebugger pour rajouter ca a une frise / agenda,
+# aussi visible depuis Machi Tool ; l'agenda de Machi Tool pourra etre visible
+# et montre par Jarvis (fenetre qui s'ouvre). » BrainDebugger garde les
+# rendez-vous (les reperes « agenda », jamais les « psy ») ; Machi Tool les
+# affiche, jour par jour.
+
+_JOURS_AG = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+_MOIS_AG = ("janvier", "fevrier", "mars", "avril", "mai", "juin", "juillet", "aout", "septembre",
+            "octobre", "novembre", "decembre")
+
+
+def nom_du_jour(iso, aujourdhui):
+    import datetime
+    d, a = datetime.date.fromisoformat(iso), datetime.date.fromisoformat(aujourdhui)
+    ecart = (d - a).days
+    long = "%s %d %s" % (_JOURS_AG[d.weekday()], d.day, _MOIS_AG[d.month - 1])
+    return {0: "Aujourd'hui", 1: "Demain"}.get(ecart, long[0].upper() + long[1:]) + \
+        (" -- " + long if ecart in (0, 1) else "")
+
+
+def agenda_par_jour(rendez_vous, aujourdhui):
+    """[(titre du jour, [(heure ou "", libelle, "jusqu'au ..." ou "")])], dans
+    l'ordre ; une periode apparait a son premier jour visible (aujourd'hui si
+    elle a commence avant)."""
+    jours = {}
+    for r in rendez_vous or []:
+        if not isinstance(r, dict) or not r.get("date") or not r.get("label"):
+            continue
+        jour = max(str(r["date"]), aujourdhui)
+        fin = ""
+        if r.get("fin"):
+            import datetime
+            f = datetime.date.fromisoformat(str(r["fin"]))
+            fin = "jusqu'au %s %d %s" % (_JOURS_AG[f.weekday()], f.day, _MOIS_AG[f.month - 1])
+        jours.setdefault(jour, []).append((str(r.get("heure") or ""), str(r["label"]), fin))
+    return [(nom_du_jour(j, aujourdhui), sorted(v, key=lambda x: (x[0] == "", x[0])))
+            for j, v in sorted(jours.items())]

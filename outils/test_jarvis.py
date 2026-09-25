@@ -444,6 +444,20 @@ class SesMains(unittest.TestCase):
         self.assertEqual(J.cible_boule("pense", "jarvis", regard, zone, 106)[1:3], J.place_boule(zone),
                          "regard fini : elle revient a sa place")
 
+    def test_l_agenda_jour_par_jour(self):
+        rdv = [{"date": "2026-10-02", "heure": "", "label": "Anniversaire de Paul"},
+               {"date": "2026-10-02", "heure": "14:30", "label": "Dentiste"},
+               {"date": "2026-10-01", "heure": "09:00", "label": "Reunion"},
+               {"date": "2026-09-28", "fin": "2026-10-04", "heure": None, "label": "Vacances"},
+               {"date": "2026-10-06", "label": "Kine", "heure": "18:00"}, {"label": "sans date"}]
+        jours = J.agenda_par_jour(rdv, "2026-10-01")
+        self.assertEqual([t for t, _ in jours], ["Aujourd'hui -- jeudi 1 octobre", "Demain -- vendredi 2 octobre",
+                                                 "Mardi 6 octobre"])
+        self.assertEqual(jours[0][1], [("09:00", "Reunion", ""), ("", "Vacances", "jusqu'au dimanche 4 octobre")],
+                         "une periode commencee avant : a aujourd'hui ; les heures d'abord")
+        self.assertEqual([x[1] for x in jours[1][1]], ["Dentiste", "Anniversaire de Paul"])
+        self.assertEqual(J.agenda_par_jour([], "2026-10-01"), [])
+
     def test_les_temperatures(self):
         import struct as st
 
@@ -548,47 +562,6 @@ class SesMains(unittest.TestCase):
         with self.assertRaisesRegex(J.ErreurSpotify, "ouvert nulle part"):
             sp.jouer("get lucky")
         self.assertEqual(sum(1 for a in appels if a[1].endswith("/api/token")), 1, "un seul jeton par heure")
-
-    def test_google_agenda(self):
-        import datetime
-        corps, dit = J.evenement_google("Dentiste", "2026-10-01T14:00", rappel=30)
-        debut = datetime.datetime.fromisoformat(corps["start"]["dateTime"])
-        fin = datetime.datetime.fromisoformat(corps["end"]["dateTime"])
-        self.assertIsNotNone(debut.tzinfo, "avec le decalage du PC")
-        self.assertEqual((debut.hour, debut.minute, fin - debut), (14, 0, datetime.timedelta(hours=1)))
-        self.assertEqual(dit, "« Dentiste », jeudi 01/10 a 14:00")
-        self.assertEqual(corps["reminders"], {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}]})
-        corps, _ = J.evenement_google("Vacances", "2026-10-01", fin="2026-10-05")
-        self.assertEqual((corps["start"], corps["end"]), ({"date": "2026-10-01"}, {"date": "2026-10-06"}),
-                         "toute la journee : la fin de l'API est exclue")
-        corps, _ = J.evenement_google("Sport", "2026-10-02 18:30", duree=90)
-        self.assertIn("T20:00:00", corps["end"]["dateTime"])
-        for mauvais in ((("", "2026-10-01"), {}), (("x", "jeudi"), {}), (("x", "2026-10-01T14:00"), {"fin": "2026-10-01T13:00"}),
-                        (("x", "2026-10-01"), {"fin": "2026-10-02T10:00"})):
-            with self.assertRaises(ValueError, msg=repr(mauvais)):
-                J.evenement_google(*mauvais[0], **mauvais[1])
-        url = J.google_url_autorisation("CID", "DEFI", "ETAT")
-        for morceau in ("access_type=offline", "code_challenge=DEFI", "code_challenge_method=S256",
-                        "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.events",
-                        "redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback"):
-            self.assertIn(morceau, url)
-        appels = []
-
-        def http(methode, url, entetes=None, corps=None):
-            appels.append((methode, url, corps))
-            if url.endswith("/token"):
-                return 200, {"access_token": "A%d" % len(appels), "expires_in": 3600}
-            if len([a for a in appels if "events" in a[1]]) == 1:
-                return 401, None                    # un jeton perime : on en reprend un
-            return 200, {"id": "e1"}
-        ag = J.GoogleAgenda("CID", "SECRET", "R1", http=http)
-        self.assertEqual(ag.poser("Dentiste", "2026-10-01T14:00"),
-                         "Repere pose dans Google Agenda : « Dentiste », jeudi 01/10 a 14:00.")
-        self.assertEqual([a[0] for a in appels], ["POST", "POST", "POST", "POST"])
-        self.assertTrue(appels[1][1].endswith("/calendars/primary/events"))
-        self.assertFalse(any(a[0] in ("GET", "DELETE") for a in appels), "il pose, il ne lit ni n'efface")
-        with self.assertRaises(J.ErreurSpotify):
-            J.GoogleAgenda("CID", "S", "R", http=lambda *a: (400, {"error": "invalid_grant"})).jeton()
 
     def test_spotify_connexion_pkce(self):
         import hashlib as h
@@ -1771,20 +1744,15 @@ class DansMachiTool(unittest.TestCase):
     def test_le_retour_de_connexion_oauth(self):
         m = self.m
         recus, messages = [], []
-        t = m.attendre_retour_oauth("ETAT", recus.append, messages.append, delai=5, service="Google Agenda")
+        t = m.attendre_retour_oauth("ETAT", recus.append, messages.append, delai=5, service="Spotify")
         base = "http://127.0.0.1:%d/callback" % m._jv.SPOTIFY_PORT
         lire = lambda q: urllib.request.urlopen(base + q, timeout=5).read().decode("utf-8")
         self.assertIn("Reponse inattendue", lire("?state=AUTRE&code=X"))
         self.assertEqual(recus, [], "un « state » etranger : aucun echange")
-        self.assertIn("Google Agenda est connecte", lire("?state=ETAT&code=CODE"))
+        self.assertIn("Spotify est connecte", lire("?state=ETAT&code=CODE"))
         t.join(3)
         self.assertEqual(recus, ["CODE"])
         self.assertFalse(t.is_alive(), "une fois connecte, le serveur s'arrete")
-        self.assertIn("pas connecte", m.executer_outil({"id": "x", "nom": "agenda_poser",
-                                                        "entree": {"titre": "x", "debut": "2026-10-01"}},
-                                                       dict(m.CFG, jarvis_pc=True))["erreur"])
-        m.CFG.update(jarvis_pc=True, google_client_id="CID", google_refresh="R")
-        self.assertTrue(m.capacites_jarvis(m.CFG)["agenda"])
 
     def test_les_temperatures_dans_machi_tool(self):
         m = self.m
@@ -1797,6 +1765,25 @@ class DansMachiTool(unittest.TestCase):
         self.phrase("Jarvis, elle chauffe ma carte graphique ?")
         self.assertNotIn("Code d'accès ?", self.dit, "lire des temperatures ne demande pas de code")
         self.assertIn("RTX 3070, nvidia-smi) : 71 °C, charge 98 %", envoyes[1]["resultats"][0]["texte"])
+
+    def test_jarvis_montre_l_agenda(self):
+        # « L'agenda de Machi Tool pourra etre visible et montre par Jarvis (fenetre qui s'ouvre). »
+        m = self.m
+        envoyes, _ = self.mains([self.outil("montrer_agenda", {}), {"texte": "Le voici.", "mode": "jarvis"}])
+        m.JARVIS["montrer_agenda"] = 0
+        self.phrase("Jarvis, montre-moi mon agenda")
+        self.assertTrue(envoyes[0]["fenetre_agenda"])
+        self.assertNotIn("Code d'accès ?", self.dit)
+        self.assertGreater(m.JARVIS["montrer_agenda"], 0, "la fenetre s'ouvrira au prochain passage de l'interface")
+        self.assertEqual(envoyes[1]["resultats"][0]["texte"], "Agenda ouvert a l'ecran.")
+        self.assertNotIn("agenda", m.capacites_jarvis(m.CFG), "plus de Google Agenda")
+        vu = {}
+        vrai = m._requete_bd
+        self.addCleanup(lambda: setattr(m, "_requete_bd", vrai))
+        m._requete_bd = lambda chemin, charge, cfg, delai: vu.update(chemin=chemin, charge=charge) or {"rendezVous": []}
+        m.lire_agenda(m.CFG)
+        self.assertRegex(vu["chemin"], r"^/api/machitool/agenda\?depuis=\d{4}-\d{2}-\d{2}&jours=14$")
+        self.assertIsNone(vu["charge"], "une lecture : GET, sans corps")
 
     def test_le_pc_entier_sans_code(self):
         # « J'aimerais avoir un compagnon qui peut interagir le plus possible avec mon PC. »
