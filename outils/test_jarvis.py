@@ -227,7 +227,7 @@ class PresqueReconnu(unittest.TestCase):
         o.det.trame = lambda x, chercher=True: None
         for i, d in enumerate((0.2, 0.07, 0.07, 0.07)):
             o.det.n = 100 + i
-            o.det.plus_proche = d
+            o.det.plus_proche, o.det.compare_n = d, o.det.n
             o.trame(np.zeros(J.TRAME, dtype=np.int16))
         presque = [e for e in sorties if e["evt"] == "presque"]
         self.assertEqual(len(presque), 1, "une fois, pas a chaque trame")
@@ -1175,7 +1175,7 @@ class OreilleSansMicro(unittest.TestCase):
         self.o.niveau_vu = float("inf")          # pas de niveaux : on regarde le reste
 
     def evts(self):
-        return [e["evt"] for e in self.sorties if e["evt"] != "voix_niveau"]
+        return [e["evt"] for e in self.sorties if e["evt"] not in ("voix_niveau", "essai")]
 
     def test_avant_l_eveil_rien_ne_sort(self):
         """Le coeur de la promesse : on parle dans la piece, personne n'a
@@ -1279,7 +1279,10 @@ class OreilleSansMicro(unittest.TestCase):
         g = self.sorties[0]["vecteurs"]
         self.assertTrue(J.GABARIT_MIN <= len(g) <= J.GABARIT_MAX)
         self.assertEqual(len(g[0]), 96)
-        self.assertNotIn("wav", self.sorties[0])
+        # le son de ce « Jarvis » part a Machi Tool, le temps de lire comment la
+        # transcription l'ecrit (voir noms_entendus) ; rien du son n'est garde
+        self.assertTrue(base64.b64decode(self.sorties[0]["wav"]).startswith(b"RIFF"))
+        self.assertGreater(self.sorties[0]["niveau"], 0, "le niveau de ta voix, pour caler les portes")
 
     def test_apprendre_sans_rien_dire(self):
         self.o.commande({"cmd": "apprendre"})
@@ -1340,7 +1343,7 @@ class EtalonnageAuFilDeLEau(unittest.TestCase):
         self.dire([np.random.default_rng(n).normal(size=96) for _ in range(n)], parole=False)
 
     def evts(self):
-        return [e["evt"] for e in self.sorties if e["evt"] != "voix_niveau"]
+        return [e["evt"] for e in self.sorties if e["evt"] not in ("voix_niveau", "essai")]
 
     def test_l_appel_rate_puis_repete_est_appris(self):
         self.silence(20)
@@ -1468,8 +1471,124 @@ class LeNomDansLaTranscription(unittest.TestCase):
     def test_contient_nom(self):
         for t in ("Jarvis, allume", "Jervis ?", "charvis", "bon jar vis mets la musique", "Jarvi", "hé Djarvis"):
             self.assertTrue(J.contient_nom(t), t)
-        for t in ("je vais dormir", "Travis Scott", "service", "j'arrive", "garage", ""):
+        for t in ("je vais dormir", "Travis Scott", "service", "j'arrive", "garage", "", "j'avais dit",
+                  "javel", "Gervais", "jardin", "archives"):
             self.assertFalse(J.contient_nom(t), t)
+
+    def test_comme_la_transcription_l_a_ecrit_a_l_apprentissage(self):
+        # « Jarvis galere vraiment a reconnaitre ma voix » : si le moteur ecrit
+        # son « Jarvis » « Travis », c'est son nom a lui
+        noms = J.noms_entendus("Travis.")
+        self.assertIn("travis", noms)
+        self.assertTrue(J.contient_nom("travis mets de la musique", noms))
+        self.assertFalse(J.contient_nom("travis mets de la musique"))
+        self.assertEqual(J.noms_entendus("et oh"), [], "pas les tout petits mots")
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class SeuilsDeTaVoix(unittest.TestCase):
+    """« Il me faudrait un indicateur de detection, plus de facons de calibrer,
+    et un moyen de baisser le seuil. » Les seuils se calent sur l'ecart entre
+    TES « Jarvis », et la facilite les deplace."""
+
+    def voix(self, ecart, n=6, graine=4):
+        rng = np.random.default_rng(graine)
+        base = rng.normal(size=(9, 96))
+        return [J.normer(base + ecart * rng.normal(size=base.shape)).tolist() for _ in range(n)]
+
+    def test_le_seuil_personnel_suit_l_ecart_de_ta_voix(self):
+        self.assertIsNone(J.seuil_personnel(self.voix(0.3, n=2)), "pas assez de facons")
+        reguliere, variable = J.seuil_personnel(self.voix(0.1)), J.seuil_personnel(self.voix(0.5))
+        self.assertLess(reguliere, variable)
+
+    def test_une_voix_qui_varie_elargit_la_zone_verifiee(self):
+        sans = J.seuils_detection(0.5)
+        avec = J.seuils_detection(0.5, 0.14)
+        self.assertGreater(avec[1], sans[1])
+        self.assertLessEqual(avec[0], J.SEUIL_DIRECT_MAX, "le reveil direct reste prudent")
+        self.assertLessEqual(avec[0], avec[1])
+
+    def test_la_facilite_deplace_les_deux_seuils(self):
+        bas, milieu, haut = (J.seuils_detection(s, 0.14) for s in (0.0, 0.5, 1.0))
+        self.assertLess(bas[1], milieu[1])
+        self.assertLess(milieu[1], haut[1])
+        self.assertLessEqual(bas[0], haut[0])
+        self.assertLessEqual(J.seuils_detection(1.0, 5.0)[1], J.SEUIL_VERIFIE_MAX, "jamais n'importe quoi")
+        self.assertGreaterEqual(J.seuils_detection(0.0)[1], J.SEUIL_VERIFIE_MIN)
+
+    def test_sans_zone_tolerante_un_seul_seuil(self):
+        d, v = J.seuils_detection(0.5, 0.14, tolerant=False)
+        self.assertEqual(d, v)
+        self.assertLessEqual(d, J.SEUIL_DIRECT_MAX)
+
+    def test_l_oreille_recoit_ses_seuils(self):
+        o = J.Oreille(EmpreintesEcrites(), lambda e: None)
+        o.commande({"cmd": "config", "gabarits": self.voix(0.3), "sensibilite": 0.8,
+                    "seuil_perso": 0.14, "niveau_voix": 200.0})
+        self.assertEqual((o.det.seuil, o.det.seuil_verifie), J.seuils_detection(0.8, 0.14))
+        self.assertEqual(o.det.niveau_appris, 200.0)
+        # un micro faible, une piece calme : sa voix passe les portes de parole
+        o.det.plancher = 30.0
+        self.assertTrue(o.det.parle(120.0))
+        o.commande({"cmd": "config", "niveau_voix": None})
+        self.assertFalse(o.det.parle(120.0))
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LIndicateurDeDetection(EtalonnageAuFilDeLEau):
+    """Chaque mot proche de « Jarvis » : sa distance, et ce qui en est sorti."""
+
+    def essais(self):
+        return [e for e in self.sorties if e["evt"] == "essai"]
+
+    def test_un_appel_rate_est_signale_avec_sa_distance(self):
+        self.silence(20)
+        self.dire(self.autrement)
+        self.silence(20)
+        (e,) = self.essais()
+        self.assertEqual(e["issue"], "rate")
+        self.assertAlmostEqual(e["d"], J.distance_eveil(self.g, self.autrement), places=2)
+        self.assertGreater(e["d"], e["direct"])
+
+    def test_un_appel_reconnu_est_signale(self):
+        self.silence(20)
+        self.dire(self.g)
+        e = self.essais()[-1]
+        self.assertEqual((e["issue"], e["par"]), ("reveil", "voix"))
+        self.assertLessEqual(e["d"], e["direct"])
+
+    def test_un_rate_est_signale_meme_quand_la_distance_reste_en_place(self):
+        # dans le silence, le detecteur ne compare plus : sa derniere distance
+        # reste, et ne doit pas tenir l'essai ouvert indefiniment
+        self.silence(20)
+        self.dire(self.autrement)
+        n = len(self.essais())
+        self.silence(J.GABARIT_FIN + 6)
+        self.assertEqual(len(self.essais()), n + 1)
+
+    def test_le_bruit_ne_remplit_pas_l_indicateur(self):
+        self.silence(60)
+        self.assertEqual(self.essais(), [])
+
+    test_l_appel_rate_puis_repete_est_appris = None
+    test_rate_mais_rien_ne_suit_rien_n_est_garde = None
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LaVoixNeGresillePlus(unittest.TestCase):
+    """« Le TTS gresille. » Pas a pleine echelle (le reechantillonnage de
+    Windows ecretait), et pas de clic aux bords."""
+
+    def test_crete_et_fondus(self):
+        son = np.sin(np.linspace(0, 400, 24000)).astype(np.float32) * 3.0
+        out = J.son_propre(son, 24000)
+        self.assertEqual(out.dtype, np.int16)
+        self.assertLessEqual(int(np.max(np.abs(out))), int(0.81 * 32767))
+        self.assertGreater(int(np.max(np.abs(out))), int(0.75 * 32767))
+        self.assertLess(abs(int(out[0])), 200)
+        self.assertLess(abs(int(out[-1])), 200)
+        self.assertEqual(len(J.son_propre(np.zeros(0))), 0)
+        self.assertEqual(len(J.son_propre(np.ones(3))), 3, "un son minuscule ne casse rien")
 
 
 class Alignement(unittest.TestCase):
@@ -1636,7 +1755,8 @@ class DansMachiTool(unittest.TestCase):
         def oreille(o):
             if o.get("cmd") == "apprendre":
                 consignes.append(m.JARVIS["apprentissage"]["message"])
-                m._GABARIT_RECU["evt"] = {"evt": "gabarit", "vecteurs": file_.pop(0)}
+                v = file_.pop(0)
+                m._GABARIT_RECU["evt"] = v if isinstance(v, dict) else {"evt": "gabarit", "vecteurs": v}
                 m._GABARIT_RECU["signal"].set()
             return True
 
@@ -1830,6 +1950,50 @@ class DansMachiTool(unittest.TestCase):
         ok, _, gardes = self.apprentissage([rng.normal(size=(8, 96)).tolist()], total=1, ajouter=True)
         self.assertFalse(ok)
         self.assertEqual(len(gardes), 9)
+
+    def test_calibrer_encore_niveau_et_nom_de_ta_voix(self):
+        # « Jarvis galere vraiment a reconnaitre ma voix » : l'apprentissage garde
+        # le niveau de ta voix et comment la transcription ecrit ton « Jarvis »,
+        # et l'oreille recoit un seuil cale sur l'ecart entre tes « Jarvis »
+        m = self.m
+        rng = np.random.default_rng(8)
+        base = rng.normal(size=(8, 96))
+        proche = lambda e: (base + rng.normal(scale=e, size=base.shape)).tolist()
+        m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
+        m.transcrire = lambda o: "Travis."
+        wav = base64.b64encode(b"RIFF").decode()
+        evs = [{"evt": "gabarit", "vecteurs": proche(0.3), "niveau": 180.0 + k, "wav": wav} for k in range(8)]
+        ok, _, gardes = self.apprentissage(evs)
+        self.assertTrue(ok)
+        self.assertEqual(m.niveau_voix_appris(), 184.0)
+        self.assertIn("travis", m.noms_appris())
+        cfg = m.config_oreille(m.CFG)
+        self.assertEqual(cfg["niveau_voix"], 184.0)
+        self.assertIsNotNone(cfg["seuil_perso"])
+        self.assertIn("verifie jusqu'a", m.JARVIS["apprentissage"]["message"])
+        # une verification entendue « Travis » : c'est bien lui
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        m.transcrire = lambda o: "Travis, la lumiere"
+        self.assertTrue(m.verifier_appel(wav))
+        # « Calibrer encore » : les tons de TONS_CALIBRATION, ajoutes aux autres
+        m.transcrire = lambda o: "Jarvis"
+        ok, consignes, apres = self.apprentissage([proche(0.4) for _ in m.TONS_CALIBRATION],
+                                                  total=len(m.TONS_CALIBRATION), ajouter=True,
+                                                  tons=m.TONS_CALIBRATION)
+        self.assertTrue(ok)
+        self.assertEqual(len(apres), len(gardes) + len(m.TONS_CALIBRATION))
+        self.assertIn("milieu d'une phrase", consignes[1])
+        self.assertEqual(m.niveau_voix_appris(), 184.0, "garde quand on ajoute")
+        self.assertIn("travis", m.noms_appris())
+
+    def test_l_indicateur_garde_les_derniers_essais(self):
+        m = self.m
+        m.JARVIS["essais"] = []
+        for k in range(15):
+            m.traiter_evenement({"evt": "essai", "d": 0.1 + k / 100, "issue": "rate", "direct": 0.05, "verifie": 0.1})
+        self.assertEqual(len(m.JARVIS["essais"]), 12)
+        self.assertAlmostEqual(m.JARVIS["essais"][-1]["d"], 0.24)
 
     def test_sa_voix_francaise_par_kokoro_sinon_piper(self):
         m = self.m
@@ -3289,9 +3453,18 @@ class PourDeVrai(unittest.TestCase):
         o.configurer({"gabarits": list(gabarits)})
         return o, sorties
 
-    def reveils(self, o, sorties, son):
-        for x in flux(son):
+    @staticmethod
+    def ecouter(o, sorties, trames, texte=None):
+        """Les trames, une a une ; un appel pas net est verifie comme Machi Tool
+        le fait (la transcription contient-elle son nom ?) -- ici, le texte dit."""
+        for x in trames:
+            n = len(sorties)
             o.trame(x)
+            if any(e["evt"] == "verifier" for e in sorties[n:]):
+                o.commande({"cmd": "verifie", "ok": bool(texte) and J.contient_nom(texte)})
+
+    def reveils(self, o, sorties, son, texte=None):
+        self.ecouter(o, sorties, flux(son), texte)
         return [e for e in sorties if e["evt"] == "reveil"]
 
     def test_hey_jarvis_a_l_anglaise(self):
@@ -3325,7 +3498,7 @@ class PourDeVrai(unittest.TestCase):
         for texte, vitesse in (("Jarvis", 140), ("Jarvis, allume la lumière en bleu", 160),
                                ("Jarvis", 180)):
             o, s = self.oreille(gabarits)
-            r = self.reveils(o, s, dire(texte, vitesse=vitesse))
+            r = self.reveils(o, s, dire(texte, vitesse=vitesse), texte)
             self.assertEqual([e["par"] for e in r], ["voix"], texte)
 
         for texte in ("j'arrive", "Travis", "service", "jardin", "java", "bonjour comment ça va",
@@ -3355,7 +3528,7 @@ class PourDeVrai(unittest.TestCase):
                                         ("ok Jarvis", 150, 50), ("bon, Jarvis ?", 150, 50),
                                         ("hé Jarvis", 150, 50), ("dis Jarvis", 150, 50)):
             o, s = self.oreille(gabarits)
-            r = self.reveils(o, s, dire(texte, vitesse=vitesse, hauteur=hauteur))
+            r = self.reveils(o, s, dire(texte, vitesse=vitesse, hauteur=hauteur), texte)
             self.assertEqual([e["par"] for e in r], ["voix"], texte)
         for texte in ("j'arrive", "Travis", "service", "jardin", "java", "bonjour comment ça va",
                       "je vais dormir", "garage", "ça va vite", "j'avais dit", "il pleut sur la ville",
@@ -3387,8 +3560,7 @@ class PourDeVrai(unittest.TestCase):
         def entendu(texte, vitesse=150, hauteur=50):
             o, s = self.oreille(gabarits)
             o.configurer({"hey": False})
-            for x in flux(dire(texte, vitesse=vitesse, hauteur=hauteur)) + flux(np.zeros(40000)):
-                o.trame(x)
+            self.ecouter(o, s, flux(dire(texte, vitesse=vitesse, hauteur=hauteur)) + flux(np.zeros(40000)), texte)
             return [e["evt"] for e in s if e["evt"] in ("reveil", "phrase", "vide")]
         for texte, vitesse, hauteur in (("Jarvis", 120, 30), ("Jarvis", 190, 70), ("Jarvis ?", 140, 75),
                                         ("JARVIS", 160, 60), ("Jaaarvis", 130, 50), ("Jarvis", 200, 50)):
@@ -3993,7 +4165,7 @@ class DoubleTransmission(unittest.TestCase):
         self.assertIsNone(jouer(self.jarvis[1]))
         self.assertEqual(sorties, [], "sa propre voix ne fait rien sortir")
         self.assertIsNotNone(jouer(self.jarvis[2], voix=self.voix[1]))
-        evts = [e["evt"] for e in sorties if e["evt"] != "voix_niveau"]
+        evts = [e["evt"] for e in sorties if e["evt"] not in ("voix_niveau", "essai")]
         self.assertEqual(evts, ["coupure", "phrase"])
         wav = base64.b64decode([e for e in sorties if e["evt"] == "phrase"][0]["wav"])
         with wave.open(io.BytesIO(wav)) as w:
