@@ -690,6 +690,57 @@ class SesMains(unittest.TestCase):
                          ("5NV6Rdv1a3I", "Daft Punk - Get Lucky (Official Audio) ft. Pharrell Williams, Nile Rodgers & more"))
         self.assertIsNone(J.premiere_video_youtube("<html>consent.youtube.com</html>"))
 
+    def test_pourquoi_spotify_ne_repond_pas(self):
+        # « verifie pourquoi il ne peut pas acceder a l'API Spotify »
+        import urllib.request
+        import ssl
+        vus = []
+        vrai = urllib.request.urlopen
+
+        def refuse(req, timeout=None, context=None):
+            vus.append(context)
+            raise urllib.error.URLError(ssl.SSLCertVerificationError(
+                "certificate verify failed: unable to get local issuer certificate"))
+        urllib.request.urlopen = refuse
+        ancien = J.CONTEXTE_SSL
+        try:
+            J.CONTEXTE_SSL = lambda: "LE-CONTEXTE"
+            statut, r = J.http_json("GET", "https://api.spotify.com/v1/me")
+        finally:
+            urllib.request.urlopen, J.CONTEXTE_SSL = vrai, ancien
+        self.assertEqual(vus, ["LE-CONTEXTE"], "le magasin de certificats de Machi Tool, pas celui par defaut")
+        self.assertEqual(statut, 0, "une panne reseau n'est plus une exception")
+        self.assertIn("certificat HTTPS est refuse", J.raison_spotify(statut, r))
+        self.assertIn("Client ID inconnu", J.raison_spotify(400, {"error": "invalid_client"}))
+        self.assertIn("Reconnecte Spotify", J.raison_spotify(400, {"error": "invalid_grant",
+                                                                   "error_description": "Refresh token revoked"}))
+        self.assertIn(J.SPOTIFY_RETOUR, J.raison_spotify(400, {"error": "invalid_request",
+                                                               "error_description": "INVALID_CLIENT: Invalid redirect URI"}))
+        self.assertIn("User Management", J.raison_spotify(403, {"error": {"status": 403,
+                      "message": "User not registered in the Developer Dashboard"}}))
+        # le jeton : plus de faux « expire » quand c'est le reseau
+        sp = J.Spotify("CID", "R", http=lambda *a, **k: (0, {"error": "injoignable",
+                                                            "error_description": "timed out"}))
+        with self.assertRaises(J.ErreurSpotify) as e:
+            sp.jeton()
+        self.assertIn("injoignable", str(e.exception))
+        # le diagnostic, pas a pas
+        def http(methode, url, entetes=None, corps=None):
+            if url.endswith("/api/token"):
+                return 200, {"access_token": "A", "expires_in": 3600}
+            if url.endswith("/me"):
+                return 200, {"display_name": "Alex", "product": "free"}
+            return 200, {"devices": [{"name": "PC-ALEX"}]}
+        ok, lignes = J.Spotify("CID", "R", http=http).diagnostic()
+        self.assertTrue(ok)
+        self.assertEqual(lignes[0], "Jeton : OK.")
+        self.assertIn("Alex (free)", lignes[1])
+        self.assertIn("Sans Premium", lignes[2])
+        self.assertIn("PC-ALEX", lignes[3])
+        ok, lignes = J.Spotify("CID", "R", http=lambda *a, **k: (400, {"error": "invalid_client"})).diagnostic()
+        self.assertFalse(ok)
+        self.assertIn("Client ID inconnu", lignes[-1])
+
     def test_spotify_par_son_api(self):
         appels, sauves = [], []
         etat = {"appareils": [], "ouvert": False, "play": 204}
@@ -1578,6 +1629,26 @@ class DansMachiTool(unittest.TestCase):
         return ok, consignes, m.gabarits_jarvis()
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_diagnostic_spotify_de_machi_tool(self):
+        m = self.m
+        self.assertIn("Pas de Client ID", m.diagnostic_spotify(m.CFG))
+        m.CFG.update(spotify_client_id="CID")
+        self.assertIn("Pas encore connecte", m.diagnostic_spotify(m.CFG))
+        m.CFG.update(spotify_refresh="R", jarvis_pc=False)
+        vrai = m._SPOTIFY["client"]
+        self.addCleanup(lambda: m._SPOTIFY.update(client=None, cle=None))
+
+        class Faux:
+            def diagnostic(self):
+                return True, ["Jeton : OK."]
+        m._SPOTIFY.update(client=Faux(), cle=("CID", "R"))
+        r = m.diagnostic_spotify(m.CFG)
+        self.assertIn("Il peut agir sur le PC", r, "sans ses mains, Jarvis ne s'en sert pas : on le dit")
+        self.assertFalse(r.startswith("OK."))
+        m.CFG["jarvis_pc"] = True
+        self.assertEqual(m.diagnostic_spotify(m.CFG), "OK. Jeton : OK.")
+        self.assertIs(m._jv.CONTEXTE_SSL, m._contexte_ssl, "Spotify passe par le magasin de Machi Tool")
+
     def test_un_appel_pas_net_est_verifie_par_transcription(self):
         m = self.m
         envoye = []

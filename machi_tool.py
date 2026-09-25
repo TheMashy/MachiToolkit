@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.56.0"
+VERSION = "1.57.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -4062,7 +4062,7 @@ def _telecharger_dictee(cible, ouvrir=None):
     """Les trois fichiers, un par un, avec la progression pour l'ecran.
     `.part` puis renommage : un telechargement coupe ne passe jamais pour un
     modele complet."""
-    ouvrir = ouvrir or (lambda url: urllib.request.urlopen(url, timeout=60))
+    ouvrir = ouvrir or (lambda url: urllib.request.urlopen(url, timeout=60, context=_contexte_ssl()))
     for i, nom in enumerate(DICTEE_FICHIERS):
         dst = os.path.join(cible, nom)
         if os.path.isfile(dst) and os.path.getsize(dst) > 0:
@@ -7012,7 +7012,7 @@ def ouvrir_youtube(recherche):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/126.0 Safari/537.36",
             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8", "Cookie": "SOCS=CAI; CONSENT=YES+"})
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=8, context=_contexte_ssl()) as r:
             video = _jv.premiere_video_youtube(r.read(3_000_000).decode("utf-8", "replace"))
     except Exception:
         video = None
@@ -7041,6 +7041,24 @@ def spotify_de(cfg):
             sauver_config(cfg)
         _SPOTIFY["client"], _SPOTIFY["cle"] = _jv.Spotify(cle[0], cle[1], sauver=sauver), cle
     return _SPOTIFY["client"]
+
+
+def diagnostic_spotify(cfg):
+    """« Pourquoi il ne peut pas acceder a l'API Spotify » : pas a pas, en clair."""
+    if not str(cfg.get("spotify_client_id") or "").strip():
+        return "Pas de Client ID : colle celui de ton app Spotify, puis « Connecter »."
+    if not cfg.get("spotify_refresh"):
+        return "Pas encore connecte : clique « Connecter » et accepte dans le navigateur."
+    try:
+        ok, lignes = spotify_de(cfg).diagnostic()
+    except Exception as e:
+        ok, lignes = False, ["%s : %s" % (type(e).__name__, str(e)[:200])]
+    if not cfg.get("jarvis_pc"):
+        lignes.append("« Il peut agir sur le PC » est decoche : Jarvis ne peut pas s'en servir.")
+        ok = False
+    texte = " ".join(lignes)
+    print("Spotify : %s" % texte)
+    return ("OK. " if ok else "") + texte
 
 
 def ouvrir_appli_spotify():
@@ -11144,6 +11162,7 @@ class Panneau:
         self.champ_spotify.pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Connecter", self.connecter_spotify, compact=True).pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Deconnecter", self.deconnecter_spotify, compact=True).pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Tester", self.tester_spotify, compact=True).pack(side="left", padx=(8, 0))
         self.txt_spotify = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_spotify.pack(fill="x", pady=(4, 0))
 
@@ -11265,6 +11284,12 @@ class Panneau:
             connecter_spotify(self.cfg, rappel=lambda m: JARVIS.__setitem__("spotify_message", m))
         except Exception as e:
             JARVIS["spotify_message"] = str(e)
+
+    def tester_spotify(self):
+        def tester():
+            JARVIS["spotify_message"] = "Test en cours..."
+            JARVIS["spotify_message"] = diagnostic_spotify(self.cfg)
+        threading.Thread(target=tester, daemon=True).start()
 
     def deconnecter_spotify(self):
         self.cfg["spotify_refresh"] = ""
@@ -11426,6 +11451,8 @@ class Panneau:
                 self.txt_onglets.configure(text=etat_on)
         if hasattr(self, "txt_spotify"):
             etat_sp = ("Connecte." if spotify_connecte(self.cfg) else "Pas connecte.")
+            if spotify_connecte(self.cfg) and not self.cfg.get("jarvis_pc"):
+                etat_sp += " Mais « Il peut agir sur le PC » est decoche : Jarvis ne s'en sert pas."
             if JARVIS.get("spotify_message"):
                 etat_sp += "  " + JARVIS["spotify_message"]
             if self.txt_spotify.cget("text") != etat_sp:
@@ -12427,6 +12454,9 @@ def _contexte_ssl():
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
         return contexte
+
+
+_jv.CONTEXTE_SSL = _contexte_ssl          # Spotify (http_json) : le meme magasin de certificats
 
 
 def _ouvrir(url, delai=20):

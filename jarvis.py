@@ -3505,7 +3505,19 @@ def premiere_video_youtube(html):
 SPOTIFY_PORT = 8765
 SPOTIFY_RETOUR = "http://127.0.0.1:%d/callback" % SPOTIFY_PORT
 SPOTIFY_PORTEES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
-                   "user-library-modify user-library-read playlist-read-private")
+                   "user-library-modify user-library-read playlist-read-private user-read-private")
+# Le contexte SSL des requetes : Machi Tool y met le sien (_contexte_ssl), qui
+# tombe sur certifi quand le magasin de Windows ressort vide -- ce qui arrive
+# dans l'exe. Sans lui, TOUT Spotify echouait (« certificate verify failed »),
+# jusqu'a l'echange du code a la connexion.
+CONTEXTE_SSL = None
+
+
+def _contexte():
+    try:
+        return CONTEXTE_SSL() if callable(CONTEXTE_SSL) else CONTEXTE_SSL
+    except Exception:
+        return None
 _SPOTIFY_API = "https://api.spotify.com/v1"
 _SPOTIFY_COMPTES = "https://accounts.spotify.com"
 
@@ -3529,7 +3541,9 @@ def spotify_url_autorisation(client_id, defi, etat):
 
 
 def http_json(methode, url, entetes=None, corps=None, delai=10):
-    """(statut, reponse JSON ou None). `corps` : un dict (JSON) ou des octets."""
+    """(statut, reponse JSON ou None). `corps` : un dict (JSON) ou des octets.
+    Injoignable (reseau, certificat) : statut 0 et {"error": "injoignable",
+    "error_description": la raison} -- jamais une exception."""
     import urllib.request
     import urllib.error
     donnees = None
@@ -3541,11 +3555,14 @@ def http_json(methode, url, entetes=None, corps=None, delai=10):
         donnees = corps
     req = urllib.request.Request(url, data=donnees, headers=entetes, method=methode)
     try:
-        with urllib.request.urlopen(req, timeout=delai) as r:
+        with urllib.request.urlopen(req, timeout=delai, context=_contexte()) as r:
             brut = r.read()
             statut = r.status
     except urllib.error.HTTPError as e:
         brut, statut = e.read(), e.code
+    except (urllib.error.URLError, OSError) as e:
+        raison = getattr(e, "reason", e)
+        return 0, {"error": "injoignable", "error_description": str(raison)[:200]}
     try:
         return statut, (json.loads(brut.decode("utf-8")) if brut else None)
     except ValueError:
@@ -3554,6 +3571,36 @@ def http_json(methode, url, entetes=None, corps=None, delai=10):
 
 class ErreurSpotify(Exception):
     pass
+
+
+def raison_spotify(statut, r, quoi="Spotify refuse"):
+    """Une phrase qui dit QUOI ne va pas, et quoi faire."""
+    r = r if isinstance(r, dict) else {}
+    err = r.get("error")
+    if isinstance(err, dict):                     # l'API : {"error": {"status", "message"}}
+        err, detail = str(err.get("message") or ""), ""
+    else:
+        detail = str(r.get("error_description") or "")
+    if statut == 0:
+        certificat = "certificat" in detail.lower() or "ssl" in detail.lower() or "certificate" in detail.lower()
+        return ("Spotify injoignable : %s. %s" % (detail or "pas de reseau",
+                "Le certificat HTTPS est refuse (antivirus ou proxy qui inspecte le trafic ?)."
+                if certificat else "Verifie la connexion Internet."))
+    if err == "invalid_client":
+        return ("%s : Client ID inconnu. Recopie-le depuis developer.spotify.com/dashboard." % quoi)
+    if err == "invalid_grant" or "refresh token" in detail.lower() or "revoked" in detail.lower():
+        return ("%s : la connexion a expire ou a ete retiree. Reconnecte Spotify dans Machi Tool "
+                "(Jarvis > Spotify)." % quoi)
+    if "redirect" in detail.lower():
+        return ("%s : l'adresse de retour ne correspond pas. Dans ton app Spotify, Redirect URI doit etre "
+                "exactement %s." % (quoi, SPOTIFY_RETOUR))
+    if statut == 403 and ("user" in (err or "").lower() or "developer" in (err or "").lower()
+                          or "registered" in (err or "").lower()):
+        return ("%s : ce compte n'est pas autorise sur l'app. Dans developer.spotify.com/dashboard > ton app > "
+                "User Management, ajoute l'e-mail de ton compte Spotify." % quoi)
+    if statut == 429:
+        return "%s : trop de demandes, reessaie dans une minute." % quoi
+    return "%s (%s%s)." % (quoi, statut, " : " + (detail or err) if (detail or err) else "")
 
 
 class Spotify:
@@ -3575,8 +3622,7 @@ class Spotify:
                                     "redirect_uri": SPOTIFY_RETOUR, "client_id": client_id,
                                     "code_verifier": verif}).encode("ascii"))
         if statut != 200 or not (r or {}).get("refresh_token"):
-            raise ErreurSpotify("Spotify a refuse la connexion (%s)." % ((r or {}).get("error_description")
-                                                                       or (r or {}).get("error") or statut))
+            raise ErreurSpotify(raison_spotify(statut, r, "Spotify a refuse la connexion"))
         return r
 
     def jeton(self):
@@ -3588,8 +3634,7 @@ class Spotify:
                               urlencode({"grant_type": "refresh_token", "refresh_token": self.refresh,
                                          "client_id": self.client_id}).encode("ascii"))
         if statut != 200 or not (r or {}).get("access_token"):
-            raise ErreurSpotify("La connexion a Spotify a expire : reconnecte-le dans Machi Tool "
-                                "(Reglages > Jarvis > Spotify).")
+            raise ErreurSpotify(raison_spotify(statut, r, "Spotify refuse le jeton"))
         self.acces, self.expire = r["access_token"], time.time() + float(r.get("expires_in") or 3600)
         if r.get("refresh_token") and r["refresh_token"] != self.refresh:
             self.refresh = r["refresh_token"]
@@ -3607,6 +3652,33 @@ class Spotify:
                 continue
             return statut, r
         return statut, r
+
+    def diagnostic(self):
+        """Ce qui marche et ce qui bloque, pas a pas : le jeton, le compte
+        (Premium ?), les appareils. Rend (ok, lignes)."""
+        lignes = []
+        try:
+            self.acces = None
+            self.jeton()
+            lignes.append("Jeton : OK.")
+        except ErreurSpotify as e:
+            return False, lignes + [str(e)]
+        statut, r = self.api("GET", "/me")
+        if statut != 200:
+            return False, lignes + [raison_spotify(statut, r, "Le compte ne repond pas")]
+        produit = (r or {}).get("product")
+        lignes.append("Compte : %s%s." % ((r or {}).get("display_name") or (r or {}).get("id") or "?",
+                                           {"premium": " (Premium)", None: ""}.get(produit, " (%s)" % produit)))
+        if produit and produit != "premium":
+            lignes.append("Sans Premium, Spotify refuse de lancer la lecture a distance : Jarvis passera "
+                          "par YouTube.")
+        statut, r = self.api("GET", "/me/player/devices")
+        if statut != 200:
+            return False, lignes + [raison_spotify(statut, r, "Les appareils ne repondent pas")]
+        noms = [a.get("name", "?") for a in (r or {}).get("devices") or [] if a]
+        lignes.append("Appareils : %s." % (", ".join(noms) if noms else
+                                            "aucun ouvert (ouvre l'application Spotify pour qu'il la trouve)"))
+        return True, lignes
 
     def appareil(self):
         statut, r = self.api("GET", "/me/player/devices")
@@ -3673,7 +3745,7 @@ class Spotify:
         if statut == 403:
             raise ErreurSpotify("Spotify refuse : lancer la lecture a distance demande un compte Premium.")
         if statut not in (200, 202, 204):
-            raise ErreurSpotify("Spotify a repondu %s." % (((r or {}).get("error") or {}).get("message") or statut))
+            raise ErreurSpotify(raison_spotify(statut, r, "Spotify refuse"))
         return fait
 
     def en_cours(self):
