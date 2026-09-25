@@ -837,7 +837,7 @@ class DansMachiTool(unittest.TestCase):
         finally:
             m.kokoro_present, m.bibli_espeak, m.piper_pret = origines
 
-    def mains(self, reponses, code="4815", ecran=False):
+    def mains(self, reponses, code="4815", ecran=False, code_actif=True):
         """Jarvis avec ses mains : BrainDebugger est remplace par `reponses` (une
         liste, une par requete), le PC par un dossier temporaire. Rend la liste
         des requetes envoyees et le dossier."""
@@ -857,7 +857,7 @@ class DansMachiTool(unittest.TestCase):
         m.touche_media = lambda action: "Piste suivante." if action == "suivant" else "Fait."
         m.capturer_ecran = lambda n: ("QUJD", int(n or 1), 2)
         m.envoyer_oreille = lambda o: True
-        m.CFG.update(jarvis_pc=True, jarvis_ecran=ecran, jarvis_langue="fr")
+        m.CFG.update(jarvis_pc=True, jarvis_ecran=ecran, jarvis_langue="fr", jarvis_code_actif=code_actif)
         m.poser_code(m.CFG, code)
         m.JARVIS.update(acces_jusqua=0.0, verrou_jusqua=0.0, attente_code=None)
         return envoyes, maison
@@ -931,6 +931,16 @@ class DansMachiTool(unittest.TestCase):
         self.phrase("Jarvis, crée un dossier X dans mes documents")
         self.assertIn("Aucun code", envoyes[1]["resultats"][0]["erreur"])
         self.assertFalse(os.path.exists(os.path.join(maison, "Documents", "X")))
+
+    def test_sans_code_par_defaut_il_agit_directement(self):
+        # « Faire en sorte qu'il n'y ait plus de code d'acces a demander. »
+        self.assertFalse(self.m.CONFIG_DEFAUT["jarvis_code_actif"])
+        envoyes, maison = self.mains([self.outil("creer_dossier", {"chemin": "Documents\\Direct"}),
+                                      {"texte": "C'est fait.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, crée un dossier Direct dans mes documents")
+        self.assertNotIn("Code d'accès ?", self.dit)
+        self.assertTrue(os.path.isdir(os.path.join(maison, "Documents", "Direct")))
+        self.assertEqual(self.dit[-1], "C'est fait.")
 
     def test_la_musique_sans_code(self):
         envoyes, _ = self.mains([self.outil("musique", {"action": "suivant"}),

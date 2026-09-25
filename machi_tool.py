@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.35.0"
+VERSION = "1.36.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -350,6 +350,9 @@ CONFIG_DEFAUT = {
     # d'acces dit a voix haute. Du code, on ne garde qu'une empreinte.
     "jarvis_pc": False,
     "jarvis_ecran": False,
+    # « Faire en sorte qu'il n'y ait plus de code d'acces a demander » : il agit
+    # directement. Le code reste possible, si on coche la case qui le demande.
+    "jarvis_code_actif": False,
     "jarvis_code_sel": "",
     "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
     "jarvis_voix_kokoro": "jarvis",   # sa voix anglaise, voir VOIX_KOKORO dans jarvis.py
@@ -5919,7 +5922,7 @@ def outils_de_jarvis(etat, cfg):
     L = langue_jarvis(cfg)
     outils = etat["outils"]
     besoin = [o for o in outils if o.get("nom") not in OUTILS_SANS_CODE]
-    if besoin and not acces_ouvert():
+    if besoin and cfg.get("jarvis_code_actif") and not acces_ouvert():
         if time.time() < float(JARVIS.get("verrou_jusqua") or 0):
             refus = "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
             return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
@@ -8797,11 +8800,11 @@ class Panneau:
         self.texte(f, "Ouvert, Jarvis peut piloter la musique (lecture, pause, piste suivante, volume), "
                       "ouvrir Spotify sur une recherche, parcourir tes dossiers, chercher un fichier, "
                       "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
-                      "deplacer, ni renommer. Avant les dossiers, les fichiers et l'ecran, il demande "
-                      "le code d'acces a voix haute ; juste, c'est ouvert dix minutes (« verrouille » "
-                      "referme). Les noms de dossiers et les captures partent a BrainDebugger et a "
-                      "Claude le temps de la reponse, et ne sont gardes nulle part. Attention : un "
-                      "code dit a voix haute s'entend dans la piece.",
+                      "deplacer, ni renommer. Il agit directement, sans code : quiconque l'appelle dans "
+                      "la piece peut lui demander tes dossiers. Si tu preferes, coche le code d'acces "
+                      "plus bas : il le demandera a voix haute avant les dossiers, les fichiers et "
+                      "l'ecran. Les noms de dossiers et les captures partent a BrainDebugger et a "
+                      "Claude le temps de la reponse, et ne sont gardes nulle part.",
                    BRUME, 8, largeur=500).pack(fill="x")
         self.var_jarvis_pc = tk.IntVar(value=1 if self.cfg.get("jarvis_pc") else 0)
         self.case(f, "Jarvis peut agir sur le PC : musique, Spotify, dossiers, fichiers",
@@ -8809,6 +8812,10 @@ class Panneau:
         self.var_jarvis_ecran = tk.IntVar(value=1 if self.cfg.get("jarvis_ecran") else 0)
         self.case(f, "Et regarder un ecran quand tu le lui demandes (« regarde mon ecran 2 »)",
                   self.var_jarvis_ecran, lambda: self.regler_mains("jarvis_ecran", self.var_jarvis_ecran)).pack(fill="x")
+        self.var_jarvis_code_actif = tk.IntVar(value=1 if self.cfg.get("jarvis_code_actif") else 0)
+        self.case(f, "Demander un code d'acces avant les dossiers, les fichiers et l'ecran (facultatif)",
+                  self.var_jarvis_code_actif,
+                  lambda: self.regler_mains("jarvis_code_actif", self.var_jarvis_code_actif)).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
         self.texte(ligne, "Code d'acces", CRAIE, 9).pack(side="left")
@@ -8929,6 +8936,8 @@ class Panneau:
             t = message
         elif not self.cfg.get("jarvis_pc"):
             t = "Fermees : Jarvis ne touche a rien sur le PC."
+        elif not self.cfg.get("jarvis_code_actif"):
+            t = "Sans code : il agit directement."
         elif code_regle(self.cfg):
             t = "Code regle. La musique et Spotify marchent sans ; le reste le demande."
         else:
