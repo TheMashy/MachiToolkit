@@ -748,33 +748,52 @@ def _distance_mots(a, b):
     return prec[-1]
 
 
+NOM_APPRIS_ECART_MAX = 3
+
+
+def nom_plausible(m):
+    """Un mot qui peut etre ton « Jarvis » tel qu'un moteur l'ecrit (« travis »,
+    « djarvis », « jarvi ») : a trois lettres au plus de « jarvis »."""
+    m = str(m or "")
+    return 4 <= len(m) <= 12 and _distance_mots(m, "jarvis") <= NOM_APPRIS_ECART_MAX
+
+
 def noms_entendus(transcription):
     """Comment le moteur de transcription a ecrit ton « Jarvis » pendant
-    l'apprentissage : les mots (colles deux a deux aussi) qu'on acceptera
-    ensuite comme ton nom -- sauf les tout petits mots."""
+    l'apprentissage : LE mot (ou deux mots colles) le plus proche de « jarvis »,
+    s'il l'est assez. « Au bout d'un moment il s'active tout seul » : on
+    gardait TOUS les mots de la phrase -- « Calibrer encore » fait dire
+    « ... et Jarvis ... » au milieu d'une phrase, et « lumiere » ou
+    « musique » devenaient ton nom : chaque faux appel etait confirme."""
     mots = [normaliser(m).replace("'", "").strip(" -") for m in str(transcription or "").split()]
     mots = [m for m in mots if m]
     paires = [a + b for a, b in zip(mots, mots[1:]) if len(a) >= 3 and len(b) >= 3]
-    return [m for m in mots + paires if 4 <= len(m) <= 12]
+    candidats = sorted((_distance_mots(m, "jarvis"), m) for m in mots + paires if nom_plausible(m))
+    return [candidats[0][1]] if candidats else []
 
 
-def contient_nom(texte, noms=()):
-    """La transcription contient-elle « Jarvis », meme ecorche (« Jervis »,
-    « Charvis », « Jarvi », « jar vis »), ou tel que le moteur l'a ecrit
-    quand tu l'as appris (`noms`) ? Sert a confirmer un appel pas net."""
+def nom_trouve(texte, noms=()):
+    """Le mot de la transcription qui est « Jarvis », meme ecorche (« Jervis »,
+    « Charvis », « Jarvi », « jar vis »), ou tel que le moteur l'a ecrit quand
+    tu l'as appris (`noms`) ; None s'il n'y en a pas."""
     mots = [normaliser(m).replace("'", "") for m in str(texte or "").split()]
     mots = [m.strip(" -") for m in mots if m.strip(" -")]
     candidats = mots + [a + b for a, b in zip(mots, mots[1:])]
-    appris = {str(n) for n in noms or () if n}
+    appris = {str(n) for n in noms or () if n and nom_plausible(n)}
     for m in candidats:
         if _EVEIL.match(m) or m in appris:
-            return True
+            return m
         # ... et son squelette : un « r » et un « v » (« j'avais », a deux
         # lettres de « jarvis », n'en est pas un)
         if 4 <= len(m) <= 9 and _distance_mots(m, "jarvis") <= 2 and m[0] in "jgcdzs" \
                 and "r" in m and ("v" in m or "w" in m):
-            return True
-    return False
+            return m
+    return None
+
+
+def contient_nom(texte, noms=()):
+    """Sert a confirmer un appel pas net (voir nom_trouve)."""
+    return nom_trouve(texte, noms) is not None
 
 
 _POLITESSE = re.compile(r"^(?:s'? ?il (?:te|vous) plait|stp|svp|merci|please|ok|hein|allez|vas-y)$")
@@ -2291,6 +2310,10 @@ def choisir_micro(micros, voulu, defaut):
     return defaut(), False
 
 
+MICRO_MUET_S = 30.0          # que du silence numerique si longtemps : le micro est rouvert
+MICRO_VERIFIE_S = 10.0       # toutes les dix secondes : est-ce toujours le bon micro ?
+
+
 def micro_windows(nom="", annoncer=None):
     """Les trames du micro, 1280 echantillons int16 a 16 kHz. WASAPI convertit
     lui-meme la frequence (soundcard ouvre le flux avec AUTOCONVERTPCM)."""
@@ -2299,11 +2322,30 @@ def micro_windows(nom="", annoncer=None):
     micro, trouve = choisir_micro(sc.all_microphones, nom, sc.default_microphone)
     if annoncer:
         annoncer(str(getattr(micro, "name", "")), trouve)
+    ident = getattr(micro, "id", None)
     with micro.recorder(samplerate=FREQ, channels=1, blocksize=TRAME) as r:
+        vu, muet = time.monotonic(), None
         while True:
             b = r.record(numframes=TRAME)
             mono = b[:, 0] if getattr(b, "ndim", 1) > 1 else b
-            yield (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
+            x = (np.clip(mono, -1.0, 1.0) * 32767).astype(np.int16)
+            t = time.monotonic()
+            # « AU BOUT D'UN MOMENT IL NE SE DETECTE PLUS » : un micro qui ne rend
+            # plus que des zeros (casque debranche, mise en veille, un autre
+            # programme qui l'a pris) ne se reveille pas seul -- on le rouvre.
+            muet = (muet or t) if not x.any() else None
+            if muet is not None and t - muet > MICRO_MUET_S:
+                return
+            # le micro de Windows a change, ou celui qu'on voulait est rebranche
+            if t - vu > MICRO_VERIFIE_S:
+                vu = t
+                try:
+                    if getattr(choisir_micro(sc.all_microphones, nom, sc.default_microphone)[0], "id",
+                               ident) != ident:
+                        return
+                except Exception:
+                    pass
+            yield x
 
 
 class Oreille:

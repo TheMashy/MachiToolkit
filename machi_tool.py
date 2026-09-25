@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.60.0"
+VERSION = "1.61.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -4573,8 +4573,10 @@ def niveau_voix_appris():
 
 
 def noms_appris():
-    """Comment la transcription a ecrit ton « Jarvis » pendant l'apprentissage."""
-    return [str(x) for x in _voix_lue().get("noms") or [] if x][:24]
+    """Comment la transcription a ecrit ton « Jarvis » pendant l'apprentissage
+    -- seulement ce qui ressemble a son nom (la v1.59 gardait tous les mots
+    des phrases de calibration : on les ecarte ici, a la lecture)."""
+    return [str(x) for x in _voix_lue().get("noms") or [] if x and _jv.nom_plausible(x)][:24]
 
 
 def oublier_gabarits_auto():
@@ -5410,9 +5412,18 @@ def _fermer_enfant(sock, proc):
                 pass
 
 
+OREILLE_MUETTE_S = 25.0      # l'oreille dit son niveau chaque seconde
+
+
+def oreille_muette(maintenant=None):
+    t = time.time() if maintenant is None else maintenant
+    return t - float(JARVIS.get("niveau_t") or t) > OREILLE_MUETTE_S
+
+
 def demarrer_oreille(cfg):
     arreter_oreille()
     JARVIS.update(etat="demarrage", message="Ouverture du micro...")
+    JARVIS["niveau_t"] = time.time()        # le chien de garde lui laisse le temps de demarrer
     proc, sock = _lancer_enfant(lambda port, secret: _commande_oreille(port, secret), "du micro")
     _OREILLE.update(proc=proc, sock=sock)
     envoyer_oreille(config_oreille(cfg))
@@ -5475,6 +5486,7 @@ def traiter_evenement(ev):
     elif quoi == "voix_niveau":
         JARVIS["voix_niveau"] = (float(ev.get("v") or 0.0), time.time())
     elif quoi == "niveau":
+        JARVIS["niveau_t"] = time.time()
         JARVIS["db"] = ev.get("db")
         JARVIS["coupure"] = ev.get("coupure")
     elif quoi == "coupure":
@@ -5544,10 +5556,12 @@ def verifier_appel(wav64):
     try:
         if etat_dictee()["etat"] == "pret":
             texte = transcrire(base64.b64decode(wav64))
-            ok = _jv.contient_nom(texte, noms_appris())
+            lu = _jv.nom_trouve(texte, noms_appris())
+            ok = lu is not None
     except Exception as e:
         print("Jarvis : verification impossible (%s)" % type(e).__name__)
-    print("Jarvis : appel pas net %s" % ("confirme" if ok else "ecarte"))
+    # le mot qui l'a confirme, pour comprendre un reveil intempestif (pas la phrase)
+    print("Jarvis : appel pas net %s" % ("confirme (« %s »)" % lu if ok else "ecarte"))
     for e in reversed(JARVIS.get("essais") or []):
         if e.get("issue") == "verifier":
             e["issue"] = "confirme" if ok else "ecarte"
@@ -5574,7 +5588,10 @@ def garder_facons(transcription):
     return n
 
 
-AUTO_PURGE_VERSION = 158      # les facons apprises seul avant les controles de la v1.58 : effacees une fois
+# les facons apprises seul avant les controles de la v1.58, puis pendant que
+# les « noms appris » etaient pollues (v1.59-1.60 : n'importe quel mot d'une
+# phrase de calibration confirmait un appel) : effacees une fois
+AUTO_PURGE_VERSION = 161
 
 
 def purger_facons_douteuses(cfg):
@@ -5652,6 +5669,15 @@ def veiller_sur_jarvis(cfg):
                 VOIX.taire()
                 poser_led(None)
                 JARVIS.update(etat="eteint", message="")
+            elif voulu and vivant and oreille_muette():
+                # « AU BOUT D'UN MOMENT IL NE SE DETECTE PLUS » : l'oreille vit
+                # mais ne dit plus rien (un micro bloque dans le pilote) ; elle
+                # n'entend plus rien ni ne lit ses commandes. On la relance.
+                print("Jarvis : l'oreille ne donne plus signe de vie depuis %d s, je la relance"
+                      % (time.time() - float(JARVIS.get("niveau_t") or 0)))
+                arreter_oreille()
+                _OREILLE["prochain"] = time.time() + 2
+                JARVIS.update(etat="erreur", message="Le micro ne repondait plus ; il repart.")
             elif voulu and not vivant and _OREILLE["proc"] is not None:
                 # Tombe en route : on nettoie, la prochaine boucle relance.
                 arreter_oreille()
