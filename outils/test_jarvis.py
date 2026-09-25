@@ -1175,7 +1175,7 @@ class OreilleSansMicro(unittest.TestCase):
         self.o.niveau_vu = float("inf")          # pas de niveaux : on regarde le reste
 
     def evts(self):
-        return [e["evt"] for e in self.sorties]
+        return [e["evt"] for e in self.sorties if e["evt"] != "voix_niveau"]
 
     def test_avant_l_eveil_rien_ne_sort(self):
         """Le coeur de la promesse : on parle dans la piece, personne n'a
@@ -1199,8 +1199,8 @@ class OreilleSansMicro(unittest.TestCase):
         # reveille par « Hey Jarvis », et on lui a vraiment parle ensuite : cette
         # facon de l'appeler est gardee (l'etalonnage au fil de l'eau)
         self.assertEqual(self.evts(), ["reveil", "phrase", "gabarit_auto"])
-        self.assertEqual(len(self.sorties[2]["vecteurs"][0]), 96)
-        with wave.open(io.BytesIO(base64.b64decode(self.sorties[1]["wav"]))) as w:
+        self.assertEqual(len([e for e in self.sorties if e["evt"] == "gabarit_auto"][0]["vecteurs"][0]), 96)
+        with wave.open(io.BytesIO(base64.b64decode([e for e in self.sorties if e["evt"] == "phrase"][0]["wav"]))) as w:
             # Les deux secondes d'avant l'eveil sont la : « Jarvis » y est, et
             # la transcription le retire.
             self.assertGreater(w.getnframes() / 16000.0, 2.5)
@@ -1340,7 +1340,7 @@ class EtalonnageAuFilDeLEau(unittest.TestCase):
         self.dire([np.random.default_rng(n).normal(size=96) for _ in range(n)], parole=False)
 
     def evts(self):
-        return [e["evt"] for e in self.sorties]
+        return [e["evt"] for e in self.sorties if e["evt"] != "voix_niveau"]
 
     def test_l_appel_rate_puis_repete_est_appris(self):
         self.silence(20)
@@ -1386,7 +1386,7 @@ class TresTolerant(EtalonnageAuFilDeLEau):
     def appel_pas_net(self):
         self.silence(20)
         self.dire(self.autrement)
-        self.silence(3)
+        self.silence(J.TOLERANCE_ATTENTE + 1)
         self.assertEqual([e for e in self.evts() if e != "presque"], ["verifier"])
         self.assertEqual(self.sons, [], "pas de carillon tant que ce n'est pas sur")
         v = [e for e in self.sorties if e["evt"] == "verifier"][0]
@@ -1433,6 +1433,33 @@ class TresTolerant(EtalonnageAuFilDeLEau):
         self.assertNotIn("reveil", self.evts())
 
     # l'heritage : ces deux-la ne valent que sans zone tolerante
+    test_l_appel_rate_puis_repete_est_appris = None
+    test_rate_mais_rien_ne_suit_rien_n_est_garde = None
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class UnBruitNEstPasUnMot(EtalonnageAuFilDeLEau):
+    """« Il se declenche tout seul des qu'il y a un bruit dans le micro. » Un
+    mot a une duree : il faut au moins TRAMES_VOISEES_MIN trames de parole ;
+    un clic ou un claquement d'une trame ne reveille rien, meme s'il
+    « ressemble »."""
+
+    def test_un_bruit_bref_qui_ressemble_ne_reveille_pas(self):
+        self.o.commande({"cmd": "config", "tolerant": True})
+        self.silence(20)
+        # les empreintes du mot, mais un seul coup de son fort (un claquement)
+        for i, v in enumerate(self.g):
+            self.e.a_venir.append(np.asarray(v, dtype=np.float32))
+            self.o.trame(trame(parole=(i == len(self.g) - 1)))
+        self.silence(10)
+        self.assertEqual([e for e in self.evts() if e != "presque"], [])
+
+    def test_une_variante_raccourcie_n_est_jamais_minuscule(self):
+        g = J.normer(np.random.default_rng(2).normal(size=(10, 96)))
+        fen = J.normer(np.random.default_rng(3).normal(size=(20, 96)))
+        fen[-5:] = g[3:8]                          # cinq trames du mot, pas plus
+        self.assertGreater(J.distance_eveil(g, fen), J.seuil_gabarit(1.0))
+
     test_l_appel_rate_puis_repete_est_appris = None
     test_rate_mais_rien_ne_suit_rien_n_est_garde = None
 
@@ -1745,10 +1772,22 @@ class DansMachiTool(unittest.TestCase):
         m.sauver_gabarits([g.tolist()], garder_auto=False)
         self.assertEqual(m.gabarits_auto(), [], "tout reappris : ce qu'il avait garde seul s'en va")
         m.traiter_evenement({"evt": "gabarit_auto", "vecteurs": proche(20)})
+        self.assertEqual(m.gabarits_auto(), [], "pas encore : la phrase n'est pas transcrite")
+        self.assertEqual(m.garder_facons("mets de la musique"), 0, "sans son nom dans la phrase : un bruit")
+        self.assertEqual(m.gabarits_auto(), [])
+        m.traiter_evenement({"evt": "gabarit_auto", "vecteurs": proche(20)})
+        self.assertEqual(m.garder_facons("Jarvis, mets de la musique"), 1)
         self.assertEqual(len(m.gabarits_auto()), 1)
         self.assertEqual(len(self.envoye[-1]["gabarits"]), 2)
         m.sauver_gabarits([g.tolist(), proche(30)], garder_auto=True)
         self.assertEqual(len(m.gabarits_auto()), 1, "une facon de plus : on garde le reste")
+        # « il se declenche tout seul des qu'il y a un bruit » : les facons
+        # apprises seul avant la v1.58 sont effacees une fois ; les tiennes restent
+        m.CFG["jarvis_auto_purge"] = 0
+        self.assertTrue(m.purger_facons_douteuses(m.CFG))
+        self.assertEqual(m.gabarits_auto(), [])
+        self.assertEqual(len(m.gabarits_jarvis()), 2)
+        self.assertFalse(m.purger_facons_douteuses(m.CFG), "une seule fois")
         # coupe : plus rien n'est garde, et l'oreille ne recoit que celles apprises
         m.CFG["jarvis_auto_etalonnage"] = False
         self.assertFalse(m.ajouter_gabarit_auto(proche(40)))
@@ -3954,9 +3993,9 @@ class DoubleTransmission(unittest.TestCase):
         self.assertIsNone(jouer(self.jarvis[1]))
         self.assertEqual(sorties, [], "sa propre voix ne fait rien sortir")
         self.assertIsNotNone(jouer(self.jarvis[2], voix=self.voix[1]))
-        evts = [e["evt"] for e in sorties]
+        evts = [e["evt"] for e in sorties if e["evt"] != "voix_niveau"]
         self.assertEqual(evts, ["coupure", "phrase"])
-        wav = base64.b64decode(sorties[1]["wav"])
+        wav = base64.b64decode([e for e in sorties if e["evt"] == "phrase"][0]["wav"])
         with wave.open(io.BytesIO(wav)) as w:
             self.assertGreater(w.getnframes() / 16000.0, 1.5, "la phrase de la personne, entiere")
         self.assertGreaterEqual(lb.demarre, 3)

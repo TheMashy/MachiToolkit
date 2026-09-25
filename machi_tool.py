@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.57.0"
+VERSION = "1.58.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -338,6 +338,7 @@ CONFIG_DEFAUT = {
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
     "jarvis_tolerant": True,          # un « Jarvis » pas net : verifie par transcription (voir TOLERANCE_FACTEUR)
+    "jarvis_auto_purge": 0,           # version de la derniere purge des facons apprises seul
     "jarvis_son": True,               # le petit son quand il s'allume
     "jarvis_leds": True,              # la guirlande dit ou il en est
     "jarvis_voix": True,              # il repond a voix haute
@@ -4667,6 +4668,17 @@ def poser_led(etat, duree=None):
     JARVIS["led_fin"] = time.time() + duree if duree else 0.0
 
 
+def niveau_de_la_voix(maintenant=None, cle="voix_lisse"):
+    """Le niveau de ta voix pendant qu'il ecoute, lisse (monte vite, retombe
+    doucement) ; 0 quand l'oreille ne dit plus rien depuis un instant."""
+    t = time.time() if maintenant is None else maintenant
+    v, tv = JARVIS.get("voix_niveau") or (0.0, 0.0)
+    brut = v if t - tv < 0.35 else 0.0
+    lisse = max(brut, float(JARVIS.get(cle) or 0.0) * 0.82)
+    JARVIS[cle] = lisse
+    return lisse
+
+
 def couleur_jarvis(cfg, maintenant=None):
     """((r, v, b), gain) quand Jarvis a quelque chose a montrer, sinon None.
     Passe devant tout le reste : quand on lui parle, on doit le voir."""
@@ -4679,8 +4691,13 @@ def couleur_jarvis(cfg, maintenant=None):
     if JARVIS["led_fin"] and t > JARVIS["led_fin"]:
         JARVIS["led"] = None
         return None
-    return _jv.couleur_etat(etat, t - JARVIS["led_t0"], cfg.get("jarvis_couleurs") or {},
-                            JARVIS.get("mode", "jarvis"))
+    rvb_gain = _jv.couleur_etat(etat, t - JARVIS["led_t0"], cfg.get("jarvis_couleurs") or {},
+                                JARVIS.get("mode", "jarvis"))
+    if rvb_gain and etat == "ecoute" and JARVIS.get("voix_niveau"):
+        # la guirlande aussi suit ta voix pendant qu'il ecoute
+        n = niveau_de_la_voix(t, "voix_lisse_led")
+        rvb_gain = (rvb_gain[0], 0.45 + 0.55 * n)
+    return rvb_gain
 
 
 # ---------- la voix ----------
@@ -5415,6 +5432,8 @@ def traiter_evenement(ev):
         # « Jarvis » passe pres du seuil sans le franchir : on le garde pour
         # l'afficher, avec de quoi y remedier.
         JARVIS["presque"] = (float(ev.get("distance") or 0), float(ev.get("seuil") or 0), time.time())
+    elif quoi == "voix_niveau":
+        JARVIS["voix_niveau"] = (float(ev.get("v") or 0.0), time.time())
     elif quoi == "niveau":
         JARVIS["db"] = ev.get("db")
         JARVIS["coupure"] = ev.get("coupure")
@@ -5466,13 +5485,13 @@ def traiter_evenement(ev):
         # quelques secondes, et il ne se reveille que si on y lit son nom
         threading.Thread(target=verifier_appel, args=(ev.get("wav") or "",), daemon=True).start()
     elif quoi == "gabarit_auto":
-        # un appel qu'il avait rate de peu, puis une vraie conversation : il le garde
-        try:
-            if ajouter_gabarit_auto(ev.get("vecteurs")):
-                print("Jarvis : une facon de plus de l'appeler, gardee seule (%d)" % len(gabarits_auto()))
-                envoyer_oreille(config_oreille(CFG))
-        except Exception as e:
-            print("Jarvis : facon non gardee (%s)" % type(e).__name__)
+        # un appel qu'il avait rate de peu, puis une vraie conversation : il le
+        # gardera -- SI la transcription de la phrase contient bien son nom
+        # (voir traiter_phrase). Sans ce controle, un bruit suivi de n'importe
+        # quoi devenait « une facon de l'appeler », et chaque bruit pareil le
+        # reveillait ensuite.
+        JARVIS.setdefault("auto_en_attente", []).append(ev.get("vecteurs"))
+        del JARVIS["auto_en_attente"][:-4]
     elif quoi == "erreur":
         print("Jarvis : %s" % str(ev.get("message"))[:200])
         JARVIS.update(etat="erreur", message=str(ev.get("message") or "")[:200])
@@ -5491,6 +5510,42 @@ def verifier_appel(wav64):
     print("Jarvis : appel pas net %s" % ("confirme" if ok else "ecarte"))
     envoyer_oreille({"cmd": "verifie", "ok": ok})
     return ok
+
+
+def garder_facons(transcription):
+    """Les facons de l'appeler en attente ne sont gardees que si on a
+    vraiment dit son nom dans cette phrase."""
+    attente, JARVIS["auto_en_attente"] = list(JARVIS.get("auto_en_attente") or []), []
+    if not attente or not _jv.contient_nom(transcription):
+        return 0
+    n = 0
+    for v in attente:
+        try:
+            n += 1 if ajouter_gabarit_auto(v) else 0
+        except Exception as e:
+            print("Jarvis : facon non gardee (%s)" % type(e).__name__)
+    if n:
+        print("Jarvis : %d facon(s) de plus de l'appeler, gardee(s) seul (%d)" % (n, len(gabarits_auto())))
+        envoyer_oreille(config_oreille(CFG))
+    return n
+
+
+AUTO_PURGE_VERSION = 158      # les facons apprises seul avant les controles de la v1.58 : effacees une fois
+
+
+def purger_facons_douteuses(cfg):
+    """« Il se declenche tout seul des qu'il y a un bruit. » Les facons
+    apprises seul avant la v1.58 ont pu etre des bruits : on les efface, une
+    fois ; celles que TU lui as apprises restent."""
+    if int(cfg.get("jarvis_auto_purge") or 0) >= AUTO_PURGE_VERSION:
+        return False
+    n = len(gabarits_auto())
+    if n:
+        _ecrire_voix(gabarits_jarvis(), [])
+        print("Jarvis : %d facon(s) apprise(s) seul effacee(s) (elles ont pu etre du bruit)" % n)
+    cfg["jarvis_auto_purge"] = AUTO_PURGE_VERSION
+    sauver_config(cfg)
+    return True
 
 
 def reprendre_apres_coupure():
@@ -5519,6 +5574,10 @@ def message_attente():
 def veiller_sur_jarvis(cfg):
     """Tourne dans son fil : tient l'oreille ouverte quand on l'a demande,
     la ferme sinon, et la relance si elle tombe (de plus en plus lentement)."""
+    try:
+        purger_facons_douteuses(cfg)
+    except Exception as e:
+        print("Jarvis : purge impossible (%s)" % e)
     while ETAT["en_marche"]:
         try:
             voulu = bool(cfg.get("jarvis_actif", False))
@@ -5947,6 +6006,7 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
     finally:
         octets = None
     brut = texte
+    garder_facons(brut)
     texte = _jv.retirer_mot_eveil(texte)
     JARVIS["suite_active"] = False
     if JARVIS.pop("attend_veille", False):
@@ -7800,7 +7860,7 @@ def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False):
     « Ajouter une facon de l'appeler », pour celle qui ne passe pas."""
     if not oreille_vivante():
         JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": True,
-                                   "message": "Coche d'abord « Ecouter Jarvis » : il faut le micro."}
+                                   "message": "Clique d'abord « Activer Jarvis » : il faut le micro."}
         return False
     appris, essais = [], 0
     JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": False, "message": ""}
@@ -9935,7 +9995,9 @@ class Panneau:
         from PIL import Image, ImageTk
         # ce qu'il dit s'ecrit au fil de sa voix, DANS le panneau
         texte = sous_titre_courant(maintenant) if etat == "parle" else ""
-        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis"), texte), pas)
+        niveau = niveau_de_la_voix(maintenant) if etat in ("ecoute", "comprend") else None
+        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis"), texte,
+                                             niveau=niveau), pas)
         photo = ImageTk.PhotoImage(Image.fromarray(img))
         self.fen_led_image.configure(image=photo)
         self.fen_led_image.image = photo
@@ -10466,6 +10528,7 @@ class Panneau:
         tk.Label(f, text="Mes outils", bg=NUIT, fg=CRAIE,
                  font=(self.f_titre, 24), anchor="w").pack(fill="x", pady=(2, 2))
         self.texte(f, "De quoi veux-tu t'occuper ?", BRUME, 9).pack(fill="x")
+        self.gros_bouton_jarvis(f).pack(anchor="w", pady=(14, 0))
 
         grille = tk.Frame(f, bg=NUIT)
         grille.pack(fill="both", expand=True, pady=(22, 0))
@@ -11035,8 +11098,8 @@ class Panneau:
         page = self.nouvelle_page("jarvis", defilante=True)
         f = page
         self.var_jarvis = tk.IntVar(value=1 if self.cfg.get("jarvis_actif") else 0)
-        self.case(f, "Ecouter « Jarvis » — le micro reste ouvert, sur ce PC",
-                  self.var_jarvis, self.basculer_jarvis).pack(fill="x")
+        # « un gros bouton pour desactiver Jarvis »
+        self.gros_bouton_jarvis(f).pack(anchor="w", pady=(0, self.px(8)))
         self.txt_jarvis = self.texte(f, "", CRAIE, 10, True)
         self.txt_jarvis.pack(fill="x", pady=(6, 0))
         self.txt_jarvis_detail = self.texte(f, "", BRUME, 8, largeur=500)
@@ -11237,6 +11300,42 @@ class Panneau:
     def basculer_jarvis(self):
         self.cfg["jarvis_actif"] = bool(self.var_jarvis.get())
         sauver_config(self.cfg)
+        if not self.cfg["jarvis_actif"]:
+            # coupe net : il se tait et n'ecoute plus la suite ; l'oreille se ferme
+            try:
+                terminer_conversation()
+            except Exception:
+                pass
+        self.peindre_boutons_jarvis()
+
+    def gros_bouton_jarvis(self, parent):
+        """Un gros bouton : Jarvis actif -> « Desactiver Jarvis » (rouge),
+        eteint -> « Activer Jarvis »."""
+        b = self.tk.Button(parent, text="", command=self.inverser_jarvis, relief="flat", bd=0,
+                           font=(self.f_ui, 13, "bold"), padx=self.px(28), pady=self.px(12),
+                           cursor="hand2", highlightthickness=0)
+        self.__dict__.setdefault("boutons_jarvis", []).append(b)
+        self.peindre_boutons_jarvis()
+        return b
+
+    def inverser_jarvis(self):
+        self.var_jarvis.set(0 if self.cfg.get("jarvis_actif") else 1)
+        self.basculer_jarvis()
+
+    def peindre_boutons_jarvis(self):
+        actif = bool(self.cfg.get("jarvis_actif"))
+        texte = "\u23fb  Desactiver Jarvis" if actif else "\u23fb  Activer Jarvis"
+        fond = ALERTE if actif else VIF
+        vivants = []
+        for b in getattr(self, "boutons_jarvis", []):
+            try:
+                if b.winfo_exists():
+                    if b.cget("text") != texte:
+                        b.configure(text=texte, bg=fond, fg=NUIT, activebackground=fond, activeforeground=NUIT)
+                    vivants.append(b)
+            except Exception:
+                pass
+        self.boutons_jarvis = vivants
 
     def regler_jarvis(self, cle):
         self.cfg[cle] = bool(self.vars_jarvis[cle].get())
@@ -11429,6 +11528,7 @@ class Panneau:
                   "attente": "A l'ecoute.", "ecoute": "Il t'ecoute.",
                   "comprend": "Il transcrit.", "pense": "Il reflechit.",
                   "parle": "Il repond.", "erreur": "Un souci."}
+        self.peindre_boutons_jarvis()        # l'icone (menu) peut l'avoir change
         self.txt_jarvis.configure(
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)
