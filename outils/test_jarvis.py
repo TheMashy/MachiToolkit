@@ -211,6 +211,62 @@ class FinEtModes(unittest.TestCase):
             self.assertIsNone(J.changement_de_mode(t), t)
 
 
+class SesMains(unittest.TestCase):
+    """Ce que Jarvis peut faire sur le PC, sans Windows : le code, les
+    chemins, les listes, la recherche, les dossiers."""
+
+    def test_le_code_dit_comme_on_veut(self):
+        sel = "ab" * 16
+        e = J.empreinte_code("4815", sel)
+        self.assertNotIn("4815", e)
+        for dit in ("4815", "4 8 1 5", "Quatre, huit, un, cinq.", "quatre-huit-un-cinq", "4815."):
+            self.assertTrue(J.code_juste(dit, sel, e), dit)
+        for dit in ("4816", "", "quatre huit un", "48150"):
+            self.assertFalse(J.code_juste(dit, sel, e), dit)
+        self.assertTrue(J.code_juste("Abricot !", sel, J.empreinte_code("abricot", sel)))
+
+    def test_les_chemins(self):
+        b = {"home": os.sep + "maison", "documents": os.path.join(os.sep + "maison", "Documents"),
+             "downloads": os.path.join(os.sep + "maison", "Downloads")}
+        self.assertEqual(J.resoudre_chemin("Documents", b), b["documents"])
+        self.assertEqual(J.resoudre_chemin("téléchargements", b), b["downloads"])
+        self.assertEqual(J.resoudre_chemin("Documents" + os.sep + "Projets", b), os.path.join(b["documents"], "Projets"))
+        self.assertEqual(J.resoudre_chemin("~", b), b["home"])
+        self.assertEqual(J.resoudre_chemin("", b), b["home"])
+
+    def test_lister_chercher_creer(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, "Projets", "Jarvis"))
+            os.makedirs(os.path.join(d, "AppData", "projets caches"))
+            open(os.path.join(d, "projet.txt"), "w").close()
+            open(os.path.join(d, ".secret"), "w").close()
+            l = J.lister_dossier(d)
+            self.assertIn("2 dossiers, 1 fichiers", l)
+            self.assertNotIn(".secret", l)
+            self.assertIn("Jarvis", J.lister_dossier(d, 2))
+            c = J.chercher_fichiers("PROJ", d)
+            self.assertIn("projet.txt", c)
+            self.assertNotIn("caches", c, "AppData n'est pas fouille")
+            protege = os.path.join(d, "Windows")
+            with self.assertRaises(PermissionError):
+                J.creer_dossier(os.path.join(protege, "x"), [protege])
+            self.assertIn("Cree", J.creer_dossier(os.path.join(d, "Nouveau", "Sous")))
+            self.assertIn("existe deja", J.creer_dossier(os.path.join(d, "Nouveau")))
+            beaucoup = os.path.join(d, "beaucoup")
+            os.makedirs(beaucoup)
+            for i in range(200):
+                open(os.path.join(beaucoup, "f%03d" % i), "w").close()
+            self.assertIn("et 80 de plus", J.lister_dossier(beaucoup))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_verrouille(self):
+        for t in ("verrouille", "Ferme l'accès.", "lock"):
+            self.assertEqual(J.comprendre(t)["action"], "verrouiller", t)
+        self.assertIsNone(J.comprendre("ferme la fenêtre du salon"))
+
+
 class EnAnglais(unittest.TestCase):
     """« And in English as well » : on peut lui parler anglais -- les commandes
     se lisent dans les deux langues, et une phrase sur soi n'en devient pas une."""
@@ -664,7 +720,8 @@ class DansMachiTool(unittest.TestCase):
         m.ETAT["forcage"] = None
         m.JARVIS.update(led=None, led_fin=0.0, minuteurs=[], etat="attente", mode="jarvis",
                         mode_vu=0.0, historique=[], vu=0.0, propose_psy=False,
-                        psy_echange=[], psy_grave=False, reveil_par=None)
+                        psy_echange=[], psy_grave=False, reveil_par=None,
+                        attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0)
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
         m.JARVIS_CROCHETS["notifier"] = lambda t, x: self.dit.append(x)
@@ -758,6 +815,129 @@ class DansMachiTool(unittest.TestCase):
             self.assertEqual(m.voix_fr_choisie(m.CFG), "fr_jarvis")
         finally:
             m.kokoro_present, m.bibli_espeak, m.piper_pret = origines
+
+    def mains(self, reponses, code="4815", ecran=False):
+        """Jarvis avec ses mains : BrainDebugger est remplace par `reponses` (une
+        liste, une par requete), le PC par un dossier temporaire. Rend la liste
+        des requetes envoyees et le dossier."""
+        m = self.m
+        envoyes = []
+        file_ = list(reponses)
+
+        def bd(chemin, charge, cfg, delai):
+            envoyes.append(json.loads(json.dumps(charge)))
+            return file_.pop(0)
+        maison = tempfile.mkdtemp(dir=self.tmp)
+        os.makedirs(os.path.join(maison, "Documents"))
+        vrais = {k: getattr(m, k) for k in ("_requete_bd", "bases_dossiers", "touche_media", "capturer_ecran")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        m._requete_bd = bd
+        m.bases_dossiers = lambda: {"home": maison, "documents": os.path.join(maison, "Documents")}
+        m.touche_media = lambda action: "Piste suivante." if action == "suivant" else "Fait."
+        m.capturer_ecran = lambda n: ("QUJD", int(n or 1), 2)
+        m.envoyer_oreille = lambda o: True
+        m.CFG.update(jarvis_pc=True, jarvis_ecran=ecran, jarvis_langue="fr")
+        m.poser_code(m.CFG, code)
+        m.JARVIS.update(acces_jusqua=0.0, verrou_jusqua=0.0, attente_code=None)
+        return envoyes, maison
+
+    @staticmethod
+    def outil(nom, entree, ident="t1"):
+        return {"texte": "", "mode": "jarvis", "outils": [{"id": ident, "nom": nom, "entree": entree}],
+                "suite": [{"role": "user", "content": "x"},
+                          {"role": "assistant", "content": [{"type": "tool_use", "id": ident, "name": nom,
+                                                             "input": entree}]}]}
+
+    def test_ses_mains_demandent_le_code_a_voix_haute(self):
+        # « Lorsqu'il doit interagir il demande un code d'acces a l'oral avant
+        # d'effectuer l'operation. »
+        envoyes, maison = self.mains([self.outil("creer_dossier", {"chemin": "Documents\\Projets 2026"}),
+                                      {"texte": "C'est fait.", "mode": "jarvis"}])
+        cible = os.path.join(maison, "Documents", "Projets 2026")
+        self.phrase("Jarvis, crée un dossier Projets 2026 dans mes documents")
+        self.assertTrue(envoyes[0]["outils"], "Machi Tool annonce ses mains")
+        self.assertFalse(envoyes[0]["ecran"], "l'ecran n'est pas permis")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+        self.assertFalse(os.path.exists(cible), "rien avant le code")
+        self.phrase("1 2 3 4")
+        self.assertEqual(self.dit[-1], "Ce n'est pas le bon code. Encore une fois ?")
+        self.assertFalse(os.path.exists(cible))
+        self.phrase("Quatre, huit, un, cinq.")
+        self.assertTrue(os.path.isdir(cible), "le code juste : c'est fait")
+        self.assertEqual(self.dit[-1], "C'est fait.")
+        self.assertEqual(envoyes[1]["resultats"][0]["id"], "t1")
+        self.assertIn("Projets 2026", envoyes[1]["resultats"][0]["texte"])
+        tout = json.dumps(envoyes)
+        for dit in ("4815", "Quatre, huit", "1 2 3 4", "1234"):
+            self.assertNotIn(dit, tout, "le code ne part jamais")
+        self.assertNotIn("4815", json.dumps(self.m.CFG), "on ne garde que l'empreinte")
+
+    def test_dix_minutes_ouvert_puis_verrouille(self):
+        envoyes, maison = self.mains([self.outil("lister_dossier", {"chemin": "Documents"}),
+                                      {"texte": "Un dossier, vide.", "mode": "jarvis"},
+                                      self.outil("lister_dossier", {"chemin": "~"}, "t2"),
+                                      {"texte": "Voila.", "mode": "jarvis"},
+                                      self.outil("lister_dossier", {"chemin": "~"}, "t3")])
+        self.phrase("Jarvis, qu'est-ce qu'il y a dans mes documents ?")
+        self.phrase("4 8 1 5")
+        self.assertEqual(self.dit[-1], "Un dossier, vide.")
+        # la session est ouverte : pas de code a la seconde
+        self.phrase("Jarvis, et dans mon dossier ?")
+        self.assertEqual(self.dit[-1], "Voila.")
+        self.assertIn("Documents", envoyes[3]["resultats"][0]["texte"])
+        # « verrouille » : on redemande
+        self.phrase("Jarvis, verrouille.")
+        self.assertEqual(self.dit[-1], "Accès verrouillé.")
+        self.phrase("Jarvis, et dans mon dossier ?")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+
+    def test_trois_codes_faux_ferment_cinq_minutes(self):
+        envoyes, _ = self.mains([self.outil("ouvrir", {"chemin": "Documents"}),
+                                 self.outil("ouvrir", {"chemin": "Documents"}, "t2"),
+                                 {"texte": "L'accès est verrouillé pour l'instant.", "mode": "jarvis"}])
+        self.phrase("Jarvis, ouvre mes documents")
+        for faux in ("1111", "2222", "3333"):
+            self.phrase(faux)
+        self.assertEqual(self.dit[-1], "Accès refusé.")
+        self.assertIsNone(self.m.JARVIS["attente_code"])
+        self.phrase("Jarvis, ouvre mes documents")
+        self.assertIn("verrouille", envoyes[-1]["resultats"][0]["erreur"])
+        self.assertNotEqual(self.dit[-1], "Code d'accès ?", "verrouille : il ne redemande pas")
+
+    def test_sans_code_regle_les_fichiers_restent_fermes(self):
+        envoyes, maison = self.mains([self.outil("creer_dossier", {"chemin": "Documents\\X"}),
+                                      {"texte": "Il me faut d'abord un code d'accès.", "mode": "jarvis"}], code="")
+        self.phrase("Jarvis, crée un dossier X dans mes documents")
+        self.assertIn("Aucun code", envoyes[1]["resultats"][0]["erreur"])
+        self.assertFalse(os.path.exists(os.path.join(maison, "Documents", "X")))
+
+    def test_la_musique_sans_code(self):
+        envoyes, _ = self.mains([self.outil("musique", {"action": "suivant"}),
+                                 {"texte": "Piste suivante.", "mode": "jarvis"}])
+        self.phrase("Jarvis, musique suivante")
+        self.assertEqual(envoyes[1]["resultats"][0]["texte"], "Piste suivante.")
+        self.assertNotIn("Code d'accès ?", self.dit)
+
+    def test_l_ecran_seulement_s_il_est_permis(self):
+        envoyes, _ = self.mains([self.outil("regarder_ecran", {"ecran": 2}),
+                                 {"texte": "Vous perdez, et avec panache.", "mode": "jarvis"}], ecran=True)
+        self.phrase("Jarvis, regarde mon écran 2")
+        self.assertTrue(envoyes[0]["ecran"])
+        self.phrase("4815")
+        self.assertEqual(envoyes[1]["resultats"][0]["image"], "QUJD")
+        self.assertEqual(self.dit[-1], "Vous perdez, et avec panache.")
+        # l'ecran decoche : meme demande, refus
+        self.m.CFG["jarvis_ecran"] = False
+        self.assertIn("pas permis", self.m.executer_outil({"id": "x", "nom": "regarder_ecran", "entree": {}},
+                                                          self.m.CFG)["erreur"])
+
+    def test_sans_les_mains_rien_ne_s_execute(self):
+        envoyes, maison = self.mains([self.outil("creer_dossier", {"chemin": "Documents\\Y"})])
+        self.m.CFG["jarvis_pc"] = False
+        self.phrase("Jarvis, crée un dossier Y")
+        self.assertFalse(envoyes[0]["outils"])
+        self.assertFalse(os.path.exists(os.path.join(maison, "Documents", "Y")))
+        self.assertEqual(len(envoyes), 1)
 
     def test_le_micro_choisi_part_a_l_oreille_et_revient(self):
         m = self.m

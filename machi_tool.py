@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.33.0"
+VERSION = "1.34.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -344,7 +344,14 @@ CONFIG_DEFAUT = {
     # voix d'homme britannique, pas celle d'un acteur. Le mode psy reste en
     # francais, avec la voix du dessus. "fr" remet Jarvis en francais.
     "jarvis_langue": "en",
-    "jarvis_micro": "",               # l'identifiant Windows du micro ; vide = celui de Windows
+    "jarvis_micro": "",
+    # SES MAINS SUR LE PC (dossiers, fichiers, Spotify) et SES YEUX (un ecran,
+    # sur demande) : fermes tant qu'on ne les ouvre pas, et derriere un code
+    # d'acces dit a voix haute. Du code, on ne garde qu'une empreinte.
+    "jarvis_pc": False,
+    "jarvis_ecran": False,
+    "jarvis_code_sel": "",
+    "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
     "jarvis_voix_kokoro": "jarvis",   # sa voix anglaise, voir VOIX_KOKORO dans jarvis.py
     "jarvis_voix_fr": "fr_jarvis",    # sa voix francaise : VOIX_KOKORO_FR, ou "piper" (jarvis_voix_modele)
     "jarvis_astuce_voix": False,      # il a deja dit comment l'appeler par « Jarvis » tout seul
@@ -5349,6 +5356,10 @@ _OUI = {"oui", "ouais", "oui vas y", "vas y", "d'accord", "ok", "okay", "volonti
 # CE QUE JARVIS DIT DE LUI-MEME, dans ses deux langues. Le mode psy parle
 # francais (le compagnon est francais) ; le majordome parle la langue choisie.
 _PHRASES = {
+    "code_demande": ("Code d'accès ?", "Access code, please."),
+    "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
+    "code_refuse": ("Accès refusé.", "Access denied."),
+    "verrouille": ("Accès verrouillé.", "Access locked."),
     "oui": ("Oui ?", "Yes?"),
     "mode_psy": ("Mode psychologue. Je vous écoute.", None),
     "mode_jarvis": ("Mode Jarvis. À votre service.", "At your service."),
@@ -5433,6 +5444,7 @@ def terminer_conversation():
     envoyer_oreille({"cmd": "annuler"})
     poser_mode("jarvis")
     JARVIS["historique"] = []
+    JARVIS["attente_code"] = None
     poser_led(None)
     JARVIS.update(etat="attente", message=message_attente())
     jouer_son("fin")
@@ -5569,6 +5581,19 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         octets = None
     brut = texte
     texte = _jv.retirer_mot_eveil(texte)
+    att = JARVIS.get("attente_code")
+    if att:
+        # LA REPONSE A « CODE D'ACCES ? » -- comparee ici, jamais journalisee
+        # ni envoyee. « Annule », « degage » : on laisse tomber.
+        if time.time() > float(att.get("expire") or 0):
+            JARVIS["attente_code"] = None
+        elif _jv.renvoi(texte) or _jv.fin_de_conversation(texte):
+            JARVIS["attente_code"] = None
+            return terminer_conversation()
+        elif not texte:
+            return dire(phrase("code_demande", langue_jarvis(cfg)), suite=True, langue=langue_jarvis(cfg))
+        else:
+            return repondre_au_code(texte, cfg)
     if apres_coupure:
         if not texte:
             # Le micro a entendu quelque chose, mais pas des mots : c'etait
@@ -5719,35 +5744,235 @@ def parler_au_compagnon(texte, cfg):
     dire(reponse, suite=True, langue="fr")
 
 
-def parler_a_jarvis(texte, cfg):
-    """Le mode Jarvis : le majordome du PC, par BrainDebugger (qui tient la cle
-    Claude) -- Sonnet, effort bas. Rien n'entre dans le journal, sauf un
-    message grave : BrainDebugger l'envoie alors au compagnon, et on passe en
-    mode psychologue."""
+# ---------- ses mains sur le PC ----------
+#
+# « Donne l'acces total a Jarvis... lorsqu'il doit interagir il demande un
+# code d'acces a l'oral avant d'effectuer l'operation. » BrainDebugger dit a
+# Jarvis ce qu'il peut faire ; quand il veut un outil, la reponse revient ICI,
+# on l'execute sur le poste, et on renvoie le resultat. Avant les dossiers, les
+# fichiers et l'ecran, Jarvis demande le code a voix haute : la phrase qui suit
+# est comparee a l'empreinte gardee dans la config, sur le poste -- elle n'est
+# ni transcrite dans un journal, ni envoyee, ni ecrite nulle part. Juste, les
+# mains restent ouvertes dix minutes ; trois faux, elles se ferment cinq.
+
+OUTILS_SANS_CODE = {"musique", "spotify"}
+ACCES_DUREE_S = 600
+VERROU_DUREE_S = 300
+OUTILS_TOURS_MAX = 5
+_TOUCHES_MEDIA = {"lecture_pause": 0xB3, "suivant": 0xB0, "precedent": 0xB1,
+                  "volume_plus": 0xAF, "volume_moins": 0xAE, "muet": 0xAD}
+
+
+def code_regle(cfg):
+    return bool(cfg.get("jarvis_code_sel") and cfg.get("jarvis_code_empreinte"))
+
+
+def poser_code(cfg, code):
+    """Le code choisi dans les reglages : on n'en garde que l'empreinte."""
+    if not _jv.normaliser_code(code):
+        cfg["jarvis_code_sel"] = cfg["jarvis_code_empreinte"] = ""
+        return False
+    sel = os.urandom(16).hex()
+    cfg["jarvis_code_sel"], cfg["jarvis_code_empreinte"] = sel, _jv.empreinte_code(code, sel)
+    return True
+
+
+def acces_ouvert():
+    return time.time() < float(JARVIS.get("acces_jusqua") or 0)
+
+
+def bases_dossiers():
+    """Les dossiers qu'on nomme : Documents, Bureau, Telechargements..."""
+    home = os.path.expanduser("~")
+    bases = {"home": home}
+    for cle, nom in (("documents", "Documents"), ("desktop", "Desktop"), ("downloads", "Downloads"),
+                     ("pictures", "Pictures"), ("music", "Music"), ("videos", "Videos")):
+        bases[cle] = os.path.join(home, nom)
+    if os.name == "nt":
+        try:
+            # les vrais emplacements, meme deplaces (OneDrive, un autre disque)
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion"
+                                r"\Explorer\User Shell Folders") as k:
+                for cle, val in (("documents", "Personal"), ("desktop", "Desktop"),
+                                 ("downloads", "{374DE290-123F-4565-9164-39C4925E467B}"),
+                                 ("pictures", "My Pictures"), ("music", "My Music"), ("videos", "My Video")):
+                    try:
+                        bases[cle] = os.path.expandvars(winreg.QueryValueEx(k, val)[0])
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    return bases
+
+
+def dossiers_proteges():
+    env = os.environ
+    return [env.get("SystemRoot") or env.get("windir"), env.get("ProgramFiles"),
+            env.get("ProgramFiles(x86)"), env.get("ProgramData")]
+
+
+def touche_media(action):
+    """Les touches multimedia du clavier, ENVOYEES (pas ecoutees) : Spotify et
+    tout lecteur y repondent. Aucun crochet clavier : on n'ecoute rien."""
+    vk = _TOUCHES_MEDIA.get(str(action))
+    if vk is None:
+        raise ValueError("action inconnue : %s" % action)
+    if os.name != "nt":
+        raise OSError("les touches multimedia ne se pilotent que sous Windows")
+    import ctypes
+    user = ctypes.WinDLL("user32")
+    user.keybd_event(vk, 0, 0, 0)
+    user.keybd_event(vk, 0, 2, 0)          # KEYEVENTF_KEYUP
+    return {"lecture_pause": "Lecture ou pause.", "suivant": "Piste suivante.",
+            "precedent": "Piste precedente.", "volume_plus": "Volume monte.",
+            "volume_moins": "Volume baisse.", "muet": "Son coupe ou remis."}[action]
+
+
+def ouvrir_spotify(recherche):
+    q = str(recherche or "").strip()
+    uri = "spotify:search:" + urllib.parse.quote(q) if q else "spotify:"
+    try:
+        os.startfile(uri)                  # l'application, si elle est installee
+        return "Spotify ouvert" + (" sur « %s »." % q if q else ".")
+    except Exception:
+        import webbrowser
+        webbrowser.open("https://open.spotify.com/search/" + urllib.parse.quote(q) if q
+                        else "https://open.spotify.com")
+        return "Spotify ouvert dans le navigateur" + (" sur « %s »." % q if q else ".")
+
+
+def capturer_ecran(numero):
+    """UNE capture de l'ecran 1 ou 2, en memoire, reduite (1280 px de large au
+    plus) et en JPEG : rendue en base64 pour Jarvis, jamais ecrite sur le
+    disque. Rien a voir avec la lumiere d'ecran, qui ne garde qu'une couleur."""
+    import mss
+    from PIL import Image
+    with mss.mss() as sct:
+        ecrans = sct.monitors[1:]
+        if not ecrans:
+            raise OSError("aucun ecran")
+        n = max(1, min(len(ecrans), int(numero or 1)))
+        brut = sct.grab(ecrans[n - 1])
+        im = Image.frombytes("RGB", brut.size, brut.rgb)
+    if im.width > 1280:
+        im = im.resize((1280, max(1, im.height * 1280 // im.width)), Image.BILINEAR)
+    tampon = io.BytesIO()
+    im.save(tampon, "JPEG", quality=70)
+    return base64.b64encode(tampon.getvalue()).decode("ascii"), n, len(ecrans)
+
+
+def executer_outil(outil, cfg):
+    """Un outil demande par Jarvis, sur le poste. Rend {"id", "texte"} (ou
+    "image"), ou {"id", "erreur"} -- jamais d'exception."""
+    ident, nom, e = outil.get("id"), outil.get("nom"), outil.get("entree") or {}
+    try:
+        if nom == "musique":
+            return {"id": ident, "texte": touche_media(e.get("action"))}
+        if nom == "spotify":
+            return {"id": ident, "texte": ouvrir_spotify(e.get("recherche"))}
+        if nom == "regarder_ecran":
+            if not cfg.get("jarvis_ecran"):
+                return {"id": ident, "erreur": "Regarder l'ecran n'est pas permis dans Machi Tool."}
+            image, n, total = capturer_ecran(e.get("ecran", 1))
+            return {"id": ident, "image": image, "texte": "Ecran %d sur %d." % (n, total)}
+        bases = bases_dossiers()
+        if nom == "lister_dossier":
+            ch = _jv.resoudre_chemin(e.get("chemin"), bases)
+            return {"id": ident, "texte": _jv.lister_dossier(ch, max(1, min(2, int(e.get("profondeur") or 1))))}
+        if nom == "chercher_fichiers":
+            ch = _jv.resoudre_chemin(e.get("dans") or "~", bases)
+            return {"id": ident, "texte": _jv.chercher_fichiers(e.get("nom"), ch)}
+        if nom == "creer_dossier":
+            ch = _jv.resoudre_chemin(e.get("chemin"), bases)
+            return {"id": ident, "texte": _jv.creer_dossier(ch, dossiers_proteges())}
+        if nom == "ouvrir":
+            ch = _jv.resoudre_chemin(e.get("chemin"), bases)
+            if not os.path.exists(ch):
+                return {"id": ident, "erreur": "Rien a cet endroit : %s" % ch}
+            os.startfile(ch)
+            return {"id": ident, "texte": "Ouvert : %s" % ch}
+        return {"id": ident, "erreur": "outil inconnu : %s" % nom}
+    except Exception as ex:
+        return {"id": ident, "erreur": "%s : %s" % (type(ex).__name__, str(ex)[:300])}
+
+
+def outils_de_jarvis(etat, cfg):
+    """Les outils d'un tour : ceux qui touchent aux fichiers ou a l'ecran
+    attendent le code (ou une session ouverte) ; ceux-la mis a part, on
+    execute, on renvoie, et Jarvis continue -- cinq tours au plus."""
     L = langue_jarvis(cfg)
-    if not _cle_presente(cfg):
-        return signaler_erreur(phrase("cle_absente", L))
+    outils = etat["outils"]
+    besoin = [o for o in outils if o.get("nom") not in OUTILS_SANS_CODE]
+    if besoin and not acces_ouvert():
+        if time.time() < float(JARVIS.get("verrou_jusqua") or 0):
+            refus = "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
+            return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
+                                           else {"id": o.get("id"), "erreur": refus} for o in outils], cfg)
+        if not code_regle(cfg):
+            refus = ("Aucun code d'acces n'est regle dans Machi Tool (Reglages > Jarvis) : les dossiers, "
+                     "les fichiers et l'ecran restent fermes.")
+            return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
+                                           else {"id": o.get("id"), "erreur": refus} for o in outils], cfg)
+        JARVIS["attente_code"] = dict(etat, expire=time.time() + 30, essais=0)
+        print("Jarvis : code d'acces demande")
+        return dire(phrase("code_demande", L), suite=True, langue=L)
+    return continuer_jarvis(etat, [executer_outil(o, cfg) for o in outils], cfg)
+
+
+def repondre_au_code(texte, cfg):
+    """La phrase qui suit « Code d'acces ? ». Ni journalisee, ni envoyee."""
+    att = JARVIS.get("attente_code") or {}
+    L = langue_jarvis(cfg)
+    if _jv.code_juste(texte, cfg.get("jarvis_code_sel"), cfg.get("jarvis_code_empreinte")):
+        JARVIS["attente_code"] = None
+        JARVIS["acces_jusqua"] = time.time() + ACCES_DUREE_S
+        print("Jarvis : code d'acces juste")
+        jouer_son("fait")
+        return outils_de_jarvis(att, cfg)
+    att["essais"] = int(att.get("essais") or 0) + 1
+    print("Jarvis : code d'acces faux (%d)" % att["essais"])
+    if att["essais"] >= 3:
+        JARVIS["attente_code"] = None
+        JARVIS["verrou_jusqua"] = time.time() + VERROU_DUREE_S
+        poser_led("erreur", 1.2)
+        return dire(phrase("code_refuse", L), langue=L)
+    att["expire"] = time.time() + 30
+    JARVIS["attente_code"] = att
+    return dire(phrase("code_faux", L), suite=True, langue=L)
+
+
+def continuer_jarvis(etat, resultats, cfg):
+    """Renvoie a BrainDebugger ce que les outils ont fait ; Jarvis continue."""
+    L = langue_jarvis(cfg)
     poser_led("pense")
-    JARVIS.update(etat="pense", message="Jarvis reflechit...")
-    print("Jarvis : question au majordome (%d signes)" % len(texte))
+    JARVIS.update(etat="pense", message="Jarvis agit...")
     try:
         donnees = _requete_bd("/api/machitool/jarvis",
-                              {"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
-                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
-                              cfg, 90)
+                              {"suite": etat["suite"], "resultats": resultats, "langue": L,
+                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
+                               "outils": True, "ecran": bool(cfg.get("jarvis_ecran"))}, cfg, 90)
     except urllib.error.HTTPError as e:
-        detail = _detail_http(e)
-        return signaler_erreur(
-            phrase("cle_refusee", L) if e.code in (401, 403)
-            else phrase("bd_ancien_jarvis", L) if e.code == 404
-            else phrase("bd_sans_cle", L) if "clé API" in detail
-            else phrase("bd_erreur", L, e.code))
+        return signaler_erreur(phrase("bd_erreur", L, e.code))
     except Exception:
         return signaler_erreur(phrase("bd_injoignable", L))
-    reponse = str((donnees or {}).get("texte") or "").strip()
+    return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1)
+
+
+def recevoir_jarvis(texte, donnees, cfg, tour=1):
+    """Ce que BrainDebugger renvoie : une reponse a dire, le compagnon (grave),
+    ou des outils a executer ici."""
+    L = langue_jarvis(cfg)
+    donnees = donnees or {}
+    if donnees.get("outils") and cfg.get("jarvis_pc"):
+        if tour > OUTILS_TOURS_MAX:
+            return signaler_erreur(phrase("sans_reponse", L))
+        return outils_de_jarvis({"texte": texte, "suite": donnees.get("suite") or [],
+                                 "outils": list(donnees["outils"]), "tour": tour}, cfg)
+    reponse = str(donnees.get("texte") or "").strip()
     if not reponse:
         return signaler_erreur(phrase("sans_reponse", L))
-    if (donnees or {}).get("mode") == "psy":
+    if donnees.get("mode") == "psy":
         # Grave : c'est le compagnon qui a repondu, et on reste avec lui. Et
         # a l'au revoir, Jarvis se taira : `psy_grave`.
         print("Jarvis : bascule en mode psychologue")
@@ -5762,6 +5987,36 @@ def parler_a_jarvis(texte, cfg):
     JARVIS["propose_psy"] = "mode psychologue" in n or "therapist mode" in n
     JARVIS["vu"] = time.time()
     dire(reponse, suite=True, langue=L)
+
+
+def parler_a_jarvis(texte, cfg):
+    """Le mode Jarvis : le majordome du PC, par BrainDebugger (qui tient la cle
+    Claude) -- Sonnet, effort bas. Rien n'entre dans le journal, sauf un
+    message grave : BrainDebugger l'envoie alors au compagnon, et on passe en
+    mode psychologue."""
+    L = langue_jarvis(cfg)
+    if not _cle_presente(cfg):
+        return signaler_erreur(phrase("cle_absente", L))
+    poser_led("pense")
+    JARVIS.update(etat="pense", message="Jarvis reflechit...")
+    print("Jarvis : question au majordome (%d signes)" % len(texte))
+    try:
+        donnees = _requete_bd("/api/machitool/jarvis",
+                              {"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
+                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
+                               "outils": bool(cfg.get("jarvis_pc")),
+                               "ecran": bool(cfg.get("jarvis_pc") and cfg.get("jarvis_ecran"))},
+                              cfg, 90)
+    except urllib.error.HTTPError as e:
+        detail = _detail_http(e)
+        return signaler_erreur(
+            phrase("cle_refusee", L) if e.code in (401, 403)
+            else phrase("bd_ancien_jarvis", L) if e.code == 404
+            else phrase("bd_sans_cle", L) if "clé API" in detail
+            else phrase("bd_erreur", L, e.code))
+    except Exception:
+        return signaler_erreur(phrase("bd_injoignable", L))
+    return recevoir_jarvis(texte, donnees, cfg)
 
 
 _JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -5794,6 +6049,10 @@ def executer_commande(a, cfg, maintenant=None):
     quoi = a["action"]
     t = time.localtime(maintenant) if maintenant is not None else time.localtime()
     L = langue_du_mode(cfg)
+    if quoi == "verrouiller":
+        JARVIS["acces_jusqua"] = 0.0
+        JARVIS["attente_code"] = None
+        return phrase("verrouille", langue_jarvis(cfg))
     if quoi == "silence":
         VOIX.taire()
         return None
@@ -8498,6 +8757,35 @@ class Panneau:
             "Plus haut = plus pose. Enregistrer pour appliquer.")
 
         self.separateur(f, 12, 8)
+        self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Ouvert, Jarvis peut piloter la musique (lecture, pause, piste suivante, volume), "
+                      "ouvrir Spotify sur une recherche, parcourir tes dossiers, chercher un fichier, "
+                      "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
+                      "deplacer, ni renommer. Avant les dossiers, les fichiers et l'ecran, il demande "
+                      "le code d'acces a voix haute ; juste, c'est ouvert dix minutes (« verrouille » "
+                      "referme). Les noms de dossiers et les captures partent a BrainDebugger et a "
+                      "Claude le temps de la reponse, et ne sont gardes nulle part. Attention : un "
+                      "code dit a voix haute s'entend dans la piece.",
+                   BRUME, 8, largeur=500).pack(fill="x")
+        self.var_jarvis_pc = tk.IntVar(value=1 if self.cfg.get("jarvis_pc") else 0)
+        self.case(f, "Jarvis peut agir sur le PC : musique, Spotify, dossiers, fichiers",
+                  self.var_jarvis_pc, lambda: self.regler_mains("jarvis_pc", self.var_jarvis_pc)).pack(fill="x")
+        self.var_jarvis_ecran = tk.IntVar(value=1 if self.cfg.get("jarvis_ecran") else 0)
+        self.case(f, "Et regarder un ecran quand tu le lui demandes (« regarde mon ecran 2 »)",
+                  self.var_jarvis_ecran, lambda: self.regler_mains("jarvis_ecran", self.var_jarvis_ecran)).pack(fill="x")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.texte(ligne, "Code d'acces", CRAIE, 9).pack(side="left")
+        self.champ_code = self.champ(ligne, "", 14)
+        self.champ_code.configure(show="\u2022")
+        self.champ_code.pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Enregistrer le code", self.enregistrer_code, compact=True).pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Retirer", self.retirer_code, compact=True).pack(side="left", padx=(8, 0))
+        self.txt_code = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_code.pack(fill="x", pady=(4, 0))
+        self.afficher_code()
+
+        self.separateur(f, 12, 8)
         self.titre(f, "ce qu'il fait").pack(fill="x", pady=(0, 4))
         self.vars_jarvis = {}
         for cle, libelle in (
@@ -8576,6 +8864,40 @@ class Panneau:
         oublier_voix()
         JARVIS["apprentissage"] = {"n": 0, "total": 4, "fini": True,
                                    "message": "Oublie. Seul « Hey Jarvis » le reveille."}
+
+    def regler_mains(self, cle, var):
+        self.cfg[cle] = bool(var.get())
+        sauver_config(self.cfg)
+        if not self.cfg.get("jarvis_pc"):
+            JARVIS["acces_jusqua"] = 0.0          # fermees : plus de session ouverte
+        self.afficher_code()
+
+    def enregistrer_code(self):
+        code = self.champ_code.get()
+        self.champ_code.delete(0, "end")
+        if not poser_code(self.cfg, code):
+            self.txt_code.configure(text="Un code, des chiffres ou un mot : « 4 8 1 5 », « abricot ».")
+            return
+        sauver_config(self.cfg)
+        JARVIS["acces_jusqua"] = 0.0
+        self.afficher_code("Code enregistre. Dis-le comme tu l'as tape : chiffre par chiffre, ou le mot.")
+
+    def retirer_code(self):
+        poser_code(self.cfg, "")
+        sauver_config(self.cfg)
+        JARVIS["acces_jusqua"] = 0.0
+        self.afficher_code()
+
+    def afficher_code(self, message=""):
+        if message:
+            t = message
+        elif not self.cfg.get("jarvis_pc"):
+            t = "Fermees : Jarvis ne touche a rien sur le PC."
+        elif code_regle(self.cfg):
+            t = "Code regle. La musique et Spotify marchent sans ; le reste le demande."
+        else:
+            t = "Aucun code : la musique et Spotify marchent, les dossiers, fichiers et l'ecran restent fermes."
+        self.txt_code.configure(text=t)
 
     def remplir_micros(self):
         """Les micros branches, un bouton chacun ; « celui de Windows » d'abord.

@@ -991,6 +991,12 @@ def comprendre(texte, raccourcis=()):
                 r"|^(?:learn|remember)\s+my\s+(?:voice|jarvis)$", t):
         return {"action": "apprendre"}
 
+    # « Verrouille » : ses mains sur le PC se referment tout de suite, sans
+    # attendre la fin des dix minutes.
+    if re.match(r"^(?:verrouille|reverrouille|ferme|referme)(?:\s+(?:l'acces|tout|les acces|l'ordi|le pc))?$"
+                r"|^(?:lock|lock (?:it|access|everything|up))$", t):
+        return {"action": "verrouiller"}
+
     en = _comprendre_en(t, mots)
     if en:
         return en
@@ -2399,3 +2405,172 @@ def voix_enfant(port, secret, lecteur=None):
         s.close()
     except Exception:
         pass
+
+
+# ======================================================================
+#  SES MAINS SUR LE PC -- CE QUI NE DEPEND PAS DE WINDOWS
+#
+#  « Donne l'acces total a Jarvis, qu'il puisse interagir avec Spotify ou
+#  creer des dossiers, decouvrir l'arborescence du PC ; lorsqu'il doit
+#  interagir il demande un code d'acces a l'oral avant d'effectuer
+#  l'operation. » BrainDebugger decrit les outils au modele ; Machi Tool les
+#  execute ici, sur le poste, et c'est lui qui demande le code, a voix haute,
+#  et le verifie ici : le code ne quitte jamais le PC.
+#
+#  CE QU'IL N'A PAS : supprimer, deplacer, renommer, ecrire dans un fichier,
+#  lancer une commande. Ce qui ne se defait pas n'est pas dans la boite.
+# ======================================================================
+
+import hashlib
+import hmac
+
+_CHIFFRES_DITS = {
+    "zero": "0", "un": "1", "une": "1", "deux": "2", "trois": "3", "quatre": "4", "cinq": "5", "six": "6",
+    "sept": "7", "huit": "8", "neuf": "9", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "seven": "7", "eight": "8", "nine": "9", "oh": "0",
+}
+
+
+def normaliser_code(texte):
+    """Le code tel qu'on le compare : les chiffres dits en lettres deviennent
+    des chiffres (« un deux trois quatre », « 1, 2, 3, 4 », « 1234. » -- la
+    transcription ecrit l'un ou l'autre), sans espaces ni ponctuation. Un mot
+    de passe (« abricot ») reste un mot."""
+    mots = normaliser(texte).replace("-", " ").split()
+    return "".join(_CHIFFRES_DITS.get(m, m) for m in mots).replace("'", "")
+
+
+def empreinte_code(code, sel):
+    """Ce qu'on garde du code : une empreinte lente (PBKDF2, 200 000 tours),
+    jamais le code."""
+    return hashlib.pbkdf2_hmac("sha256", normaliser_code(code).encode("utf-8"),
+                               bytes.fromhex(sel), 200000).hex()
+
+
+def code_juste(dit, sel, empreinte):
+    if not sel or not empreinte or not normaliser_code(dit):
+        return False
+    return hmac.compare_digest(empreinte_code(dit, sel), str(empreinte))
+
+
+# Les noms qu'on donne aux dossiers, dans les deux langues -- sans accents.
+ALIAS_DOSSIERS = {
+    "accueil": "home", "home": "home", "~": "home", "mon dossier": "home", "profil": "home",
+    "documents": "documents", "mes documents": "documents",
+    "bureau": "desktop", "desktop": "desktop",
+    "telechargements": "downloads", "mes telechargements": "downloads", "downloads": "downloads",
+    "images": "pictures", "mes images": "pictures", "pictures": "pictures", "photos": "pictures",
+    "musique": "music", "ma musique": "music", "music": "music",
+    "videos": "videos", "mes videos": "videos",
+}
+
+
+def resoudre_chemin(chemin, bases):
+    """« Documents\\Projets », « téléchargements », « C: », « D:\\Jeux », « ~ »
+    -> un chemin absolu. `bases` : {"home": ..., "documents": ..., ...}."""
+    brut = str(chemin or "").strip().strip('"').replace("\\", "/").replace("/", os.sep)
+    if not brut:
+        return bases.get("home", os.path.expanduser("~"))
+    if re.fullmatch(r"[A-Za-z]:\\?", brut):
+        return brut[0].upper() + ":" + os.sep
+    tete, _, queue = brut.partition(os.sep)
+    alias = ALIAS_DOSSIERS.get(sans_accents(tete).lower().strip())
+    if alias and alias in bases:
+        return os.path.normpath(os.path.join(bases[alias], queue)) if queue else bases[alias]
+    if brut.startswith("~"):
+        return os.path.normpath(os.path.join(bases.get("home", os.path.expanduser("~")), brut[1:].lstrip(os.sep)))
+    return os.path.normpath(os.path.abspath(brut))
+
+
+def chemin_protege(chemin, protegees):
+    """Dans un dossier du systeme (Windows, Program Files...) : on n'y cree rien."""
+    c = os.path.normcase(os.path.abspath(chemin))
+    return any(c == os.path.normcase(p) or c.startswith(os.path.normcase(p).rstrip(os.sep) + os.sep)
+               for p in protegees if p)
+
+
+def _cache(nom, chemin=None):
+    if nom.startswith(".") or nom.lower() in ("desktop.ini", "thumbs.db", "$recycle.bin",
+                                              "system volume information"):
+        return True
+    try:
+        attr = os.stat(chemin).st_file_attributes if chemin else 0
+        return bool(attr & 0x6)          # cache ou systeme (Windows)
+    except Exception:
+        return False
+
+
+def lister_dossier(chemin, profondeur=1, plafond=120):
+    """Les NOMS de ce que contient un dossier, dossiers d'abord, sur un ou deux
+    niveaux -- ni tailles, ni contenus. Rend un texte pour le modele."""
+    if not os.path.isdir(chemin):
+        raise FileNotFoundError("pas de dossier ici : %s" % chemin)
+    lignes, compte = [], {"dossiers": 0, "fichiers": 0}
+
+    def un(ch, niveau, marge):
+        try:
+            noms = sorted(os.listdir(ch), key=str.lower)
+        except PermissionError:
+            lignes.append(marge + "(acces refuse)")
+            return
+        dossiers = [n for n in noms if os.path.isdir(os.path.join(ch, n)) and not _cache(n, os.path.join(ch, n))]
+        fichiers = [n for n in noms if not os.path.isdir(os.path.join(ch, n)) and not _cache(n, os.path.join(ch, n))]
+        for d in dossiers:
+            compte["dossiers"] += 1
+            if len(lignes) < plafond:
+                lignes.append(marge + d + "\\")
+            if niveau < profondeur:
+                un(os.path.join(ch, d), niveau + 1, marge + "  ")
+        for f in fichiers:
+            compte["fichiers"] += 1
+            if len(lignes) < plafond:
+                lignes.append(marge + f)
+
+    un(chemin, 1, "")
+    tete = "%s : %d dossiers, %d fichiers%s." % (chemin, compte["dossiers"], compte["fichiers"],
+                                                  "" if profondeur == 1 else " (sur deux niveaux)")
+    reste = compte["dossiers"] + compte["fichiers"] - len(lignes)
+    return tete + "\n" + "\n".join(lignes) + ("\n... et %d de plus." % reste if reste > 0 else "")
+
+
+_SAUTES = {"appdata", "node_modules", ".git", "$recycle.bin", "windows", "program files",
+           "program files (x86)", "programdata", "system volume information", "__pycache__"}
+
+
+def chercher_fichiers(nom, racine, plafond=40, delai=4.0, profondeur_max=7, horloge=time.monotonic):
+    """Ce dont le nom contient `nom` (sans accents ni majuscules), sous
+    `racine`. Borne en nombre, en profondeur et en temps : un disque entier ne
+    se parcourt pas pendant qu'on attend une reponse."""
+    if not os.path.isdir(racine):
+        raise FileNotFoundError("pas de dossier ici : %s" % racine)
+    cle = sans_accents(str(nom)).lower().strip()
+    if not cle:
+        raise ValueError("rien a chercher")
+    trouve, fin, coupe = [], horloge() + delai, False
+    base = racine.rstrip(os.sep).count(os.sep)
+    for ch, dossiers, fichiers in os.walk(racine):
+        if horloge() > fin:
+            coupe = True
+            break
+        dossiers[:] = [d for d in dossiers if d.lower() not in _SAUTES and not _cache(d)
+                       and ch.count(os.sep) - base < profondeur_max]
+        for n in dossiers + fichiers:
+            if cle in sans_accents(n).lower():
+                trouve.append(os.path.join(ch, n) + (os.sep if n in dossiers else ""))
+                if len(trouve) >= plafond:
+                    break
+        if len(trouve) >= plafond:
+            coupe = True
+            break
+    tete = "%d trouves pour « %s » sous %s%s." % (len(trouve), nom, racine,
+                                                   " (recherche arretee avant la fin)" if coupe else "")
+    return tete + ("\n" + "\n".join(trouve) if trouve else "")
+
+
+def creer_dossier(chemin, protegees=()):
+    if chemin_protege(chemin, protegees):
+        raise PermissionError("dossier du systeme : on n'y cree rien (%s)" % chemin)
+    if os.path.exists(chemin):
+        return "Il existe deja : %s" % chemin
+    os.makedirs(chemin)
+    return "Cree : %s" % chemin
