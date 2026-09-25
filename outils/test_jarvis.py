@@ -1277,7 +1277,8 @@ class EtalonnageAuFilDeLEau(unittest.TestCase):
         self.sorties = []
         self.o = J.Oreille(self.e, self.sorties.append)
         self.o.niveau_vu = float("inf")
-        self.o.commande({"cmd": "config", "gabarits": [self.g.tolist()], "son": False})
+        # l'etalonnage seul : sans la zone tolerante (voir TresTolerant)
+        self.o.commande({"cmd": "config", "gabarits": [self.g.tolist()], "son": False, "tolerant": False})
 
     def dire(self, vecteurs, parole=True):
         for v in vecteurs:
@@ -1317,6 +1318,80 @@ class EtalonnageAuFilDeLEau(unittest.TestCase):
         self.dire(self.g)
         self.silence(80)                             # reveille, mais personne ne parle
         self.assertNotIn("gabarit_auto", self.evts())
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class TresTolerant(EtalonnageAuFilDeLEau):
+    """« Il ne se declenche pas assez : il faudrait qu'il soit tres tolerant
+    au mot Jarvis. » Un appel pas net : ecoute en silence, verifie par
+    transcription, reveil seulement si c'etait lui."""
+
+    def setUp(self):
+        super().setUp()
+        self.sons = []
+        self.o.jouer = self.sons.append
+        self.o.commande({"cmd": "config", "tolerant": True, "son": True})
+
+    def appel_pas_net(self):
+        self.silence(20)
+        self.dire(self.autrement)
+        self.silence(3)
+        self.assertEqual([e for e in self.evts() if e != "presque"], ["verifier"])
+        self.assertEqual(self.sons, [], "pas de carillon tant que ce n'est pas sur")
+        v = [e for e in self.sorties if e["evt"] == "verifier"][0]
+        self.assertTrue(base64.b64decode(v["wav"]).startswith(b"RIFF"), "le son a transcrire")
+
+    def test_confirme_il_se_reveille_et_la_phrase_suit(self):
+        self.appel_pas_net()
+        self.o.commande({"cmd": "verifie", "ok": True})
+        self.assertEqual(self.sons, ["eveil"])
+        self.assertEqual([e for e in self.evts() if e != "presque"][-1], "reveil")
+        self.assertTrue(self.sorties[-1]["verifie"])
+        self.dire([np.random.default_rng(5).normal(size=96)] * 12)
+        self.silence(20)
+        self.assertIn("phrase", self.evts())
+
+    def test_ecarte_il_se_rendort_sans_un_bruit(self):
+        self.appel_pas_net()
+        self.o.commande({"cmd": "verifie", "ok": False})
+        self.dire([np.random.default_rng(6).normal(size=96)] * 12)
+        self.silence(20)
+        self.assertEqual([e for e in self.evts() if e not in ("presque", "gabarit_auto")], ["verifier"])
+        self.assertEqual(self.sons, [])
+        self.assertEqual(self.o.etat, "veille")
+
+    def test_la_phrase_finie_avant_le_verdict_l_attend(self):
+        self.appel_pas_net()
+        self.dire([np.random.default_rng(7).normal(size=96)] * 12)
+        self.silence(30)
+        self.assertNotIn("phrase", self.evts(), "pas avant le verdict")
+        self.o.commande({"cmd": "verifie", "ok": True})
+        self.assertEqual([e for e in self.evts() if e not in ("presque", "gabarit_auto")],
+                         ["verifier", "reveil", "phrase"])
+
+    def test_net_il_se_reveille_tout_de_suite(self):
+        self.silence(20)
+        self.dire(self.g)
+        self.assertIn("reveil", self.evts())
+        self.assertEqual(self.sons, ["eveil"])
+
+    def test_sans_reponse_il_laisse_tomber(self):
+        self.appel_pas_net()
+        self.silence(100)
+        self.assertIsNone(self.o.doute)
+        self.assertNotIn("reveil", self.evts())
+
+    # l'heritage : ces deux-la ne valent que sans zone tolerante
+    test_l_appel_rate_puis_repete_est_appris = None
+    test_rate_mais_rien_ne_suit_rien_n_est_garde = None
+
+
+class LeNomDansLaTranscription(unittest.TestCase):
+    def test_contient_nom(self):
+        for t in ("Jarvis, allume", "Jervis ?", "charvis", "bon jar vis mets la musique", "Jarvi", "hé Djarvis"):
+            self.assertTrue(J.contient_nom(t), t)
+        for t in ("je vais dormir", "Travis Scott", "service", "j'arrive", "garage", ""):
+            self.assertFalse(J.contient_nom(t), t)
 
 
 class Alignement(unittest.TestCase):
@@ -1503,6 +1578,20 @@ class DansMachiTool(unittest.TestCase):
         return ok, consignes, m.gabarits_jarvis()
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_un_appel_pas_net_est_verifie_par_transcription(self):
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        m.transcrire = lambda o: "Jervis, mets de la musique"
+        self.assertTrue(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+        self.assertEqual(envoye[-1], {"cmd": "verifie", "ok": True})
+        m.transcrire = lambda o: "j'arrive dans deux minutes"
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+        self.assertEqual(envoye[-1], {"cmd": "verifie", "ok": False})
+        m.etat_dictee = lambda: {"etat": "absent", "progres": 0.0}
+        self.assertFalse(m.verifier_appel(""), "sans transcription, on ne se reveille pas au hasard")
+        self.assertTrue(m.config_oreille(m.CFG)["tolerant"])
+
     def test_le_sous_titre_suit_la_voix(self):
         m = self.m
         m.SOUS_TITRES.clear()
@@ -3201,6 +3290,41 @@ class PourDeVrai(unittest.TestCase):
                       "Charles vise", "archives", "Gervais", "tu arrives ?", "on part en vacances demain",
                       "j'ai vu Marvin hier"):
             self.assertEqual(entendu(texte), [], texte)
+
+    def test_tres_tolerant_au_mot_jarvis(self):
+        """« Il ne se declenche pas assez : il faudrait qu'il soit tres tolerant
+        au mot Jarvis. » Des « Jarvis » difficiles (tres grave, tres aigu, tres
+        bas, tres lent) : ratés en strict, entendus en tolerant -- nets ou a
+        verifier. Les mots voisins, eux, ne le reveillent jamais directement."""
+        o, sorties = self.oreille()
+        gab = []
+        for texte, vitesse, hauteur in (("Jarvis", 130, 45), ("Jarvis", 150, 50), ("Jarvis", 170, 55),
+                                        ("Jarvis", 140, 48), ("Jarvis", 160, 52)):
+            sorties.clear()
+            for x in flux(np.zeros(1))[:10]:
+                o.trame(x)
+            o.commande({"cmd": "apprendre"})
+            for x in flux(dire(texte, vitesse=vitesse, hauteur=hauteur))[8:]:
+                o.trame(x)
+                if any(e["evt"] == "gabarit" for e in sorties):
+                    break
+            gab.append([e for e in sorties if e["evt"] == "gabarit"][0]["vecteurs"])
+
+        def entendu(texte, vitesse, hauteur, fort, tolerant):
+            o, s = self.oreille(gab)
+            o.configurer({"tolerant": tolerant, "hey": False})
+            for x in flux(dire(texte, vitesse=vitesse, hauteur=hauteur) * fort) + flux(np.zeros(20000)):
+                o.trame(x)
+            ev = [e["evt"] for e in s if e["evt"] in ("reveil", "verifier")]
+            return ev[0] if ev else "-"
+        durs = [("Jarvis", 100, 20, 0.25), ("Jarvis", 200, 80, 1.0), ("Jarvis", 100, 80, 0.25),
+                ("Jarvis", 200, 20, 0.25), ("jarvis", 90, 25, 0.2), ("JARVIS !", 190, 75, 2.0)]
+        stricts = [entendu(*d, tolerant=False) for d in durs]
+        tolerants = [entendu(*d, tolerant=True) for d in durs]
+        self.assertGreater(sum(r != "-" for r in tolerants), sum(r != "-" for r in stricts))
+        self.assertGreaterEqual(sum(r != "-" for r in tolerants), len(durs) - 1)
+        for texte in ("j'arrive", "Travis", "service", "jardin", "garage", "Gervais", "on part en vacances demain"):
+            self.assertNotEqual(entendu(texte, 150, 50, 1.0, True), "reveil", texte)
 
     def test_la_phrase_suit_l_eveil(self):
         o, s = self.oreille()

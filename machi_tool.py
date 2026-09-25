@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.55.0"
+VERSION = "1.56.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -337,6 +337,7 @@ CONFIG_DEFAUT = {
     "jarvis_sensibilite": 0.5,        # 0 strict .. 1 permissif (le mot appris)
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
+    "jarvis_tolerant": True,          # un « Jarvis » pas net : verifie par transcription (voir TOLERANCE_FACTEUR)
     "jarvis_son": True,               # le petit son quand il s'allume
     "jarvis_leds": True,              # la guirlande dit ou il en est
     "jarvis_voix": True,              # il repond a voix haute
@@ -5268,6 +5269,7 @@ def config_oreille(cfg):
     auto = bool(cfg.get("jarvis_auto_etalonnage", True))
     return {"cmd": "config", "gabarits": gabarits_jarvis() + (gabarits_auto() if auto else []),
             "auto": auto,
+            "tolerant": bool(cfg.get("jarvis_tolerant", True)),
             "sensibilite": float(cfg.get("jarvis_sensibilite", 0.5)),
             "hey": bool(cfg.get("jarvis_hey", True)),
             "son": bool(cfg.get("jarvis_son", True)),
@@ -5459,6 +5461,10 @@ def traiter_evenement(ev):
     elif quoi == "gabarit":
         _GABARIT_RECU["evt"] = ev
         _GABARIT_RECU["signal"].set()
+    elif quoi == "verifier":
+        # UN « JARVIS » PAS NET : l'oreille ecoute en silence ; on transcrit ces
+        # quelques secondes, et il ne se reveille que si on y lit son nom
+        threading.Thread(target=verifier_appel, args=(ev.get("wav") or "",), daemon=True).start()
     elif quoi == "gabarit_auto":
         # un appel qu'il avait rate de peu, puis une vraie conversation : il le garde
         try:
@@ -5470,6 +5476,21 @@ def traiter_evenement(ev):
     elif quoi == "erreur":
         print("Jarvis : %s" % str(ev.get("message"))[:200])
         JARVIS.update(etat="erreur", message=str(ev.get("message") or "")[:200])
+
+
+def verifier_appel(wav64):
+    """Tranche un appel pas net : « Jarvis » (meme ecorche) dans la
+    transcription -> il se reveille ; sinon, il se rendort sans un bruit."""
+    ok = False
+    try:
+        if etat_dictee()["etat"] == "pret":
+            texte = transcrire(base64.b64decode(wav64))
+            ok = _jv.contient_nom(texte)
+    except Exception as e:
+        print("Jarvis : verification impossible (%s)" % type(e).__name__)
+    print("Jarvis : appel pas net %s" % ("confirme" if ok else "ecarte"))
+    envoyer_oreille({"cmd": "verifie", "ok": ok})
+    return ok
 
 
 def reprendre_apres_coupure():
@@ -11168,6 +11189,7 @@ class Panneau:
                 ("jarvis_suite", "Il ecoute encore apres sa reponse, sans qu'on redise « Jarvis »"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
+                ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
                 ("jarvis_panneau", "Son panneau en haut de l'ecran quand il est actif"),
                 ("jarvis_boule", "Une petite boule sur l'ecran qu'il regarde")):
@@ -11200,7 +11222,7 @@ class Panneau:
     def regler_jarvis(self, cle):
         self.cfg[cle] = bool(self.vars_jarvis[cle].get())
         sauver_config(self.cfg)
-        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper", "jarvis_auto_etalonnage"):
+        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper", "jarvis_auto_etalonnage", "jarvis_tolerant"):
             envoyer_oreille(config_oreille(self.cfg))
         if cle == "jarvis_leds" and not self.cfg[cle]:
             poser_led(None)

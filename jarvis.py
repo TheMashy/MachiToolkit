@@ -114,6 +114,21 @@ def seuil_gabarit(sensibilite):
     return 0.03 + 0.04 * s
 
 
+# « IL NE SE DECLENCHE PAS ASSEZ : IL FAUDRAIT QU'IL SOIT TRES TOLERANT AU MOT
+# JARVIS. » Deux zones. Sous le seuil, c'est lui : il se reveille. Au-dela,
+# jusqu'a TOLERANCE_FACTEUR fois le seuil (et pour « Hey Jarvis » des la moitie
+# du sien), il n'en est pas sur : il ecoute EN SILENCE -- ni carillon ni
+# guirlande --, fait transcrire ces quelques secondes sur ce PC, et ne se
+# reveille que si on y lit un mot proche de « Jarvis » (voir contient_nom).
+# Un mot voisin (« j'arrive », « Travis ») coute une transcription, pas un
+# reveil.
+TOLERANCE_FACTEUR = 1.9
+TOLERANCE_HEY = 0.5
+TOLERANCE_ATTENTE = 4           # trames : un « presque » attend de voir s'il devient net
+PAROLE_DOUCE_FACTEUR = 1.8      # un « jarvis » dit bas compte aussi comme de la parole
+PAROLE_DOUCE_MIN = 150.0
+
+
 def seuil_hey(sensibilite, actif=True):
     """Le seuil du modele « Hey Jarvis » suit la meme sensibilite : 0,5 au
     milieu (celui d'openWakeWord), 0,35 tout en haut, 0,65 tout en bas."""
@@ -267,6 +282,9 @@ class Detecteur:
         self.repos_jusqua = 0
         self.derniere_parole = -999
         self.plus_proche = None       # la distance du dernier mot compare, pour « presque »
+        self.tolerance = TOLERANCE_FACTEUR     # 0 : pas de zone tolerante
+        self.en_doute = None          # (trame, genre, score) : un appel pas net, en attente
+        self.derniere_parole_douce = -999
         self.long_proche = 12         # la longueur (en trames) du gabarit le plus proche
         self.queue_proche = 0         # reconnu avant sa fin : combien de trames du mot restent a venir
 
@@ -298,6 +316,24 @@ class Detecteur:
     def parle(self, rms):
         return rms > max(PAROLE_FACTEUR * (self.plancher or PAROLE_MIN), PAROLE_MIN)
 
+    def parle_doucement(self, rms):
+        return rms > max(PAROLE_DOUCE_FACTEUR * (self.plancher or PAROLE_DOUCE_MIN), PAROLE_DOUCE_MIN)
+
+    def _doute(self, genre, score, meilleur_si_plus_petit=True):
+        """Un appel pas net : on garde le meilleur, il sera rendu s'il ne
+        devient pas net dans les trames qui suivent."""
+        d = self.en_doute
+        if d is None or (score < d[2] if meilleur_si_plus_petit else score > d[2]):
+            self.en_doute = (self.n, genre, score)
+
+    def _rendre_doute(self):
+        d = self.en_doute
+        if d is not None and self.n - d[0] >= TOLERANCE_ATTENTE:
+            self.en_doute = None
+            self.repos_jusqua = self.n + 25
+            return (d[1] + "_a_verifier", d[2])
+        return None
+
     def _suivre_plancher(self, rms):
         if self.plancher is None:
             self.plancher = max(rms, 20.0)
@@ -320,17 +356,24 @@ class Detecteur:
         self.niveaux.append(rms)
         if self.parle(rms):
             self.derniere_parole = self.n
+        if self.parle_doucement(rms):
+            self.derniere_parole_douce = self.n
         if not chercher or self.n < self.repos_jusqua:
+            self.en_doute = None
             return None
         if self.e.hey_m is not None and score >= self.seuil_hey:
             self.repos_jusqua = self.n + 25
+            self.en_doute = None
             return ("hey", score)
+        if self.e.hey_m is not None and self.tolerance and score >= self.seuil_hey * TOLERANCE_HEY:
+            self._doute("hey", score, meilleur_si_plus_petit=False)
         if not self.gabarits:
-            return None
+            return self._rendre_doute()
         # Rien a comparer si personne n'a parle a l'instant : economise le
-        # calcul, et un silence ne peut pas ressembler a un mot.
-        if self.n - self.derniere_parole > GABARIT_FIN + 3:
-            return None
+        # calcul, et un silence ne peut pas ressembler a un mot. (Parole
+        # « douce » : un « jarvis » dit bas doit etre compare aussi.)
+        if self.n - self.derniere_parole_douce > GABARIT_FIN + 3:
+            return self._rendre_doute()
         x_ = np.array(self.emps)
         meilleur = 9.0
         self.plus_proche = None
@@ -344,8 +387,11 @@ class Detecteur:
         self.plus_proche = meilleur if meilleur < 9.0 else None
         if meilleur <= self.seuil:
             self.repos_jusqua = self.n + 25
+            self.en_doute = None
             return ("voix", meilleur)
-        return None
+        if self.tolerance and meilleur <= self.seuil * self.tolerance:
+            self._doute("voix", meilleur)
+        return self._rendre_doute()
 
     def son_d_avant(self):
         import numpy as np
@@ -619,6 +665,31 @@ def normaliser(texte):
 
 
 _EVEIL = re.compile(r"^(?:d?[jg]h?[ae]r+v[iy]+[sc]*e?|jarvi|jervis|arvis)$")
+
+
+def _distance_mots(a, b):
+    """Levenshtein, pour des mots courts."""
+    prec = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prec[j] + 1, cur[j - 1] + 1, prec[j - 1] + (ca != cb)))
+        prec = cur
+    return prec[-1]
+
+
+def contient_nom(texte):
+    """La transcription contient-elle « Jarvis », meme ecorche (« Jervis »,
+    « Charvis », « Jarvi », « jar vis ») ? Sert a confirmer un appel pas net."""
+    mots = [normaliser(m).replace("'", "") for m in str(texte or "").split()]
+    mots = [m.strip(" -") for m in mots if m.strip(" -")]
+    candidats = mots + [a + b for a, b in zip(mots, mots[1:])]
+    for m in candidats:
+        if _EVEIL.match(m):
+            return True
+        if 4 <= len(m) <= 9 and _distance_mots(m, "jarvis") <= 2 and m[0] in "jgcdzs":
+            return True
+    return False
 
 
 _POLITESSE = re.compile(r"^(?:s'? ?il (?:te|vous) plait|stp|svp|merci|please|ok|hein|allez|vas-y)$")
@@ -2177,6 +2248,7 @@ class Oreille:
         self.apres_coupure = False
         self.candidat = None          # l'appel rate de peu le plus recent
         self.auto_attente = []        # les facons de l'appeler a garder si la conversation est reelle
+        self.doute = None             # un appel pas net, que Machi Tool verifie : {"n", "fin", "ev"}
 
     def _arreter_parole(self):
         self.parole = False
@@ -2216,6 +2288,7 @@ class Oreille:
                              if len(g) >= GABARIT_MIN]
         self.det.seuil = seuil_gabarit(self.reglages.get("sensibilite", 0.5))
         self.det.seuil_hey = seuil_hey(self.reglages.get("sensibilite", 0.5), self.reglages.get("hey", True))
+        self.det.tolerance = TOLERANCE_FACTEUR if self.reglages.get("tolerant", True) else 0
 
     def commande(self, c):
         cmd = (c or {}).get("cmd")
@@ -2235,6 +2308,10 @@ class Oreille:
         elif cmd == "annuler":  # l'oreille : on laisse tomber ce qu'on ecoutait
             self.phrase, self.appris, self.etat = None, None, "veille"
             self.auto_attente = []
+            self.doute = None
+        elif cmd == "verifie":
+            # Machi Tool a transcrit l'appel pas net : c'etait « Jarvis », ou pas
+            self._verdict(bool(c.get("ok")))
         elif cmd == "parole":
             # Jarvis commence ou finit de parler (le processus de la voix le dit)
             if c.get("actif") and self.reglages.get("couper", True) and self.loopback is not None:
@@ -2252,6 +2329,28 @@ class Oreille:
             # quand on appelle Jarvis pour de vrai. Le signal est visuel.
             self.appris = {"emps": [], "niveaux": [], "t": 0.0, "parole": False, "silence": 0.0}
             self.etat = "apprendre"
+
+    def _verdict(self, ok):
+        d, self.doute = self.doute, None
+        if d is None:
+            return
+        if not ok:
+            if self.etat == "phrase":
+                self.phrase, self.etat = None, "veille"
+            self.auto_attente = []
+            return
+        # c'etait bien lui : le carillon, maintenant, et le reveil
+        if self.reglages.get("son", True):
+            self.jouer("eveil")
+        self.sortie(dict(d["reveil"], verifie=True))
+        if d.get("fin") is not None:
+            self._sortir_phrase(*d["fin"])
+
+    def _sortir_phrase(self, ev, a_garder):
+        self.sortie(ev)
+        for a in a_garder:
+            if a.get("v") is not None:
+                self.sortie({"evt": "gabarit_auto", "vecteurs": a["v"]})
 
     def _a_prendre(self):
         """L'empreinte du mot qu'on vient d'entendre, prise quand il est FINI :
@@ -2300,9 +2399,13 @@ class Oreille:
                 self._presque_n = self.det.n
                 self.sortie({"evt": "presque", "distance": round(float(d), 4),
                              "seuil": round(float(self.det.seuil), 4)})
+        if self.doute is not None and self.det.n - self.doute["n"] > 90:
+            self._verdict(False)          # pas de reponse de Machi Tool : on laisse tomber
         if ev is not None:
             self._arreter_parole()
-            if self.reglages.get("son", True):
+            doute = ev[0].endswith("_a_verifier")
+            ev = (ev[0].replace("_a_verifier", ""), ev[1])
+            if self.reglages.get("son", True) and not doute:
                 self.jouer("eveil")
             self.auto_attente = self._facons_a_garder(ev)
             self.candidat = None
@@ -2315,7 +2418,15 @@ class Oreille:
             self.phrase.morceaux.append(np.asarray(x, dtype=np.int16))
             self.etat = "phrase"
             self.apres_coupure = False
-            self.sortie({"evt": "reveil", "par": ev[0], "score": round(float(ev[1]), 4)})
+            reveil = {"evt": "reveil", "par": ev[0], "score": round(float(ev[1]), 4)}
+            if doute:
+                # PAS NET : on ecoute en silence, et Machi Tool transcrit ces
+                # secondes-la (l'appel et ce qui l'entoure) pour trancher
+                self.doute = {"n": self.det.n, "reveil": reveil, "fin": None}
+                self.sortie({"evt": "verifier", "wav": base64.b64encode(wav_de(avant)).decode("ascii"),
+                             "par": ev[0], "score": reveil["score"]})
+            else:
+                self.sortie(reveil)
             return
         if self.parole and self.etat == "veille" and self._coupe(x):
             # ON LUI COUPE LA PAROLE : il se tait (Machi Tool s'en charge), et la
@@ -2340,13 +2451,15 @@ class Oreille:
                     self.coupure.fausse_coupure()      # personne n'a parle : c'etait de l'echo
                 # on lui a vraiment parle : ces facons de l'appeler etaient bien des appels
                 a_garder, self.auto_attente = (self.auto_attente if fin == "fini" else []), []
+                if self.doute is not None:
+                    # la phrase est finie avant le verdict : elle l'attend
+                    self.doute["fin"] = (ev, a_garder)
+                    self.phrase, self.etat = None, "veille"
+                    return
                 if apres:
                     ev["apres_coupure"] = True
                 self.phrase, self.etat = None, "veille"
-                self.sortie(ev)
-                for a in a_garder:
-                    if a.get("v") is not None:
-                        self.sortie({"evt": "gabarit_auto", "vecteurs": a["v"]})
+                self._sortir_phrase(ev, a_garder)
         elif self.etat == "apprendre" and self.appris is not None:
             a = self.appris
             a["emps"].append(self.det.emps[-1])
