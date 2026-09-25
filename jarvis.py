@@ -2550,15 +2550,57 @@ _SAUTES = {"appdata", "node_modules", ".git", "$recycle.bin", "windows", "progra
            "program files (x86)", "programdata", "system volume information", "__pycache__"}
 
 
-def chercher_fichiers(nom, racine, plafond=40, delai=4.0, profondeur_max=7, horloge=time.monotonic):
-    """Ce dont le nom contient `nom` (sans accents ni majuscules), sous
-    `racine`. Borne en nombre, en profondeur et en temps : un disque entier ne
-    se parcourt pas pendant qu'on attend une reponse."""
+# LA RECHERCHE QU'ON AFFINE. « J'ai 523 fichiers qui mentionnent unit » --
+# « rajoute stage » -- « j'en ai 3 » -- « ouvre-les ». Les criteres : des mots
+# (tous, dans le chemin sous le dossier de depart : le nom du fichier ou de ses
+# dossiers), un type, une anciennete. Les resultats sont numerotes du plus
+# recent au plus ancien, pour « ouvre le 2 ».
+
+TYPES_FICHIERS = {
+    "pdf": {".pdf"},
+    "image": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff", ".svg"},
+    "video": {".mp4", ".mkv", ".mov", ".avi", ".webm", ".wmv", ".m4v"},
+    "audio": {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".wma"},
+    "document": {".doc", ".docx", ".odt", ".rtf", ".txt", ".md", ".pages"},
+    "tableur": {".xls", ".xlsx", ".xlsm", ".csv", ".ods", ".numbers"},
+    "presentation": {".ppt", ".pptx", ".odp", ".key"},
+    "archive": {".zip", ".rar", ".7z", ".tar", ".gz"},
+    "code": {".py", ".js", ".ts", ".cs", ".cpp", ".c", ".h", ".java", ".html", ".css", ".json", ".unity"},
+}
+_NOMS_TYPES = {"pdf": "PDF", "image": "images", "video": "videos", "audio": "sons", "document": "documents",
+               "tableur": "tableurs", "presentation": "presentations", "archive": "archives",
+               "code": "code", "dossier": "dossiers"}
+
+
+def criteres(mots="", type_="", jours=None):
+    t = str(type_ or "").strip().lower()
+    if t and t not in TYPES_FICHIERS and t != "dossier":
+        raise ValueError("type inconnu : %s (%s)" % (t, ", ".join(list(TYPES_FICHIERS) + ["dossier"])))
+    j = int(jours) if jours else None
+    return {"mots": [m for m in _mots(mots) if len(m) > 1], "type": t, "jours": j if j and j > 0 else None}
+
+
+def correspond(relatif, est_dossier, mtime, crit, maintenant):
+    if crit["type"] == "dossier" and not est_dossier:
+        return False
+    if crit["type"] and crit["type"] != "dossier" and (
+            est_dossier or os.path.splitext(relatif)[1].lower() not in TYPES_FICHIERS[crit["type"]]):
+        return False
+    if crit["jours"] and mtime < maintenant - crit["jours"] * 86400:
+        return False
+    chemin = sans_accents(relatif).lower()
+    return all(m in chemin for m in crit["mots"])
+
+
+def trouver_fichiers(racine, crit, plafond=5000, delai=6.0, profondeur_max=8, horloge=time.monotonic,
+                     maintenant=None):
+    """([(chemin, est_dossier, mtime)] du plus recent au plus ancien, coupe).
+    Borne en nombre, en profondeur et en temps."""
     if not os.path.isdir(racine):
         raise FileNotFoundError("pas de dossier ici : %s" % racine)
-    cle = sans_accents(str(nom)).lower().strip()
-    if not cle:
+    if not crit["mots"] and not crit["type"] and not crit["jours"]:
         raise ValueError("rien a chercher")
+    maintenant = time.time() if maintenant is None else maintenant
     trouve, fin, coupe = [], horloge() + delai, False
     base = racine.rstrip(os.sep).count(os.sep)
     for ch, dossiers, fichiers in os.walk(racine):
@@ -2568,16 +2610,71 @@ def chercher_fichiers(nom, racine, plafond=40, delai=4.0, profondeur_max=7, horl
         dossiers[:] = [d for d in dossiers if d.lower() not in _SAUTES and not _cache(d)
                        and ch.count(os.sep) - base < profondeur_max]
         for n in dossiers + fichiers:
-            if cle in sans_accents(n).lower():
-                trouve.append(os.path.join(ch, n) + (os.sep if n in dossiers else ""))
-                if len(trouve) >= plafond:
-                    break
+            if _cache(n):
+                continue
+            chemin = os.path.join(ch, n)
+            try:
+                mtime = os.stat(chemin).st_mtime
+            except OSError:
+                continue
+            if correspond(os.path.relpath(chemin, racine), n in dossiers, mtime, crit, maintenant):
+                trouve.append((chemin, n in dossiers, mtime))
         if len(trouve) >= plafond:
             coupe = True
             break
-    tete = "%d trouves pour « %s » sous %s%s." % (len(trouve), nom, racine,
-                                                   " (recherche arretee avant la fin)" if coupe else "")
-    return tete + ("\n" + "\n".join(trouve) if trouve else "")
+    trouve.sort(key=lambda x: -x[2])
+    return trouve[:plafond], coupe
+
+
+def resume_recherche(racine, crit, resultats, coupe, montrer=10):
+    quoi = " ".join(crit["mots"])
+    bouts = ["« %s »" % quoi] if quoi else []
+    if crit["type"]:
+        bouts.append(_NOMS_TYPES[crit["type"]])
+    if crit["jours"]:
+        bouts.append("des %d derniers jours" % crit["jours"])
+    n_dos = sum(1 for _, d, _ in resultats if d)
+    tete = "%d resultat%s (%d dossier%s, %d fichier%s) pour %s sous %s%s." % (
+        len(resultats), "s" if len(resultats) > 1 else "", n_dos, "s" if n_dos > 1 else "",
+        len(resultats) - n_dos, "s" if len(resultats) - n_dos > 1 else "", ", ".join(bouts), racine,
+        " (recherche arretee avant la fin : il y en a peut-etre plus)" if coupe else "")
+    if not resultats:
+        return tete
+    lignes = ["%d. %s%s -- %s" % (i, chemin, os.sep if d else "", time.strftime("%d/%m/%Y", time.localtime(t)))
+              for i, (chemin, d, t) in enumerate(resultats[:montrer], 1)]
+    reste = len(resultats) - montrer
+    return tete + " Les plus recents :\n" + "\n".join(lignes) + ("\n... et %d de plus." % reste if reste > 0 else "")
+
+
+def affiner(recherche, ajouter="", retirer="", type_=None, jours=None, maintenant=None):
+    """Les criteres de `recherche` modifies, et s'il suffit de filtrer ce qu'on
+    a deja (on resserre, et la recherche d'avant etait complete) ou s'il faut
+    tout reparcourir. Rend (criteres, resultats ou None)."""
+    c = dict(recherche["criteres"], mots=list(recherche["criteres"]["mots"]))
+    resserre = True
+    for m in criteres(ajouter)["mots"]:
+        if m not in c["mots"]:
+            c["mots"].append(m)
+    otes = set(criteres(retirer)["mots"])
+    if otes & set(c["mots"]):
+        c["mots"] = [m for m in c["mots"] if m not in otes]
+        resserre = False
+    if type_ is not None:
+        t = criteres(type_=type_)["type"]
+        if c["type"] and t != c["type"]:
+            resserre = False
+        c["type"] = t
+    if jours is not None:
+        j = criteres(jours=jours)["jours"]
+        if c["jours"] and (not j or j > c["jours"]):
+            resserre = False
+        c["jours"] = j
+    if resserre and not recherche.get("coupe"):
+        maintenant = time.time() if maintenant is None else maintenant
+        garde = [r for r in recherche["resultats"]
+                 if correspond(os.path.relpath(r[0], recherche["racine"]), r[1], r[2], c, maintenant)]
+        return c, garde
+    return c, None
 
 
 def creer_dossier(chemin, protegees=()):

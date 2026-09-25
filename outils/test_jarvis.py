@@ -267,9 +267,10 @@ class SesMains(unittest.TestCase):
             self.assertIn("2 dossiers, 1 fichiers", l)
             self.assertNotIn(".secret", l)
             self.assertIn("Jarvis", J.lister_dossier(d, 2))
-            c = J.chercher_fichiers("PROJ", d)
-            self.assertIn("projet.txt", c)
-            self.assertNotIn("caches", c, "AppData n'est pas fouille")
+            res, _ = J.trouver_fichiers(d, J.criteres("PROJ"))
+            noms = [os.path.basename(c) for c, _, _ in res]
+            self.assertIn("projet.txt", noms)
+            self.assertNotIn("projets caches", noms, "AppData n'est pas fouille")
             protege = os.path.join(d, "Windows")
             with self.assertRaises(PermissionError):
                 J.creer_dossier(os.path.join(protege, "x"), [protege])
@@ -488,6 +489,51 @@ class SesMains(unittest.TestCase):
         self.assertNotIn(verif, url, "le verificateur ne part pas avec l'autorisation")
         with self.assertRaises(J.ErreurSpotify):
             J.Spotify.echanger_code("CID", "CODE", verif, http=lambda *a: (400, {"error": "invalid_grant"}))
+
+    def test_la_recherche_qu_on_affine(self):
+        # « J'ai 523 ... possedant la mention », « rajoute la mention stage »,
+        # « j'ai 3 ... de stages », « parfait, ouvre-les » -- pour les fichiers.
+        d = tempfile.mkdtemp()
+        try:
+            maintenant = time.time()
+            def f(chemin, age_jours=1):
+                p = os.path.join(d, *chemin.split("/"))
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "w").close()
+                for x in (p, os.path.dirname(p)):          # un dossier a l'age de son dernier fichier
+                    os.utime(x, (maintenant - age_jours * 86400,) * 2)
+            for i in range(30):
+                f("Cours/Unit %02d/notes.txt" % i, age_jours=40 + i)
+            f("Stage/Rapport Unit.pdf", 2)
+            f("Stage/unit tests.docx", 5)
+            f("Stage/Convention.pdf", 3)
+            f("Stage 2024/Unité 3 - stage.pdf", 400)
+            crit = J.criteres("unit")
+            res, coupe = J.trouver_fichiers(d, crit, maintenant=maintenant)
+            self.assertFalse(coupe)
+            r = {"racine": d, "criteres": crit, "resultats": res, "coupe": coupe}
+            texte = J.resume_recherche(d, crit, res, coupe)
+            self.assertRegex(texte, r"^6\d resultats \(3\d dossiers, 3\d fichiers\)")
+            self.assertIn("1. " + os.path.join(d, "Stage", "Rapport Unit.pdf"), texte, "le plus recent en premier")
+            self.assertIn("... et", texte)
+            c2, garde = J.affiner(r, ajouter="stage", maintenant=maintenant)
+            self.assertEqual(c2["mots"], ["unit", "stage"])
+            self.assertEqual(sorted(os.path.basename(x) for x, _, _ in garde),
+                             ["Rapport Unit.pdf", "Unite 3 - stage.pdf".replace("Unite", "Unité"), "unit tests.docx"],
+                             "« stage » : dans le nom ou dans le dossier ; les accents ne comptent pas")
+            r2 = dict(r, criteres=c2, resultats=garde)
+            c3, garde3 = J.affiner(r2, type_="pdf", jours=30, maintenant=maintenant)
+            self.assertEqual([os.path.basename(x) for x, _, _ in garde3], ["Rapport Unit.pdf"])
+            _, a_refaire = J.affiner(dict(r2, criteres=c3, resultats=garde3), retirer="unit", maintenant=maintenant)
+            self.assertIsNone(a_refaire, "on elargit : il faut tout reparcourir")
+            _, a_refaire = J.affiner(dict(r2, coupe=True), ajouter="rapport", maintenant=maintenant)
+            self.assertIsNone(a_refaire, "la recherche d'avant etait coupee : on reparcourt")
+            with self.assertRaises(ValueError):
+                J.criteres("x", type_="chaussette")
+            with self.assertRaises(ValueError):
+                J.trouver_fichiers(d, J.criteres(""))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_verrouille(self):
         for t in ("verrouille", "Ferme l'accès.", "lock"):
@@ -1237,6 +1283,32 @@ class DansMachiTool(unittest.TestCase):
         m.CFG["jarvis_historique"] = False
         r = m.executer_outil({"id": "x", "nom": "chercher_historique", "entree": {"recherche": "chat"}}, m.CFG)
         self.assertIn("pas permis", r["erreur"])
+
+    def test_chercher_affiner_ouvrir(self):
+        m = self.m
+        ouverts = []
+        vrai = getattr(os, "startfile", None)
+        os.startfile = ouverts.append
+        self.addCleanup(lambda: setattr(os, "startfile", vrai) if vrai else delattr(os, "startfile"))
+        envoyes, maison = self.mains([], code_actif=False)
+        docs = os.path.join(maison, "Documents")
+        for i in range(14):
+            open(os.path.join(docs, "unit %02d.txt" % i), "w").close()
+        os.makedirs(os.path.join(docs, "Stage"))
+        for n in ("unit rapport.pdf", "unit notes.txt"):
+            open(os.path.join(docs, "Stage", n), "w").close()
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        self.assertIn("16 resultats", ex("chercher_fichiers", {"mots": "unit", "dans": "Documents"})["texte"])
+        self.assertIn("trop pour tout ouvrir", ex("ouvrir_resultats", {})["erreur"])
+        self.assertEqual(ouverts, [])
+        self.assertIn("2 resultats", ex("affiner_recherche", {"ajouter": "stage"})["texte"])
+        self.assertIn("Ouverts", ex("ouvrir_resultats", {})["texte"])
+        self.assertEqual(sorted(os.path.basename(o) for o in ouverts), ["unit notes.txt", "unit rapport.pdf"])
+        self.assertIn("1 resultat ", ex("affiner_recherche", {"type": "pdf"})["texte"])
+        self.assertIn("pas de numero 4", ex("ouvrir_resultats", {"numeros": [4]})["erreur"])
+        self.assertIn("16 resultats", ex("affiner_recherche", {"retirer": "stage", "type": ""})["texte"])
+        self.assertIn("unit 00.txt", ex("chercher_fichiers", {"nom": "unit 00", "dans": "Documents"})["texte"],
+                      "l'ancien parametre « nom » marche encore")
 
     def test_le_pc_entier_sans_code(self):
         # « J'aimerais avoir un compagnon qui peut interagir le plus possible avec mon PC. »

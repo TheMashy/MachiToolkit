@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.38.0"
+VERSION = "1.39.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5791,6 +5791,7 @@ OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
 VERROU_DUREE_S = 300
 OUTILS_TOURS_MAX = 5
+OUVRIR_MAX = 10          # « ouvre-les » : dix au plus d'un coup
 _TOUCHES_MEDIA = {"lecture_pause": 0xB3, "suivant": 0xB0, "precedent": 0xB1,
                   "volume_plus": 0xAF, "volume_moins": 0xAE, "muet": 0xAD}
 
@@ -6395,7 +6396,41 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": _jv.lister_dossier(ch, max(1, min(2, int(e.get("profondeur") or 1))))}
         if nom == "chercher_fichiers":
             ch = _jv.resoudre_chemin(e.get("dans") or "~", bases)
-            return {"id": ident, "texte": _jv.chercher_fichiers(e.get("nom"), ch)}
+            crit = _jv.criteres(e.get("mots") or e.get("nom") or "", e.get("type"), e.get("jours"))
+            res, coupe = _jv.trouver_fichiers(ch, crit)
+            JARVIS["recherche"] = {"racine": ch, "criteres": crit, "resultats": res, "coupe": coupe}
+            return {"id": ident, "texte": _jv.resume_recherche(ch, crit, res, coupe)}
+        if nom == "affiner_recherche":
+            r = JARVIS.get("recherche")
+            if not r:
+                return {"id": ident, "erreur": "Aucune recherche en cours : commence par chercher_fichiers."}
+            racine = _jv.resoudre_chemin(e["dans"], bases) if e.get("dans") else r["racine"]
+            crit, garde = _jv.affiner(r, e.get("ajouter") or "", e.get("retirer") or "",
+                                      e.get("type"), e.get("jours"))
+            coupe = False if garde is not None else r["coupe"]
+            if garde is None or racine != r["racine"]:
+                garde, coupe = _jv.trouver_fichiers(racine, crit)
+            JARVIS["recherche"] = {"racine": racine, "criteres": crit, "resultats": garde, "coupe": coupe}
+            return {"id": ident, "texte": _jv.resume_recherche(racine, crit, garde, coupe)}
+        if nom == "ouvrir_resultats":
+            r = JARVIS.get("recherche")
+            if not r or not r["resultats"]:
+                return {"id": ident, "erreur": "Aucun resultat de recherche a ouvrir."}
+            res = r["resultats"]
+            if e.get("numeros"):
+                choisis = []
+                for n in e["numeros"]:
+                    if not (1 <= int(n) <= len(res)):
+                        return {"id": ident, "erreur": "Il n'y a pas de numero %s (de 1 a %d)." % (n, len(res))}
+                    choisis.append(res[int(n) - 1])
+            elif len(res) > OUVRIR_MAX:
+                return {"id": ident, "erreur": "Il y en a %d : c'est trop pour tout ouvrir d'un coup (%d au plus). "
+                                               "Affine, ou dis lesquels." % (len(res), OUVRIR_MAX)}
+            else:
+                choisis = res
+            for chemin, _, _ in choisis[:OUVRIR_MAX]:
+                os.startfile(chemin)
+            return {"id": ident, "texte": "Ouverts : %s." % " ; ".join(os.path.basename(c) for c, _, _ in choisis[:OUVRIR_MAX])}
         if nom == "creer_dossier":
             ch = _jv.resoudre_chemin(e.get("chemin"), bases)
             return {"id": ident, "texte": _jv.creer_dossier(ch, dossiers_proteges())}
