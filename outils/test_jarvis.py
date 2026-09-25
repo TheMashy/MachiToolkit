@@ -505,27 +505,26 @@ class SesMains(unittest.TestCase):
         self.assertEqual(tuple(dalle[0, 0]), (8, 9, 12), "le fond entre les LED")
         self.assertEqual(tuple(dalle[2, 2]), (18, 20, 26), "une LED eteinte, a peine visible")
 
-    def test_les_sous_titres_montrent_toute_la_reponse(self):
-        # « montre tout le texte lorsque Jarvis repond » : plus de defilement,
-        # la reponse entiere, sur plusieurs lignes, sous le panneau
+    def test_le_sous_titre_s_ecrit_au_fil_de_la_voix_dans_le_panneau(self):
+        # « le texte ecrit en meme temps que Jarvis l'enonce, comme un
+        # sous-titre, dans la case du panneau LED uniquement »
         import numpy as np
-        reponse = ("Bien sur monsieur. Votre rendez-vous chez le dentiste est demain a quatorze heures trente, "
-                   "et il fera beau toute la journee a Lyon.")
-        lignes = J.lignes_led(reponse)
-        self.assertGreater(len(lignes), 1)
-        self.assertTrue(all(J.largeur_led(l) <= J.SOUS_TITRES_COLONNES - 2 for l in lignes))
-        self.assertEqual(" ".join(lignes), J.texte_led(reponse), "aucun mot perdu")
-        im = J.image_sous_titres(reponse, 0.0)
-        self.assertEqual(im.shape, (len(lignes) * 9 + 3, J.SOUS_TITRES_COLONNES, 3))
-        self.assertEqual(J.image_sous_titres("", 0.0), None)
-        self.assertEqual(J.lignes_led("A" * 80), ["A" * 26, "A" * 26, "A" * 26, "AA"], "un mot trop long est coupe")
-        # trop long pour tenir : des pages, qui tournent, avec des points
-        long = " ".join(["phrase numero %d assez longue pour remplir" % i for i in range(12)])
-        self.assertGreater(len(J.lignes_led(long)), J.SOUS_TITRES_LIGNES)
-        p1, p2 = J.image_sous_titres(long, 0.0), J.image_sous_titres(long, J.SOUS_TITRES_PAGE_S + 0.1)
-        self.assertEqual(p1.shape, (J.SOUS_TITRES_LIGNES * 9 + 3, J.SOUS_TITRES_COLONNES, 3))
-        self.assertFalse(np.array_equal(p1, p2), "la page suivante")
-        self.assertEqual(J.dalle_led(im, 3).shape, (im.shape[0] * 3, im.shape[1] * 3, 3))
+        phrases = ["Bien sur monsieur.", "Votre rendez-vous est demain a quatorze heures."]
+        self.assertEqual(J.texte_dit(phrases, -1, 0.0), "", "rien tant que la voix n'a pas commence")
+        self.assertEqual(J.texte_dit(phrases, 0, 0.0), "Bien")
+        self.assertEqual(J.texte_dit(phrases, 1, 0.3), "Bien sur monsieur. Votre rendez-vous")
+        self.assertEqual(J.texte_dit(phrases, 1, 1.0), " ".join(phrases))
+        self.assertEqual(J.texte_dit(phrases, 5, 0.0), " ".join(phrases))
+        self.assertEqual(J.lignes_led("Votre rendez-vous est demain", J.LED_N),
+                         ["VOTRE", "RENDEZ-", "VOUS EST", "DEMAIN"], "un mot trop long se coupe au trait d'union")
+        self.assertTrue(all(J.largeur_led(l) <= J.LED_N - 2 for l in J.lignes_led("A" * 40, J.LED_N)))
+        court = J.image_jarvis("parle", 1.0, sous_titre="Bien")
+        long_ = J.image_jarvis("parle", 1.0, sous_titre=" ".join(phrases))
+        self.assertEqual(court.shape, (64, 64, 3), "dans le panneau, pas a cote")
+        texte = lambda im: int((im[16:64].max(axis=2) > 0).sum())
+        self.assertGreater(texte(long_), texte(court), "plus il a parle, plus il y a de texte")
+        self.assertEqual(int((J.image_jarvis("parle", 1.0)[48:59].max(axis=2) > 0).sum() > 0), 1,
+                         "sans texte : SPEAKING")
 
     def test_l_agenda_jour_par_jour(self):
         rdv = [{"date": "2026-10-02", "heure": "", "label": "Anniversaire de Paul"},
@@ -1504,6 +1503,23 @@ class DansMachiTool(unittest.TestCase):
         return ok, consignes, m.gabarits_jarvis()
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_sous_titre_suit_la_voix(self):
+        m = self.m
+        m.SOUS_TITRES.clear()
+        m.SOUS_TITRES[7] = {"phrases": ["Bien sur monsieur.", "Il fait beau."], "k": -1}
+        m.JARVIS["sous_titre"] = None
+        self.assertEqual(m.sous_titre_courant(), "")
+        m.JARVIS["sous_titre"] = m.SOUS_TITRES[7]
+        self.assertEqual(m.sous_titre_courant(), "", "la voix n'a pas encore commence")
+        t = time.time()
+        m.SOUS_TITRES[7].update(k=1, t0=t, duree=2.0)
+        self.assertEqual(m.sous_titre_courant(t + 0.1), "Bien sur monsieur. Il")
+        self.assertEqual(m.sous_titre_courant(t + 3.0), "Bien sur monsieur. Il fait beau.")
+        # la voix de Windows ne dit rien : au debit moyen
+        m.JARVIS["sous_titre"] = {"phrases": ["un deux trois quatre cinq six"], "k": -1, "estime": True, "t0": t}
+        self.assertEqual(m.sous_titre_courant(t + 0.7), "un deux trois")
+        self.assertEqual(m.sous_titre_courant(t + 60), "un deux trois quatre cinq six")
+
     def test_l_aide_courte(self):
         m = self.m
         long = ("Avant le mot d'eveil, rien ne sort du micro. Apres, la phrase est transcrite sur ce PC, "
@@ -3390,7 +3406,7 @@ class ReprendreOuIlEnEtait(unittest.TestCase):
         hp, evts = FauxHautParleur(self, couper_apres=12 + 3), []
         self.bouche = J.Bouche(syn, evts.append, hp)
         self.bouche.dire(9, "Bonjour. Tous les systemes sont operationnels. Autre chose ?")
-        self.assertEqual([e["evt"] for e in evts], ["debut", "fini"])
+        self.assertEqual([e["evt"] for e in evts if e["evt"] != "dit"], ["debut", "fini"])
         self.assertTrue(evts[-1]["coupe"])
         self.assertEqual(evts[-1]["reste"], "Tous les systemes sont operationnels. Autre chose ?")
         self.assertEqual(len(hp.morceaux), 15)
@@ -3399,6 +3415,11 @@ class ReprendreOuIlEnEtait(unittest.TestCase):
         self.bouche.dire(10, "Bonjour. Au revoir.")
         self.assertEqual(evts[-1], {"evt": "fini", "id": 10, "coupe": False}, "rien a reprendre quand il a fini")
         self.assertEqual(syn.lues[-2:], ["Bonjour.", "Au revoir."], "une phrase a la fois")
+        # les sous-titres : chaque phrase dit quand elle commence et combien elle dure
+        dits = [e for e in evts if e["evt"] == "dit"]
+        self.assertEqual([(e["id"], e["phrase"]) for e in dits], [(10, 0), (10, 1)])
+        self.assertAlmostEqual(dits[0]["duree"], 16000 / float(syn.frequence), places=2)
+        self.assertLess(evts.index(dits[0]), evts.index(evts[-1]))
 
     def test_les_phrases(self):
         self.assertEqual(J.decouper_phrases("Good evening. All systems go! Is 3.5 enough? Yes\u2026 Fine"),
@@ -3440,7 +3461,7 @@ class VoixEnMemoire(unittest.TestCase):
         evts = []
         self.bouche = J.Bouche(self.syn, evts.append, hp)
         self.bouche.dire(7, "Bonjour. Tous les systèmes sont opérationnels.")
-        self.assertEqual([e["evt"] for e in evts], ["debut", "fini"])
+        self.assertEqual([e["evt"] for e in evts if e["evt"] != "dit"], ["debut", "fini"])
         self.assertFalse(evts[-1]["coupe"])
         self.assertGreater(len(hp.morceaux), 15, "joue par dixiemes de seconde")
         hp2 = FauxHautParleur(self, couper_apres=3)
@@ -3987,7 +4008,7 @@ class VoixAnglaise(unittest.TestCase):
         self.assertEqual(hp.frequence, J.KOKORO_FREQ)
         b.dire(2, "Bonsoir.", 1.0, "fr")
         self.assertEqual(hp.frequence, piper.frequence)
-        self.assertEqual([e["evt"] for e in evts], ["debut", "fini", "debut", "fini"])
+        self.assertEqual([e["evt"] for e in evts if e["evt"] != "dit"], ["debut", "fini", "debut", "fini"])
 
 
 if __name__ == "__main__":

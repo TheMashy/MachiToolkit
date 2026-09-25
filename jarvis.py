@@ -2546,6 +2546,10 @@ class Bouche:
                 if premiere:
                     self.sortie({"evt": "debut", "id": ident})
                     premiere = False
+                # LES SOUS-TITRES : quelle phrase commence a sonner, et combien de
+                # temps elle dure -- Machi Tool l'ecrit au meme rythme dans le panneau
+                self.sortie({"evt": "dit", "id": ident, "phrase": en_cours,
+                             "duree": round(len(son) / float(syn.frequence), 3)})
                 son = np.concatenate([son, np.zeros(int(self.silence * self.syn.frequence), np.int16)])
                 for i in range(0, len(son), pas):
                     if self.couper.is_set():
@@ -4566,7 +4570,7 @@ def _fois(c, f):
     return (c[0] * f, c[1] * f, c[2] * f)
 
 
-def image_jarvis(etat, t, reponse="", mode="jarvis"):
+def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre=""):
     """L'image 64 x 64 (uint8) du panneau pour cet etat, au temps t (s).
     ecoute / comprend : LISTENING, l'anneau qui respire ; pense : THINKING,
     l'arc qui tourne ; parle : les barres, et la reponse qui defile ; fait :
@@ -4589,12 +4593,25 @@ def image_jarvis(etat, t, reponse="", mode="jarvis"):
             a += 0.04
         m.disque(32, 26, 2, _fois(c, 0.5))
         mot = "THINKING"
+    elif etat == "parle" and sous_titre:
+        # « le texte ecrit en meme temps que Jarvis l'enonce, comme un
+        # sous-titre, dans la case du panneau uniquement » : les barres
+        # retrecissent en haut, et ce qu'il a deja dit s'ecrit dessous,
+        # les lignes les plus recentes en bas.
+        c = C["ambre"]
+        for i in range(12):
+            h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * 5)
+            m.bloc(9 + i * 4, 7 - h, 2, 2 * h + 1, c)
+        blanc = _fois(C["blanc"], 0.92)
+        for k, ligne in enumerate(lignes_led(sous_titre, LED_N)[-SOUS_TITRES_LIGNES:]):
+            m.texte(ligne, (LED_N - largeur_led(ligne)) // 2, 17 + k * 9, blanc)
+        return np.clip(m.px, 0, 255).astype(np.uint8)
     elif etat == "parle":
         c = C["ambre"]
-        haut = 12 if reponse else 14
+        haut = 14
         for i in range(12):
             h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * haut)
-            m.bloc(9 + i * 4, (22 if reponse else 26) - h, 2, 2 * h + 1, c)
+            m.bloc(9 + i * 4, 26 - h, 2, 2 * h + 1, c)
         mot = "SPEAKING"
     elif etat == "erreur":
         c = C["rouge"]
@@ -4606,22 +4623,44 @@ def image_jarvis(etat, t, reponse="", mode="jarvis"):
         m.trait(21, 26, 28, 33, c, 3)
         m.trait(28, 33, 43, 18, c, 3)
         mot = "DONE"
-    # « Montre tout le texte » : la reponse entiere va dans les sous-titres,
-    # sous le panneau (image_sous_titres) ; le panneau garde son mot.
+    # Quand il parle et qu'on a son texte, c'est la branche du sous-titre, plus haut.
     m.texte(mot, (LED_N - largeur_led(mot)) // 2, 50, _fois(c, 0.85))
     return np.clip(m.px, 0, 255).astype(np.uint8)
 
 
-SOUS_TITRES_COLONNES = 160
-SOUS_TITRES_LIGNES = 6
-SOUS_TITRES_PAGE_S = 4.5
+SOUS_TITRES_LIGNES = 5         # dans le panneau 64 x 64, sous les barres
+LETTRES_PAR_S = 14.0           # le debit d'une voix, quand elle ne dit pas ou elle en est
 
 
-def lignes_led(texte, colonnes=SOUS_TITRES_COLONNES):
+def texte_dit(phrases, k, fraction):
+    """Ce que Jarvis a deja prononce : les phrases avant la `k`-ieme, et la
+    part `fraction` (0 a 1) de celle-ci -- mot a mot, un mot apparaissant
+    quand il commence (au prorata de ses lettres)."""
+    if k < 0 or not phrases:
+        return ""
+    if k >= len(phrases):
+        return " ".join(phrases)
+    mots = str(phrases[k]).split()
+    total = sum(len(m_) + 1 for m_ in mots)
+    cible = max(0.0, min(1.0, fraction)) * total
+    n, acc = 0, 0
+    for m_ in mots:
+        if acc > cible:
+            break
+        acc += len(m_) + 1
+        n += 1
+    return " ".join(list(phrases[:k]) + ([" ".join(mots[:n])] if n else []))
+
+
+def lignes_led(texte, colonnes=LED_N):
     """Le texte en lignes qui tiennent en `colonnes` points (mot a mot ; un mot
     trop long est coupe)."""
     lignes, cur = [], ""
+    mots = []
     for mot in texte_led(texte).split(" "):
+        # un mot trop long se coupe d'abord a ses traits d'union (« RENDEZ- VOUS »)
+        mots += re.findall(r"[^-]+-?|-", mot) if largeur_led(mot) > colonnes - 2 and "-" in mot else [mot]
+    for mot in mots:
         while largeur_led(mot) > colonnes - 2:
             n = len(mot)
             while n > 1 and largeur_led(mot[:n]) > colonnes - 2:
@@ -4640,28 +4679,6 @@ def lignes_led(texte, colonnes=SOUS_TITRES_COLONNES):
     if cur:
         lignes.append(cur)
     return [l for l in lignes if l]
-
-
-def image_sous_titres(texte, t, colonnes=SOUS_TITRES_COLONNES, lignes_max=SOUS_TITRES_LIGNES):
-    """La reponse ENTIERE, en LED, sur plusieurs lignes centrees ; plus longue
-    que `lignes_max`, elle passe de page en page (4,5 s chacune). None si
-    rien a montrer."""
-    import numpy as np
-    lignes = lignes_led(texte, colonnes)
-    if not lignes:
-        return None
-    pages = [lignes[i:i + lignes_max] for i in range(0, len(lignes), lignes_max)]
-    page = pages[int(t / SOUS_TITRES_PAGE_S) % len(pages)] if len(pages) > 1 else pages[0]
-    hauteur = min(len(lignes), lignes_max) * 9 + 3
-    m = Matrice(colonnes, hauteur)
-    for k, ligne in enumerate(page):
-        m.texte(ligne, (colonnes - largeur_led(ligne)) // 2, 2 + k * 9, _fois(LED_COULEURS["blanc"], 0.9))
-    if len(pages) > 1:
-        # ou l'on en est : un point par page, en bas a droite
-        for i in range(len(pages)):
-            m.set(colonnes - 3 - (len(pages) - 1 - i) * 3, hauteur - 1,
-                  LED_COULEURS["ambre"] if pages[i] is page else (70, 56, 18))
-    return np.clip(m.px, 0, 255).astype(np.uint8)
 
 
 def dalle_led(image, pas=5, eteinte=(18, 20, 26), fond=(8, 9, 12)):

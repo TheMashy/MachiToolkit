@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.54.0"
+VERSION = "1.55.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5007,6 +5007,26 @@ def arreter_voix():
 atexit.register(arreter_voix)
 
 
+# LES SOUS-TITRES DU PANNEAU : ce que dit chaque texte envoye a la voix, et
+# ou elle en est (l'evenement « dit » : telle phrase commence, elle dure tant).
+SOUS_TITRES = {}
+
+
+def sous_titre_courant(maintenant=None):
+    """Ce que Jarvis a deja prononce, a l'instant."""
+    st = JARVIS.get("sous_titre")
+    if not st:
+        return ""
+    t = time.time() if maintenant is None else maintenant
+    if st.get("k", -1) < 0:
+        if not st.get("estime") or not st.get("t0"):
+            return ""
+        # la voix de Windows ne dit pas ou elle en est : au debit moyen d'une voix
+        tout = " ".join(st["phrases"])
+        return _jv.texte_dit([tout], 0, (t - st["t0"]) * _jv.LETTRES_PAR_S / max(1, len(tout)))
+    return _jv.texte_dit(st["phrases"], st["k"], (t - st["t0"]) / max(0.1, st.get("duree") or 0.1))
+
+
 def _lire_voix(sock):
     while True:
         try:
@@ -5016,9 +5036,16 @@ def _lire_voix(sock):
         if ev is None:
             break
         quoi = ev.get("evt")
-        if quoi == "debut":
+        if quoi == "dit":
+            st = SOUS_TITRES.get(ev.get("id"))
+            if st is not None:
+                st.update(k=int(ev.get("phrase") or 0), t0=time.time(), duree=float(ev.get("duree") or 0.0))
+                JARVIS["sous_titre"] = st
+        elif quoi == "debut":
             # IL PARLE : l'oreille guette qu'on lui coupe la parole
             envoyer_oreille({"cmd": "parole", "actif": True})
+            if ev.get("id") in SOUS_TITRES:
+                JARVIS["sous_titre"] = SOUS_TITRES[ev.get("id")]
         elif quoi == "pret":
             _VOIX_ENFANT["pretes"].add(str(ev.get("cle") or "fr"))
             _VOIX_ENFANT.update(pret=True, echecs=0)
@@ -5086,6 +5113,9 @@ class Voix:
             ident = self.n
             self.attentes[ident] = fin
             self.en_cours[ident] = (texte, fin, langue)
+            SOUS_TITRES[ident] = {"phrases": _jv.decouper_phrases(texte) or [texte], "k": -1}
+            for vieux in sorted(SOUS_TITRES)[:-6]:
+                SOUS_TITRES.pop(vieux, None)
             self.parle = True
             if envoyer_voix({"cmd": "dire", "id": ident, "texte": texte, "cle": cle,
                              "lenteur": float(CFG.get("jarvis_lenteur", 0.95))}):
@@ -5096,6 +5126,7 @@ class Voix:
             if fin:
                 fin()
             return
+        JARVIS["sous_titre"] = {"phrases": [texte], "k": -1, "estime": True, "t0": time.time()}
         self.file.append((texte, fin, langue))
         self.signal.set()
         if self.fil is None or not self.fil.is_alive():
@@ -9833,44 +9864,11 @@ class Panneau:
         setattr(self, attribut, f)
         setattr(self, attribut + "_image", lab)
 
-    def _sous_titres_tic(self, montre, alpha, pas, x_milieu, y_haut):
-        """Sous le panneau, la reponse de Jarvis EN ENTIER, tant qu'il parle."""
-        f = getattr(self, "fen_st", None)
-        st = self.panneau_etat
-        reponse = JARVIS.get("reponse_affichee", "") if montre else ""
-        img = None
-        if reponse:
-            if reponse != st.get("st_texte"):
-                st["st_texte"], st["st_debut"] = reponse, time.time()
-            img = _jv.image_sous_titres(reponse, time.time() - st["st_debut"])
-        if img is None:
-            if f is not None and f.winfo_exists() and f.state() != "withdrawn":
-                f.withdraw()
-            return
-        from PIL import Image, ImageTk
-        dalle = _jv.dalle_led(img, pas)
-        h, l = dalle.shape[0], dalle.shape[1]
-        if f is None or not f.winfo_exists():
-            self._panneau_creer(l, "fen_st")
-            f = self.fen_st
-        photo = ImageTk.PhotoImage(Image.fromarray(dalle))
-        self.fen_st_image.configure(image=photo)
-        self.fen_st_image.image = photo
-        f.geometry("%dx%d+%d+%d" % (l, h, x_milieu - l // 2, y_haut))
-        try:
-            f.attributes("-alpha", 0.96 * alpha)
-        except Exception:
-            pass
-        if f.state() == "withdrawn":
-            f.deiconify()
-            f.attributes("-topmost", True)
-
     def _panneau_tic(self):
         f = getattr(self, "fen_led", None)
         def cache():
-            for w in (f, getattr(self, "fen_st", None)):
-                if w is not None and w.winfo_exists() and w.state() != "withdrawn":
-                    w.withdraw()
+            if f is not None and f.winfo_exists() and f.state() != "withdrawn":
+                f.withdraw()
         if not self.cfg.get("jarvis_panneau", True) or not self.cfg.get("jarvis_actif"):
             cache()
             return 500
@@ -9896,7 +9894,9 @@ class Panneau:
             cache()
             return 300
         from PIL import Image, ImageTk
-        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis")), pas)
+        # ce qu'il dit s'ecrit au fil de sa voix, DANS le panneau
+        texte = sous_titre_courant(maintenant) if etat == "parle" else ""
+        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis"), texte), pas)
         photo = ImageTk.PhotoImage(Image.fromarray(img))
         self.fen_led_image.configure(image=photo)
         self.fen_led_image.image = photo
@@ -9910,7 +9910,6 @@ class Panneau:
         if f.state() == "withdrawn":
             f.deiconify()
             f.attributes("-topmost", True)
-        self._sous_titres_tic(etat == "parle", st["alpha"], max(3, pas - 1), x0 + l // 2, haut + taille + pas)
         return 50
 
     def boule_tic(self):
