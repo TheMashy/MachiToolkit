@@ -479,6 +479,47 @@ class SesMains(unittest.TestCase):
             sp.jouer("get lucky")
         self.assertEqual(sum(1 for a in appels if a[1].endswith("/api/token")), 1, "un seul jeton par heure")
 
+    def test_google_agenda(self):
+        import datetime
+        corps, dit = J.evenement_google("Dentiste", "2026-10-01T14:00", rappel=30)
+        debut = datetime.datetime.fromisoformat(corps["start"]["dateTime"])
+        fin = datetime.datetime.fromisoformat(corps["end"]["dateTime"])
+        self.assertIsNotNone(debut.tzinfo, "avec le decalage du PC")
+        self.assertEqual((debut.hour, debut.minute, fin - debut), (14, 0, datetime.timedelta(hours=1)))
+        self.assertEqual(dit, "« Dentiste », jeudi 01/10 a 14:00")
+        self.assertEqual(corps["reminders"], {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}]})
+        corps, _ = J.evenement_google("Vacances", "2026-10-01", fin="2026-10-05")
+        self.assertEqual((corps["start"], corps["end"]), ({"date": "2026-10-01"}, {"date": "2026-10-06"}),
+                         "toute la journee : la fin de l'API est exclue")
+        corps, _ = J.evenement_google("Sport", "2026-10-02 18:30", duree=90)
+        self.assertIn("T20:00:00", corps["end"]["dateTime"])
+        for mauvais in ((("", "2026-10-01"), {}), (("x", "jeudi"), {}), (("x", "2026-10-01T14:00"), {"fin": "2026-10-01T13:00"}),
+                        (("x", "2026-10-01"), {"fin": "2026-10-02T10:00"})):
+            with self.assertRaises(ValueError, msg=repr(mauvais)):
+                J.evenement_google(*mauvais[0], **mauvais[1])
+        url = J.google_url_autorisation("CID", "DEFI", "ETAT")
+        for morceau in ("access_type=offline", "code_challenge=DEFI", "code_challenge_method=S256",
+                        "scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.events",
+                        "redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback"):
+            self.assertIn(morceau, url)
+        appels = []
+
+        def http(methode, url, entetes=None, corps=None):
+            appels.append((methode, url, corps))
+            if url.endswith("/token"):
+                return 200, {"access_token": "A%d" % len(appels), "expires_in": 3600}
+            if len([a for a in appels if "events" in a[1]]) == 1:
+                return 401, None                    # un jeton perime : on en reprend un
+            return 200, {"id": "e1"}
+        ag = J.GoogleAgenda("CID", "SECRET", "R1", http=http)
+        self.assertEqual(ag.poser("Dentiste", "2026-10-01T14:00"),
+                         "Repere pose dans Google Agenda : « Dentiste », jeudi 01/10 a 14:00.")
+        self.assertEqual([a[0] for a in appels], ["POST", "POST", "POST", "POST"])
+        self.assertTrue(appels[1][1].endswith("/calendars/primary/events"))
+        self.assertFalse(any(a[0] in ("GET", "DELETE") for a in appels), "il pose, il ne lit ni n'efface")
+        with self.assertRaises(J.ErreurSpotify):
+            J.GoogleAgenda("CID", "S", "R", http=lambda *a: (400, {"error": "invalid_grant"})).jeton()
+
     def test_spotify_connexion_pkce(self):
         import hashlib as h
         verif, defi = J.pkce_paire()
@@ -1608,6 +1649,24 @@ class DansMachiTool(unittest.TestCase):
                                {"id": c["id"], "onglets": []})[0], 200)
         t.join(3)
         self.assertEqual(resultat["r"]["onglets"], [])
+
+    def test_le_retour_de_connexion_oauth(self):
+        m = self.m
+        recus, messages = [], []
+        t = m.attendre_retour_oauth("ETAT", recus.append, messages.append, delai=5, service="Google Agenda")
+        base = "http://127.0.0.1:%d/callback" % m._jv.SPOTIFY_PORT
+        lire = lambda q: urllib.request.urlopen(base + q, timeout=5).read().decode("utf-8")
+        self.assertIn("Reponse inattendue", lire("?state=AUTRE&code=X"))
+        self.assertEqual(recus, [], "un « state » etranger : aucun echange")
+        self.assertIn("Google Agenda est connecte", lire("?state=ETAT&code=CODE"))
+        t.join(3)
+        self.assertEqual(recus, ["CODE"])
+        self.assertFalse(t.is_alive(), "une fois connecte, le serveur s'arrete")
+        self.assertIn("pas connecte", m.executer_outil({"id": "x", "nom": "agenda_poser",
+                                                        "entree": {"titre": "x", "debut": "2026-10-01"}},
+                                                       dict(m.CFG, jarvis_pc=True))["erreur"])
+        m.CFG.update(jarvis_pc=True, google_client_id="CID", google_refresh="R")
+        self.assertTrue(m.capacites_jarvis(m.CFG)["agenda"])
 
     def test_le_pc_entier_sans_code(self):
         # « J'aimerais avoir un compagnon qui peut interagir le plus possible avec mon PC. »

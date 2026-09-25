@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.43.0"
+VERSION = "1.44.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -368,6 +368,11 @@ CONFIG_DEFAUT = {
     # LES ONGLETS DE CHROME : la cle de l'extension de Machi Tool (a part du
     # jeton du serveur local : elle ne sert qu'aux onglets).
     "onglets_cle": "",
+    # GOOGLE AGENDA : l'acces « application de bureau » de la personne (console
+    # Google Cloud) et le jeton de renouvellement de la connexion.
+    "google_client_id": "",
+    "google_client_secret": "",
+    "google_refresh": "",
     "spotify_refresh": "",
     "jarvis_code_sel": "",
     "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
@@ -5842,7 +5847,7 @@ def parler_au_compagnon(texte, cfg):
 
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
                     "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets",
-                    "spotify_jouer", "spotify_en_cours", "spotify_aimer"}
+                    "spotify_jouer", "spotify_en_cours", "spotify_aimer", "agenda_poser"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -6557,17 +6562,11 @@ def ouvrir_appli_spotify():
         pass
 
 
-def connecter_spotify(cfg, rappel=None, delai=180):
-    """Ouvre la page de connexion de Spotify dans le navigateur et attend son
-    retour sur 127.0.0.1:8765, une fois. `rappel(message)` dit ou on en est."""
-    import http.server
-    client_id = str(cfg.get("spotify_client_id") or "").strip()
-    if not client_id:
-        raise ValueError("Colle d'abord le Client ID de ton app Spotify.")
-    verif, defi = _jv.pkce_paire()
-    etat = os.urandom(12).hex()
+def attendre_retour_oauth(etat, echanger, rappel, delai=180, service="Spotify"):
+    """Le retour d'une connexion (Spotify, Google) sur 127.0.0.1:8765/callback,
+    une fois : verifie `state`, appelle `echanger(code)` (qui garde le jeton)
+    et rend la main. `rappel(message)` dit ou on en est."""
     fini = threading.Event()
-    rappel = rappel or (lambda m: None)
 
     class Retour(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -6580,18 +6579,15 @@ def connecter_spotify(cfg, rappel=None, delai=180):
                 self.send_response(404)
                 self.end_headers()
                 return
-            ok, message = False, "Spotify n'a pas ete connecte."
+            ok, message = False, "%s n'a pas ete connecte." % service
             if q.get("state") != etat:
                 message = "Reponse inattendue : recommence depuis Machi Tool."
             elif q.get("error"):
-                message = "Connexion refusee sur Spotify (%s)." % q["error"]
+                message = "Connexion refusee sur %s (%s)." % (service, q["error"])
             else:
                 try:
-                    r = _jv.Spotify.echanger_code(client_id, q.get("code", ""), verif)
-                    cfg["spotify_refresh"] = r["refresh_token"]
-                    sauver_config(cfg)
-                    _SPOTIFY["client"] = None
-                    ok, message = True, "Spotify est connecte a Machi Tool. Tu peux fermer cet onglet."
+                    echanger(q.get("code", ""))
+                    ok, message = True, "%s est connecte a Machi Tool. Tu peux fermer cet onglet." % service
                 except Exception as e:
                     message = str(e)
             corps = ("<!doctype html><meta charset=utf-8><title>Machi Tool</title>"
@@ -6613,14 +6609,73 @@ def connecter_spotify(cfg, rappel=None, delai=180):
             while not fini.is_set() and time.time() < limite:
                 serveur.handle_request()
             if not fini.is_set():
-                rappel("Pas de retour de Spotify : recommence.")
+                rappel("Pas de retour de %s : recommence." % service)
         finally:
             serveur.server_close()
-            _SPOTIFY["connexion"] = None
-    _SPOTIFY["connexion"] = threading.Thread(target=servir, daemon=True)
-    _SPOTIFY["connexion"].start()
+    t = threading.Thread(target=servir, daemon=True)
+    t.start()
+    return t
+
+
+def connecter_spotify(cfg, rappel=None, delai=180):
+    """Ouvre la page de connexion de Spotify dans le navigateur et attend son
+    retour sur 127.0.0.1:8765, une fois."""
+    client_id = str(cfg.get("spotify_client_id") or "").strip()
+    if not client_id:
+        raise ValueError("Colle d'abord le Client ID de ton app Spotify.")
+    verif, defi = _jv.pkce_paire()
+    etat = os.urandom(12).hex()
+    rappel = rappel or (lambda m: None)
+
+    def echanger(code):
+        r = _jv.Spotify.echanger_code(client_id, code, verif)
+        cfg["spotify_refresh"] = r["refresh_token"]
+        sauver_config(cfg)
+        _SPOTIFY["client"] = None
+    _SPOTIFY["connexion"] = attendre_retour_oauth(etat, echanger, rappel, delai, "Spotify")
     ouvrir_dans_chrome(_jv.spotify_url_autorisation(client_id, defi, etat))
     rappel("Connecte-toi a Spotify dans le navigateur...")
+
+
+# --- GOOGLE AGENDA -----------------------------------------------------
+# « Est-ce que tu peux lier Google Agenda pour qu'il puisse poser des
+# reperes ? » L'API officielle, avec le compte de la personne : un acces
+# « application de bureau » cree une fois dans la console Google Cloud, une
+# connexion (PKCE), et Jarvis pose des evenements. Il n'en lit ni n'en
+# efface aucun.
+
+_AGENDA = {"client": None, "cle": None}
+
+
+def agenda_connecte(cfg):
+    return bool(str(cfg.get("google_client_id") or "").strip() and cfg.get("google_refresh"))
+
+
+def agenda_de(cfg):
+    cle = (str(cfg.get("google_client_id") or "").strip(), str(cfg.get("google_client_secret") or "").strip(),
+           cfg.get("google_refresh"))
+    if _AGENDA["cle"] != cle or _AGENDA["client"] is None:
+        _AGENDA["client"], _AGENDA["cle"] = _jv.GoogleAgenda(*cle), cle
+    return _AGENDA["client"]
+
+
+def connecter_google(cfg, rappel=None, delai=180):
+    client_id = str(cfg.get("google_client_id") or "").strip()
+    secret = str(cfg.get("google_client_secret") or "").strip()
+    if not client_id or not secret:
+        raise ValueError("Colle d'abord l'ID client et le code secret de ton acces Google (application de bureau).")
+    verif, defi = _jv.pkce_paire()
+    etat = os.urandom(12).hex()
+    rappel = rappel or (lambda m: None)
+
+    def echanger(code):
+        r = _jv.GoogleAgenda.echanger_code(client_id, secret, code, verif)
+        cfg["google_refresh"] = r["refresh_token"]
+        sauver_config(cfg)
+        _AGENDA["client"] = None
+    attendre_retour_oauth(etat, echanger, rappel, delai, "Google Agenda")
+    ouvrir_dans_chrome(_jv.google_url_autorisation(client_id, defi, etat))
+    rappel("Connecte-toi a Google dans le navigateur...")
 
 
 def capturer_ecran(numero):
@@ -6701,6 +6756,12 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": agir_onglets(e.get("action") or "lister", e.get("cible") or "",
                                                        e.get("url") or "", e.get("recherche") or "",
                                                        bool(e.get("tous")))}
+        if nom == "agenda_poser":
+            if not agenda_connecte(cfg):
+                return {"id": ident, "erreur": "Google Agenda n'est pas connecte a Machi Tool (Reglages > Jarvis > Google Agenda)."}
+            return {"id": ident, "texte": agenda_de(cfg).poser(
+                e.get("titre"), e.get("debut"), e.get("fin") or "", e.get("duree_minutes") or 60,
+                e.get("description") or "", e.get("lieu") or "", e.get("rappel_minutes"))}
         if nom.startswith("spotify_"):
             if not spotify_connecte(cfg):
                 return {"id": ident, "erreur": "Spotify n'est pas connecte a Machi Tool (Reglages > Jarvis > Spotify)."}
@@ -6850,6 +6911,7 @@ def capacites_jarvis(cfg):
             "navigation": pc and bool(cfg.get("jarvis_historique")),
             "spotify": pc and spotify_connecte(cfg),
             "onglets": pc and extension_branchee(),
+            "agenda": pc and agenda_connecte(cfg),
             "souvenirs": souvenirs_a_envoyer(cfg),
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
@@ -9791,6 +9853,32 @@ class Panneau:
         self.txt_spotify.pack(fill="x", pady=(4, 0))
 
         self.separateur(f, 12, 8)
+        self.titre(f, "google agenda").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Pour qu'il pose des reperes dans ton agenda (« mets-moi dentiste jeudi a 14 h », "
+                      "« bloque vendredi pour le demenagement »). Il en pose ; il n'en lit ni n'en efface "
+                      "aucun. Une fois, sur console.cloud.google.com : cree un projet, active « Google "
+                      "Calendar API », configure l'ecran de consentement (Externe, ajoute ton adresse en "
+                      "utilisateur test, puis « Publier l'application » -- en mode Test, Google coupe la "
+                      "connexion au bout de 7 jours), puis Identifiants > Creer > ID client OAuth > "
+                      "« Application de bureau ». Colle l'ID client et le code secret ici, puis « Connecter ». "
+                      "Le jeton reste sur ce PC.", BRUME, 8, largeur=500).pack(fill="x")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.texte(ligne, "ID client", CRAIE, 9).pack(side="left")
+        self.champ_google_id = self.champ(ligne, self.cfg.get("google_client_id", ""), 30)
+        self.champ_google_id.pack(side="left", padx=(8, 0))
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(4, 0))
+        self.texte(ligne, "Code secret", CRAIE, 9).pack(side="left")
+        self.champ_google_secret = self.champ(ligne, self.cfg.get("google_client_secret", ""), 26)
+        self.champ_google_secret.configure(show="\u2022")
+        self.champ_google_secret.pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Connecter", self.connecter_google, compact=True).pack(side="left", padx=(8, 0))
+        self.bouton(ligne, "Deconnecter", self.deconnecter_google, compact=True).pack(side="left", padx=(8, 0))
+        self.txt_google = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_google.pack(fill="x", pady=(4, 0))
+
+        self.separateur(f, 12, 8)
         self.titre(f, "les onglets de chrome").pack(fill="x", pady=(0, 4))
         self.texte(f, "Pour qu'il liste, ouvre, affiche, coupe et ferme des onglets (« ferme les onglets "
                       "YouTube », « ouvre un onglet sur la meteo »). Une petite extension de Machi Tool, a "
@@ -9857,9 +9945,8 @@ class Panneau:
                       "compagnon de BrainDebugger, avec ton journal ; dis « psychologue », "
                       "« notes psy » ou « note pour le psy » (« therapist », « take a note ») pour y "
                       "passer. « Note que... » : avec ses mains ouvertes, Jarvis l'ecrit dans ses notes "
-                      "(Documents > Notes de Jarvis) et, sauf une liste de courses ou une petite note "
-                      "pratique, la depose aussi au carnet du psychologue ; mains fermees, elle part "
-                      "directement au psychologue. Pour revenir : « Jarvis ? Re ! », « mode Jarvis », ou simplement "
+                      "(Documents > Notes de Jarvis) ; elle ne va aussi au psychologue que si tu le "
+                      "demandes. Mains fermees, elle part directement au psychologue. Pour revenir : « Jarvis ? Re ! », « mode Jarvis », ou simplement "
                       "le rappeler -- il se reveille toujours en mode Jarvis. « Au revoir » au "
                       "psychologue : retour au majordome, qui se tait si c'etait lourd, ou dit "
                       "un mot leger. Un message grave part toujours au compagnon. « Non rien », "
@@ -9919,6 +10006,21 @@ class Panneau:
             JARVIS["onglets_message"] = "Dossier pret : %s" % dossier
         except Exception as e:
             JARVIS["onglets_message"] = "Impossible : %s" % e
+
+    def connecter_google(self):
+        self.cfg["google_client_id"] = self.champ_google_id.get().strip()
+        self.cfg["google_client_secret"] = self.champ_google_secret.get().strip()
+        sauver_config(self.cfg)
+        try:
+            connecter_google(self.cfg, rappel=lambda m: JARVIS.__setitem__("google_message", m))
+        except Exception as e:
+            JARVIS["google_message"] = str(e)
+
+    def deconnecter_google(self):
+        self.cfg["google_refresh"] = ""
+        sauver_config(self.cfg)
+        _AGENDA["client"] = None
+        JARVIS["google_message"] = "Deconnecte."
 
     def connecter_spotify(self):
         self.cfg["spotify_client_id"] = self.champ_spotify.get().strip()
@@ -10076,6 +10178,12 @@ class Panneau:
             etat_on = "Branchee." if extension_branchee() else (JARVIS.get("onglets_message") or "Pas branchee.")
             if self.txt_onglets.cget("text") != etat_on:
                 self.txt_onglets.configure(text=etat_on)
+        if hasattr(self, "txt_google"):
+            etat_g = ("Connecte." if agenda_connecte(self.cfg) else "Pas connecte.")
+            if JARVIS.get("google_message"):
+                etat_g += "  " + JARVIS["google_message"]
+            if self.txt_google.cget("text") != etat_g:
+                self.txt_google.configure(text=etat_g)
         if hasattr(self, "txt_spotify"):
             etat_sp = ("Connecte." if spotify_connecte(self.cfg) else "Pas connecte.")
             if JARVIS.get("spotify_message"):
