@@ -801,6 +801,37 @@ class SesMains(unittest.TestCase):
         with self.assertRaisesRegex(J.ErreurSpotify, "ouvert nulle part"):
             sp.jouer("get lucky")
         self.assertEqual(sum(1 for a in appels if a[1].endswith("/api/token")), 1, "un seul jeton par heure")
+        # « Jarvis ne peut pas interagir avec Spotify » : l'appli ne s'annonce pas
+        # -> le morceau s'ouvre directement dedans
+        ouverts = []
+        self.assertIn("Ouvert dans l'application Spotify", sp.jouer("get lucky", ouvrir_uri=ouverts.append))
+        self.assertEqual(ouverts, ["spotify:track:GL"])
+        # un appareil endormi (404) : on lui passe la lecture, et on relance
+        etat["appareils"] = [{"id": "PC", "name": "BUREAU", "type": "Computer", "is_active": False}]
+        reponses = [(404, {"error": {"status": 404, "message": "Device not found"}}), (204, None)]
+        vrai = http
+
+        def http2(methode, url, entetes=None, corps=None):
+            if "/me/player/play" in url:
+                appels.append((methode, url, corps))
+                return reponses.pop(0)
+            if url.endswith("/me/player"):
+                appels.append((methode, url, corps))
+                return 204, None
+            return vrai(methode, url, entetes, corps)
+        sp.http = http2
+        self.assertIn("Lecture", sp.jouer("get lucky"))
+        transfert = [a for a in appels if a[1].endswith("/me/player")]
+        self.assertEqual(transfert[-1][2], {"device_ids": ["PC"], "play": False})
+        # un 403 qui n'est pas « Premium » : ce que Spotify a vraiment dit
+        reponses[:] = [(403, {"error": {"status": 403, "message": "Player command failed: Restriction violated",
+                                         "reason": "UNKNOWN"}})]
+        with self.assertRaisesRegex(J.ErreurSpotify, "Restriction violated"):
+            sp.jouer("get lucky")
+        reponses[:] = [(403, {"error": {"status": 403, "message": "Player command failed: Premium required",
+                                         "reason": "PREMIUM_REQUIRED"}})]
+        with self.assertRaisesRegex(J.ErreurSpotify, "Premium"):
+            sp.jouer("get lucky")
 
     def test_spotify_connexion_pkce(self):
         import hashlib as h
@@ -1574,6 +1605,45 @@ class LIndicateurDeDetection(EtalonnageAuFilDeLEau):
     test_rate_mais_rien_ne_suit_rien_n_est_garde = None
 
 
+class SesTachesEtTesProjets(unittest.TestCase):
+    """« Que Jarvis puisse accomplir des taches (rechercher des choses sur le
+    cote ?) et reflechir avec un peu de contexte des projets. »"""
+
+    def test_une_note_se_range_sous_son_projet(self):
+        texte = "Irontide :\n  - jeu de robots sous Godot\n\nMachi Tool :\n  - la guirlande\n"
+        t = J.ajouter_note_projet(texte, "irontide", "ajouter un mode coop")
+        self.assertEqual(t.split("\n")[:3], ["Irontide :", "  - jeu de robots sous Godot", "  - ajouter un mode coop"])
+        self.assertIn("Machi Tool :\n  - la guirlande", t)
+        t = J.ajouter_note_projet(t, "BrainDebugger", "la carte des fonctionnements")
+        self.assertTrue(t.rstrip().endswith("BrainDebugger :\n  - la carte des fonctionnements"))
+        self.assertEqual(J.ajouter_note_projet("", "Irontide", "x"), "Irontide :\n  - x\n")
+        # « - Irontide (jeu) » ou « ## Irontide » : reconnus aussi ; « Irontides » non
+        self.assertIn("## Irontide\n  - y", J.ajouter_note_projet("## Irontide\nautre", "Irontide", "y"))
+        self.assertIn("Irontide :\n  - z", J.ajouter_note_projet("Irontides :\n", "Irontide", "z"))
+        with self.assertRaises(ValueError):
+            J.ajouter_note_projet("x", "", "note")
+        with self.assertRaises(ValueError):
+            J.ajouter_note_projet("a" * J.PROJETS_MAX, "Irontide", "trop")
+
+    def test_la_liste_et_l_annonce(self):
+        t0 = 1_000_000.0
+        taches = [{"id": "a", "titre": "Cartes graphiques", "etat": "fini", "debut": t0 - 600,
+                   "resume": "La 5070 est le meilleur choix.", "genre": "recherche"},
+                  {"id": "b", "titre": "Mode coop", "etat": "en_cours", "debut": t0 - 60, "genre": "reflexion"},
+                  {"id": "c", "titre": "Horaires", "etat": "erreur", "debut": t0 - 7200 * 2, "erreur": "credit"}]
+        l = J.lister_taches(taches, t0)
+        self.assertEqual(l.split("\n")[0], "1. Mode coop (en cours, il y a 1 min)")
+        self.assertIn("2. Cartes graphiques (finie, il y a 10 min) : La 5070", l)
+        self.assertIn("3. Horaires (echouee, il y a 4 h) : credit", l)
+        self.assertIn("Aucune", J.lister_taches([]))
+        a = J.annonce_tache(taches[0])
+        self.assertIn("La recherche sur « Cartes graphiques » est prete. La 5070", a)
+        self.assertIn("Ma reflexion sur", J.annonce_tache(dict(taches[1], etat="fini")))
+        self.assertIn("n'ait pas abouti", J.annonce_tache(taches[2]))
+        self.assertIn("is ready", J.annonce_tache(taches[0], "en"))
+        self.assertTrue(J.nom_fichier_tache("Cartes : 600 € / RTX?", t0).endswith("cartes 600 rtx.md"))
+
+
 @unittest.skipUnless(NUMPY, "numpy absent")
 class LaVoixNeGresillePlus(unittest.TestCase):
     """« Le TTS gresille. » Pas a pleine echelle (le reechantillonnage de
@@ -1986,6 +2056,94 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("milieu d'une phrase", consignes[1])
         self.assertEqual(m.niveau_voix_appris(), 184.0, "garde quand on ajoute")
         self.assertIn("travis", m.noms_appris())
+
+    def test_une_tache_de_fond_de_bout_en_bout(self):
+        """Jarvis la lance (sans les mains sur le PC), un fil la suit, le texte
+        est range, la notification part, et il l'annonce une fois libre."""
+        m = self.m
+        m.CFG.update(jarvis_pc=False, jarvis_actif=True, jarvis_langue="fr",
+                     jarvis_projets="Irontide :\n  - robots\n")
+        envois, sondes = [], [{"etat": "en_cours"}, {}, {"etat": "fini", "resume": "La 5070.",
+                                                        "texte": "## Comparatif\nDetail."}]
+
+        def bd(chemin, charge, cfg, delai):
+            envois.append((chemin, charge))
+            if charge is not None:
+                return {"id": "T1", "etat": "en_cours"}
+            r = sondes.pop(0)
+            if not r:
+                raise OSError("reseau")          # un reseau qui tousse ne l'arrete pas
+            return r
+        vrai = m._requete_bd
+        self.addCleanup(lambda: setattr(m, "_requete_bd", vrai))
+        m._requete_bd = bd
+        m.TACHES_PRETES.clear()
+        suivre = m.suivre_tache
+        m.suivre_tache = lambda *a, **k: None       # le fil : suivi a la main, plus bas
+        self.addCleanup(lambda: setattr(m, "suivre_tache", suivre))
+        r = m.executer_outil({"id": "x", "nom": "lancer_tache",
+                              "entree": {"demande": "Compare les cartes a 600 euros", "genre": "recherche",
+                                         "titre": "Cartes graphiques"}}, m.CFG)
+        self.assertIn("Tache lancee : « Cartes graphiques »", r["texte"])
+        self.assertEqual(envois[0][0], "/api/machitool/tache")
+        self.assertIn("Irontide", envois[0][1]["projets"], "le contexte des projets part avec")
+        # le suivi (sans attendre pour de vrai)
+        suivre("T1", m.CFG, dormir=lambda s: None)
+        t = m.lire_taches()[0]
+        self.assertEqual((t["etat"], t["resume"]), ("fini", "La 5070."))
+        with open(t["fichier"], encoding="utf-8") as f:
+            contenu = f.read()
+        self.assertIn("# Cartes graphiques", contenu)
+        self.assertIn("## Comparatif", contenu)
+        self.assertIn("est prete", self.dit[-1], "la notification")
+        # occupe (il parle) : pas d'annonce ; libre : l'annonce
+        m.JARVIS["etat"] = "parle"
+        self.assertIsNone(m.annoncer_taches(m.CFG))
+        m.JARVIS["etat"] = "attente"
+        self.assertIn("La recherche sur « Cartes graphiques » est prete", m.annoncer_taches(m.CFG))
+        self.assertIsNone(m.annoncer_taches(m.CFG), "une seule fois")
+        # « qu'as-tu trouve ? »
+        lu = m.executer_outil({"id": "y", "nom": "taches", "entree": {"action": "lire"}}, m.CFG)
+        self.assertIn("Detail.", lu["texte"])
+        self.assertIn("1. Cartes graphiques (finie",
+                      m.executer_outil({"id": "z", "nom": "taches", "entree": {"action": "lister"}}, m.CFG)["texte"])
+        self.assertIn("numero 4", m.executer_outil({"id": "w", "nom": "taches",
+                                                    "entree": {"action": "lire", "numero": 4}}, m.CFG)["erreur"])
+        # BrainDebugger pas encore redeploye : on le dit
+        err = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b"{}"))
+
+        def ancien(*a, **k):
+            raise err
+        m._requete_bd = ancien
+        r = m.executer_outil({"id": "v", "nom": "lancer_tache", "entree": {"demande": "x"}}, m.CFG)
+        self.assertIn("redeployer", r["erreur"])
+
+    def test_noter_un_projet_et_les_capacites(self):
+        m = self.m
+        m.CFG.update(jarvis_pc=False, jarvis_projets="")
+        r = m.executer_outil({"id": "p", "nom": "noter_projet",
+                              "entree": {"projet": "Irontide", "note": "un mode coop a deux"}}, m.CFG)
+        self.assertNotIn("erreur", r)
+        self.assertEqual(m.CFG["jarvis_projets"], "Irontide :\n  - un mode coop a deux\n")
+        c = m.capacites_jarvis(m.CFG)
+        self.assertTrue(c["taches"])
+        self.assertIn("un mode coop", c["projets"])
+        self.assertFalse(_jv_modifiable := J.reglage_modifiable("jarvis_projets", m.CONFIG_DEFAUT),
+                         "reglages_machi ne peut pas effacer tes projets")
+
+    def test_un_outil_qui_echoue_dit_pourquoi(self):
+        m = self.m
+        m.CFG.update(jarvis_pc=True, spotify_client_id="CID", spotify_refresh="R")
+
+        class Casse:
+            def jouer(self, *a, **k):
+                raise J.ErreurSpotify("Spotify refuse (403 : Restriction violated).")
+        vrai = m.spotify_de
+        self.addCleanup(lambda: setattr(m, "spotify_de", vrai))
+        m.spotify_de = lambda cfg: Casse()
+        r = m.executer_outil({"id": "s", "nom": "spotify_jouer", "entree": {"recherche": "get lucky"}}, m.CFG)
+        self.assertEqual(r["erreur"], "Spotify refuse (403 : Restriction violated).", "sans « ErreurSpotify : »")
+        self.assertIn("Restriction violated", m.JARVIS["spotify_message"], "et on le voit sous « Spotify »")
 
     def test_l_indicateur_garde_les_derniers_essais(self):
         m = self.m

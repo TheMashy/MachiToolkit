@@ -3323,6 +3323,105 @@ def retirer_preference(liste, texte="", tout=False):
     return [p for p, s in zip(liste, scores) if s != meilleur], retirees
 
 
+# ======================================================================
+#  SES TACHES DE FOND ET TES PROJETS
+#  « Que Jarvis puisse accomplir des taches (rechercher des choses sur le
+#  cote ?) et avoir acces a Claude pour reflechir sur des idees simples avec
+#  un peu de contexte des projets. » Une tache part chez BrainDebugger et
+#  tourne sans nous (voir server/taches.js la-bas) ; Machi Tool la suit,
+#  range le resultat et l'annonce. Les projets : un texte a toi, que Jarvis
+#  complete (« retiens pour Irontide que... ») et qui part avec les taches.
+# ======================================================================
+
+PROJETS_MAX = 4000
+TACHES_GARDEES = 30
+
+
+def ajouter_note_projet(texte, projet, note):
+    """Le texte des projets, avec la note rangee sous son projet (« Irontide : »,
+    « - Irontide », « ## Irontide »...) ; un projet inconnu est ajoute a la fin.
+    ValueError si c'est vide ou si le texte deborde."""
+    projet = " ".join(str(projet or "").split()).strip(" :-#")[:60]
+    note = " ".join(str(note or "").split())[:300]
+    if not projet or not note:
+        raise ValueError("il faut un projet et une note")
+    lignes = str(texte or "").replace("\r", "").rstrip().split("\n") if str(texte or "").strip() else []
+    cle = normaliser(projet)
+    tete = None
+    for i, l in enumerate(lignes):
+        nu = normaliser(l.strip().lstrip("#-*• ").strip())
+        if nu == cle or (nu.startswith(cle) and nu[len(cle):len(cle) + 1] in (" ", ":", "-", "(", ",")):
+            if not l.startswith((" ", "\t")):
+                tete = i
+                break
+    if tete is None:
+        lignes += ([""] if lignes else []) + ["%s :" % projet, "  - %s" % note]
+    else:
+        j = tete + 1
+        while j < len(lignes) and lignes[j].strip() and (lignes[j].startswith((" ", "\t", "-", "*", "•"))):
+            j += 1
+        lignes.insert(j, "  - %s" % note)
+    neuf = "\n".join(lignes).strip() + "\n"
+    if len(neuf) > PROJETS_MAX:
+        raise ValueError("les notes de projets sont pleines (%d signes) : fais le tri dans Machi Tool" % PROJETS_MAX)
+    return neuf
+
+
+def titre_tache(titre, demande=""):
+    t = " ".join(str(titre or "").split())
+    if not t:
+        d = " ".join(str(demande or "").split())
+        t = d if len(d) <= 60 else d[:57].rsplit(" ", 1)[0] + "..."
+    return t[:60] or "tache"
+
+
+def taches_recentes(taches):
+    """La plus recente d'abord."""
+    return sorted([t for t in taches or [] if isinstance(t, dict)],
+                  key=lambda t: float(t.get("debut") or 0), reverse=True)
+
+
+def lister_taches(taches, maintenant=None, langue="fr"):
+    """Pour Jarvis : les taches numerotees, la plus recente en 1."""
+    t0 = time.time() if maintenant is None else maintenant
+    rec = taches_recentes(taches)[:10]
+    if not rec:
+        return "No background task yet." if langue == "en" else "Aucune tache de fond pour l'instant."
+    etats = ({"en_cours": "running", "fini": "done", "erreur": "failed"} if langue == "en"
+             else {"en_cours": "en cours", "fini": "finie", "erreur": "echouee"})
+    out = []
+    for i, t in enumerate(rec, 1):
+        age = max(0, int((t0 - float(t.get("debut") or t0)) // 60))
+        quand = ("%d min ago" % age if langue == "en" else "il y a %d min" % age) if age < 120 else \
+            ("%d h ago" % (age // 60) if langue == "en" else "il y a %d h" % (age // 60))
+        ligne = "%d. %s (%s, %s)" % (i, t.get("titre") or "?", etats.get(t.get("etat"), t.get("etat")), quand)
+        if t.get("etat") == "fini" and t.get("resume"):
+            ligne += " : " + str(t["resume"])[:200]
+        elif t.get("etat") == "erreur" and t.get("erreur"):
+            ligne += " : " + str(t["erreur"])[:120]
+        out.append(ligne)
+    return "\n".join(out)
+
+
+def annonce_tache(t, langue="fr"):
+    """Ce que Jarvis dit quand une tache est prete (ou a echoue)."""
+    titre = t.get("titre") or ("your task" if langue == "en" else "votre tache")
+    if t.get("etat") == "erreur":
+        return ("I'm afraid the task « %s » did not succeed." % titre if langue == "en"
+                else "Je crains que la tache « %s » n'ait pas abouti." % titre)
+    quoi = {"reflexion": ("My thoughts on", "Ma reflexion sur")}.get(t.get("genre"), ("The research on",
+                                                                                     "La recherche sur"))
+    if langue == "en":
+        return "%s « %s » is ready. %s The full text is in Machi Tool." % (quoi[0], titre, t.get("resume") or "")
+    return "%s « %s » est prete. %s Le detail est dans Machi Tool." % (quoi[1], titre, t.get("resume") or "")
+
+
+def nom_fichier_tache(titre, debut):
+    """« 2026-09-25 2130 cartes graphiques.md » : lisible, sans caractere interdit."""
+    propre = re.sub(r"[^\w\- ]+", "", normaliser(str(titre or "tache"))).strip()[:50] or "tache"
+    return "%s %s.md" % (time.strftime("%Y-%m-%d %H%M", time.localtime(float(debut or 0))), propre)
+
+
 _EPOQUE_CHROME = 11644473600          # secondes entre 1601 (Chrome) et 1970
 
 
@@ -3683,6 +3782,7 @@ def _contexte():
     except Exception:
         return None
 _SPOTIFY_API = "https://api.spotify.com/v1"
+SPOTIFY_ATTENTE_APPAREIL_S = 15    # l'application qui demarre met souvent plus de 8 s a s'annoncer
 _SPOTIFY_COMPTES = "https://accounts.spotify.com"
 
 
@@ -3892,22 +3992,44 @@ class Spotify:
             return i["uri"], i.get("name", ""), True
         return i["uri"], "la playlist « %s »" % i.get("name"), True
 
-    def jouer(self, recherche, genre="titre", file=False, ouvrir_appli=None):
+    def jouer(self, recherche, genre="titre", file=False, ouvrir_appli=None, ouvrir_uri=None):
+        """« Jarvis ne peut pas interagir avec Spotify. » Trois ecueils connus :
+        l'application qui met du temps a apparaitre parmi les appareils (on
+        attend plus longtemps, et en dernier recours on lui ouvre le morceau
+        directement) ; un appareil endormi (404 : on le reveille en lui
+        transferant la lecture, puis on relance) ; un 403 qui n'est pas
+        forcement « Premium » (on dit ce que Spotify a vraiment repondu)."""
         uri, dit, contexte = self.chercher(recherche, genre)
-        a = self.attendre_appareil(ouvrir_appli)
+        a = self.attendre_appareil(ouvrir_appli, SPOTIFY_ATTENTE_APPAREIL_S)
         if not a:
+            if ouvrir_uri and not file:
+                ouvrir_uri(uri)
+                return ("Ouvert dans l'application Spotify : %s. Spotify ne s'est pas encore annonce comme "
+                        "lecteur : si la lecture ne part pas seule, un clic sur lecture." % dit)
             raise ErreurSpotify("Spotify n'est ouvert nulle part : ouvre l'application, puis redemande.")
-        if file:
-            if contexte:
-                raise ErreurSpotify("On ne peut mettre dans la file qu'un titre, pas un album ni une playlist.")
-            statut, r = self.api("POST", "/me/player/queue", {"uri": uri, "device_id": a["id"]})
-            fait = "Ajoute a la file : %s." % dit
-        else:
-            statut, r = self.api("PUT", "/me/player/play", {"device_id": a["id"]},
-                                 {"context_uri": uri} if contexte else {"uris": [uri]})
-            fait = "Lecture : %s, sur %s." % (dit, a.get("name") or "Spotify")
+
+        def lancer():
+            if file:
+                return self.api("POST", "/me/player/queue", {"uri": uri, "device_id": a["id"]})
+            return self.api("PUT", "/me/player/play", {"device_id": a["id"]},
+                            {"context_uri": uri} if contexte else {"uris": [uri]})
+        if file and contexte:
+            raise ErreurSpotify("On ne peut mettre dans la file qu'un titre, pas un album ni une playlist.")
+        statut, r = lancer()
+        if statut == 404:
+            # « Device not found » / « No active device » : l'appli est la mais
+            # endormie -- on lui passe la lecture, et on recommence
+            self.api("PUT", "/me/player", None, {"device_ids": [a["id"]], "play": False})
+            self.dormir(1.0)
+            statut, r = lancer()
+        fait = ("Ajoute a la file : %s." % dit if file
+                else "Lecture : %s, sur %s." % (dit, a.get("name") or "Spotify"))
         if statut == 403:
-            raise ErreurSpotify("Spotify refuse : lancer la lecture a distance demande un compte Premium.")
+            err = (r or {}).get("error") if isinstance(r, dict) else None
+            message = " ".join(str(err.get(k) or "") for k in ("message", "reason")) if isinstance(err, dict) else ""
+            if not message.strip() or "premium" in message.lower():
+                raise ErreurSpotify("Spotify refuse : lancer la lecture a distance demande un compte Premium.")
+            raise ErreurSpotify(raison_spotify(statut, r, "Spotify refuse la lecture"))
         if statut not in (200, 202, 204):
             raise ErreurSpotify(raison_spotify(statut, r, "Spotify refuse"))
         return fait
@@ -4634,7 +4756,7 @@ REGLAGES_INTERDITS = {
     "jarvis_pc", "jarvis_ecran", "jarvis_historique", "jarvis_code_actif", "collecte_active",
     "collecte_envoi", "collecte_titres_complets", "maj_verifier", "maj_installation_auto", "maj_prereleases",
     "maj_intervalle_heures", "config_version", "derniere_version", "jarvis_preferences", "jarvis_souvenirs",
-    "routines_lumiere", "jarvis_raccourcis", "regles", "jarvis_astuce_voix", "jarvis_actif",
+    "jarvis_projets", "routines_lumiere", "jarvis_raccourcis", "regles", "jarvis_astuce_voix", "jarvis_actif",
 }
 REGLAGES_CHOIX = {
     "mode": ("applications", "ecran", "mixte", "son"),
