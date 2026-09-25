@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.58.0"
+VERSION = "1.59.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -4548,8 +4548,28 @@ def _ecrire_voix(gabarits, auto):
     with open(chemin + ".part", "w", encoding="utf-8") as f:
         json.dump({"gabarits": gabarits, "auto": auto,
                    "appris_le": ancien.get("appris_le") or time.strftime("%Y-%m-%d %H:%M"),
-                   "micro": ancien.get("micro") or str(JARVIS.get("micro") or "")}, f)
+                   "micro": ancien.get("micro") or str(JARVIS.get("micro") or ""),
+                   "niveau": ancien.get("niveau"), "noms": ancien.get("noms") or []}, f)
     os.replace(chemin + ".part", chemin)
+
+
+def _voix_lue():
+    try:
+        with open(_fichier_gabarits(), encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def niveau_voix_appris():
+    """Le niveau de ta voix quand tu as dit « Jarvis » (mediane), ou None."""
+    n = _voix_lue().get("niveau")
+    return float(n) if isinstance(n, (int, float)) and n > 0 else None
+
+
+def noms_appris():
+    """Comment la transcription a ecrit ton « Jarvis » pendant l'apprentissage."""
+    return [str(x) for x in _voix_lue().get("noms") or [] if x][:24]
 
 
 def oublier_gabarits_auto():
@@ -4566,16 +4586,21 @@ def micro_des_gabarits():
         return ""
 
 
-def sauver_gabarits(gabarits, garder_auto=False):
+def sauver_gabarits(gabarits, garder_auto=False, niveau=None, noms=None):
     """`garder_auto` : une facon de plus ; sinon (tout reappris : une autre
-    voix, un autre micro), ce qu'il avait garde seul s'en va aussi."""
+    voix, un autre micro), ce qu'il avait garde seul s'en va aussi. `niveau`,
+    `noms` : ton niveau de voix et les orthographes de ton « Jarvis » (gardes
+    s'ils ne sont pas donnes et qu'on ajoute)."""
+    ancien = _voix_lue() if garder_auto else {}
     auto = gabarits_auto() if garder_auto else []
+    noms = list(dict.fromkeys(list(noms or []) + (list(ancien.get("noms") or []) if garder_auto else [])))[:24]
     os.makedirs(dossier_jarvis(), exist_ok=True)
     chemin = _fichier_gabarits()
     with open(chemin + ".part", "w", encoding="utf-8") as f:
         # le micro avec lequel on l'a appris : un autre micro entend une autre voix
         json.dump({"gabarits": gabarits, "auto": auto, "appris_le": time.strftime("%Y-%m-%d %H:%M"),
-                   "micro": str(JARVIS.get("micro") or "")}, f)
+                   "micro": str(JARVIS.get("micro") or ""),
+                   "niveau": niveau if niveau else ancien.get("niveau"), "noms": noms}, f)
     os.replace(chemin + ".part", chemin)
 
 
@@ -5284,8 +5309,12 @@ def _commande_oreille(port, secret):
 
 def config_oreille(cfg):
     auto = bool(cfg.get("jarvis_auto_etalonnage", True))
-    return {"cmd": "config", "gabarits": gabarits_jarvis() + (gabarits_auto() if auto else []),
+    manuels = gabarits_jarvis()
+    return {"cmd": "config", "gabarits": manuels + (gabarits_auto() if auto else []),
             "auto": auto,
+            # CALE SUR TA VOIX : la distance typique entre tes « Jarvis », et leur niveau
+            "seuil_perso": _jv.seuil_personnel(manuels),
+            "niveau_voix": niveau_voix_appris(),
             "tolerant": bool(cfg.get("jarvis_tolerant", True)),
             "sensibilite": float(cfg.get("jarvis_sensibilite", 0.5)),
             "hey": bool(cfg.get("jarvis_hey", True)),
@@ -5428,6 +5457,12 @@ def traiter_evenement(ev):
             JARVIS["micro_absent"] = not ev.get("trouve", True)
             if JARVIS["micro_absent"]:
                 print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
+    elif quoi == "essai":
+        # L'INDICATEUR DE DETECTION : chaque mot proche de « Jarvis », sa
+        # distance, les deux seuils, et ce qui en est sorti
+        e = {"d": ev.get("d"), "issue": ev.get("issue"), "direct": ev.get("direct"),
+             "verifie": ev.get("verifie"), "t": time.time()}
+        JARVIS["essais"] = (list(JARVIS.get("essais") or []) + [e])[-12:]
     elif quoi == "presque":
         # « Jarvis » passe pres du seuil sans le franchir : on le garde pour
         # l'afficher, avec de quoi y remedier.
@@ -5504,10 +5539,14 @@ def verifier_appel(wav64):
     try:
         if etat_dictee()["etat"] == "pret":
             texte = transcrire(base64.b64decode(wav64))
-            ok = _jv.contient_nom(texte)
+            ok = _jv.contient_nom(texte, noms_appris())
     except Exception as e:
         print("Jarvis : verification impossible (%s)" % type(e).__name__)
     print("Jarvis : appel pas net %s" % ("confirme" if ok else "ecarte"))
+    for e in reversed(JARVIS.get("essais") or []):
+        if e.get("issue") == "verifier":
+            e["issue"] = "confirme" if ok else "ecarte"
+            break
     envoyer_oreille({"cmd": "verifie", "ok": ok})
     return ok
 
@@ -5516,7 +5555,7 @@ def garder_facons(transcription):
     """Les facons de l'appeler en attente ne sont gardees que si on a
     vraiment dit son nom dans cette phrase."""
     attente, JARVIS["auto_en_attente"] = list(JARVIS.get("auto_en_attente") or []), []
-    if not attente or not _jv.contient_nom(transcription):
+    if not attente or not _jv.contient_nom(transcription, noms_appris()):
         return 0
     n = 0
     for v in attente:
@@ -7836,7 +7875,7 @@ def apprendre_a_voix_haute(cfg):
     return ok
 
 
-GABARITS_PLAFOND = 12         # au-dela, chaque mot entendu coute trop a comparer
+GABARITS_PLAFOND = 20         # au-dela, chaque mot entendu coute trop a comparer
 # « L'APPELER AVEC BEAUCOUP DE TONS DIFFERENTS », et « plus de tests pour que
 # ma voix soit reconnue le plus justement possible ». Cinq fois normalement
 # (le noyau de la voix : voir choisir_gabarits dans jarvis.py), puis les tons
@@ -7848,29 +7887,62 @@ TONS_APPRENTISSAGE = (
     "Plus bas, en passant, comme dans une phrase : « ...jarvis... »",
 )
 N_NORMAUX = sum(1 for t in TONS_APPRENTISSAGE if t is None)
+# « PLUS DE FACONS DE CALIBRER, pour reconnaitre les differents types de Jarvis
+# que je peux dire » : « Calibrer encore » ajoute ces cinq-la aux autres.
+TONS_CALIBRATION = (
+    "Comme d'habitude, sans y penser",
+    "Au milieu d'une phrase : « ... et Jarvis ... »",
+    "Fatigue, a moitie articule",
+    "D'un peu plus loin du micro",
+    "Vite et sec : « Jarvis ! »",
+)
+_MOTS_COURANTS = {"bonjour", "merci", "voila", "alors", "ouais", "bien", "donc", "cest", "quoi", "comment"}
 
 
-def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False):
+def _lire_nom(ev):
+    """Comment la transcription ecrit ce « Jarvis » -- le son sert a ca et
+    n'est garde nulle part."""
+    try:
+        if ev.get("wav") and etat_dictee()["etat"] == "pret":
+            return [m for m in _jv.noms_entendus(transcrire(base64.b64decode(ev["wav"])))
+                    if m not in _MOTS_COURANTS]
+    except Exception as e:
+        print("Jarvis : lecture du nom impossible (%s)" % type(e).__name__)
+    return []
+
+
+def resume_seuils(cfg):
+    """« Ta voix varie de 0,12 : reveil direct jusqu'a 0,05, verifie jusqu'a 0,14. »"""
+    perso = _jv.seuil_personnel(gabarits_jarvis())
+    direct, verifie = _jv.seuils_detection(cfg.get("jarvis_sensibilite", 0.5), perso,
+                                           cfg.get("jarvis_tolerant", True))
+    return ("%sreveil direct jusqu'a %.2f, verifie jusqu'a %.2f" % (
+        "ta voix varie de %.2f : " % perso if perso else "", direct, verifie)).replace(".", ",")
+
+
+def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False, tons=None):
     """« Jarvis », huit fois, dit par la personne -- cinq fois a plat, puis
     sur les tons de TONS_APPRENTISSAGE : « Jarvis ? » monte et traine, et trois
     « Jarvis » dits a plat ne le reconnaissaient pas (voir GABARIT_SAUT dans
     jarvis.py) ; fort ou bas, c'est la meme chose. A lancer dans un fil.
 
-    `ajouter` : une seule facon de plus, gardee avec celles deja apprises --
-    « Ajouter une facon de l'appeler », pour celle qui ne passe pas."""
+    `ajouter` : des facons de plus, gardees avec celles deja apprises --
+    « Ajouter une facon » (une, celle qui ne passe pas) ou « Calibrer encore »
+    (les tons de TONS_CALIBRATION). Chacune est jugee a part."""
     if not oreille_vivante():
         JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": True,
                                    "message": "Clique d'abord « Activer Jarvis » : il faut le micro."}
         return False
-    appris, essais = [], 0
+    appris, essais, niveaux, noms = [], 0, [], []
     JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": False, "message": ""}
     while len(appris) < total and essais < essais_max:
         essais += 1
-        ton = TONS_APPRENTISSAGE[len(appris)] if len(appris) < len(TONS_APPRENTISSAGE) else None
-        if ajouter:
-            consigne = "Dis-le maintenant, de la facon qu'il ne reconnait pas."
-        elif ton:
+        liste = tons if tons is not None else (() if ajouter else TONS_APPRENTISSAGE)
+        ton = liste[len(appris)] if len(appris) < len(liste) else None
+        if ton:
             consigne = "%s (%d/%d)." % (ton, len(appris) + 1, total)
+        elif ajouter:
+            consigne = "Dis-le maintenant, de la facon qu'il ne reconnait pas."
         else:
             consigne = "Dis « Jarvis » maintenant, comme tu l'appelleras (%d/%d)." % (len(appris) + 1, total)
         JARVIS["apprentissage"].update(n=len(appris), message=consigne)
@@ -7886,6 +7958,9 @@ def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False):
         ev = _GABARIT_RECU["evt"] or {}
         if ev.get("vecteurs"):
             appris.append(ev["vecteurs"])
+            if isinstance(ev.get("niveau"), (int, float)) and ev["niveau"] > 0:
+                niveaux.append(float(ev["niveau"]))
+            noms += _lire_nom(ev)
             poser_led("fait", 0.5)
             time.sleep(0.8)
         else:
@@ -7896,18 +7971,23 @@ def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False):
         poser_led(None)
         JARVIS["apprentissage"].update(fini=True, message="Pas assez d'essais reussis. Reessaie au calme.")
         return False
+    niveau = sorted(niveaux)[len(niveaux) // 2] if niveaux else None
+    ecartes = 0
     if ajouter:
         deja = gabarits_jarvis()
-        # Une facon de plus, mais du meme mot : loin de toutes celles apprises,
+        # Des facons de plus, mais du meme mot : loin de toutes celles apprises,
         # c'est un autre mot (ou un bruit), et il se reveillerait dessus.
-        if deja and min(_jv.distance_gabarit(_jv.normer(g), _jv.normer(appris[0])) for g in deja) > _jv.ESSAI_ECART_MAX:
+        bons = [g for g in appris if not deja or min(
+            _jv.distance_gabarit(_jv.normer(d), _jv.normer(g)) for d in deja) <= _jv.ESSAI_ECART_MAX]
+        ecartes = len(appris) - len(bons)
+        if not bons:
             poser_led("erreur", 1.2)
             JARVIS["apprentissage"].update(
                 fini=True, message="Ca ne ressemble a aucune des facons apprises. Reessaie, "
                                    "ou reapprends tout.")
             return False
-        appris = (deja + appris)[-GABARITS_PLAFOND:]
-        sauver_gabarits(appris, garder_auto=True)
+        appris = (deja + bons)[-GABARITS_PLAFOND:]
+        sauver_gabarits(appris, garder_auto=True, niveau=niveau, noms=noms)
     else:
         # le plus grand groupe coherent des essais normaux, puis tout essai
         # assez proche de lui (voir choisir_gabarits) : un essai rate ne fait
@@ -7920,13 +8000,13 @@ def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=16, ajouter=False):
                                    "entend-il bien ta voix ? Rapproche-toi et reessaie au calme." % ecart)
             return False
         appris = gardes[:GABARITS_PLAFOND]
-        sauver_gabarits(appris)
+        sauver_gabarits(appris, niveau=niveau, noms=noms)
     envoyer_oreille(config_oreille(CFG))
     poser_led("fait", 1.2)
     jouer_son("fait")
-    fin = "Appris (%d facons%s). Dis « Jarvis » pour essayer." % (
-        len(appris), "" if ajouter or not ecartes else ", %d essai%s ecarte%s : du bruit" % (
-            ecartes, "s" if ecartes > 1 else "", "s" if ecartes > 1 else ""))
+    fin = "Appris (%d facons%s) -- %s. Dis « Jarvis » pour essayer." % (
+        len(appris), "" if not ecartes else ", %d essai%s ecarte%s : du bruit" % (
+            ecartes, "s" if ecartes > 1 else "", "s" if ecartes > 1 else ""), resume_seuils(CFG))
     JARVIS["apprentissage"].update(n=total, fini=True, message=fin)
     JARVIS["message"] = message_attente()
     return True
@@ -11119,14 +11199,24 @@ class Panneau:
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
         self.bouton(ligne, "Apprendre ma voix", self.apprendre_jarvis, compact=True).pack(side="left")
+        self.bouton(ligne, "Calibrer encore", self.calibrer_jarvis,
+                    compact=True).pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Ajouter une facon", self.ajouter_facon_jarvis,
                     compact=True).pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Oublier ma voix", self.oublier_jarvis, compact=True).pack(side="left", padx=(8, 0))
         self.txt_jarvis_appris = self.texte(f, "", CRAIE, 9, largeur=500)
         self.txt_jarvis_appris.pack(fill="x", pady=(6, 4))
+        # L'INDICATEUR DE DETECTION : ou tombe chaque « Jarvis » que tu dis
+        self.titre(f, "detection").pack(fill="x", pady=(6, 2))
+        self.indicateur = tk.Canvas(f, height=self.px(58), bg=NUIT, highlightthickness=0)
+        self.indicateur.pack(fill="x")
+        self.txt_indicateur = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_indicateur.pack(fill="x", pady=(2, 6))
         self.var_jarvis_sens = self.reglette(
-            f, "jarvis_sensibilite", "Sensibilite", 0.0, 1.0, 0.05,
-            "Il ne t'entend pas : monte. Il se reveille tout seul : descends.")
+            f, "jarvis_sensibilite", "Facilite de detection", 0.0, 1.0, 0.05,
+            "Plus haut : il te reconnait plus facilement. S'il se reveille tout seul : descends. "
+            "S'applique tout de suite.")
+        self.var_jarvis_sens.trace_add("write", lambda *_: self.sensibilite_en_direct())
 
         self.separateur(f, 12, 8)
         self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
@@ -11351,6 +11441,83 @@ class Panneau:
             return
         threading.Thread(target=apprendre_voix, daemon=True).start()
 
+    def calibrer_jarvis(self):
+        """« Calibrer encore » : cinq autres facons de dire « Jarvis »."""
+        a = JARVIS.get("apprentissage")
+        if a and not a.get("fini"):
+            return
+        if not gabarits_jarvis():
+            return self.apprendre_jarvis()
+        threading.Thread(target=apprendre_voix, kwargs={"total": len(TONS_CALIBRATION), "ajouter": True,
+                                                        "tons": TONS_CALIBRATION}, daemon=True).start()
+
+    def sensibilite_en_direct(self):
+        """La reglette agit tout de suite (l'oreille recoit ses seuils)."""
+        try:
+            self.cfg["jarvis_sensibilite"] = round(float(self.var_jarvis_sens.get()), 2)
+        except Exception:
+            return
+        if getattr(self, "_sens_attente", None):
+            self.root.after_cancel(self._sens_attente)
+
+        def appliquer():
+            self._sens_attente = None
+            sauver_config(self.cfg)
+            envoyer_oreille(config_oreille(self.cfg))
+        self._sens_attente = self.root.after(350, appliquer)
+
+    def peindre_indicateur(self):
+        """Une regle de 0 a 0,30 : en vert, le reveil direct ; en ambre, verifie par
+        transcription ; au-dela, rate. Un point par « Jarvis » entendu (le dernier
+        en gros), a sa distance."""
+        c = getattr(self, "indicateur", None)
+        if c is None or not c.winfo_exists():
+            return
+        essais = list(JARVIS.get("essais") or [])
+        cle = (c.winfo_width(), tuple((e.get("d"), e.get("issue"), e.get("t")) for e in essais),
+               self.cfg.get("jarvis_sensibilite"), self.cfg.get("jarvis_tolerant", True), len(gabarits_jarvis()))
+        if getattr(self, "_indicateur_vu", None) == cle:
+            return
+        self._indicateur_vu = cle
+        perso = _jv.seuil_personnel(gabarits_jarvis())
+        direct, verifie = _jv.seuils_detection(self.cfg.get("jarvis_sensibilite", 0.5), perso,
+                                               self.cfg.get("jarvis_tolerant", True))
+        c.delete("all")
+        W, H = max(c.winfo_width(), self.px(300)), self.px(58)
+        g, dr = self.px(4), W - self.px(4)
+        haut, bas = self.px(14), self.px(34)
+        echelle = 0.30
+        x = lambda d: g + (dr - g) * max(0.0, min(1.0, float(d) / echelle))
+        c.create_rectangle(g, haut, dr, bas, fill=ENCRE, outline="")
+        c.create_rectangle(x(direct), haut, x(verifie), bas, fill="#4A3C18", outline="")
+        c.create_rectangle(g, haut, x(direct), bas, fill="#1D4A36", outline="")
+        police = (self.f_mono, 7)
+        c.create_text(x(direct), bas + self.px(3), text="%.2f" % direct, fill=VIF, font=police, anchor="n")
+        c.create_text(x(verifie), bas + self.px(3), text="%.2f" % verifie, fill=ETOILE, font=police, anchor="n")
+        c.create_text(g, haut - self.px(3), text="REVEIL", fill=VIF, font=police, anchor="sw")
+        c.create_text(x(verifie), haut - self.px(3), text="VERIFIE", fill=ETOILE, font=police, anchor="se")
+        c.create_text(dr, haut - self.px(3), text="RATE", fill=BRUME, font=police, anchor="se")
+        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME}
+        for k, e in enumerate(essais):
+            if e.get("d") is None:
+                continue
+            dernier = k == len(essais) - 1
+            r = self.px(6 if dernier else 3)
+            cx, cy = x(e["d"]), (haut + bas) / 2
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=teinte.get(e.get("issue"), BRUME),
+                          outline=CRAIE if dernier else "")
+        if essais and essais[-1].get("d") is not None:
+            e = essais[-1]
+            quoi = {"reveil": "reveil direct", "confirme": "verifie : c'etait bien toi",
+                    "verifier": "verification en cours...", "ecarte": "verifie : ce n'etait pas « Jarvis »",
+                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)"}
+            texte = "Dernier : %.3f -- %s." % (e["d"], quoi.get(e.get("issue"), e.get("issue")))
+        else:
+            texte = "Dis « Jarvis » : chaque essai apparait ici, a sa distance de ta voix apprise."
+        if perso:
+            texte += " Ta voix varie de %.2f." % perso
+        self.txt_indicateur.configure(text=texte)
+
     def ajouter_facon_jarvis(self):
         a = JARVIS.get("apprentissage")
         if a and not a.get("fini"):
@@ -11529,6 +11696,12 @@ class Panneau:
                   "comprend": "Il transcrit.", "pense": "Il reflechit.",
                   "parle": "Il repond.", "erreur": "Un souci."}
         self.peindre_boutons_jarvis()        # l'icone (menu) peut l'avoir change
+        try:
+            self.peindre_indicateur()
+        except Exception as e:
+            if not getattr(self, "_indicateur_erreur", False):
+                self._indicateur_erreur = True
+                print("Indicateur de detection : %s" % e)
         self.txt_jarvis.configure(
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)

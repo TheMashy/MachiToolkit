@@ -87,11 +87,17 @@ GABARIT_SAUT = 3
 # passe de 0,062 a 0,036 pour un seuil de 0,05 ; le plus proche des vingt-deux
 # mots et phrases voisins reste a 0,065.
 GABARIT_QUEUE = 4
-GABARIT_RACCOURCI_MIN = 8     # trames : en dessous, une variante raccourcie ne compte pas
+# Pas moins de 6 (480 ms) : les « Jarvis » appris font 7 a 10 trames, et a 8
+# (v1.58) plus aucune variante ne passait -- « Jarvis baisse le son » d'une
+# traite n'etait plus reconnu (0,107). A 6, mesure (espeak, six tons appris) :
+# les « Jarvis » dans une phrase entre 0,033 et 0,086 ; le plus proche des
+# vingt et un mots voisins a 0,077, loin du reveil direct (0,05).
+GABARIT_RACCOURCI_MIN = 6     # trames : en dessous, une variante raccourcie ne compte pas
 PRESQUE_FACTEUR = 1.7         # jusqu'ou un mot « presque reconnu » est signale
 # UN MOT, PAS UN BRUIT : sur la duree du gabarit, au moins tant de trames de
 # vraie parole (un clic, une porte, un clavier en donnent une ou deux).
 TRAMES_VOISEES_MIN = 3
+ESSAI_SIGNALE_MAX = 0.4       # au-dela, ce n'etait pas un « Jarvis » du tout : l'indicateur se tait
 FENETRE_FACTEUR = 2.2
 # L'ETALONNAGE AU FIL DE L'EAU. Un appel rate de peu (« Jarvis ? »... puis
 # « JARVIS ! » qui passe) ou reconnu de justesse est une facon de l'appeler
@@ -132,6 +138,48 @@ TOLERANCE_HEY = 0.5
 TOLERANCE_ATTENTE = 4           # trames : un « presque » attend de voir s'il devient net
 PAROLE_DOUCE_FACTEUR = 1.8      # un « jarvis » dit bas compte aussi comme de la parole
 PAROLE_DOUCE_MIN = 150.0
+
+
+# « JARVIS GALERE VRAIMENT A RECONNAITRE MA VOIX. » Les seuils ci-dessus ont
+# ete cales sur des voix de synthese, tres regulieres : leurs « Jarvis »
+# s'ecartent de 0,02. Une vraie voix, d'un essai a l'autre, s'ecarte de 0,10 a
+# 0,15 -- et la plupart de ses « Jarvis » tombaient hors de tout. Le seuil se
+# cale donc sur TA voix : pour chaque « Jarvis » appris, la distance au plus
+# proche des autres (ce qu'un nouvel essai aura, a peu pres) ; on en prend le
+# haut (80e centile), avec une marge.
+SEUIL_VERIFIE_MIN = 0.04
+SEUIL_VERIFIE_MAX = 0.22
+SEUIL_DIRECT_MAX = 0.08
+SEUIL_DEFAUT = 0.08            # sans voix apprise
+
+
+def seuil_personnel(gabarits):
+    """La distance typique entre deux de tes « Jarvis » (80e centile des
+    plus-proches-voisins, x 1,15) ; None s'il y en a moins de trois."""
+    gs = [normer(g) for g in gabarits or [] if len(g) >= GABARIT_MIN]
+    if len(gs) < 3:
+        return None
+    proches = sorted(min(distance_gabarit(gs[j], gs[i]) for j in range(len(gs)) if j != i)
+                     for i in range(len(gs)))
+    k = min(len(proches) - 1, int(round(0.8 * (len(proches) - 1))))
+    return round(proches[k] * 1.15, 4)
+
+
+def seuils_detection(sensibilite, perso=None, tolerant=True):
+    """(direct, verifie) : sous `direct`, il se reveille tout de suite ; jusqu'a
+    `verifie`, il ecoute en silence et verifie par transcription. Avec ta voix
+    apprise, la zone verifiee va de 0,75 a 1,5 fois ta distance typique selon
+    la sensibilite ; le reveil direct reste prudent (au plus 0,08)."""
+    s = max(0.0, min(1.0, float(sensibilite)))
+    verifie = seuil_gabarit(s) * TOLERANCE_FACTEUR
+    if perso:
+        verifie = max(verifie, float(perso) * (0.75 + 0.75 * s))
+    verifie = max(SEUIL_VERIFIE_MIN, min(SEUIL_VERIFIE_MAX, verifie))
+    direct = min(SEUIL_DIRECT_MAX, max(seuil_gabarit(s), 0.45 * verifie))
+    if not tolerant:
+        direct = min(SEUIL_DIRECT_MAX, max(direct, 0.6 * verifie))
+        return round(direct, 4), round(direct, 4)
+    return round(direct, 4), round(max(direct, verifie), 4)
 
 
 def seuil_hey(sensibilite, actif=True):
@@ -290,7 +338,10 @@ class Detecteur:
         self.repos_jusqua = 0
         self.derniere_parole = -999
         self.plus_proche = None       # la distance du dernier mot compare, pour « presque »
+        self.compare_n = -1           # la trame ou elle a ete mesuree
         self.tolerance = TOLERANCE_FACTEUR     # 0 : pas de zone tolerante
+        self.seuil_verifie = self.seuil * TOLERANCE_FACTEUR
+        self.niveau_appris = None     # le niveau de ta voix quand tu as dit « Jarvis » (mediane)
         self.en_doute = None          # (trame, genre, score) : un appel pas net, en attente
         self.derniere_parole_douce = -999
         self.long_proche = 12         # la longueur (en trames) du gabarit le plus proche
@@ -325,10 +376,13 @@ class Detecteur:
         return sum(1 for r in zone if self.parle(r)) >= minimum
 
     def parle(self, rms):
-        return rms > max(PAROLE_FACTEUR * (self.plancher or PAROLE_MIN), PAROLE_MIN)
+        # le plancher absolu se cale sur TON micro : un micro faible ne passait jamais 300
+        mini = min(PAROLE_MIN, 0.45 * self.niveau_appris) if self.niveau_appris else PAROLE_MIN
+        return rms > max(PAROLE_FACTEUR * (self.plancher or mini), mini)
 
     def parle_doucement(self, rms):
-        return rms > max(PAROLE_DOUCE_FACTEUR * (self.plancher or PAROLE_DOUCE_MIN), PAROLE_DOUCE_MIN)
+        mini = min(PAROLE_DOUCE_MIN, 0.25 * self.niveau_appris) if self.niveau_appris else PAROLE_DOUCE_MIN
+        return rms > max(PAROLE_DOUCE_FACTEUR * (self.plancher or mini), mini)
 
     def _doute(self, genre, score, meilleur_si_plus_petit=True):
         """Un appel pas net : on garde le meilleur, il sera rendu s'il ne
@@ -396,6 +450,7 @@ class Detecteur:
             if d < meilleur:
                 meilleur, self.long_proche, self.queue_proche = d, len(g), queue
         self.plus_proche = meilleur if meilleur < 9.0 else None
+        self.compare_n = self.n           # plus_proche vaut pour CETTE trame
         # un mot a une duree : assez de trames de parole sur la longueur du gabarit
         niv = list(self.niveaux)[-(self.long_proche + 2):]
         voise = sum(1 for r in niv if self.parle(r)) >= TRAMES_VOISEES_MIN
@@ -404,8 +459,7 @@ class Detecteur:
             self.repos_jusqua = self.n + 25
             self.en_doute = None
             return ("voix", meilleur)
-        if self.tolerance and voise_doux and meilleur <= min(self.seuil * self.tolerance,
-                                                             max(self.seuil, TOLERANCE_PLAFOND)):
+        if self.tolerance and voise_doux and meilleur <= self.seuil_verifie:
             self._doute("voix", meilleur)
         return self._rendre_doute()
 
@@ -694,16 +748,31 @@ def _distance_mots(a, b):
     return prec[-1]
 
 
-def contient_nom(texte):
+def noms_entendus(transcription):
+    """Comment le moteur de transcription a ecrit ton « Jarvis » pendant
+    l'apprentissage : les mots (colles deux a deux aussi) qu'on acceptera
+    ensuite comme ton nom -- sauf les tout petits mots."""
+    mots = [normaliser(m).replace("'", "").strip(" -") for m in str(transcription or "").split()]
+    mots = [m for m in mots if m]
+    paires = [a + b for a, b in zip(mots, mots[1:]) if len(a) >= 3 and len(b) >= 3]
+    return [m for m in mots + paires if 4 <= len(m) <= 12]
+
+
+def contient_nom(texte, noms=()):
     """La transcription contient-elle « Jarvis », meme ecorche (« Jervis »,
-    « Charvis », « Jarvi », « jar vis ») ? Sert a confirmer un appel pas net."""
+    « Charvis », « Jarvi », « jar vis »), ou tel que le moteur l'a ecrit
+    quand tu l'as appris (`noms`) ? Sert a confirmer un appel pas net."""
     mots = [normaliser(m).replace("'", "") for m in str(texte or "").split()]
     mots = [m.strip(" -") for m in mots if m.strip(" -")]
     candidats = mots + [a + b for a, b in zip(mots, mots[1:])]
+    appris = {str(n) for n in noms or () if n}
     for m in candidats:
-        if _EVEIL.match(m):
+        if _EVEIL.match(m) or m in appris:
             return True
-        if 4 <= len(m) <= 9 and _distance_mots(m, "jarvis") <= 2 and m[0] in "jgcdzs":
+        # ... et son squelette : un « r » et un « v » (« j'avais », a deux
+        # lettres de « jarvis », n'en est pas un)
+        if 4 <= len(m) <= 9 and _distance_mots(m, "jarvis") <= 2 and m[0] in "jgcdzs" \
+                and "r" in m and ("v" in m or "w" in m):
             return True
     return False
 
@@ -1524,8 +1593,7 @@ class Synthese:
             entrees["sid"] = np.array([self.locuteur if locuteur is None else int(locuteur)],
                                       dtype=np.int64)
         son = self.session.run(None, entrees)[0].reshape(-1)
-        crete = max(0.01, float(np.max(np.abs(son))))
-        return np.clip(son * (32767.0 / crete), -32768, 32767).astype(np.int16)
+        return son_propre(son)
 
     def phrases(self, texte, lenteur=1.0, **kw):
         """Genere le son phrase par phrase : on joue la premiere pendant que
@@ -1716,8 +1784,7 @@ class SyntheseKokoro:
         son = self.session.run(None, {self.entree: np.array([[0] + ids + [0]], dtype=np.int64),
                                       "style": style,
                                       "speed": np.array([vitesse], dtype=np.float32)})[0].reshape(-1)
-        crete = max(0.01, float(np.max(np.abs(son))))
-        return np.clip(son * (32767.0 / crete), -32768, 32767).astype(np.int16)
+        return son_propre(son)
 
     def phrases(self, texte, lenteur=1.0, **kw):
         for ph in self.phonemiseur.phrases(texte):
@@ -2265,6 +2332,7 @@ class Oreille:
         self.candidat = None          # l'appel rate de peu le plus recent
         self.auto_attente = []        # les facons de l'appeler a garder si la conversation est reelle
         self.doute = None             # un appel pas net, que Machi Tool verifie : {"n", "fin", "ev"}
+        self.essai = None             # le plus proche de « Jarvis » dans ce qui se dit en ce moment
 
     def _arreter_parole(self):
         self.parole = False
@@ -2302,9 +2370,13 @@ class Oreille:
         self.reglages.update({k: v for k, v in r.items() if k != "cmd"})
         self.det.gabarits = [normer(g) for g in self.reglages.get("gabarits") or []
                              if len(g) >= GABARIT_MIN]
-        self.det.seuil = seuil_gabarit(self.reglages.get("sensibilite", 0.5))
+        tolerant = self.reglages.get("tolerant", True)
+        self.det.seuil, self.det.seuil_verifie = seuils_detection(
+            self.reglages.get("sensibilite", 0.5), self.reglages.get("seuil_perso"), tolerant)
         self.det.seuil_hey = seuil_hey(self.reglages.get("sensibilite", 0.5), self.reglages.get("hey", True))
-        self.det.tolerance = TOLERANCE_FACTEUR if self.reglages.get("tolerant", True) else 0
+        self.det.tolerance = TOLERANCE_FACTEUR if tolerant else 0
+        n = self.reglages.get("niveau_voix")
+        self.det.niveau_appris = float(n) if isinstance(n, (int, float)) and n > 0 else None
 
     def commande(self, c):
         cmd = (c or {}).get("cmd")
@@ -2345,6 +2417,12 @@ class Oreille:
             # quand on appelle Jarvis pour de vrai. Le signal est visuel.
             self.appris = {"emps": [], "niveaux": [], "t": 0.0, "parole": False, "silence": 0.0}
             self.etat = "apprendre"
+
+    def _signaler_essai(self, d, issue, par="voix"):
+        self.essai = None
+        self.sortie({"evt": "essai", "d": None if d is None else round(float(d), 4), "issue": issue,
+                     "par": par.replace("_a_verifier", ""), "direct": round(float(self.det.seuil), 4),
+                     "verifie": round(float(self.det.seuil_verifie), 4)})
 
     def _verdict(self, ok):
         d, self.doute = self.doute, None
@@ -2387,9 +2465,10 @@ class Oreille:
         if not self.reglages.get("auto", True):
             return []
         out = []
-        c = self.candidat
-        if c is not None and c.get("v") is not None and 3 < self.det.n - c["n"] <= AUTO_RATE_TRAMES:
-            out.append(c)
+        for c in (self.candidat, getattr(self, "candidat_avant", None)):
+            if c is not None and c.get("v") is not None and 3 < self.det.n - c["n"] <= AUTO_RATE_TRAMES:
+                out.append(c)
+                break
         if ev[0] == "hey" or ev[1] > AUTO_JUSTESSE * self.det.seuil:
             out.append(self._prendre(self._a_prendre() if ev[0] == "voix" else
                                      {"long": self.det.longueur_mot(), "prise": self.det.n, "v": None}))
@@ -2405,10 +2484,16 @@ class Oreille:
         # du seuil sans le franchir, on le dit -- un NOMBRE, rien d'autre ne
         # sort d'ici avant l'eveil. Machi Tool l'affiche : monter la
         # sensibilite, ou reapprendre avec ce micro.
-        d = getattr(self.det, "plus_proche", None)
+        # (seulement si elle vient d'etre mesuree : dans le silence, la derniere
+        # distance reste en place, et un silence n'est pas un « presque »)
+        d = self.det.plus_proche if getattr(self.det, "compare_n", self.det.n) == self.det.n else None
         if ev is None and d is not None and self.etat == "veille" and d < self.det.seuil * PRESQUE_FACTEUR:
             # le meilleur « presque » de ce moment-ci ; un nouveau moment le remplace
             c = self.candidat
+            if c is not None and self.det.n - c["n"] > 12:
+                # un nouveau moment : le precedent reste en memoire (le mot qui
+                # passe enfin peut lui-meme frôler le seuil juste avant)
+                self.candidat_avant = c
             if c is None or self.det.n - c["n"] > 12 or d < c["d"]:
                 # la fin du mot arrive encore (reconnu sans sa queue) : on la prendra
                 self.candidat = self._a_prendre()
@@ -2419,6 +2504,17 @@ class Oreille:
                              "seuil": round(float(self.det.seuil), 4)})
         if self.doute is not None and self.det.n - self.doute["n"] > 90:
             self._verdict(False)          # pas de reponse de Machi Tool : on laisse tomber
+        # L'INDICATEUR DE DETECTION : a chaque mot entendu, a quelle distance de
+        # ton « Jarvis » il etait, et ce qui en est sorti -- des nombres, rien d'autre.
+        if self.etat == "veille" and ev is None:
+            if d is not None and d < ESSAI_SIGNALE_MAX:
+                self.essai = d if self.essai is None else min(self.essai, d)
+            elif self.essai is not None and self.det.n - self.det.derniere_parole_douce > GABARIT_FIN + 4:
+                self._signaler_essai(self.essai, "rate")
+        elif ev is not None:
+            genre = ev[0]
+            self._signaler_essai(ev[1] if genre.startswith("voix") else self.essai,
+                                 "verifier" if genre.endswith("_a_verifier") else "reveil", genre)
         if ev is not None:
             self._arreter_parole()
             doute = ev[0].endswith("_a_verifier")
@@ -2426,7 +2522,7 @@ class Oreille:
             if self.reglages.get("son", True) and not doute:
                 self.jouer("eveil")
             self.auto_attente = self._facons_a_garder(ev)
-            self.candidat = None
+            self.candidat = self.candidat_avant = None
             avant = self.det.son_d_avant()
             self.phrase = Phrase(self.det.parle, avant=avant[:-TRAME] if len(avant) > TRAME else None,
                                  deja_dit=self.det.parlait_avant(),
@@ -2498,7 +2594,12 @@ class Oreille:
                 if g is None:
                     self.sortie({"evt": "gabarit", "erreur": "trop court ou trop long -- dis juste « Jarvis »"})
                 else:
-                    self.sortie({"evt": "gabarit", "vecteurs": g})
+                    # le niveau de ta voix (les portes de parole s'y calent) et le
+                    # son de ce « Jarvis », pour lire comment la transcription
+                    # l'ecrit -- tu l'apprends toi-meme, rien n'est garde du son
+                    voix = sorted(r for r in a["niveaux"] if self.det.parle_doucement(r)) or [0.0]
+                    self.sortie({"evt": "gabarit", "vecteurs": g, "niveau": round(voix[len(voix) // 2], 1),
+                                 "wav": base64.b64encode(wav_de(self.det.son_d_avant())).decode("ascii")})
         # « FAIRE REAGIR LE LISTENING A LA VOIX » : pendant qu'il t'ecoute (apres
         # l'eveil seulement), le niveau de ta voix, a chaque trame -- un nombre.
         if self.etat == "phrase" and self.phrase is not None:
@@ -2622,9 +2723,43 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
 #  pendant que la suivante se calcule. « Stop » coupe au dixieme de seconde.
 # ======================================================================
 
+# « LE TTS GRESILLE. » Trois causes, trois remedes :
+#   - chaque phrase etait normalisee a 100 % de la pleine echelle : Windows la
+#     reechantillonne vers la frequence de la carte son (48 kHz), les cretes
+#     entre les echantillons depassent, et ca ecrete -> on vise 80 % ;
+#   - une phrase commencait et finissait net : un clic a chaque bord -> un
+#     fondu de quelques millisecondes ;
+#   - le tampon du haut-parleur etait petit : pendant que la phrase suivante se
+#     calcule, il se vidait (craquement) -> un tampon de 150 ms.
+VOIX_CRETE = 0.8
+VOIX_FONDU_S = 0.008
+HAUT_PARLEUR_TAMPON_S = 0.15
+
+
+def son_propre(son, frequence=None):
+    """Un son de synthese (float) -> int16 a 80 % de la pleine echelle, avec un
+    fondu d'entree et de sortie."""
+    import numpy as np
+    son = np.asarray(son, dtype=np.float32).reshape(-1)
+    if not len(son):
+        return np.zeros(0, dtype=np.int16)
+    crete = max(0.01, float(np.max(np.abs(son))))
+    son = son * (VOIX_CRETE * 32767.0 / crete)
+    n = min(len(son) // 2, max(1, int(VOIX_FONDU_S * (frequence or 24000))))
+    rampe = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    son[:n] *= rampe
+    son[len(son) - n:] *= rampe[::-1]
+    return np.clip(np.round(son), -32768, 32767).astype(np.int16)
+
+
 def haut_parleur_windows(frequence):
     import soundcard as sc
-    return sc.default_speaker().player(samplerate=frequence, channels=1)
+    haut = sc.default_speaker()
+    try:
+        return haut.player(samplerate=frequence, channels=1,
+                           blocksize=max(1024, int(frequence * HAUT_PARLEUR_TAMPON_S)))
+    except TypeError:                     # une version de soundcard sans blocksize
+        return haut.player(samplerate=frequence, channels=1)
 
 
 class Bouche:
@@ -2692,7 +2827,7 @@ class Bouche:
                 # temps elle dure -- Machi Tool l'ecrit au meme rythme dans le panneau
                 self.sortie({"evt": "dit", "id": ident, "phrase": en_cours,
                              "duree": round(len(son) / float(syn.frequence), 3)})
-                son = np.concatenate([son, np.zeros(int(self.silence * self.syn.frequence), np.int16)])
+                son = np.concatenate([son, np.zeros(int(self.silence * syn.frequence), np.int16)])
                 for i in range(0, len(son), pas):
                     if self.couper.is_set():
                         coupe = True
