@@ -2587,3 +2587,206 @@ def creer_dossier(chemin, protegees=()):
         return "Il existe deja : %s" % chemin
     os.makedirs(chemin)
     return "Cree : %s" % chemin
+
+
+# ======================================================================
+#   CE QU'IL RETIENT DE TOI, CE QUE TU AS VU SUR LE WEB
+# ======================================================================
+#
+# « Il faudrait que Jarvis retienne des preferences, et qu'il ait acces a
+# l'historique pour retrouver une video ou un lien, ou qu'il puisse faire une
+# recherche internet sur Google Chrome. »
+#
+# LES PREFERENCES : des phrases courtes qu'il retient quand on le lui demande
+# (« retiens que je prefere les reponses courtes »). Elles vivent dans la
+# config, sur le poste, et partent avec chaque question a Jarvis -- c'est ce
+# qui les lui fait connaitre. Reglages > Jarvis les montre et les efface.
+#
+# L'HISTORIQUE : lu SUR LE POSTE, a la demande seulement, dans une copie
+# temporaire effacee aussitot. Ce qui part a Jarvis, ce sont les quelques pages
+# qui correspondent a la recherche (dix au plus) -- jamais l'historique entier.
+# Rien n'est garde. Les parametres d'adresse qui ressemblent a des jetons
+# (token, session, code...) sont retires avant de partir.
+
+PREFERENCES_MAX = 40
+PREFERENCE_LONGUEUR = 200
+_MOTS_VIDES = frozenset(
+    "le la les l de d des du un une et en a au aux sur pour avec que qui ce cette ces mon ma mes "
+    "the an of on in to for and my".split())
+
+
+def _mots(texte):
+    return [m for m in normaliser(texte).replace("'", " ").split() if m not in _MOTS_VIDES]
+
+
+def ajouter_preference(liste, texte):
+    """Rend la liste avec la preference en dernier (sans doublon, 40 au plus :
+    la plus ancienne s'en va)."""
+    t = " ".join(str(texte or "").split())[:PREFERENCE_LONGUEUR]
+    if not _mots(t):
+        raise ValueError("preference vide")
+    liste = [p for p in (liste or []) if normaliser(p) != normaliser(t)]
+    return (liste + [t])[-PREFERENCES_MAX:]
+
+
+def retirer_preference(liste, texte="", tout=False):
+    """Rend (liste restante, preferences retirees). La designation est quelques
+    mots : on retire celle(s) qui en partagent le plus, s'il y en a assez."""
+    liste = list(liste or [])
+    if tout:
+        return [], liste
+    cible = set(_mots(texte))
+    if not cible:
+        return liste, []
+    scores = [len(cible & set(_mots(p))) / len(cible) for p in liste]
+    meilleur = max(scores, default=0)
+    if meilleur < 0.5:
+        return liste, []
+    retirees = [p for p, s in zip(liste, scores) if s == meilleur]
+    return [p for p, s in zip(liste, scores) if s != meilleur], retirees
+
+
+_EPOQUE_CHROME = 11644473600          # secondes entre 1601 (Chrome) et 1970
+
+
+def fichiers_historique(env=None):
+    """Les historiques des navigateurs du poste : [(navigateur, genre, chemin)]."""
+    env = os.environ if env is None else env
+    local, roaming = env.get("LOCALAPPDATA", ""), env.get("APPDATA", "")
+    out = []
+    for nom, parties in (("Chrome", ("Google", "Chrome")), ("Edge", ("Microsoft", "Edge")),
+                         ("Brave", ("BraveSoftware", "Brave-Browser"))):
+        base = os.path.join(local, *parties, "User Data") if local else ""
+        if not base or not os.path.isdir(base):
+            continue
+        for profil in sorted(os.listdir(base)):
+            f = os.path.join(base, profil, "History")
+            if (profil == "Default" or profil.startswith("Profile ")) and os.path.isfile(f):
+                out.append((nom, "chromium", f))
+    ff = os.path.join(roaming, "Mozilla", "Firefox", "Profiles") if roaming else ""
+    if ff and os.path.isdir(ff):
+        for profil in sorted(os.listdir(ff)):
+            f = os.path.join(ff, profil, "places.sqlite")
+            if os.path.isfile(f):
+                out.append(("Firefox", "firefox", f))
+    return out
+
+
+def lire_historique(genre, chemin, depuis, plafond=50000):
+    """[(url, titre, quand)] depuis `depuis` (secondes, epoque Unix). Le
+    navigateur tient le fichier ouvert : on lit une copie, dans un dossier
+    temporaire efface en sortant."""
+    import shutil
+    import sqlite3
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="machi-") as d:
+        copie = os.path.join(d, "h.sqlite")
+        shutil.copyfile(chemin, copie)
+        if os.path.isfile(chemin + "-wal"):
+            shutil.copyfile(chemin + "-wal", copie + "-wal")
+        con = sqlite3.connect(copie)
+        try:
+            if genre == "chromium":
+                lignes = con.execute(
+                    "SELECT url, title, last_visit_time FROM urls WHERE last_visit_time >= ? "
+                    "ORDER BY last_visit_time DESC LIMIT ?",
+                    (int((depuis + _EPOQUE_CHROME) * 1000000), plafond)).fetchall()
+                return [(u, t or "", q / 1e6 - _EPOQUE_CHROME) for u, t, q in lignes]
+            lignes = con.execute(
+                "SELECT url, title, last_visit_date FROM moz_places WHERE last_visit_date >= ? "
+                "ORDER BY last_visit_date DESC LIMIT ?", (int(depuis * 1000000), plafond)).fetchall()
+            return [(u, t or "", q / 1e6) for u, t, q in lignes]
+        finally:
+            con.close()
+
+
+_PARAM_SECRET = re.compile(r"token|session|sess|auth|code|key|sig|secret|pass|pwd|ticket|otp|jwt", re.I)
+
+
+def adresse_propre(url):
+    """L'adresse sans son ancre, ni les parametres qui ressemblent a des secrets."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    try:
+        p = urlsplit(url)
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _PARAM_SECRET.search(k)]
+        return urlunsplit((p.scheme, p.netloc, p.path, urlencode(q), ""))[:400]
+    except ValueError:
+        return url[:400]
+
+
+def _quand(t, maintenant):
+    import datetime
+    jours = (datetime.date.fromtimestamp(maintenant) - datetime.date.fromtimestamp(t)).days
+    if jours <= 0:
+        return "aujourd'hui"
+    if jours == 1:
+        return "hier"
+    if jours < 60:
+        return "il y a %d jours" % jours
+    return time.strftime("%d/%m/%Y", time.localtime(t))
+
+
+def chercher_historique(recherche, fichiers, jours=90, plafond=10, maintenant=None):
+    """Les pages dont le titre ou l'adresse contient tous les mots (ou tous
+    sauf un, a defaut), les plus recentes d'abord. Rend un texte pour Jarvis."""
+    mots = _mots(recherche)
+    if not mots:
+        raise ValueError("rien a chercher")
+    if not fichiers:
+        return "Aucun historique de navigateur trouve sur ce PC (Chrome, Edge, Brave, Firefox)."
+    maintenant = time.time() if maintenant is None else maintenant
+    jours = max(1, min(3650, int(jours or 90)))
+    depuis = maintenant - jours * 86400
+    trouves, lus, rates = {}, [], []
+    for nav, genre, chemin in fichiers:
+        try:
+            lignes = lire_historique(genre, chemin, depuis)
+        except Exception:
+            rates.append(nav)
+            continue
+        if nav not in lus:
+            lus.append(nav)
+        for url, titre, quand in lignes:
+            if not str(url).startswith(("http://", "https://")):
+                continue
+            botte = normaliser(titre + " " + url.split("://", 1)[-1].replace("/", " ").replace(".", " "))
+            score = sum(1 for m in mots if m in botte)
+            if score and (url not in trouves or quand > trouves[url][2]):
+                trouves[url] = (score, titre, quand, nav)
+    complets = [(u, v) for u, v in trouves.items() if v[0] == len(mots)]
+    partiels = False
+    if not complets and len(mots) > 1:
+        complets = [(u, v) for u, v in trouves.items() if v[0] >= len(mots) - 1]
+        partiels = bool(complets)
+    if not lus:
+        return "Impossible de lire l'historique (%s)." % ", ".join(rates)
+    if not complets:
+        return "Rien dans l'historique (%s, %d derniers jours) pour « %s »." % (
+            ", ".join(lus), jours, " ".join(mots))
+    complets.sort(key=lambda x: -x[1][2])
+    lignes = ["%d page%s trouvee%s (%s, %d derniers jours)%s ; les plus recentes :" % (
+        len(complets), "s" if len(complets) > 1 else "", "s" if len(complets) > 1 else "",
+        ", ".join(lus), jours, ", sans tous les mots" if partiels else "")]
+    for url, (_, titre, quand, nav) in complets[:plafond]:
+        lignes.append("- « %s » -- %s -- %s" % ((titre or "(sans titre)")[:160], _quand(quand, maintenant),
+                                                adresse_propre(url)))
+    return "\n".join(lignes)
+
+
+def lien_permis(url):
+    """Une adresse web qu'on peut ouvrir : http(s), un domaine, pas d'espace."""
+    from urllib.parse import urlsplit
+    u = str(url or "").strip()
+    try:
+        p = urlsplit(u)
+    except ValueError:
+        return False
+    return p.scheme in ("http", "https") and bool(p.netloc) and not re.search(r"\s", u) and len(u) <= 2000
+
+
+def adresse_google(recherche):
+    from urllib.parse import quote_plus
+    q = " ".join(str(recherche or "").split())[:300]
+    if not q:
+        raise ValueError("rien a chercher")
+    return "https://www.google.com/search?q=" + quote_plus(q)

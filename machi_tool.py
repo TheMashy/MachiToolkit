@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.36.0"
+VERSION = "1.37.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -353,6 +353,12 @@ CONFIG_DEFAUT = {
     # « Faire en sorte qu'il n'y ait plus de code d'acces a demander » : il agit
     # directement. Le code reste possible, si on coche la case qui le demande.
     "jarvis_code_actif": False,
+    # CE QU'IL RETIENT DE TOI : des phrases courtes, dictees (« retiens que... »),
+    # envoyees avec chaque question. Reglages > Jarvis les montre et les efface.
+    "jarvis_preferences": [],
+    # L'HISTORIQUE DU NAVIGATEUR, pour retrouver une video ou un lien : lu sur
+    # le poste a la demande ; seules les pages qui correspondent partent.
+    "jarvis_historique": False,
     "jarvis_code_sel": "",
     "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
     "jarvis_voix_kokoro": "jarvis",   # sa voix anglaise, voir VOIX_KOKORO dans jarvis.py
@@ -5773,7 +5779,9 @@ def parler_au_compagnon(texte, cfg):
 # ni transcrite dans un journal, ni envoyee, ni ecrite nulle part. Juste, les
 # mains restent ouvertes dix minutes ; trois faux, elles se ferment cinq.
 
-OUTILS_SANS_CODE = {"musique", "spotify"}
+OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier"}
+# Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
+OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
 VERROU_DUREE_S = 300
 OUTILS_TOURS_MAX = 5
@@ -5860,6 +5868,43 @@ def ouvrir_spotify(recherche):
         return "Spotify ouvert dans le navigateur" + (" sur « %s »." % q if q else ".")
 
 
+def chemin_chrome():
+    """chrome.exe, s'il est installe : le registre (App Paths), puis les
+    emplacements habituels."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        for racine in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(racine, r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+                                    r"\chrome.exe") as k:
+                    p = winreg.QueryValueEx(k, "")[0]
+                    if p and os.path.isfile(p):
+                        return p
+            except OSError:
+                pass
+    except Exception:
+        pass
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"),
+                 os.environ.get("LOCALAPPDATA")):
+        p = os.path.join(base or "", "Google", "Chrome", "Application", "chrome.exe")
+        if base and os.path.isfile(p):
+            return p
+    return None
+
+
+def ouvrir_dans_chrome(url):
+    """Une adresse web dans Chrome (ou, sans Chrome, le navigateur par defaut)."""
+    chrome = chemin_chrome()
+    if chrome:
+        subprocess.Popen([chrome, url], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return "Chrome"
+    import webbrowser
+    webbrowser.open(url)
+    return "le navigateur"
+
+
 def capturer_ecran(numero):
     """UNE capture de l'ecran 1 ou 2, en memoire, reduite (1280 px de large au
     plus) et en JPEG : rendue en base64 pour Jarvis, jamais ecrite sur le
@@ -5885,6 +5930,37 @@ def executer_outil(outil, cfg):
     "image"), ou {"id", "erreur"} -- jamais d'exception."""
     ident, nom, e = outil.get("id"), outil.get("nom"), outil.get("entree") or {}
     try:
+        if nom == "retenir":
+            cfg["jarvis_preferences"] = _jv.ajouter_preference(cfg.get("jarvis_preferences"), e.get("preference"))
+            sauver_config(cfg)
+            return {"id": ident, "texte": "Retenu : %s" % cfg["jarvis_preferences"][-1]}
+        if nom == "oublier":
+            reste, retirees = _jv.retirer_preference(cfg.get("jarvis_preferences"), e.get("preference", ""),
+                                                     tout=bool(e.get("tout")))
+            if not retirees:
+                return {"id": ident, "texte": "Aucune preference retenue ne correspond."}
+            cfg["jarvis_preferences"] = reste
+            sauver_config(cfg)
+            return {"id": ident, "texte": "Oublie : %s" % " ; ".join(retirees)}
+        if not cfg.get("jarvis_pc"):
+            return {"id": ident, "erreur": "Les mains de Jarvis sur le PC sont fermees (Machi Tool > Reglages > Jarvis)."}
+        if nom == "rechercher_google":
+            ou = ouvrir_dans_chrome(_jv.adresse_google(e.get("recherche")))
+            return {"id": ident, "texte": "Recherche Google ouverte dans %s." % ou}
+        if nom == "lien":
+            url = str(e.get("url") or "").strip()
+            if not _jv.lien_permis(url):
+                return {"id": ident, "erreur": "Adresse refusee : seulement une adresse web http(s)."}
+            if e.get("action") == "copier":
+                if not copier_presse_papiers(url):
+                    return {"id": ident, "erreur": "Le presse-papiers n'a pas pu etre rempli."}
+                return {"id": ident, "texte": "Lien copie dans le presse-papiers."}
+            return {"id": ident, "texte": "Ouvert dans %s." % ouvrir_dans_chrome(url)}
+        if nom == "chercher_historique":
+            if not cfg.get("jarvis_historique"):
+                return {"id": ident, "erreur": "L'historique du navigateur n'est pas permis dans Machi Tool."}
+            return {"id": ident, "texte": _jv.chercher_historique(
+                e.get("recherche"), _jv.fichiers_historique(), e.get("jours") or 90)}
         if nom == "musique":
             return {"id": ident, "texte": touche_media(e.get("action"))}
         if nom == "spotify":
@@ -5921,7 +5997,8 @@ def outils_de_jarvis(etat, cfg):
     execute, on renvoie, et Jarvis continue -- cinq tours au plus."""
     L = langue_jarvis(cfg)
     outils = etat["outils"]
-    besoin = [o for o in outils if o.get("nom") not in OUTILS_SANS_CODE]
+    # mains fermees : ces outils seront refuses, inutile de demander le code
+    besoin = [o for o in outils if o.get("nom") not in OUTILS_SANS_CODE] if cfg.get("jarvis_pc") else []
     if besoin and cfg.get("jarvis_code_actif") and not acces_ouvert():
         if time.time() < float(JARVIS.get("verrou_jusqua") or 0):
             refus = "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
@@ -5960,6 +6037,16 @@ def repondre_au_code(texte, cfg):
     return dire(phrase("code_faux", L), suite=True, langue=L)
 
 
+def capacites_jarvis(cfg):
+    """Ce que Jarvis peut faire ici, dit a BrainDebugger a chaque question :
+    ses mains, ses yeux, l'historique -- et ce qu'il retient de toi."""
+    pc = bool(cfg.get("jarvis_pc"))
+    return {"outils": pc, "ecran": pc and bool(cfg.get("jarvis_ecran")),
+            "navigation": pc and bool(cfg.get("jarvis_historique")),
+            "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
+                                             for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
+
+
 def continuer_jarvis(etat, resultats, cfg):
     """Renvoie a BrainDebugger ce que les outils ont fait ; Jarvis continue."""
     L = langue_jarvis(cfg)
@@ -5967,9 +6054,9 @@ def continuer_jarvis(etat, resultats, cfg):
     JARVIS.update(etat="pense", message="Jarvis agit...")
     try:
         donnees = _requete_bd("/api/machitool/jarvis",
-                              {"suite": etat["suite"], "resultats": resultats, "langue": L,
-                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                               "outils": True, "ecran": bool(cfg.get("jarvis_ecran"))}, cfg, 180)
+                              dict({"suite": etat["suite"], "resultats": resultats, "langue": L,
+                                    "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
+                                   **capacites_jarvis(cfg)), cfg, 180)
     except urllib.error.HTTPError as e:
         return signaler_erreur(phrase("bd_erreur", L, e.code))
     except Exception:
@@ -6003,7 +6090,8 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1):
             notifier = JARVIS_CROCHETS.get("notifier")
             if notifier:
                 notifier("Jarvis", "La réponse complète de Claude est dans le presse-papiers.")
-    if donnees.get("outils") and cfg.get("jarvis_pc"):
+    if donnees.get("outils"):
+        # executer_outil refuse lui-meme ce que les reglages ne permettent pas
         if tour > OUTILS_TOURS_MAX:
             return signaler_erreur(phrase("sans_reponse", L))
         return outils_de_jarvis({"texte": texte, "suite": donnees.get("suite") or [],
@@ -6041,11 +6129,9 @@ def parler_a_jarvis(texte, cfg):
     print("Jarvis : question au majordome (%d signes)" % len(texte))
     try:
         donnees = _requete_bd("/api/machitool/jarvis",
-                              {"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
-                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                               "outils": bool(cfg.get("jarvis_pc")),
-                               "ecran": bool(cfg.get("jarvis_pc") and cfg.get("jarvis_ecran"))},
-                              cfg, 180)
+                              dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
+                                    "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
+                                   **capacites_jarvis(cfg)), cfg, 180)
     except urllib.error.HTTPError as e:
         detail = _detail_http(e)
         return signaler_erreur(
@@ -8798,7 +8884,8 @@ class Panneau:
         self.separateur(f, 12, 8)
         self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
         self.texte(f, "Ouvert, Jarvis peut piloter la musique (lecture, pause, piste suivante, volume), "
-                      "ouvrir Spotify sur une recherche, parcourir tes dossiers, chercher un fichier, "
+                      "ouvrir Spotify sur une recherche, ouvrir une recherche Google ou un lien dans "
+                      "Chrome, parcourir tes dossiers, chercher un fichier, "
                       "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
                       "deplacer, ni renommer. Il agit directement, sans code : quiconque l'appelle dans "
                       "la piece peut lui demander tes dossiers. Si tu preferes, coche le code d'acces "
@@ -8812,6 +8899,11 @@ class Panneau:
         self.var_jarvis_ecran = tk.IntVar(value=1 if self.cfg.get("jarvis_ecran") else 0)
         self.case(f, "Et regarder un ecran quand tu le lui demandes (« regarde mon ecran 2 »)",
                   self.var_jarvis_ecran, lambda: self.regler_mains("jarvis_ecran", self.var_jarvis_ecran)).pack(fill="x")
+        self.var_jarvis_historique = tk.IntVar(value=1 if self.cfg.get("jarvis_historique") else 0)
+        self.case(f, "Et chercher dans l'historique du navigateur, pour retrouver une video ou un lien "
+                     "(Chrome, Edge, Brave, Firefox : lu sur le PC, seules les pages trouvees partent)",
+                  self.var_jarvis_historique,
+                  lambda: self.regler_mains("jarvis_historique", self.var_jarvis_historique)).pack(fill="x")
         self.var_jarvis_code_actif = tk.IntVar(value=1 if self.cfg.get("jarvis_code_actif") else 0)
         self.case(f, "Demander un code d'acces avant les dossiers, les fichiers et l'ecran (facultatif)",
                   self.var_jarvis_code_actif,
@@ -8827,6 +8919,16 @@ class Panneau:
         self.txt_code = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_code.pack(fill="x", pady=(4, 0))
         self.afficher_code()
+
+        self.separateur(f, 12, 8)
+        self.titre(f, "ce qu'il retient de toi").pack(fill="x", pady=(0, 4))
+        self.texte(f, "« Jarvis, retiens que je prefere les reponses courtes. » -- « oublie que... ». "
+                      "Ces phrases restent sur le PC et partent avec chaque question a Jarvis : c'est "
+                      "comme ca qu'il s'en souvient. Rien de ton journal n'y entre.",
+                   BRUME, 8, largeur=500).pack(fill="x")
+        self.boite_preferences = tk.Frame(f, bg=NUIT)
+        self.boite_preferences.pack(fill="x", pady=(4, 0))
+        self.remplir_preferences()
 
         self.separateur(f, 12, 8)
         self.titre(f, "ce qu'il fait").pack(fill="x", pady=(0, 4))
@@ -8907,6 +9009,30 @@ class Panneau:
         oublier_voix()
         JARVIS["apprentissage"] = {"n": 0, "total": 4, "fini": True,
                                    "message": "Oublie. Seul « Hey Jarvis » le reveille."}
+
+    def remplir_preferences(self):
+        """Une ligne par preference, avec son bouton « Oublier » ; relue a
+        chaque ouverture de la page (Jarvis en ajoute pendant qu'elle est fermee)."""
+        tk = self.tk
+        for w in self.boite_preferences.winfo_children():
+            w.destroy()
+        prefs = list(self.cfg.get("jarvis_preferences") or [])
+        if not prefs:
+            self.texte(self.boite_preferences, "Rien pour l'instant.", BRUME, 8).pack(fill="x")
+            return
+        for i, p in enumerate(prefs):
+            ligne = tk.Frame(self.boite_preferences, bg=NUIT)
+            ligne.pack(fill="x", pady=(2, 0))
+            self.bouton(ligne, "Oublier", lambda i=i: self.oublier_preference(i), compact=True).pack(side="left")
+            self.texte(ligne, p, CRAIE, 9, largeur=420).pack(side="left", padx=(8, 0))
+        self.bouton(self.boite_preferences, "Tout oublier", lambda: self.oublier_preference(None),
+                    compact=True).pack(anchor="w", pady=(6, 0))
+
+    def oublier_preference(self, i):
+        prefs = list(self.cfg.get("jarvis_preferences") or [])
+        self.cfg["jarvis_preferences"] = [] if i is None else prefs[:i] + prefs[i + 1:]
+        sauver_config(self.cfg)
+        self.remplir_preferences()
 
     def regler_mains(self, cle, var):
         self.cfg[cle] = bool(var.get())
@@ -9012,6 +9138,10 @@ class Panneau:
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)
         details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
+        prefs = tuple(self.cfg.get("jarvis_preferences") or [])
+        if getattr(self, "_prefs_peintes", None) != prefs and hasattr(self, "boite_preferences"):
+            self._prefs_peintes = prefs          # Jarvis vient d'en retenir ou d'en oublier une
+            self.remplir_preferences()
         if JARVIS.get("db") is not None and etat != "eteint":
             details.append("micro %.0f dB" % JARVIS["db"])
         pr = JARVIS.get("presque")

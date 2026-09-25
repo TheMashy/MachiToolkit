@@ -282,6 +282,85 @@ class SesMains(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_les_preferences(self):
+        l = J.ajouter_preference([], "  Préfère   les réponses courtes. ")
+        self.assertEqual(l, ["Préfère les réponses courtes."])
+        l = J.ajouter_preference(l, "Écoute du jazz le soir.")
+        l = J.ajouter_preference(l, "prefere les reponses courtes")          # doublon : remonte en dernier
+        self.assertEqual(len(l), 2)
+        self.assertEqual(l[-1], "prefere les reponses courtes")
+        with self.assertRaises(ValueError):
+            J.ajouter_preference(l, "  le la ")
+        self.assertEqual(len(J.ajouter_preference(["p%d" % i for i in range(40)], "une de plus")), 40)
+        self.assertLessEqual(len(J.ajouter_preference([], "x" * 500)[0]), 200)
+        reste, retirees = J.retirer_preference(l, "le jazz")
+        self.assertEqual(retirees, ["Écoute du jazz le soir."])
+        self.assertEqual(reste, ["prefere les reponses courtes"])
+        self.assertEqual(J.retirer_preference(l, "la météo")[1], [], "rien qui corresponde : rien ne part")
+        self.assertEqual(J.retirer_preference(l, tout=True), ([], l))
+
+    def test_l_historique_des_navigateurs(self):
+        import sqlite3
+        d = tempfile.mkdtemp()
+        try:
+            local, roaming = os.path.join(d, "Local"), os.path.join(d, "Roaming")
+            chrome = os.path.join(local, "Google", "Chrome", "User Data", "Default")
+            profil2 = os.path.join(local, "Google", "Chrome", "User Data", "Profile 2")
+            ff = os.path.join(roaming, "Mozilla", "Firefox", "Profiles", "abc.default")
+            for x in (chrome, profil2, ff, os.path.join(local, "Google", "Chrome", "User Data", "System Profile")):
+                os.makedirs(x)
+            maintenant = time.time()
+            chromium = lambda t: int((t + 11644473600) * 1000000)
+            con = sqlite3.connect(os.path.join(chrome, "History"))
+            con.execute("CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER, "
+                        "last_visit_time INTEGER, hidden INTEGER DEFAULT 0)")
+            con.executemany("INSERT INTO urls (url, title, visit_count, last_visit_time) VALUES (?,?,1,?)", [
+                ("https://www.youtube.com/watch?v=aaa", "Le chat qui joue du piano - YouTube", chromium(maintenant - 3 * 86400)),
+                ("https://www.youtube.com/watch?v=bbb", "Chat piano 2 : le retour - YouTube", chromium(maintenant - 3600)),
+                ("https://exemple.fr/reset?token=SECRET123&page=2#haut", "Piano et chat, réinitialiser", chromium(maintenant - 7200)),
+                ("https://vieux.fr", "Chat piano ancien", chromium(maintenant - 400 * 86400)),
+                ("chrome://settings", "chat piano réglages", chromium(maintenant)),
+            ])
+            con.commit()
+            con.close()
+            open(os.path.join(profil2, "History"), "wb").write(b"pas une base sqlite")
+            con = sqlite3.connect(os.path.join(ff, "places.sqlite"))
+            con.execute("CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, last_visit_date INTEGER)")
+            con.execute("INSERT INTO moz_places (url, title, last_visit_date) VALUES (?,?,?)",
+                        ("https://www.youtube.com/watch?v=ccc", "Un chat au piano, en direct", int((maintenant - 86400) * 1e6)))
+            con.commit()
+            con.close()
+            fichiers = J.fichiers_historique({"LOCALAPPDATA": local, "APPDATA": roaming})
+            self.assertEqual([(n, g) for n, g, _ in fichiers], [("Chrome", "chromium"), ("Chrome", "chromium"),
+                                                                 ("Firefox", "firefox")])
+            r = J.chercher_historique("chat piano youtube", fichiers, maintenant=maintenant)
+            self.assertIn("3 pages", r)
+            self.assertLess(r.index("bbb"), r.index("ccc"), "les plus recentes d'abord")
+            self.assertLess(r.index("ccc"), r.index("aaa"))
+            self.assertIn("hier", r)
+            self.assertIn("il y a 3 jours", r)
+            self.assertNotIn("vieux.fr", r, "au-dela de 90 jours")
+            self.assertNotIn("chrome://", r)
+            r = J.chercher_historique("piano chat", fichiers, maintenant=maintenant)
+            self.assertIn("page=2", r)
+            self.assertNotIn("SECRET123", r, "un jeton ne part pas")
+            self.assertNotIn("#haut", r)
+            self.assertIn("vieux.fr", J.chercher_historique("piano chat", fichiers, jours=500, maintenant=maintenant))
+            r = J.chercher_historique("chat piano guitare", fichiers, maintenant=maintenant)
+            self.assertIn("sans tous les mots", r)
+            self.assertIn("Rien", J.chercher_historique("dinosaure", fichiers, maintenant=maintenant))
+            self.assertEqual(os.listdir(chrome), ["History"], "la copie temporaire n'est pas laissee a cote")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_liens_et_google(self):
+        self.assertTrue(J.lien_permis("https://www.youtube.com/watch?v=abc"))
+        for mauvais in ("file:///C:/x", "javascript:alert(1)", "https://", "https://a.fr/x y", "", None):
+            self.assertFalse(J.lien_permis(mauvais), mauvais)
+        self.assertEqual(J.adresse_google("chat & piano"), "https://www.google.com/search?q=chat+%26+piano")
+        with self.assertRaises(ValueError):
+            J.adresse_google("  ")
+
     def test_verrouille(self):
         for t in ("verrouille", "Ferme l'accès.", "lock"):
             self.assertEqual(J.comprendre(t)["action"], "verrouiller", t)
@@ -963,12 +1042,73 @@ class DansMachiTool(unittest.TestCase):
                                                           self.m.CFG)["erreur"])
 
     def test_sans_les_mains_rien_ne_s_execute(self):
-        envoyes, maison = self.mains([self.outil("creer_dossier", {"chemin": "Documents\\Y"})])
+        envoyes, maison = self.mains([self.outil("creer_dossier", {"chemin": "Documents\\Y"}),
+                                      {"texte": "Mes mains sont fermées.", "mode": "jarvis"}])
         self.m.CFG["jarvis_pc"] = False
         self.phrase("Jarvis, crée un dossier Y")
         self.assertFalse(envoyes[0]["outils"])
         self.assertFalse(os.path.exists(os.path.join(maison, "Documents", "Y")))
-        self.assertEqual(len(envoyes), 1)
+        self.assertIn("fermees", envoyes[1]["resultats"][0]["erreur"])
+        self.assertFalse(envoyes[1]["outils"], "la suite ne rouvre pas les mains")
+        self.assertEqual(self.dit[-1], "Mes mains sont fermées.")
+
+    def test_il_retient_une_preference_meme_sans_les_mains(self):
+        # « Il faudrait que Jarvis retienne des preferences. »
+        envoyes, _ = self.mains([self.outil("retenir", {"preference": "Prefere les reponses courtes."}),
+                                 {"texte": "Noté.", "mode": "jarvis"},
+                                 {"texte": "Bien sûr.", "mode": "jarvis"},
+                                 self.outil("oublier", {"preference": "reponses courtes"}, "t2"),
+                                 {"texte": "Oublié.", "mode": "jarvis"}])
+        self.m.CFG["jarvis_pc"] = False
+        self.phrase("Jarvis, retiens que je préfère les réponses courtes")
+        self.assertTrue(envoyes[0]["memoire"])
+        self.assertEqual(envoyes[0]["preferences"], [])
+        self.assertEqual(self.m.CFG["jarvis_preferences"], ["Prefere les reponses courtes."])
+        self.assertIn("Retenu", envoyes[1]["resultats"][0]["texte"])
+        self.assertEqual(envoyes[1]["preferences"], ["Prefere les reponses courtes."])
+        self.assertEqual(self.dit[-1], "Noté.")
+        self.phrase("Jarvis, tu peux m'aider ?")
+        self.assertEqual(envoyes[2]["preferences"], ["Prefere les reponses courtes."], "elle part avec chaque question")
+        self.phrase("Jarvis, oublie que je préfère les réponses courtes")
+        self.assertEqual(self.m.CFG["jarvis_preferences"], [])
+        self.assertEqual(self.dit[-1], "Oublié.")
+
+    def test_google_et_les_liens_dans_chrome(self):
+        m = self.m
+        ouverts = []
+        vrai = m.ouvrir_dans_chrome
+        self.addCleanup(lambda: setattr(m, "ouvrir_dans_chrome", vrai))
+        m.ouvrir_dans_chrome = lambda url: ouverts.append(url) or "Chrome"
+        envoyes, _ = self.mains([self.outil("rechercher_google", {"recherche": "météo Lyon demain"}),
+                                 {"texte": "C'est ouvert.", "mode": "jarvis"}])
+        self.phrase("Jarvis, cherche la météo de Lyon demain sur Google")
+        self.assertEqual(ouverts, ["https://www.google.com/search?q=m%C3%A9t%C3%A9o+Lyon+demain"])
+        self.assertNotIn("Code d'accès ?", self.dit, "ouvrir une recherche ne demande pas de code")
+        ex = lambda e: m.executer_outil({"id": "x", "nom": "lien", "entree": e}, m.CFG)
+        self.assertIn("Ouvert", ex({"url": "https://www.youtube.com/watch?v=abc"})["texte"])
+        self.assertIn("refusee", ex({"url": "file:///C:/Windows/system32/cmd.exe"})["erreur"])
+        self.assertIn("refusee", ex({"url": "javascript:alert(1)"})["erreur"])
+        self.assertEqual(ouverts[-1], "https://www.youtube.com/watch?v=abc")
+        m.CFG["jarvis_pc"] = False
+        self.assertIn("fermees", ex({"url": "https://exemple.fr"})["erreur"])
+
+    def test_l_historique_seulement_s_il_est_coche(self):
+        m = self.m
+        envoyes, _ = self.mains([{"texte": "Bonjour.", "mode": "jarvis"}, {"texte": "Bonjour.", "mode": "jarvis"}],
+                                code_actif=False)
+        self.phrase("Jarvis, bonjour")
+        self.assertFalse(envoyes[0]["navigation"])
+        m.CFG["jarvis_historique"] = True
+        self.phrase("Jarvis, bonjour")
+        self.assertTrue(envoyes[1]["navigation"])
+        vrai = m._jv.fichiers_historique
+        self.addCleanup(lambda: setattr(m._jv, "fichiers_historique", vrai))
+        m._jv.fichiers_historique = lambda env=None: []
+        r = m.executer_outil({"id": "x", "nom": "chercher_historique", "entree": {"recherche": "chat"}}, m.CFG)
+        self.assertIn("Aucun historique", r["texte"])
+        m.CFG["jarvis_historique"] = False
+        r = m.executer_outil({"id": "x", "nom": "chercher_historique", "entree": {"recherche": "chat"}}, m.CFG)
+        self.assertIn("pas permis", r["erreur"])
 
     def test_presque_reconnu_et_le_micro_de_l_apprentissage(self):
         m = self.m
