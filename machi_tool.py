@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.32.0"
+VERSION = "1.33.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5438,6 +5438,35 @@ def terminer_conversation():
     jouer_son("fin")
 
 
+_ADIEUX = {
+    "bonne nuit": ("Bonne nuit", "Good night"), "good night": ("Bonne nuit", "Good night"),
+    "goodnight": ("Bonne nuit", "Good night"), "a demain": ("À demain", "Until tomorrow"),
+    "bonne soiree": ("Bonne soirée", "Have a good evening"),
+    "bonne journee": ("Bonne journée", "Have a good day"),
+}
+
+
+def dire_adieu(mot, cfg):
+    """IL REPOND, PUIS IL S'ETEINT : « À bientôt », « Au revoir », « Bonne nuit »
+    -- suivi de la facon dont il vous appelle, si on la lui a donnee (Reglages
+    > Jarvis > « Il t'appelle ») : jamais « Monsieur » d'office. Pas de suite :
+    l'oreille retourne a la veille, il faudra le rappeler."""
+    L = langue_jarvis(cfg)
+    envoyer_oreille({"cmd": "annuler"})
+    poser_mode("jarvis")
+    JARVIS["historique"] = []
+    if mot in _ADIEUX:
+        fr, en = _ADIEUX[mot]
+    else:
+        fr, en = random.choice((("À bientôt", "See you soon"), ("Au revoir", "Goodbye")))
+    base = en if L == "en" else fr
+    qui = str(cfg.get("jarvis_appellation", "") or "").strip()
+    texte = base + (", " + qui if qui else "") + "."
+    dire(texte, suite=False, langue=L)
+    jouer_son("fin")
+    return texte
+
+
 def quitter_psy(cfg):
     """« AU REVOIR » AU PSYCHOLOGUE : retour au majordome, qui a demande en
     toutes lettres « il peut ne pas parler si la discussion etait intense, il
@@ -5538,6 +5567,7 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         return signaler_erreur(phrase("transcription_ratee", L))
     finally:
         octets = None
+    brut = texte
     texte = _jv.retirer_mot_eveil(texte)
     if apres_coupure:
         if not texte:
@@ -5548,6 +5578,12 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
                 return
         else:
             VOIX.oublier_reprise()
+    if not texte and JARVIS.get("mode") != "psy" and _jv.adieu(brut):
+        # « Bonne nuit, Jarvis » : le nom vient APRES l'au revoir, et tout ce
+        # qui precede le mot d'eveil est coupe -- mais la phrase entiere n'est
+        # que ca.
+        print("Jarvis : au revoir")
+        return dire_adieu(_jv.adieu(brut), cfg)
     if not texte:
         # « Jarvis. » tout court : il attend la suite -- et, UNE fois, s'il
         # a ete reveille par « Hey Jarvis » sans connaitre la voix, il dit
@@ -5564,6 +5600,13 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         print("Jarvis : renvoye")
         JARVIS.update(psy_echange=[], psy_grave=False)
         return terminer_conversation()
+    mot = _jv.adieu(texte)
+    if mot and JARVIS.get("mode") != "psy":
+        # « Salut », « au revoir » : il repond sur le meme ton, puis s'eteint.
+        # (Au psychologue, c'est `quitter_psy` : le majordome decide s'il dit
+        # un mot ou se tait.)
+        print("Jarvis : au revoir")
+        return dire_adieu(mot, cfg)
     if _jv.fin_de_conversation(texte):
         print("Jarvis : fin de conversation")
         # « Au revoir » au psychologue : retour au majordome, qui se tait si
@@ -5580,6 +5623,8 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         mode, reste = changement
         revient = JARVIS.get("mode") == "psy" and mode == "jarvis"
         poser_mode(mode)
+        if revient:
+            JARVIS.update(psy_echange=[], psy_grave=False)
         print("Jarvis : mode %s" % mode)
         if not reste:
             if mode == "psy":

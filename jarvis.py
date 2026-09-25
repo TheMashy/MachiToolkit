@@ -768,6 +768,30 @@ def renvoi(texte):
     return bool(t) and len(t.split()) <= 6 and bool(_RENVOI.match(t))
 
 
+# L'AU REVOIR. « Jarvis devrait pouvoir s'eteindre lorsqu'il repond "a bientot
+# monsieur" ou "au revoir monsieur", apres que l'utilisateur lui a dit "salut"
+# ou "au revoir". » Ces mots-la meritent une reponse -- puis il n'ecoute plus.
+# `adieu` rend ce qu'on lui a dit, pour qu'il reponde sur le meme ton : une
+# bonne nuit appelle une bonne nuit.
+_ADIEU = re.compile(
+    r"^(?:(?:bon|ben|allez|ok|okay|alors|bah|merci|thanks|thank you|well|right|jarvis)\s+)*"
+    r"(au revoir|salut|bye|bye bye|a plus(?: tard)?|a tout(?: a l'heure)?|a bientot|a demain|bonne nuit|"
+    r"bonne soiree|bonne journee|ciao|tchao|goodbye|good bye|good night|goodnight|see you(?: later| soon)?|"
+    r"see ya|later|farewell)"
+    r"(?:\s+(?:jarvis|merci|thanks|thank you|a plus|a bientot|a demain|bonne nuit|et merci|"
+    r"mon ami|buddy|pal|then|alors))*$")
+
+
+def adieu(texte):
+    """« Salut », « au revoir », « bonne nuit », « goodbye »... : rend le mot
+    qu'on lui a dit (normalise), ou None."""
+    t = normaliser(texte).replace("-", " ").strip(" '")
+    if not t or len(t.split()) > 6:
+        return None
+    m = _ADIEU.match(t)
+    return m.group(1) if m else None
+
+
 def fin_de_conversation(texte):
     t = normaliser(texte).replace("-", " ").strip(" '")
     return bool(t) and len(t.split()) <= 7 and bool(_FIN.match(t) or _FIN_EN.match(t))
@@ -777,26 +801,54 @@ def fin_de_conversation(texte):
 # au compagnon de BrainDebugger (bleu). « Mode Jarvis », « quitte le mode
 # psy » : retour a Jarvis (orange). Rend (mode, reste) -- le reste est ce qui
 # suit dans la meme phrase, a envoyer tel quel -- ou None.
-_VERS_PSY = re.compile(
-    r"^(?:(?:passe|passons|mets toi|mets-toi|bascule|va|on passe|je veux)\s+(?:en\s+|au\s+)?)?"
-    r"(?:(?:le\s+)?mode\s+)?(?:psychologue|psy|psychologie|therapeute|le psy|la psy)\b"
-    # et en anglais : « therapist », « switch to therapist mode », « psych mode »
-    r"|^(?:(?:switch|go|change|put me|let's go|i want|take me)\s+(?:back\s+)?(?:to\s+|into\s+|in\s+)?)?"
-    r"(?:the\s+)?(?:therapist|therapy|psychologist|psych|psy|counsell?or)(?:\s+mode)?\b")
+# « IL FAUT FAIRE GAFFE QUE LE MODE PSYCHOLOGUE N'ARRIVE PAS TROP FACILEMENT. »
+# Il arrivait sur tout ce qui COMMENCAIT par ces mots : « psychologie de la
+# foule, c'est quoi ? », « le psy m'a dit de dormir plus », « therapy is
+# expensive », « notes de frais a rendre » -- et la phrase partait au journal.
+# On n'y passe plus que si on le DEMANDE : la phrase entiere est la demande
+# (« psychologue », « passe en mode psy »), elle commence par un verbe de
+# bascule (« passe en mode psy, j'ai mal dormi »), ou le mot est une
+# APOSTROPHE, suivi d'une virgule ou d'un point dans ce que la transcription
+# a ecrit (« Psychologue, j'ai mal dormi »). Parler DU psy ne suffit pas.
+_POLI = r"(?:\s+(?:s'il te plait|s'il vous plait|stp|svp|merci|maintenant|please|thanks|now))*"
+_MOT_PSY = r"(?:psychologue|psy|therapeute|therapist|therapy|psych|psychologist|counsell?or)"
+_BASCULE_PSY = (r"(?:passe|passons|mets toi|mets-toi|bascule|va|on passe|je veux|je voudrais|"
+                r"je veux parler (?:a|au)|switch|go|change|put me|let's go|i want|take me)")
+_VERS_PSY_SEUL = re.compile(
+    r"^(?:" + _BASCULE_PSY + r"\s+(?:back\s+)?(?:en\s+|au\s+|a la\s+|a\s+|to\s+|into\s+|in\s+)?)?"
+    r"(?:le\s+|la\s+|the\s+)?(?:mode\s+)?" + _MOT_PSY + r"(?:\s+mode)?" + _POLI + "$")
+_VERS_PSY_VERBE = re.compile(
+    r"^(?:(?:passe|passons|mets toi|mets-toi|bascule|on passe)\s+(?:en|au)\s+(?:mode\s+)?"
+    r"(?:psychologue|psy|therapeute)|mode\s+(?:psychologue|psy)"
+    r"|(?:switch|go|change|put me|take me)\s+(?:back\s+)?(?:to|into)\s+(?:the\s+)?"
+    r"(?:therapist|therapy|psych|psy)\s+mode|(?:therapist|psych)\s+mode)\b")
+_APOSTROPHE_PSY = re.compile(r"^\s*(?:psychologue|psy|th[eé]rapeute|therapist)\s*[,:;.!?\u2026]", re.I)
 _VERS_NOTES_PSY = re.compile(r"^(?:mes\s+|les\s+|my\s+)?(?:notes?\s+(?:psy|psychologue|de psy)|"
                              r"(?:psych|psy|therapy|therapist)\s+notes?)\b")
-_VERS_NOTES = re.compile(r"^(?:(?:prends|fais|ajoute|ecris|prend|take|make|add|write)\s+"
-                         r"(?:une\s+|des\s+|a\s+|some\s+)?)?notes?\b")
+# UNE NOTE, SI ON LA DEMANDE : « note que... », « prends une note », « take a
+# note » -- pas « notes de frais » ni « noter les courses ».
+_VERS_NOTES = re.compile(
+    r"^(?:notes?" + _POLI + r"$|note (?:que|qu'|ca|cela|dans mon journal|pour moi|that)\b|"
+    r"prends? note\b|(?:prends|prend|fais|ajoute|ecris|take|make|add|write)\s+"
+    r"(?:une\s+|des\s+|a\s+|some\s+)?notes?\b)")
+# ET ON EN SORT FACILEMENT : « retourne au mode Jarvis », « pars du mode
+# psychologue », « sors du psy », « plus de psy », « back to Jarvis ».
+_AVANT = r"^(?:(?:ok|okay|bon|allez|bah|ben|euh|jarvis|non|alors|maintenant|stp|please)\s+)*"
 _VERS_JARVIS = re.compile(
-    r"^(?:(?:passe|reviens|repasse|retour|retourne|bascule|on repasse)\s+(?:en\s+|a\s+|au\s+)?)?"
-    r"(?:(?:le\s+)?mode\s+)?(?:jarvis|normal)$|^(?:quitte|sors|sors du|arrete|ferme)\s+"
-    r"(?:le\s+)?(?:mode\s+)?(?:psy|psychologue)$"
+    _AVANT + r"(?:"
+    r"(?:(?:passe|reviens|repasse|retour|retourne|bascule|on repasse|redeviens|reprends|remets toi|"
+    r"je veux|je veux parler a|go|switch|change|get|go back|come back|take me back)\s+"
+    r"(?:back\s+)?(?:en\s+|a\s+|au\s+|le\s+|to\s+)?)?(?:(?:le\s+|the\s+)?mode\s+)?"
+    r"(?:jarvis|normal)(?:\s+mode)?"
+    r"|(?:quitte|quitter|sors|sort|sortir|pars|part|partir|arrete|arreter|stop|ferme|fermer|termine|"
+    r"fin|laisse tomber|oublie|exit|leave|quit|close|end)\s+(?:du\s+|de\s+|le\s+|la\s+|avec le\s+|"
+    r"the\s+)?(?:mode\s+)?(?:psy|psychologue|psychologie|therapeute|therapist|therapy|psych)(?:\s+mode)?"
+    r"|(?:plus de|assez de|fini le|fini la|c'est fini le|c'est bon pour le|no more)\s+"
+    r"(?:mode\s+)?(?:psy|psychologue|therapist|therapy)"
     # « Jarvis ? Re ! » : de retour aupres du majordome (le mot d'eveil est deja
     # retire -- il reste « re »)
-    r"|^(?:re|re jarvis|jarvis re|me revoila|je suis de retour|c'est re moi|i'm back|im back|"
-    r"back to jarvis|back to normal|normal mode|jarvis mode)$"
-    r"|^(?:switch|go|change|get)\s+(?:back\s+)?(?:to\s+)?(?:the\s+)?(?:jarvis|normal)(?:\s+mode)?$"
-    r"|^(?:exit|leave|quit|stop|close)\s+(?:the\s+)?(?:therapist|therapy|psych|psy)(?:\s+mode)?$")
+    r"|re|re jarvis|jarvis re|me revoila|je suis de retour|c'est re moi|i'm back|im back|"
+    r"back to jarvis|back to normal|normal mode|jarvis mode)" + _POLI + "$")
 
 
 def _apres(texte, n_mots):
@@ -812,7 +864,13 @@ def changement_de_mode(texte):
         return None
     if _VERS_JARVIS.match(t):
         return ("jarvis", "")
-    for motif, garder in ((_VERS_PSY, False), (_VERS_NOTES_PSY, False), (_VERS_NOTES, True)):
+    if _VERS_PSY_SEUL.match(t):
+        return ("psy", "")
+    m = _APOSTROPHE_PSY.match(str(texte))
+    if m:
+        reste = str(texte)[m.end():].strip()
+        return ("psy", "" if normaliser(reste) in ("", "s'il te plait", "stp", "merci") else reste)
+    for motif, garder in ((_VERS_PSY_VERBE, False), (_VERS_NOTES_PSY, False), (_VERS_NOTES, True)):
         m = motif.match(t)
         if m:
             # « Note que j'ai mal dormi » : la phrase entiere part au journal,

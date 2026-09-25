@@ -159,6 +159,15 @@ class FinEtModes(unittest.TestCase):
                   "merci pour tout ce que tu fais, vraiment, ça compte beaucoup pour moi"):
             self.assertFalse(J.fin_de_conversation(t), t)
 
+    def test_l_au_revoir(self):
+        for t, mot in (("Salut !", "salut"), ("Au revoir.", "au revoir"), ("Au revoir Jarvis", "au revoir"),
+                       ("Bonne nuit", "bonne nuit"), ("à plus", "a plus"), ("merci, au revoir", "au revoir"),
+                       ("Goodbye, Jarvis", "goodbye"), ("See you later", "see you later"), ("à demain", "a demain")):
+            self.assertEqual(J.adieu(t), mot, t)
+        for t in ("salut ça va ?", "salut, tu peux allumer la lumière ?", "au revoir à tout le monde dans la vidéo",
+                  "comment on dit au revoir en japonais"):
+            self.assertIsNone(J.adieu(t), t)
+
     def test_le_renvoyer(self):
         # « Quand je lui dis "degage" il devrait partir, pareil pour "pars" ou
         # "get away" ou "stop" ou "re-pars". »
@@ -180,12 +189,25 @@ class FinEtModes(unittest.TestCase):
             self.assertEqual(J.changement_de_mode(t), ("psy", reste), t)
 
     def test_retour_a_jarvis(self):
-        for t in ("mode Jarvis", "Quitte le mode psy.", "reviens en mode normal", "sors du mode psychologue"):
+        # « Qu'il puisse se quitter facilement en disant "retourne au mode
+        # jarvis" ou "pars du mode psychologue". »
+        for t in ("mode Jarvis", "Quitte le mode psy.", "reviens en mode normal", "sors du mode psychologue",
+                  "Retourne au mode Jarvis.", "Pars du mode psychologue.", "ok, retourne au mode Jarvis s'il te plaît",
+                  "sors du psy", "plus de psy", "stop le mode psy", "arrête le psychologue", "reviens à Jarvis",
+                  "je veux parler à Jarvis", "redeviens normal", "fin du mode psy", "leave therapist mode",
+                  "go back to Jarvis", "no more therapy"):
             self.assertEqual(J.changement_de_mode(t), ("jarvis", ""), t)
 
     def test_pas_de_bascule_par_hasard(self):
+        # « Il faut faire gaffe que le mode psychologue n'arrive pas trop
+        # facilement » : parler DU psy, de psychologie ou de notes n'y fait
+        # pas passer -- le demander, si.
         for t in ("je note que ça va mieux", "les notes de cours", "j'ai vu mon psy hier",
-                  "c'est un truc de psychologue ça", "combien font 12 fois 12"):
+                  "c'est un truc de psychologue ça", "combien font 12 fois 12",
+                  "psychologie de la foule, c'est quoi ?", "le psy m'a dit de dormir plus",
+                  "la psy c'est cher", "psy trance, tu connais ?", "therapy is expensive",
+                  "therapist said I should rest", "notes de frais à rendre demain", "noter les courses",
+                  "note bien la date", "mode avion"):
             self.assertIsNone(J.changement_de_mode(t), t)
 
 
@@ -807,6 +829,30 @@ class DansMachiTool(unittest.TestCase):
             self.assertEqual(self.m.JARVIS["mode"], "jarvis", fin)
             self.assertIn({"cmd": "annuler"}, envoye, "il n'ecoute plus la suite")
         self.assertEqual(self.dit, [], "on se tait, on ne repond pas « au revoir »")
+
+    def test_salut_il_repond_puis_s_eteint(self):
+        # « Jarvis devrait pouvoir s'eteindre lorsqu'il repond "a bientot
+        # monsieur" ou "au revoir monsieur", apres que l'utilisateur lui a dit
+        # "salut" ou "au revoir". » Monsieur seulement si on le lui a demande.
+        dits = []
+        vraie_dire = self.m.dire
+        self.m.dire = lambda texte, suite=False, langue=None: dits.append((texte, suite))
+        try:
+            for appellation, t in (("", "Salut !"), ("Monsieur", "Au revoir."), ("Monsieur", "Bonne nuit, Jarvis")):
+                vus = self.espions()
+                envoye = []
+                self.m.envoyer_oreille = lambda o, e=envoye: e.append(o) or True
+                self.m.CFG.update(jarvis_appellation=appellation, jarvis_langue="fr")
+                self.phrase(t)
+                self.assertEqual(vus, {"jarvis": [], "psy": []}, t)
+                self.assertIn({"cmd": "annuler"}, envoye, "il n'ecoute plus la suite")
+            self.assertIn(dits[0][0], ("À bientôt.", "Au revoir."))
+            self.assertIn(dits[1][0], ("À bientôt, Monsieur.", "Au revoir, Monsieur."))
+            self.assertEqual(dits[2][0], "Bonne nuit, Monsieur.")
+            self.assertFalse(any(suite for _, suite in dits), "puis il s'eteint : pas de suite")
+            self.assertNotIn("Monsieur", dits[0][0], "jamais Monsieur d'office")
+        finally:
+            self.m.dire = vraie_dire
 
     def test_degage_pars_stop_le_renvoient_sans_un_mot(self):
         # Meme au psychologue : « au revoir » laisse le majordome placer un
