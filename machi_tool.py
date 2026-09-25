@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.39.0"
+VERSION = "1.40.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -362,6 +362,9 @@ CONFIG_DEFAUT = {
     # SPOTIFY, par l'API officielle : le Client ID d'une app developpeur de la
     # personne, et le jeton de renouvellement que Spotify donne a la connexion.
     "spotify_client_id": "",
+    # LES ONGLETS DE CHROME : la cle de l'extension de Machi Tool (a part du
+    # jeton du serveur local : elle ne sert qu'aux onglets).
+    "onglets_cle": "",
     "spotify_refresh": "",
     "jarvis_code_sel": "",
     "jarvis_code_empreinte": "",               # l'identifiant Windows du micro ; vide = celui de Windows
@@ -5784,7 +5787,7 @@ def parler_au_compagnon(texte, cfg):
 # mains restent ouvertes dix minutes ; trois faux, elles se ferment cinq.
 
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
-                    "lancer_appli", "fenetre", "son", "pc", "youtube",
+                    "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets",
                     "spotify_jouer", "spotify_en_cours", "spotify_aimer"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
@@ -6174,6 +6177,202 @@ def regler_luminosite(action, niveau=None):
     return "Luminosite a %d %%." % _jv.nouveau_niveau(0, "regler", niveau)
 
 
+# --- LES ONGLETS DE CHROME ---------------------------------------------
+# « Il faut qu'il puisse fermer ou ouvrir des onglets. » Par une petite
+# extension de Machi Tool, installee dans Chrome (ou Edge, Brave) : elle
+# demande a Machi Tool s'il a quelque chose pour elle (127.0.0.1, sa propre
+# cle), fait ce qu'on lui dit avec les fonctions d'onglets de Chrome, et
+# repond. Rien n'est clique ni tape. Vers Jarvis ne partent que les titres et
+# les domaines, jamais les adresses entieres.
+
+ONGLETS = {"file": [], "resultats": {}, "vu": 0.0, "cond": threading.Condition()}
+ONGLETS_VIVANTE_S = 45.0
+ONGLETS_ATTENTE_S = 20.0
+
+
+def extension_branchee():
+    return time.time() - ONGLETS["vu"] < ONGLETS_VIVANTE_S
+
+
+def commande_onglets(action, delai=6.0, **args):
+    """Une commande a l'extension, et sa reponse (un dict)."""
+    if not extension_branchee():
+        raise LookupError("L'extension Chrome de Machi Tool n'est pas branchee (Reglages > Jarvis > "
+                          "les onglets de Chrome), ou Chrome est ferme.")
+    ident = os.urandom(6).hex()
+    c = ONGLETS["cond"]
+    with c:
+        ONGLETS["file"].append(dict(args, id=ident, action=action))
+        c.notify_all()
+        fin = time.time() + delai
+        while ident not in ONGLETS["resultats"] and time.time() < fin:
+            c.wait(max(0.05, fin - time.time()))
+        r = ONGLETS["resultats"].pop(ident, None)
+        ONGLETS["file"] = [x for x in ONGLETS["file"] if x["id"] != ident]
+    if r is None:
+        raise TimeoutError("Chrome n'a pas repondu.")
+    if r.get("erreur"):
+        raise OSError("Chrome : %s" % str(r["erreur"])[:200])
+    return r
+
+
+def prochaine_commande_onglets(attente=None):
+    """Pour l'extension : la commande suivante, ou None apres `attente`."""
+    attente = ONGLETS_ATTENTE_S if attente is None else attente
+    c = ONGLETS["cond"]
+    with c:
+        ONGLETS["vu"] = time.time()
+        fin = time.time() + attente
+        while not ONGLETS["file"] and time.time() < fin:
+            c.wait(max(0.05, fin - time.time()))
+        ONGLETS["vu"] = time.time()
+        return ONGLETS["file"].pop(0) if ONGLETS["file"] else None
+
+
+def resultat_onglets(r):
+    c = ONGLETS["cond"]
+    with c:
+        if isinstance(r, dict) and isinstance(r.get("id"), str):
+            ONGLETS["resultats"][r["id"]] = r
+            c.notify_all()
+
+
+def _domaine(url):
+    try:
+        return urllib.parse.urlsplit(url).netloc.lower().removeprefix("www.")
+    except ValueError:
+        return ""
+
+
+def agir_onglets(action, cible="", url="", recherche="", tous=False):
+    """Ce que Jarvis demande aux onglets. Rend un texte pour lui."""
+    if action == "ouvrir":
+        adresse = url.strip() if url else (_jv.adresse_google(recherche) if recherche else "")
+        if not _jv.lien_permis(adresse):
+            raise ValueError("Une adresse web http(s), ou une recherche.")
+        commande_onglets("ouvrir", url=adresse)
+        return "Nouvel onglet : %s." % (_domaine(adresse) or adresse)
+    onglets = commande_onglets("lister").get("onglets") or []
+    onglets = [o for o in onglets if isinstance(o, dict) and "id" in o]
+    if action == "lister":
+        if not onglets:
+            return "Aucun onglet ouvert."
+        return "%d onglets : %s" % (len(onglets), " ; ".join(
+            "%d. %s (%s)%s%s" % (i, (o.get("titre") or "")[:80], _domaine(o.get("url", "")),
+                                  " -- actif" if o.get("actif") else "", " -- joue du son" if o.get("son") else "")
+            for i, o in enumerate(onglets[:40], 1)))
+    trouves = _jv.choisir(cible, onglets, nom=lambda o: (o.get("titre") or "") + " " + _domaine(o.get("url", "")),
+                          seuil=40)
+    if not trouves:
+        raise LookupError("Aucun onglet ne correspond a « %s »." % cible)
+    vises = trouves[:20] if tous else trouves[:1]
+    ids = [o["id"] for o in vises]
+    noms = " ; ".join((o.get("titre") or _domaine(o.get("url", "")))[:60] for o in vises)
+    if action == "fermer":
+        commande_onglets("fermer", ids=ids)
+        return "Ferme : %s." % noms
+    if action == "aller":
+        commande_onglets("aller", ids=ids[:1])
+        return "Onglet affiche : %s." % noms
+    if action in ("couper_son", "remettre_son"):
+        commande_onglets("muet", ids=ids, muet=action == "couper_son")
+        return ("Son coupe : %s." if action == "couper_son" else "Son remis : %s.") % noms
+    raise ValueError("action inconnue : %s" % action)
+
+
+EXTENSION_MANIFESTE = {
+    "manifest_version": 3,
+    "name": "Machi Tool - les onglets pour Jarvis",
+    "description": "Laisse Jarvis (Machi Tool, sur ce PC) lister, ouvrir, afficher, couper et fermer des onglets.",
+    "version": "1.0",
+    "permissions": ["tabs", "alarms"],
+    "host_permissions": ["http://127.0.0.1/*"],
+    "background": {"service_worker": "fond.js"},
+}
+
+EXTENSION_FOND = r"""// Machi Tool - les onglets pour Jarvis.
+// Demande a Machi Tool (127.0.0.1) s'il a une commande, l'execute avec les
+// fonctions d'onglets de Chrome, et repond. Rien d'autre.
+importScripts('config.js');
+const BASE = 'http://127.0.0.1:' + MACHI.port + '/onglets/';
+const ENTETES = { 'X-Onglets-Cle': MACHI.cle };
+const pause = ms => new Promise(r => setTimeout(r, ms));
+let enCours = false;
+
+async function executer(c) {
+  if (c.action === 'lister') {
+    const t = await chrome.tabs.query({});
+    return { onglets: t.map(o => ({ id: o.id, titre: o.title || '', url: o.url || '', actif: !!o.active,
+                                    son: !!o.audible, muet: !!(o.mutedInfo && o.mutedInfo.muted) })) };
+  }
+  if (c.action === 'ouvrir') {
+    if (!/^https?:\/\//.test(String(c.url || ''))) throw new Error('adresse refusee');
+    const o = await chrome.tabs.create({ url: c.url, active: true });
+    await chrome.windows.update(o.windowId, { focused: true });
+    return { texte: 'ouvert' };
+  }
+  const ids = (c.ids || []).filter(Number.isInteger);
+  if (!ids.length) throw new Error('aucun onglet');
+  if (c.action === 'fermer') { await chrome.tabs.remove(ids); return { texte: 'ferme' }; }
+  if (c.action === 'aller') {
+    const o = await chrome.tabs.update(ids[0], { active: true });
+    await chrome.windows.update(o.windowId, { focused: true });
+    return { texte: 'affiche' };
+  }
+  if (c.action === 'muet') {
+    for (const id of ids) await chrome.tabs.update(id, { muted: !!c.muet });
+    return { texte: 'fait' };
+  }
+  throw new Error('action inconnue');
+}
+
+async function boucle() {
+  if (enCours) return;
+  enCours = true;
+  try {
+    for (;;) {
+      chrome.runtime.getPlatformInfo(() => {});      // garde le service worker eveille
+      let r;
+      try {
+        r = await fetch(BASE + 'attente', { headers: ENTETES, signal: AbortSignal.timeout(25000) });
+      } catch (e) { await pause(5000); continue; }
+      if (r.status === 204) continue;
+      if (r.status !== 200) { await pause(10000); continue; }
+      const c = await r.json();
+      let rep;
+      try { rep = await executer(c); } catch (e) { rep = { erreur: String((e && e.message) || e) }; }
+      await fetch(BASE + 'resultat', { method: 'POST', headers: { ...ENTETES, 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ ...rep, id: c.id }) }).catch(() => {});
+    }
+  } finally { enCours = false; }
+}
+
+chrome.runtime.onStartup.addListener(boucle);
+chrome.runtime.onInstalled.addListener(boucle);
+chrome.alarms.create('machi', { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(boucle);
+boucle();
+"""
+
+
+def preparer_extension(cfg, dossier=None):
+    """Ecrit l'extension dans le dossier de Machi Tool (avec le port et sa cle)
+    et rend son chemin."""
+    if not cfg.get("onglets_cle"):
+        cfg["onglets_cle"] = secrets.token_urlsafe(18)
+        sauver_config(cfg)
+    dossier = dossier or os.path.join(DOSSIER, "extension-chrome")
+    os.makedirs(dossier, exist_ok=True)
+    port = entier(cfg.get("api_port", 7373), 7373)
+    fichiers = {"manifest.json": json.dumps(EXTENSION_MANIFESTE, indent=2, ensure_ascii=False),
+                "fond.js": EXTENSION_FOND,
+                "config.js": "const MACHI = %s;\n" % json.dumps({"port": port, "cle": cfg["onglets_cle"]})}
+    for nom, contenu in fichiers.items():
+        with open(os.path.join(dossier, nom), "w", encoding="utf-8") as f:
+            f.write(contenu)
+    return dossier
+
+
 # --- YOUTUBE -----------------------------------------------------------
 
 def ouvrir_youtube(recherche):
@@ -6362,6 +6561,10 @@ def executer_outil(outil, cfg):
             return {"id": ident, "erreur": "action inconnue : %s" % a}
         if nom == "youtube":
             return {"id": ident, "texte": ouvrir_youtube(e.get("recherche"))}
+        if nom == "onglets":
+            return {"id": ident, "texte": agir_onglets(e.get("action") or "lister", e.get("cible") or "",
+                                                       e.get("url") or "", e.get("recherche") or "",
+                                                       bool(e.get("tous")))}
         if nom.startswith("spotify_"):
             if not spotify_connecte(cfg):
                 return {"id": ident, "erreur": "Spotify n'est pas connecte a Machi Tool (Reglages > Jarvis > Spotify)."}
@@ -6498,6 +6701,7 @@ def capacites_jarvis(cfg):
     return {"outils": pc, "ecran": pc and bool(cfg.get("jarvis_ecran")),
             "navigation": pc and bool(cfg.get("jarvis_historique")),
             "spotify": pc and spotify_connecte(cfg),
+            "onglets": pc and extension_branchee(),
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
 
@@ -6953,8 +7157,34 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
 
     # ---------- routes ----------
 
+    def cle_onglets_permise(self):
+        """L'extension de Machi Tool : sa propre cle, et une origine
+        d'extension (ou aucune). Pas le jeton du serveur local."""
+        attendue = str(CFG.get("onglets_cle", "") or "")
+        origine = self.headers.get("Origin", "")
+        return bool(attendue) and (not origine or origine.startswith("chrome-extension://")) and \
+            secrets.compare_digest(str(self.headers.get("X-Onglets-Cle", "")), attendue)
+
+    def route_onglets(self, chemin):
+        if not self.cle_onglets_permise():
+            return self.repondre(401, {"erreur": "cle d'extension invalide"})
+        if chemin == "/onglets/attente" and self.command == "GET":
+            c = prochaine_commande_onglets()
+            if c is None:
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            return self.repondre(200, c)
+        if chemin == "/onglets/resultat" and self.command == "POST":
+            resultat_onglets(self.lire_corps())
+            return self.repondre(200, {"ok": True})
+        return self.repondre(404, {"erreur": "route inconnue"})
+
     def do_GET(self):
         chemin = self.path.split("?")[0].rstrip("/") or "/"
+        if chemin.startswith("/onglets/"):
+            return self.route_onglets(chemin)
         if not self.origine_permise():
             return self.repondre(403, {"erreur": "origine non autorisee"})
         if chemin == "/etat":
@@ -6994,6 +7224,8 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         chemin = self.path.split("?")[0].rstrip("/") or "/"
+        if chemin.startswith("/onglets/"):
+            return self.route_onglets(chemin)
         if not self.origine_permise():
             return self.repondre(403, {"erreur": "origine non autorisee"})
         # La dictee AVANT la lecture JSON : son corps est du son, pas du JSON.
@@ -9397,6 +9629,21 @@ class Panneau:
         self.txt_spotify.pack(fill="x", pady=(4, 0))
 
         self.separateur(f, 12, 8)
+        self.titre(f, "les onglets de chrome").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Pour qu'il liste, ouvre, affiche, coupe et ferme des onglets (« ferme les onglets "
+                      "YouTube », « ouvre un onglet sur la meteo »). Une petite extension de Machi Tool, a "
+                      "installer une fois : « Preparer l'extension » ouvre son dossier et la page des "
+                      "extensions ; la, active le « Mode developpeur » (en haut a droite), clique « Charger "
+                      "l'extension non empaquetee » et choisis ce dossier. Marche aussi dans Edge et Brave. "
+                      "Elle ne parle qu'a Machi Tool, sur ce PC ; vers Jarvis ne partent que les titres "
+                      "et les domaines des onglets.", BRUME, 8, largeur=500).pack(fill="x")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.bouton(ligne, "Preparer l'extension", self.preparer_extension, compact=True).pack(side="left")
+        self.txt_onglets = self.texte(ligne, "", BRUME, 8, largeur=360)
+        self.txt_onglets.pack(side="left", padx=(10, 0))
+
+        self.separateur(f, 12, 8)
         self.titre(f, "ce qu'il retient de toi").pack(fill="x", pady=(0, 4))
         self.texte(f, "« Jarvis, retiens que je prefere les reponses courtes. » -- « oublie que... ». "
                       "Ces phrases restent sur le PC et partent avec chaque question a Jarvis : c'est "
@@ -9485,6 +9732,18 @@ class Panneau:
         oublier_voix()
         JARVIS["apprentissage"] = {"n": 0, "total": 4, "fini": True,
                                    "message": "Oublie. Seul « Hey Jarvis » le reveille."}
+
+    def preparer_extension(self):
+        try:
+            dossier = preparer_extension(self.cfg)
+            os.startfile(dossier)
+            chrome = chemin_chrome()
+            if chrome:
+                subprocess.Popen([chrome, "chrome://extensions"],
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            JARVIS["onglets_message"] = "Dossier pret : %s" % dossier
+        except Exception as e:
+            JARVIS["onglets_message"] = "Impossible : %s" % e
 
     def connecter_spotify(self):
         self.cfg["spotify_client_id"] = self.champ_spotify.get().strip()
@@ -9628,6 +9887,10 @@ class Panneau:
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)
         details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
+        if hasattr(self, "txt_onglets"):
+            etat_on = "Branchee." if extension_branchee() else (JARVIS.get("onglets_message") or "Pas branchee.")
+            if self.txt_onglets.cget("text") != etat_on:
+                self.txt_onglets.configure(text=etat_on)
         if hasattr(self, "txt_spotify"):
             etat_sp = ("Connecte." if spotify_connecte(self.cfg) else "Pas connecte.")
             if JARVIS.get("spotify_message"):

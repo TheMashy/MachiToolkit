@@ -40,6 +40,8 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import urllib.parse
 import unittest
 import wave
@@ -1309,6 +1311,102 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("16 resultats", ex("affiner_recherche", {"retirer": "stage", "type": ""})["texte"])
         self.assertIn("unit 00.txt", ex("chercher_fichiers", {"nom": "unit 00", "dans": "Documents"})["texte"],
                       "l'ancien parametre « nom » marche encore")
+
+    def test_les_onglets_par_l_extension(self):
+        # « Il faut qu'il puisse fermer ou ouvrir des onglets. »
+        m = self.m
+        envoyes, _ = self.mains([], code_actif=False)
+        ex = lambda e: m.executer_outil({"id": "x", "nom": "onglets", "entree": e}, m.CFG)
+        m.ONGLETS.update(file=[], resultats={}, vu=0.0)
+        self.assertIn("pas branchee", ex({"action": "lister"})["erreur"])
+        self.assertFalse(m.capacites_jarvis(m.CFG)["onglets"])
+        onglets = [{"id": 11, "titre": "Lo-fi beats - YouTube", "url": "https://www.youtube.com/watch?v=a", "son": True},
+                   {"id": 12, "titre": "Vaporwave mix - YouTube", "url": "https://www.youtube.com/watch?v=b"},
+                   {"id": 13, "titre": "Boîte de réception", "url": "https://mail.google.com/mail/u/0/#inbox"}]
+        recu, arret = [], threading.Event()
+
+        def extension():                         # ce que fait fond.js, sans Chrome
+            while not arret.is_set():
+                c = m.prochaine_commande_onglets(0.2)
+                if c is None:
+                    continue
+                recu.append(c)
+                if c["action"] == "lister":
+                    m.resultat_onglets({"id": c["id"], "onglets": onglets})
+                elif c["action"] == "fermer" and 99 in c["ids"]:
+                    m.resultat_onglets({"id": c["id"], "erreur": "No tab with id: 99."})
+                else:
+                    m.resultat_onglets({"id": c["id"], "texte": "fait"})
+        t = threading.Thread(target=extension, daemon=True)
+        t.start()
+        self.addCleanup(lambda: (arret.set(), t.join(2)))
+        time.sleep(0.3)
+        self.assertTrue(m.capacites_jarvis(m.CFG)["onglets"], "l'extension demande : elle est branchee")
+        l = ex({"action": "lister"})["texte"]
+        self.assertIn("3 onglets", l)
+        self.assertIn("(youtube.com) -- joue du son", l)
+        self.assertIn("mail.google.com", l)
+        self.assertNotIn("#inbox", l, "vers Jarvis : le domaine, pas l'adresse")
+        self.assertIn("Ferme", ex({"action": "fermer", "cible": "youtube", "tous": True})["texte"])
+        self.assertEqual(sorted(recu[-1]["ids"]), [11, 12])
+        ex({"action": "fermer", "cible": "vaporwave"})
+        self.assertEqual(recu[-1]["ids"], [12])
+        ex({"action": "couper_son", "cible": "lo-fi"})
+        self.assertEqual((recu[-1]["action"], recu[-1]["ids"], recu[-1]["muet"]), ("muet", [11], True))
+        self.assertIn("Nouvel onglet : google.com", ex({"action": "ouvrir", "recherche": "meteo Lyon"})["texte"])
+        self.assertTrue(recu[-1]["url"].startswith("https://www.google.com/search?q="))
+        n = len(recu)
+        self.assertIn("http(s)", ex({"action": "ouvrir", "url": "file:///C:/x"})["erreur"])
+        self.assertEqual(len(recu), n, "une adresse refusee ne part pas a Chrome")
+        self.assertIn("Aucun onglet", ex({"action": "fermer", "cible": "twitch"})["erreur"])
+
+    def test_l_extension_et_ses_routes(self):
+        m = self.m
+        dossier = m.preparer_extension(m.CFG, os.path.join(self.tmp, "ext-%d" % id(self)))
+        cle = m.CFG["onglets_cle"]
+        self.assertTrue(cle)
+        manifeste = json.load(open(os.path.join(dossier, "manifest.json"), encoding="utf-8"))
+        self.assertEqual(manifeste["manifest_version"], 3)
+        self.assertEqual(sorted(manifeste["permissions"]), ["alarms", "tabs"], "rien de plus que les onglets")
+        self.assertEqual(manifeste["host_permissions"], ["http://127.0.0.1/*"])
+        self.assertIn(json.dumps(cle), open(os.path.join(dossier, "config.js"), encoding="utf-8").read())
+        if shutil.which("node"):
+            r = subprocess.run(["node", "--check", os.path.join(dossier, "fond.js")], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        vrai = m.ONGLETS_ATTENTE_S
+        m.ONGLETS_ATTENTE_S = 0.2
+        self.addCleanup(lambda: setattr(m, "ONGLETS_ATTENTE_S", vrai))
+        m.ONGLETS.update(file=[], resultats={}, vu=0.0)
+        serveur = m.http.server.ThreadingHTTPServer(("127.0.0.1", 0), m.Passerelle)
+        threading.Thread(target=serveur.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (serveur.shutdown(), serveur.server_close()))
+        base = "http://127.0.0.1:%d/onglets/" % serveur.server_address[1]
+
+        def appel(chemin, entetes, corps=None):
+            req = urllib.request.Request(base + chemin, data=json.dumps(corps).encode() if corps else None,
+                                         headers=entetes, method="POST" if corps else "GET")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, r.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+        self.assertEqual(appel("attente", {})[0], 401)
+        self.assertEqual(appel("attente", {"X-Onglets-Cle": "faux"})[0], 401)
+        self.assertEqual(appel("attente", {"X-Onglets-Cle": cle, "Origin": "https://site-quelconque.fr"})[0], 401,
+                         "une page web ne se fait pas passer pour l'extension")
+        self.assertEqual(appel("attente", {"X-Onglets-Cle": cle, "Origin": "chrome-extension://abc"})[0], 204)
+        self.assertTrue(m.extension_branchee())
+        resultat = {}
+        t = threading.Thread(target=lambda: resultat.update(r=m.commande_onglets("lister", delai=3)))
+        t.start()
+        statut, corps = appel("attente", {"X-Onglets-Cle": cle})
+        self.assertEqual(statut, 200)
+        c = json.loads(corps)
+        self.assertEqual(c["action"], "lister")
+        self.assertEqual(appel("resultat", {"X-Onglets-Cle": cle, "Content-Type": "application/json"},
+                               {"id": c["id"], "onglets": []})[0], 200)
+        t.join(3)
+        self.assertEqual(resultat["r"]["onglets"], [])
 
     def test_le_pc_entier_sans_code(self):
         # « J'aimerais avoir un compagnon qui peut interagir le plus possible avec mon PC. »
