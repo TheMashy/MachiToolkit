@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.47.0"
+VERSION = "1.47.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5394,7 +5394,7 @@ def fil_jarvis_travail(cfg):
                 traiter_phrase(wav64, cfg, apres_coupure)
             except Exception as e:
                 print("Jarvis : phrase non traitee (%s)" % type(e).__name__)
-                signaler_erreur("Quelque chose a raté de mon côté.")
+                signaler_erreur("Un incident de mon côté, je le crains.")
 
 
 def demarrer_jarvis(cfg):
@@ -5444,10 +5444,10 @@ _PHRASES = {
     "j_ecoute": ("Je vous écoute.", "I'm listening."),
     "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
                       "My hands on the PC are closed: Settings, Jarvis."),
-    "youtube_video": ("C'est parti.", "Here you go."),
-    "youtube_resultats": ("Je vous ai ouvert les résultats sur YouTube.", "I've opened the YouTube results."),
+    "youtube_video": ("C'est lancé.", "Here you go."),
+    "youtube_resultats": ("Les résultats de YouTube sont à l'écran.", "I've opened the YouTube results."),
     "youtube_rate": ("YouTube ne répond pas.", "YouTube isn't answering."),
-    "son_rate": ("Je n'arrive pas à régler le son.", "I can't set the volume."),
+    "son_rate": ("Je ne parviens pas à régler le son.", "I can't set the volume."),
     "oui": ("Oui ?", "Yes?"),
     "mode_psy": ("Mode psychologue. Je vous écoute.", None),
     "mode_jarvis": ("Mode Jarvis. À votre service.", "At your service."),
@@ -5455,9 +5455,9 @@ _PHRASES = {
     "lecture": ("Je n'ai pas pu lire ce que le micro m'a donné.", "I couldn't read what the microphone gave me."),
     "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.",
                               "Transcription isn't ready yet. Have a look at the Jarvis page in Machi Tool."),
-    "transcription_ratee": ("Pardon, je n'ai pas réussi à transcrire.", "Sorry, I couldn't make that out."),
-    "commande_ratee": ("Je n'ai pas pu le faire, désolé.", "I'm afraid I couldn't do that."),
-    "rate": ("Quelque chose a raté de mon côté.", "Something went wrong on my side, I'm afraid."),
+    "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
+    "commande_ratee": ("Je crains de ne pas avoir pu le faire.", "I'm afraid I couldn't do that."),
+    "rate": ("Un incident de mon côté, je le crains.", "Something went wrong on my side, I'm afraid."),
     "cle_absente": ("Pour vous répondre, il me faut la clé de BrainDebugger : page Passerelle de Machi Tool.",
                     "To answer you, I need the BrainDebugger key. It's on the Passerelle page of Machi Tool."),
     "cle_refusee": ("BrainDebugger refuse ma clé.", "BrainDebugger is refusing my key."),
@@ -5480,7 +5480,7 @@ _PHRASES = {
     "sans_reponse": ("Je n'ai rien à répondre à cela, curieusement.", "Curiously, I have nothing to say to that."),
     "dormir": ("Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool.",
                "Very well. I'll stop listening; you can wake me from Machi Tool."),
-    "annule": ("C'est annulé.", "Cancelled."),
+    "annule": ("Annulé.", "Cancelled."),
     "aucun_minuteur": ("Il n'y avait aucun minuteur en cours.", "There were no timers running."),
     "synchro_coupee": ("L'envoi de votre journée est coupé dans Machi Tool.",
                        "Sending your day is switched off in Machi Tool."),
@@ -5494,7 +5494,7 @@ _PHRASES = {
                   "Very well. Each time the lights come on, say my name, the way you'll call me. "
                   "Four times, the last one as a question."),
     "appris": ("C'est noté. Mon nom suffit, désormais.", "Noted. My name alone will do from now on."),
-    "pas_appris": ("Je n'ai pas réussi à retenir votre voix. On réessaiera au calme.",
+    "pas_appris": ("Je n'ai pas réussi à retenir votre voix. Nous réessaierons au calme.",
                    "I couldn't quite learn your voice. Let's try again somewhere quieter."),
     "astuce_voix": ("Oui ? Pour m'appeler juste par mon nom, dites : apprends ma voix.",
                     "Yes? By the way, to call me by my name alone, just say: learn my voice."),

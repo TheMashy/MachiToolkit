@@ -1711,7 +1711,7 @@ class DansMachiTool(unittest.TestCase):
         self.phrase("Jarvis, mets-moi Get Lucky sur YouTube")
         self.assertEqual(ouvertes, ["get lucky"])
         self.assertEqual(envoyes, [], "rien ne part au modele")
-        self.assertEqual(self.dit[-1], "C'est parti.")
+        self.assertEqual(self.dit[-1], "C'est lancé.")
         m.CFG["jarvis_pc"] = False
         self.phrase("Jarvis, lance la vidéo de chat qui joue du piano sur YouTube")
         self.assertEqual(len(ouvertes), 1, "mains fermees : rien ne s'ouvre")
@@ -2156,7 +2156,7 @@ class DansMachiTool(unittest.TestCase):
         dit = self.m.executer_commande({"action": "minuteur", "secondes": 600, "quoi": ""}, self.m.CFG)
         self.assertEqual(dit, "Minuteur de 10 minutes, lancé.")
         self.assertEqual(len(self.m.JARVIS["minuteurs"]), 1)
-        self.assertEqual(self.m.executer_commande({"action": "minuteurs_annuler"}, self.m.CFG), "C'est annulé.")
+        self.assertEqual(self.m.executer_commande({"action": "minuteurs_annuler"}, self.m.CFG), "Annulé.")
         self.assertEqual(self.m.JARVIS["minuteurs"], [])
 
     def test_jarvis_parle_anglais_par_defaut(self):
