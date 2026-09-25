@@ -3622,6 +3622,200 @@ def agenda_par_jour(rendez_vous, aujourdhui):
 
 
 
+# --- la fenetre Agenda : frise, bilan, saisie --------------------------------
+#
+# « Rends l'interface des rappels beaucoup plus belle, avec un mode frise ;
+# des infos de quantified self : temps de sommeil, note, frise avec ce qui
+# arrive ; des rappels pouvant durer plusieurs jours. » Ici, ce qui se calcule
+# et se teste ; le dessin vit dans machi_tool.py.
+
+def _jour_iso(iso):
+    import datetime
+    return datetime.date.fromisoformat(str(iso)[:10])
+
+
+def plus_jours(iso, n):
+    import datetime
+    return (_jour_iso(iso) + datetime.timedelta(days=int(n))).isoformat()
+
+
+def jour_court(iso):
+    """« jeu. 1 oct. »"""
+    d = _jour_iso(iso)
+    return "%s. %d %s" % (_JOURS_AG[d.weekday()][:3], d.day, _MOIS_COURTS[d.month - 1])
+
+
+_MOIS_COURTS = ("janv.", "fevr.", "mars", "avr.", "mai", "juin", "juil.", "aout", "sept.", "oct.", "nov.", "dec.")
+
+
+def en_cours_ou_a_venir(rendez_vous, aujourdhui):
+    """Sans ce qui est deja fini (une periode close hier ne remonte pas a
+    aujourd'hui)."""
+    return [r for r in rendez_vous or [] if isinstance(r, dict) and r.get("date") and r.get("label")
+            and str(r.get("fin") or r["date"]) >= aujourdhui]
+
+
+def voies_frise(rendez_vous, debut, jours, colonnes_libelle=None):
+    """Les rendez-vous poses sur une frise de `jours` colonnes a partir de
+    `debut` : [(voie, i0, i1, heure, libelle, date, fin)], i0..i1 les colonnes
+    couvertes (une periode s'etale), coupees aux bords. Chaque rendez-vous
+    prend la premiere voie libre ; les plus longs d'abord a egalite de debut.
+    `colonnes_libelle(libelle, heure)` : combien de colonnes son texte occupe
+    (un rendez-vous d'un jour ecrit son nom a droite ; la voie reste prise
+    jusqu'au bout du nom)."""
+    d0 = _jour_iso(debut)
+    places = []
+    for r in rendez_vous or []:
+        if not isinstance(r, dict) or not r.get("date") or not r.get("label"):
+            continue
+        try:
+            a = (_jour_iso(r["date"]) - d0).days
+            b = (_jour_iso(r.get("fin") or r["date"]) - d0).days
+        except ValueError:
+            continue
+        if b < a:
+            a, b = b, a
+        if b < 0 or a > jours - 1:
+            continue
+        places.append((max(0, a), min(jours - 1, b), str(r.get("heure") or ""), str(r["label"]),
+                       str(r["date"]), str(r.get("fin") or "")))
+    places.sort(key=lambda p: (p[0], -(p[1] - p[0]), p[2] == "", p[2]))
+    fins, out = [], []
+    for i0, i1, h, lib, d, f in places:
+        bout = i1
+        if colonnes_libelle is not None:
+            bout = max(i1, i0 + max(1, int(colonnes_libelle(lib, h))) - 1)
+        v = next((k for k, x in enumerate(fins) if x < i0), None)
+        if v is None:
+            v = len(fins)
+            fins.append(bout)
+        else:
+            fins[v] = bout
+        out.append((v, i0, i1, h, lib, d, f))
+    return out
+
+
+def duree_lisible(h):
+    """7.2 -> « 7 h 12 » ; None -> « -- »."""
+    if not isinstance(h, (int, float)) or h <= 0:
+        return "--"
+    m = int(round(h * 60))
+    return "%d h %02d" % (m // 60, m % 60)
+
+
+def note_lisible(n):
+    if not isinstance(n, (int, float)):
+        return "--"
+    return ("%.1f" % n).rstrip("0").rstrip(".").replace(".", ",")
+
+
+def resume_bilan(bilan, aujourdhui):
+    """Ce que montrent les tuiles : la derniere nuit connue, l'habitude, la
+    note la plus recente, les moyennes -- et la serie [(date, sommeil_h,
+    note)] pour les petits graphes. Tout peut manquer : on rend None."""
+    jours = [j for j in (bilan or {}).get("jours") or [] if isinstance(j, dict) and j.get("date")
+             and str(j["date"]) <= aujourdhui]
+    jours.sort(key=lambda j: str(j["date"]))
+    num = lambda x: x if isinstance(x, (int, float)) and not isinstance(x, bool) else None
+    nuits = [j for j in jours if num(j.get("sommeil_h"))]
+    notes = [j for j in jours if num(j.get("note")) is not None]
+    moy = lambda xs: round(sum(xs) / len(xs), 1) if xs else None
+    derniere = nuits[-1] if nuits else None
+    return {
+        "nuit": None if not derniere else {"date": str(derniere["date"]), "h": num(derniere.get("sommeil_h")),
+                                           "coucher": derniere.get("coucher"), "lever": derniere.get("lever")},
+        "mediane": num((bilan or {}).get("sommeil_mediane")),
+        "moy_sommeil": moy([num(j["sommeil_h"]) for j in nuits]),
+        "note": None if not notes else {"date": str(notes[-1]["date"]), "n": num(notes[-1]["note"])},
+        "moy_note": moy([num(j["note"]) for j in notes]),
+        "serie": [(str(j["date"]), num(j.get("sommeil_h")), num(j.get("note"))) for j in jours],
+    }
+
+
+def quand_lisible(date, heure, aujourdhui, fin=None):
+    """« aujourd'hui a 14:30 », « demain », « dans 3 jours », « en cours,
+    jusqu'a dim. 4 oct. »."""
+    ecart = (_jour_iso(date) - _jour_iso(aujourdhui)).days
+    if ecart < 0 and fin and str(fin) >= aujourdhui:
+        return "en cours, jusqu'a " + jour_court(fin) if str(fin) > aujourdhui else "en cours, fini ce soir"
+    base = {0: "aujourd'hui", 1: "demain", 2: "apres-demain"}.get(ecart)
+    if base is None:
+        base = "dans %d jours" % ecart if ecart > 0 else "il y a %d jours" % -ecart
+    return base + (" a " + heure if heure else "")
+
+
+def prochain_rendez_vous(rendez_vous, aujourdhui, maintenant_hhmm=""):
+    """Le prochain qui n'est pas passe : (libelle, quand) ou None. Un rendez-vous
+    d'aujourd'hui dont l'heure est passee ne compte plus ; une periode en cours,
+    si."""
+    candidats = []
+    for r in en_cours_ou_a_venir(rendez_vous, aujourdhui):
+        d, h = str(r["date"]), str(r.get("heure") or "")
+        if d == aujourdhui and h and maintenant_hhmm and h < maintenant_hhmm and not r.get("fin"):
+            continue
+        candidats.append((max(d, aujourdhui), h == "", h, r))
+    if not candidats:
+        return None
+    r = min(candidats, key=lambda c: c[:3])[3]
+    return str(r["label"]), quand_lisible(str(r["date"]), str(r.get("heure") or ""), aujourdhui, r.get("fin"))
+
+
+def date_saisie(texte, aujourdhui):
+    """Une date tapee a la main -> AAAA-MM-JJ, ou None si illisible. Accepte
+    « » (aujourd'hui), « demain », « apres-demain », « +3 », « lundi »
+    (le prochain), « 12/10 », « 12/10/2026 », « 2026-10-12 »."""
+    import datetime
+    t = re.sub(r"\s+", " ", sans_accents(str(texte or "")).lower().replace("’", "'")).strip()
+    a = _jour_iso(aujourdhui)
+    if t in ("", "aujourd'hui", "aujourdhui", "auj"):
+        return aujourdhui
+    rel = {"demain": 1, "apres-demain": 2, "apres demain": 2}
+    if t in rel:
+        return (a + datetime.timedelta(days=rel[t])).isoformat()
+    m = re.fullmatch(r"\+\s*(\d{1,3})\s*j?(?:ours?)?", t)
+    if m:
+        return (a + datetime.timedelta(days=int(m.group(1)))).isoformat()
+    for i, nom in enumerate(_JOURS_AG):
+        if t in (nom, nom[:3]):
+            ecart = (i - a.weekday()) % 7 or 7
+            return (a + datetime.timedelta(days=ecart)).isoformat()
+    try:
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+        if m:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        m = re.fullmatch(r"(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?", t)
+        if m:
+            an = int(m.group(3)) if m.group(3) else a.year
+            an += 2000 if an < 100 else 0
+            d = datetime.date(an, int(m.group(2)), int(m.group(1)))
+            if not m.group(3) and d < a:
+                d = datetime.date(an + 1, d.month, d.day)      # « 12/01 » en decembre : l'an prochain
+            return d.isoformat()
+    except ValueError:
+        return None
+    return None
+
+
+def heure_saisie(texte):
+    """« 14h30 », « 9h », « 14:30 », « » -> « 14:30 », « 09:00 », « » ; None si illisible."""
+    t = str(texte or "").strip().lower().replace(" ", "")
+    if not t:
+        return ""
+    m = re.fullmatch(r"(\d{1,2})(?:[h:](\d{2})?)?", t)
+    if not m or int(m.group(1)) > 23 or (m.group(2) and int(m.group(2)) > 59):
+        return None
+    return "%02d:%s" % (int(m.group(1)), m.group(2) or "00")
+
+
+_TEINTES_AGENDA = ("#6FC3DF", "#A58BFF", "#F2C94C", "#5CE6A4", "#FF8FB1", "#8FB8FF")
+
+
+def teinte_rendez_vous(libelle):
+    """Une couleur stable par libelle (le meme rendez-vous garde la sienne)."""
+    import zlib
+    return _TEINTES_AGENDA[zlib.crc32(normaliser(str(libelle)).encode("utf-8")) % len(_TEINTES_AGENDA)]
+
+
 # --------------------------- LE SON, APPLI PAR APPLI -----------------------
 #
 # « Il faudrait que Jarvis puisse mettre le son de differentes applications de

@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.48.0"
+VERSION = "1.49.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -6752,13 +6752,36 @@ def lire_temperatures():
 # --- L'AGENDA -----------------------------------------------------------
 
 AGENDA_JOURS = 14
+AGENDA_PASSE = 7        # la frise montre aussi la semaine ecoulee : sommeil, note
 
 
-def lire_agenda(cfg, jours=AGENDA_JOURS):
-    """Les rendez-vous des prochains jours, depuis BrainDebugger (les reperes
-    « agenda » ; jamais un « psy »)."""
-    return _requete_bd("/api/machitool/agenda?depuis=%s&jours=%d" % (time.strftime("%Y-%m-%d"), int(jours)),
-                       None, cfg, 15)
+def lire_agenda(cfg, jours=AGENDA_JOURS, depuis=None, bilan=False):
+    """Les rendez-vous de `depuis` (aujourd'hui) sur `jours`, depuis
+    BrainDebugger (les reperes « agenda » ; jamais un « psy ») -- et, avec
+    `bilan`, les chiffres des derniers jours : nuits et note de la journee."""
+    return _requete_bd("/api/machitool/agenda?depuis=%s&jours=%d%s" % (
+        depuis or time.strftime("%Y-%m-%d"), int(jours), "&bilan=1&bilan_jours=%d" % AGENDA_PASSE if bilan else ""),
+        None, cfg, 15)
+
+
+def poser_agenda(cfg, titre, date, fin=None, heure=None):
+    """Un rappel dans l'agenda de BrainDebugger : un jour, ou du `date` au `fin`."""
+    return _requete_bd("/api/machitool/agenda", {"titre": titre, "date": date, "fin": fin, "heure": heure}, cfg, 15)
+
+
+def bilan_local(aujourdhui, jours=AGENDA_PASSE):
+    """Le bilan quand BrainDebugger ne le donne pas (plus ancien, injoignable) :
+    les nuits que Machi Tool a mesurees lui-meme ; pas de note."""
+    out = []
+    for k in range(jours - 1, -1, -1):
+        d = _jv.plus_jours(aujourdhui, -k)
+        try:
+            n = sommeil_estime(d) or {}
+        except Exception:
+            n = {}
+        out.append({"date": d, "note": None, "sommeil_h": n.get("sommeil_h"),
+                    "coucher": n.get("coucher"), "lever": n.get("reveil")})
+    return {"jours": out, "sommeil_mediane": None}
 
 
 # --- YOUTUBE -----------------------------------------------------------
@@ -8978,6 +9001,58 @@ class Panneau:
     #  BrainDebugger. Une fenetre a part, que Jarvis ouvre (« montre-moi mon
     #  agenda »), comme le menu de l'icone.
 
+    # ------------------------------------------------------------------
+    #  L'AGENDA. « Rends l'interface des rappels beaucoup plus belle, avec un
+    #  mode frise ; inspire-toi de BrainDebugger ; des infos de quantified
+    #  self : temps de sommeil, note, frise avec ce qui arrive ; des rappels
+    #  pouvant durer plusieurs jours. »
+    #
+    #  En tete, quatre tuiles : la derniere nuit, les sept dernieres nuits, la
+    #  note de la journee, ce qui arrive. Dessous, au choix : la LISTE, jour par
+    #  jour, ou la FRISE -- la semaine ecoulee et les deux qui viennent sur un
+    #  meme axe, les periodes etalees sur leurs jours, le sommeil et la note en
+    #  bas. En pied, poser un rappel (un jour, ou du ... au ...).
+
+    AGENDA_FOND_CARTE = "#1B2230"
+    AGENDA_WEEKEND = "#1A1F2A"
+    AGENDA_AUJOURDHUI = "#22304A"
+    AGENDA_SOMMEIL = "#8FB8FF"
+
+    def _arrondi(self, c, x0, y0, x1, y1, r, **kw):
+        r = max(0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+        pts = (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+        return c.create_polygon(pts, smooth=True, **kw)
+
+    def _champ_indice(self, parent, indice, largeur):
+        """Un champ avec son indice en gris, qui s'efface quand on y entre."""
+        e = self.tk.Entry(parent, bg=ENCRE, fg=BRUME, insertbackground=CRAIE, relief="flat", bd=6,
+                          width=largeur, font=(self.f_ui, 10), highlightthickness=1,
+                          highlightbackground=FIL, highlightcolor=self.accent)
+        e.indice = indice
+        e.insert(0, indice)
+
+        def entrer(_):
+            if e.get() == e.indice and e.cget("fg") == BRUME:
+                e.delete(0, "end")
+                e.configure(fg=CRAIE)
+
+        def sortir(_):
+            if not e.get():
+                e.insert(0, e.indice)
+                e.configure(fg=BRUME)
+        e.bind("<FocusIn>", entrer)
+        e.bind("<FocusOut>", sortir)
+        return e
+
+    def _valeur(self, e):
+        return "" if e.cget("fg") == BRUME and e.get() == e.indice else e.get().strip()
+
+    def _vider(self, e):
+        e.delete(0, "end")
+        e.insert(0, e.indice)
+        e.configure(fg=BRUME)
+
     def ouvrir_agenda(self):
         tk = self.tk
         f = getattr(self, "fen_agenda", None)
@@ -8988,80 +9063,446 @@ class Panneau:
             return self.remplir_agenda()
         f = tk.Toplevel(self.root, bg=NUIT)
         f.title("Agenda -- Machi Tool")
-        f.geometry("%dx%d" % (self.px(440), self.px(540)))
-        f.minsize(self.px(320), self.px(260))
+        f.geometry("%dx%d" % (self.px(820), self.px(680)))
+        f.minsize(self.px(560), self.px(460))
         f.attributes("-topmost", True)
         f.after(1500, lambda: f.winfo_exists() and f.attributes("-topmost", False))
         self.fen_agenda = f
+        self.__dict__.setdefault("agenda_mode", self.cfg.get("agenda_mode", "liste"))
+        self.agenda_donnees = {"etat": "lecture", "rdv": [], "bilan": None,
+                               "aujourdhui": time.strftime("%Y-%m-%d"), "message": ""}
+        marge = self.px(20)
+
         tete = tk.Frame(f, bg=NUIT)
-        tete.pack(fill="x", padx=self.px(18), pady=(self.px(16), self.px(6)))
-        tk.Label(tete, text="Agenda", bg=NUIT, fg=CRAIE, font=(self.f_ui, 15, "bold")).pack(side="left")
-        self.agenda_etat = tk.Label(tete, text="", bg=NUIT, fg=BRUME, font=(self.f_ui, 9))
-        self.agenda_etat.pack(side="left", padx=(self.px(10), 0))
-        self.bouton(tete, "Actualiser", self.remplir_agenda, compact=True).pack(side="right")
-        cadre = tk.Frame(f, bg=NUIT)
-        cadre.pack(fill="both", expand=True, padx=self.px(18), pady=(0, self.px(14)))
-        barre = tk.Scrollbar(cadre)
+        tete.pack(fill="x", padx=marge, pady=(self.px(18), self.px(10)))
+        titres = tk.Frame(tete, bg=NUIT)
+        titres.pack(side="left")
+        tk.Label(titres, text="Agenda", bg=NUIT, fg=CRAIE, font=(self.f_ui, 17, "bold")).pack(anchor="w")
+        self.agenda_sous_titre = tk.Label(titres, text="", bg=NUIT, fg=BRUME, font=(self.f_ui, 9))
+        self.agenda_sous_titre.pack(anchor="w")
+        droite = tk.Frame(tete, bg=NUIT)
+        droite.pack(side="right")
+        self.bouton(droite, "↻", self.remplir_agenda, compact=True).pack(side="right", padx=(self.px(8), 0))
+        bascule = tk.Frame(droite, bg=ENCRE, highlightthickness=1, highlightbackground=FIL)
+        bascule.pack(side="right")
+        self.agenda_boutons_mode = {}
+        for cle, nom in (("liste", "Liste"), ("frise", "Frise")):
+            b = tk.Label(bascule, text=nom, bg=ENCRE, fg=BRUME, font=(self.f_ui, 9, "bold"),
+                         padx=self.px(14), pady=self.px(5), cursor="hand2")
+            b.pack(side="left")
+            b.bind("<Button-1>", lambda _e, c=cle: self._agenda_mode(c))
+            self.agenda_boutons_mode[cle] = b
+
+        self.agenda_tuiles = tk.Canvas(f, bg=NUIT, highlightthickness=0, bd=0, height=self.px(118))
+        self.agenda_tuiles.pack(fill="x", padx=marge)
+
+        corps = tk.Frame(f, bg=NUIT)
+        corps.pack(fill="both", expand=True, padx=marge, pady=(self.px(12), 0))
+        barre = tk.Scrollbar(corps, orient="vertical")
         barre.pack(side="right", fill="y")
-        t = tk.Text(cadre, bg=NUIT, fg=CRAIE, relief="flat", bd=0, highlightthickness=0, wrap="word",
-                    font=(self.f_ui, 11), cursor="arrow", yscrollcommand=barre.set, padx=2)
-        t.pack(side="left", fill="both", expand=True)
-        barre.config(command=t.yview)
-        t.tag_configure("jour", font=(self.f_ui, 10, "bold"), foreground=VIF, spacing1=self.px(12), spacing3=self.px(4))
-        t.tag_configure("heure", font=(self.f_mono if hasattr(self, "f_mono") else self.f_ui, 10), foreground=BRUME)
-        t.tag_configure("fin", foreground=BRUME, font=(self.f_ui, 9))
-        t.tag_configure("vide", foreground=BRUME)
-        self.agenda_texte = t
-        pied = tk.Frame(f, bg=NUIT)
-        pied.pack(fill="x", padx=self.px(18), pady=(0, self.px(14)))
-        tk.Label(pied, text="Les rendez-vous se posent dans BrainDebugger (Annee > Reperes > Agenda) ou a Jarvis.",
-                 bg=NUIT, fg=BRUME, font=(self.f_ui, 8), wraplength=self.px(400), justify="left").pack(side="left")
+        c = tk.Canvas(corps, bg=NUIT, highlightthickness=0, bd=0, yscrollcommand=barre.set)
+        c.pack(side="left", fill="both", expand=True)
+        barre.config(command=c.yview)
+        c.bind("<MouseWheel>", lambda e: c.yview_scroll(int(-e.delta / 120), "units"))
+        c.bind("<Button-4>", lambda e: c.yview_scroll(-2, "units"))
+        c.bind("<Button-5>", lambda e: c.yview_scroll(2, "units"))
+        self.agenda_toile = c
+
+        pied = tk.Frame(f, bg=VELOURS)
+        pied.pack(fill="x", padx=marge, pady=(self.px(12), self.px(16)))
+        ligne = tk.Frame(pied, bg=VELOURS)
+        ligne.pack(fill="x", padx=self.px(12), pady=(self.px(10), self.px(4)))
+        tk.Label(ligne, text="NOUVEAU RAPPEL", bg=VELOURS, fg=BRUME, font=(self.f_mono, 8)).pack(side="left")
+        self.agenda_retour = tk.Label(ligne, text="", bg=VELOURS, fg=BRUME, font=(self.f_ui, 9))
+        self.agenda_retour.pack(side="right")
+        champs = tk.Frame(pied, bg=VELOURS)
+        champs.pack(fill="x", padx=self.px(12), pady=(0, self.px(12)))
+        self.agenda_titre = self._champ_indice(champs, "Dentiste, vacances, anniversaire...", 26)
+        self.agenda_titre.pack(side="left", fill="x", expand=True)
+        petit = lambda t: tk.Label(champs, text=t, bg=VELOURS, fg=BRUME, font=(self.f_ui, 9))
+        petit("le").pack(side="left", padx=(self.px(8), self.px(4)))
+        self.agenda_date = self._champ_indice(champs, "demain", 11)
+        self.agenda_date.pack(side="left")
+        petit("au").pack(side="left", padx=(self.px(6), self.px(4)))
+        self.agenda_fin = self._champ_indice(champs, "(un seul jour)", 12)
+        self.agenda_fin.pack(side="left")
+        petit("a").pack(side="left", padx=(self.px(6), self.px(4)))
+        self.agenda_heure = self._champ_indice(champs, "14h30", 6)
+        self.agenda_heure.pack(side="left")
+        self.bouton(champs, "Ajouter", self.ajouter_rappel, principal=True, compact=True).pack(
+            side="left", padx=(self.px(10), 0))
+        for e in (self.agenda_titre, self.agenda_date, self.agenda_fin, self.agenda_heure):
+            e.bind("<Return>", lambda _e: self.ajouter_rappel())
+
+        c.bind("<Configure>", lambda _e: self._agenda_redessiner_bientot())
+        self.agenda_tuiles.bind("<Configure>", lambda _e: self._agenda_redessiner_bientot())
+        self._agenda_mode(self.agenda_mode, relire=False)
         self.remplir_agenda()
 
-    def remplir_agenda(self):
-        """Va chercher l'agenda hors du fil de l'interface, puis l'ecrit."""
-        if not getattr(self, "agenda_texte", None) or not self.agenda_texte.winfo_exists():
+    def _agenda_mode(self, mode, relire=False):
+        self.agenda_mode = "frise" if mode == "frise" else "liste"
+        self.cfg["agenda_mode"] = self.agenda_mode
+        for cle, b in getattr(self, "agenda_boutons_mode", {}).items():
+            actif = cle == self.agenda_mode
+            b.configure(bg=self.accent if actif else ENCRE, fg=NUIT if actif else BRUME)
+        self._agenda_redessiner_bientot()
+
+    def _agenda_redessiner_bientot(self):
+        if getattr(self, "_agenda_attente", None):
             return
-        self.agenda_etat.configure(text="Lecture...")
+        f = getattr(self, "fen_agenda", None)
+        if f is None or not f.winfo_exists():
+            return
+
+        def faire():
+            self._agenda_attente = None
+            self._agenda_dessiner()
+        self._agenda_attente = f.after(30, faire)
+
+    def remplir_agenda(self):
+        """Va chercher l'agenda et le bilan hors du fil de l'interface."""
+        f = getattr(self, "fen_agenda", None)
+        if f is None or not f.winfo_exists():
+            return
+        self.agenda_sous_titre.configure(text="Lecture...")
         cfg = self.cfg
 
         def chercher():
+            aujourdhui = time.strftime("%Y-%m-%d")
+            d = {"etat": "ok", "rdv": [], "bilan": None, "aujourdhui": aujourdhui, "message": ""}
             try:
                 if not _cle_presente(cfg):
                     raise ValueError("Relie Machi Tool a BrainDebugger (Reglages > le pont) pour voir l'agenda.")
-                r = lire_agenda(cfg)
-                resultat = ("ok", r.get("rendezVous") or [], str(r.get("depuis") or time.strftime("%Y-%m-%d")))
+                r = lire_agenda(cfg, AGENDA_PASSE + AGENDA_JOURS, depuis=_jv.plus_jours(aujourdhui, -AGENDA_PASSE),
+                                bilan=True)
+                d["rdv"] = r.get("rendezVous") or []
+                d["bilan"] = r.get("bilan")
             except urllib.error.HTTPError as e:
-                resultat = ("erreur", "BrainDebugger a repondu %d%s." % (
-                    e.code, " : mets-le a jour" if e.code == 404 else ""), None)
+                d.update(etat="erreur", message="BrainDebugger a repondu %d%s." % (
+                    e.code, " : mets-le a jour" if e.code == 404 else ""))
             except Exception as e:
-                resultat = ("erreur", str(e) if isinstance(e, ValueError) else "BrainDebugger injoignable.", None)
-            self.root.after(0, lambda: self._ecrire_agenda(*resultat))
+                d.update(etat="erreur", message=str(e) if isinstance(e, ValueError) else "BrainDebugger injoignable.")
+            if not d["bilan"]:
+                d["bilan"] = bilan_local(aujourdhui)          # un BrainDebugger plus ancien : nos nuits a nous
+            self.root.after(0, lambda: self._agenda_recu(d))
         threading.Thread(target=chercher, daemon=True).start()
 
-    def _ecrire_agenda(self, etat, contenu, aujourdhui):
-        t = getattr(self, "agenda_texte", None)
-        if t is None or not t.winfo_exists():
+    def _agenda_recu(self, d):
+        self.agenda_donnees = d
+        f = getattr(self, "fen_agenda", None)
+        if f is None or not f.winfo_exists():
             return
-        t.configure(state="normal")
-        t.delete("1.0", "end")
-        if etat != "ok":
-            t.insert("end", contenu, "vide")
-            self.agenda_etat.configure(text="")
+        self._agenda_dessiner()
+
+    # --- le dessin --------------------------------------------------------
+
+    def _agenda_dessiner(self):
+        f = getattr(self, "fen_agenda", None)
+        if f is None or not f.winfo_exists():
+            return
+        d = self.agenda_donnees
+        auj = d["aujourdhui"]
+        jour = _jv._jour_iso(auj)
+        long = "%s %d %s" % (_jv._JOURS_AG[jour.weekday()], jour.day, _jv._MOIS_AG[jour.month - 1])
+        a_venir = [r for r in _jv.en_cours_ou_a_venir(d["rdv"], auj)
+                   if str(r["date"]) <= _jv.plus_jours(auj, AGENDA_JOURS - 1)]
+        self.agenda_sous_titre.configure(
+            text=long[0].upper() + long[1:] + ("  ·  " + d["message"] if d["etat"] != "ok" else
+                                               "  ·  %d a venir sur %d jours" % (len(a_venir), AGENDA_JOURS)))
+        self._agenda_tuiles(d, a_venir)
+        if self.agenda_mode == "frise":
+            self._agenda_frise(d)
         else:
-            jours = _jv.agenda_par_jour(contenu, aujourdhui)
-            if not jours:
-                t.insert("end", "Rien a l'agenda pour les %d prochains jours." % AGENDA_JOURS, "vide")
-            for titre, items in jours:
-                t.insert("end", titre + "\n", "jour")
-                for heure, libelle, fin in items:
-                    t.insert("end", ("%s  " % heure) if heure else "        ", "heure")
-                    t.insert("end", libelle)
-                    if fin:
-                        t.insert("end", "  " + fin, "fin")
-                    t.insert("end", "\n")
-            self.agenda_etat.configure(text="%d prochains jours" % AGENDA_JOURS)
-        t.configure(state="disabled")
+            self._agenda_liste(d, a_venir)
+
+    def _agenda_tuiles(self, d, a_venir):
+        c = self.agenda_tuiles
+        c.delete("all")
+        W, H = max(c.winfo_width(), self.px(400)), self.px(118)
+        b = _jv.resume_bilan(d["bilan"], d["aujourdhui"])
+        ecart = self.px(10)
+        l = (W - 3 * ecart) / 4.0
+        petit, moyen, gros = (self.f_mono, 8), (self.f_ui, 9), (self.f_ui, 20, "bold")
+        p = self.px(12)
+        for i in range(4):
+            x0 = i * (l + ecart)
+            self._arrondi(c, x0, 0, x0 + l, H, self.px(10), fill=VELOURS, outline="")
+        # 1. la derniere nuit
+        x = p
+        c.create_text(x, p, text="DERNIERE NUIT", fill=BRUME, font=petit, anchor="nw")
+        nuit = b["nuit"]
+        c.create_text(x, p + self.px(16), text=_jv.duree_lisible(nuit and nuit["h"]), fill=CRAIE, font=gros,
+                      anchor="nw")
+        if nuit:
+            bornes = "%s → %s" % (nuit.get("coucher") or "?", nuit.get("lever") or "?")
+            c.create_text(x, p + self.px(52), text=bornes, fill=BRUME, font=moyen, anchor="nw")
+            if b["mediane"]:
+                diff = nuit["h"] - b["mediane"]
+                sens = "▲" if diff > 0.25 else "▼" if diff < -0.25 else "●"
+                c.create_text(x, p + self.px(72), anchor="nw", font=moyen, fill=self.AGENDA_SOMMEIL,
+                              text="%s habitude %s" % (sens, _jv.duree_lisible(b["mediane"])))
+        else:
+            c.create_text(x, p + self.px(52), text="pas encore mesuree", fill=BRUME, font=moyen, anchor="nw")
+        # 2. les sept nuits
+        x0 = l + ecart
+        c.create_text(x0 + p, p, text="SOMMEIL · %d NUITS" % AGENDA_PASSE, fill=BRUME, font=petit, anchor="nw")
+        serie = b["serie"][-AGENDA_PASSE:]
+        haut, bas = p + self.px(22), H - p - self.px(16)
+        n = max(1, len(serie))
+        pas = (l - 2 * p) / float(max(n, AGENDA_PASSE))
+        plafond = max([12.0] + [h for _, h, _ in serie if h])
+        for k, (dt, h, _) in enumerate(serie):
+            cx = x0 + p + pas * k
+            self._arrondi(c, cx + pas * 0.18, haut, cx + pas * 0.82, bas, self.px(3), fill=ENCRE, outline="")
+            if h:
+                y = bas - (bas - haut) * h / plafond
+                self._arrondi(c, cx + pas * 0.18, y, cx + pas * 0.82, bas, self.px(3), outline="",
+                              fill=self.AGENDA_SOMMEIL if dt == d["aujourdhui"] else "#5E7FB8")
+            c.create_text(cx + pas / 2, bas + self.px(3), text=_jv._JOURS_AG[_jv._jour_iso(dt).weekday()][0].upper(),
+                          fill=BRUME, font=(self.f_mono, 7), anchor="n")
+        if b["mediane"]:
+            y = bas - (bas - haut) * b["mediane"] / plafond
+            c.create_line(x0 + p, y, x0 + l - p, y, fill=ETOILE, dash=(2, 3))
+        # 3. la note
+        x0 = 2 * (l + ecart)
+        c.create_text(x0 + p, p, text="NOTE DE LA JOURNEE", fill=BRUME, font=petit, anchor="nw")
+        note = b["note"]
+        t = c.create_text(x0 + p, p + self.px(16), text=_jv.note_lisible(note and note["n"]), fill=CRAIE,
+                          font=gros, anchor="nw")
+        bx = c.bbox(t)
+        c.create_text(bx[2] + self.px(3), bx[3] - self.px(6), text="/10", fill=BRUME, font=moyen, anchor="sw")
+        if note:
+            quand = {0: "aujourd'hui", -1: "hier"}.get(
+                (_jv._jour_iso(note["date"]) - _jv._jour_iso(d["aujourdhui"])).days, _jv.jour_court(note["date"]))
+            c.create_text(x0 + p, p + self.px(52), text=quand + (
+                "  ·  moy. %s" % _jv.note_lisible(b["moy_note"]) if b["moy_note"] is not None else ""),
+                fill=BRUME, font=moyen, anchor="nw")
+        pts = [(k, n_) for k, (_, _, n_) in enumerate(serie) if n_ is not None]
+        if pts:
+            y0n, y1n = p + self.px(74), H - p
+            xy = []
+            for k, n_ in pts:
+                xy += [x0 + p + pas * k + pas / 2, y1n - (y1n - y0n) * n_ / 10.0]
+            if len(xy) >= 4:
+                c.create_line(*xy, fill="#6A5A2A", width=self.px(2), smooth=True)
+            for j in range(0, len(xy), 2):
+                c.create_oval(xy[j] - self.px(3), xy[j + 1] - self.px(3), xy[j] + self.px(3), xy[j + 1] + self.px(3),
+                              fill=ETOILE, outline="")
+        # 4. ce qui arrive
+        x0 = 3 * (l + ecart)
+        c.create_text(x0 + p, p, text="A VENIR · %d JOURS" % AGENDA_JOURS, fill=BRUME, font=petit, anchor="nw")
+        c.create_text(x0 + p, p + self.px(16), text=str(len(a_venir)), fill=CRAIE, font=gros, anchor="nw")
+        prochain = _jv.prochain_rendez_vous(d["rdv"], d["aujourdhui"], time.strftime("%H:%M"))
+        largeur = int(l - 2 * p)
+        if prochain:
+            c.create_text(x0 + p, p + self.px(52), text=prochain[0], fill=CRAIE, font=(self.f_ui, 10, "bold"),
+                          anchor="nw", width=largeur)
+            c.create_text(x0 + p, p + self.px(72), text=prochain[1], fill=VIF, font=moyen, anchor="nw",
+                          width=largeur)
+        else:
+            c.create_text(x0 + p, p + self.px(52), text="rien de prevu", fill=BRUME, font=moyen, anchor="nw")
+
+    def _agenda_liste(self, d, a_venir):
+        c = self.agenda_toile
+        c.delete("all")
+        W = max(c.winfo_width(), self.px(400)) - self.px(4)
+        auj = d["aujourdhui"]
+        y = self.px(4)
+        if d["etat"] != "ok" and not a_venir:
+            c.create_text(W / 2, self.px(60), text=d["message"], fill=BRUME, font=(self.f_ui, 10), width=W - 40)
+            c.configure(scrollregion=(0, 0, W, self.px(120)))
+            return
+        if not a_venir:
+            c.create_text(W / 2, self.px(50), text="Rien a l'agenda pour les %d prochains jours." % AGENDA_JOURS,
+                          fill=CRAIE, font=(self.f_ui, 11))
+            c.create_text(W / 2, self.px(74), fill=BRUME, font=(self.f_ui, 9),
+                          text="Pose un rappel ci-dessous, dans BrainDebugger (Annee > Reperes), ou demande a Jarvis.")
+            c.configure(scrollregion=(0, 0, W, self.px(120)))
+            return
+        for titre, items in _jv.agenda_par_jour(a_venir, auj):
+            aujourdhui = titre.startswith("Aujourd'hui")
+            t = c.create_text(0, y, text=titre.replace(" -- ", "  \u00b7  "), fill=self.accent if aujourdhui else CRAIE,
+                              font=(self.f_ui, 10, "bold"), anchor="nw")
+            bx = c.bbox(t)
+            c.create_line(bx[2] + self.px(10), (bx[1] + bx[3]) / 2, W, (bx[1] + bx[3]) / 2, fill=FIL)
+            y = bx[3] + self.px(8)
+            for heure, libelle, fin in items:
+                r = next((x for x in a_venir if str(x["label"]) == libelle and str(x.get("heure") or "") == heure),
+                         {"date": auj, "label": libelle})
+                h = self.px(44)
+                self._arrondi(c, 0, y, W, y + h, self.px(9), fill=self.AGENDA_FOND_CARTE, outline="")
+                teinte = _jv.teinte_rendez_vous(libelle)
+                c.create_oval(self.px(14), y + h / 2 - self.px(4), self.px(22), y + h / 2 + self.px(4),
+                              fill=teinte, outline="")
+                c.create_text(self.px(34), y + h / 2, text=heure or "journee", anchor="w",
+                              fill=CRAIE if heure else BRUME, font=(self.f_mono, 9))
+                c.create_text(self.px(104), y + h / 2, text=libelle, anchor="w", fill=CRAIE,
+                              font=(self.f_ui, 11), width=W - self.px(104) - self.px(210))
+                if r.get("fin"):
+                    d0, d1 = _jv._jour_iso(r["date"]), _jv._jour_iso(r["fin"])
+                    total = (d1 - d0).days + 1
+                    fait = max(0, min(total, (_jv._jour_iso(auj) - d0).days))
+                    c.create_text(W - self.px(14), y + h / 2 - self.px(1), anchor="e", fill=BRUME,
+                                  font=(self.f_ui, 9), text="%d jours · jusqu'au %s" % (total, _jv.jour_court(r["fin"])))
+                    # la periode : ou l'on en est
+                    x0, x1 = self.px(104), W - self.px(14)
+                    yb = y + h - self.px(6)
+                    c.create_line(x0, yb, x1, yb, fill=FIL, width=self.px(3), capstyle="round")
+                    if fait:
+                        c.create_line(x0, yb, x0 + (x1 - x0) * fait / float(total), yb, fill=teinte,
+                                      width=self.px(3), capstyle="round")
+                else:
+                    c.create_text(W - self.px(14), y + h / 2, anchor="e", fill=BRUME, font=(self.f_ui, 9),
+                                  text=_jv.quand_lisible(r["date"], "", auj))
+                y += h + self.px(6)
+            y += self.px(10)
+        c.configure(scrollregion=(0, 0, W, y))
+
+    def _agenda_frise(self, d):
+        c = self.agenda_toile
+        c.delete("all")
+        W = max(c.winfo_width(), self.px(400)) - self.px(4)
+        auj = d["aujourdhui"]
+        debut = _jv.plus_jours(auj, -AGENDA_PASSE)
+        n = AGENDA_PASSE + AGENDA_JOURS
+        gauche = self.px(70)
+        col = (W - gauche) / float(n)
+        police = (self.f_ui, 9)
+        try:
+            import tkinter.font as tkfont
+            mesure = tkfont.Font(root=self.root, family=self.f_ui, size=9)
+            largeur_px = mesure.measure
+        except Exception:
+            largeur_px = lambda t: len(t) * self.px(7)
+        cols = lambda lib, h: 1 + int((self.px(14) + largeur_px((h + " " if h else "") + lib)) // max(1, col))
+        voies = _jv.voies_frise(d["rdv"], debut, n, cols)
+        nvoies = max(1, 1 + max([v[0] for v in voies] or [0]))
+        entete, voie_h = self.px(40), self.px(28)
+        y_rdv = entete + self.px(8)
+        y_som = y_rdv + nvoies * voie_h + self.px(24)
+        h_som = self.px(60)
+        y_note = y_som + h_som + self.px(30)
+        h_note = self.px(54)
+        bas = y_note + h_note + self.px(10)
+        # les colonnes : fin de semaine un peu plus sombre, aujourd'hui en clair
+        for k in range(n):
+            dt = _jv._jour_iso(_jv.plus_jours(debut, k))
+            x = gauche + k * col
+            if dt.isoformat() == auj:
+                self._arrondi(c, x + 1, 0, x + col - 1, bas, self.px(6), fill=self.AGENDA_AUJOURDHUI, outline="")
+            elif dt.weekday() >= 5:
+                c.create_rectangle(x, entete - self.px(4), x + col, bas, fill=self.AGENDA_WEEKEND, outline="")
+            passe = dt.isoformat() < auj
+            c.create_text(x + col / 2, self.px(8), text=_jv._JOURS_AG[dt.weekday()][0].upper(),
+                          fill=BRUME, font=(self.f_mono, 7))
+            c.create_text(x + col / 2, self.px(24), text=str(dt.day),
+                          fill=self.accent if dt.isoformat() == auj else (BRUME if passe else CRAIE),
+                          font=(self.f_ui, 10, "bold" if dt.isoformat() == auj else "normal"))
+            if dt.day == 1 or k == 0:
+                c.create_text(x + self.px(2), entete - self.px(2), text=_jv._MOIS_COURTS[dt.month - 1].upper(),
+                              fill=ETOILE, font=(self.f_mono, 7), anchor="w")
+        # les etiquettes des rangees
+        for y, nom in ((y_rdv, "RAPPELS"), (y_som, "SOMMEIL"), (y_note, "NOTE")):
+            c.create_text(0, y + self.px(2), text=nom, fill=BRUME, font=(self.f_mono, 8), anchor="nw")
+            c.create_line(gauche, y - self.px(8), W, y - self.px(8), fill=FIL)
+        # les rappels
+        for v, i0, i1, heure, libelle, date, fin in voies:
+            teinte = _jv.teinte_rendez_vous(libelle)
+            y0 = y_rdv + v * voie_h
+            y1 = y0 + voie_h - self.px(6)
+            passe = (fin or date) < auj
+            texte = (heure + " " if heure else "") + libelle
+            if i1 > i0:
+                x0, x1 = gauche + i0 * col + 2, gauche + (i1 + 1) * col - 2
+                self._arrondi(c, x0, y0, x1, y1, self.px(7), fill=FIL if passe else teinte, outline="")
+                place = int((x1 - x0 - self.px(12)) / max(1, largeur_px("m") * 0.62))
+                court = texte if len(texte) <= place else texte[:max(1, place - 1)] + "…"
+                c.create_text(x0 + self.px(8), (y0 + y1) / 2, text=court, anchor="w",
+                              fill=BRUME if passe else NUIT, font=(self.f_ui, 9, "bold"))
+            else:
+                cx = gauche + i0 * col + col / 2
+                r = self.px(5)
+                c.create_oval(cx - r, (y0 + y1) / 2 - r, cx + r, (y0 + y1) / 2 + r,
+                              fill=FIL if passe else teinte, outline="")
+                c.create_text(cx + r + self.px(5), (y0 + y1) / 2, text=texte, anchor="w",
+                              fill=BRUME if passe else CRAIE, font=police)
+        if not voies:
+            c.create_text(gauche + self.px(8), y_rdv + voie_h / 2 - self.px(3), anchor="w", fill=BRUME,
+                          font=police, text=d["message"] if d["etat"] != "ok" else "Rien sur ces trois semaines.")
+        # le sommeil et la note, jour par jour
+        b = _jv.resume_bilan(d["bilan"], auj)
+        par_jour = {dt: (h, n_) for dt, h, n_ in b["serie"]}
+        plafond = max([12.0] + [h for h, _ in par_jour.values() if h])
+        base = y_som + h_som
+        if b["mediane"]:
+            ym = base - h_som * b["mediane"] / plafond
+            c.create_line(gauche, ym, gauche + (AGENDA_PASSE + 1) * col, ym, fill=ETOILE, dash=(2, 3))
+        points = []
+        for k in range(AGENDA_PASSE + 1):
+            dt = _jv.plus_jours(debut, k)
+            h, n_ = par_jour.get(dt, (None, None))
+            x = gauche + k * col
+            if h:
+                y = base - h_som * h / plafond
+                self._arrondi(c, x + col * 0.22, y, x + col * 0.78, base, self.px(3), outline="",
+                              fill=self.AGENDA_SOMMEIL if dt == auj else "#5E7FB8")
+                c.create_text(x + col / 2, y - self.px(3), text=_jv.note_lisible(h), anchor="s", fill=BRUME,
+                              font=(self.f_mono, 7))
+            if n_ is not None:
+                points.append((x + col / 2, y_note + h_note - h_note * n_ / 10.0, n_))
+        if len(points) >= 2:
+            xy = [v for p_ in points for v in p_[:2]]
+            c.create_line(*xy, fill="#6A5A2A", width=self.px(2), smooth=True)
+        for x, y, n_ in points:
+            c.create_oval(x - self.px(4), y - self.px(4), x + self.px(4), y + self.px(4), fill=ETOILE, outline="")
+            c.create_text(x, y - self.px(7), text=_jv.note_lisible(n_), anchor="s", fill=CRAIE,
+                          font=(self.f_mono, 7))
+        xa = gauche + (AGENDA_PASSE + 1) * col
+        c.create_text(xa + self.px(10), y_som + h_som / 2, anchor="w", fill=BRUME, font=police,
+                      text="le sommeil et la note se remplissent au fil des jours")
+        c.configure(scrollregion=(0, 0, W, bas + self.px(8)))
+
+    def ajouter_rappel(self):
+        titre = self._valeur(self.agenda_titre)
+        auj = time.strftime("%Y-%m-%d")
+        date = _jv.date_saisie(self._valeur(self.agenda_date) or "", auj)
+        texte_fin = self._valeur(self.agenda_fin)
+        fin = _jv.date_saisie(texte_fin, auj) if texte_fin else None
+        heure = _jv.heure_saisie(self._valeur(self.agenda_heure))
+        dire = lambda t, c=ALERTE: self.agenda_retour.configure(text=t, fg=c)
+        if not titre:
+            return dire("Il faut un titre.")
+        if date is None:
+            return dire("Date illisible (ex. demain, lundi, 12/10).")
+        if texte_fin and (fin is None or fin < date):
+            return dire("Fin illisible, ou avant le debut.")
+        if heure is None:
+            return dire("Heure illisible (ex. 14h30).")
+        if not _cle_presente(self.cfg):
+            return dire("Relie d'abord Machi Tool a BrainDebugger.")
+        dire("Envoi...", BRUME)
+        cfg = self.cfg
+
+        def envoyer():
+            try:
+                r = poser_agenda(cfg, titre, date, fin if fin and fin != date else None, heure or None)
+                resultat = (True, r.get("texte") or "Ajoute.")
+            except urllib.error.HTTPError as e:
+                resultat = (False, _detail_http(e) or "BrainDebugger a repondu %d." % e.code)
+            except Exception:
+                resultat = (False, "BrainDebugger injoignable.")
+
+            def fini():
+                ok, texte = resultat
+                if not self.agenda_retour.winfo_exists():
+                    return
+                dire(texte, VIF if ok else ALERTE)
+                if ok:
+                    for e in (self.agenda_titre, self.agenda_date, self.agenda_fin, self.agenda_heure):
+                        self._vider(e)
+                    self.remplir_agenda()
+            self.root.after(0, fini)
+        threading.Thread(target=envoyer, daemon=True).start()
 
     BOULE_TAILLE = 44
     BOULE_CLE = "#010203"            # la couleur rendue transparente

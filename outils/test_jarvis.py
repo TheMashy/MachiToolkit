@@ -541,6 +541,60 @@ class SesMains(unittest.TestCase):
         self.assertEqual([x[1] for x in jours[1][1]], ["Dentiste", "Anniversaire de Paul"])
         self.assertEqual(J.agenda_par_jour([], "2026-10-01"), [])
 
+    def test_la_frise_de_l_agenda(self):
+        # « un mode frise », « des rappels pouvant durer plusieurs jours »
+        rdv = [{"date": "2026-09-20", "fin": "2026-09-27", "label": "Vacances"},
+               {"date": "2026-09-25", "heure": "14:30", "label": "Dentiste"},
+               {"date": "2026-09-26", "label": "Anniv"},
+               {"date": "2026-09-10", "label": "fini depuis longtemps"},
+               {"date": "2026-10-30", "label": "trop loin"}, {"label": "sans date"}]
+        v = J.voies_frise(rdv, "2026-09-22", 14)
+        self.assertEqual([(x[0], x[1], x[2], x[4]) for x in v],
+                         [(0, 0, 5, "Vacances"), (1, 3, 3, "Dentiste"), (1, 4, 4, "Anniv")],
+                         "une periode commencee avant est coupee au bord ; hors de la frise : rien")
+        # un nom qui deborde garde sa voie jusqu'au bout
+        v = J.voies_frise(rdv, "2026-09-22", 14, lambda lib, h: 3)
+        self.assertEqual([(x[0], x[4]) for x in v], [(0, "Vacances"), (1, "Dentiste"), (2, "Anniv")])
+        self.assertEqual([r["label"] for r in J.en_cours_ou_a_venir(rdv[:5], "2026-09-25")],
+                         ["Vacances", "Dentiste", "Anniv", "trop loin"])
+        self.assertEqual(J.prochain_rendez_vous(rdv, "2026-09-25", "15:00"),
+                         ("Vacances", "en cours, jusqu'a dim. 27 sept."), "la periode en cours ; 14:30 est passe")
+        self.assertEqual(J.prochain_rendez_vous(rdv[1:], "2026-09-25", "10:00"), ("Dentiste", "aujourd'hui a 14:30"))
+        self.assertEqual(J.prochain_rendez_vous([], "2026-09-25"), None)
+        self.assertEqual(J.quand_lisible("2026-09-29", "", "2026-09-25"), "dans 4 jours")
+        self.assertEqual(J.quand_lisible("2026-09-20", "", "2026-09-25", "2026-09-25"), "en cours, fini ce soir")
+        self.assertEqual(J.jour_court("2026-10-01"), "jeu. 1 oct.")
+        self.assertEqual(J.plus_jours("2026-12-30", 3), "2027-01-02")
+        self.assertEqual(J.teinte_rendez_vous("Dentiste"), J.teinte_rendez_vous("dentiste"))
+
+    def test_poser_un_rappel_a_la_main(self):
+        a = "2026-09-25"                                    # un vendredi
+        for tape, attendu in (("", a), ("demain", "2026-09-26"), ("Après-demain", "2026-09-27"), ("+3", "2026-09-28"),
+                              ("lundi", "2026-09-28"), ("ven", "2026-10-02"), ("12/10", "2026-10-12"),
+                              ("12/01", "2027-01-12"), ("12.10.26", "2026-10-12"), ("2026-10-12", "2026-10-12"),
+                              ("31/02", None), ("n'importe quoi", None)):
+            self.assertEqual(J.date_saisie(tape, a), attendu, tape)
+        for tape, attendu in (("", ""), ("14h30", "14:30"), ("9h", "09:00"), ("14:05", "14:05"), ("25h", None),
+                              ("14h75", None), ("midi", None)):
+            self.assertEqual(J.heure_saisie(tape), attendu, tape)
+
+    def test_le_bilan_des_derniers_jours(self):
+        # « des infos de quantified self : temps de sommeil, note »
+        bilan = {"jours": [{"date": "2026-09-23", "note": 7, "sommeil_h": 6.5, "coucher": "01:00", "lever": "07:30"},
+                           {"date": "2026-09-24", "note": None, "sommeil_h": 8.0, "coucher": "23:40", "lever": "07:40"},
+                           {"date": "2026-09-25", "note": 5.5, "sommeil_h": None},
+                           {"date": "2026-09-26", "note": 9, "sommeil_h": 9}],       # demain : ignore
+                 "sommeil_mediane": 7.1}
+        b = J.resume_bilan(bilan, "2026-09-25")
+        self.assertEqual(b["nuit"], {"date": "2026-09-24", "h": 8.0, "coucher": "23:40", "lever": "07:40"})
+        self.assertEqual(b["note"], {"date": "2026-09-25", "n": 5.5})
+        self.assertEqual((b["moy_sommeil"], b["moy_note"], b["mediane"]), (7.2, 6.2, 7.1))
+        self.assertEqual([x[0] for x in b["serie"]], ["2026-09-23", "2026-09-24", "2026-09-25"])
+        vide = J.resume_bilan(None, "2026-09-25")
+        self.assertEqual((vide["nuit"], vide["note"], vide["serie"]), (None, None, []))
+        self.assertEqual((J.duree_lisible(7.2), J.duree_lisible(None), J.note_lisible(6.5), J.note_lisible(7.0)),
+                         ("7 h 12", "--", "6,5", "7"))
+
     def test_les_temperatures(self):
         import struct as st
 
