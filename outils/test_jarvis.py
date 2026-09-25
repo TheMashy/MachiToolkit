@@ -408,6 +408,76 @@ class SesMains(unittest.TestCase):
         with self.assertRaises(ValueError):
             J.nouveau_niveau(5, "regler")
 
+    def test_l_ecoute_s_adapte(self):
+        self.assertEqual(J.attente_suite("Il est 14 h."), 5.0)
+        self.assertEqual(J.attente_suite("Vous voulez que je le lance ?"), 12.0, "il vient de poser une question")
+        self.assertEqual(J.attente_suite("Voila.", echanges=4), 9.5, "la conversation dure")
+        self.assertEqual(J.attente_suite("D'accord ?", echanges=10), 15.0, "15 s au plus")
+        self.assertEqual(J.attente_suite("Je vous entends.", mode="psy"), 10.0)
+        self.assertFalse(J.doit_demander_veille(2, False))
+        self.assertTrue(J.doit_demander_veille(3, False))
+        self.assertFalse(J.doit_demander_veille(5, True), "une fois")
+        for t, attendu in (("oui", "reste"), ("reste", "reste"), ("oui reste là", "reste"), ("continue", "reste"),
+                           ("non", "veille"), ("c'est bon merci", "veille"), ("tu peux te désactiver", "veille"),
+                           ("mets-toi en veille", "veille"), ("quelle heure est-il", None), ("", None)):
+            self.assertEqual(J.reponse_veille(t), attendu, t)
+
+    def test_la_boule_de_jarvis(self):
+        # « toujours placee au meme endroit peu importe la resolution de l'ecran »
+        for zone in ((0, 0, 1920, 1040), (0, 0, 3840, 2080), (0, 0, 2560, 1400)):
+            x, y = J.place_boule(zone, 0.97, 0.90, 44)
+            self.assertAlmostEqual((x + 22) / zone[2], 0.97, delta=0.002)
+            self.assertAlmostEqual((y + 22) / zone[3], 0.90, delta=0.002)
+        self.assertEqual(J.place_boule((100, 50, 800, 600), 1.0, 1.0, 44), (856, 606), "jamais hors de l'ecran")
+        self.assertEqual(J.place_boule((-1920, 0, 1920, 1080), 0.0, 0.0, 44), (-1920, 0))
+        zone = (0, 0, 1920, 1040)
+        self.assertFalse(J.cible_boule("attente", "jarvis", None, zone, 100)[0], "endormi : pas de boule")
+        visible, x, y, couleur, _ = J.cible_boule("ecoute", "jarvis", None, zone, 100)
+        self.assertTrue(visible)
+        self.assertEqual((x, y, couleur), J.place_boule(zone) + ("#FF9A3C",))
+        self.assertEqual(J.cible_boule("pense", "psy", None, zone, 100)[3], "#4DA3FF")
+        # « la boule se deplace la ou Jarvis doit regarder l'ecran »
+        regard = {"ecran": {"left": 1920, "top": 0, "width": 2560, "height": 1440}, "jusqua": 105}
+        visible, x, y, _, _ = J.cible_boule("pense", "jarvis", regard, zone, 100)
+        self.assertTrue(visible)
+        self.assertEqual((x, y), (1920 + 1280 - 22, 57), "en haut, au milieu de l'ecran regarde")
+        self.assertEqual(J.cible_boule("pense", "jarvis", regard, zone, 106)[1:3], J.place_boule(zone),
+                         "regard fini : elle revient a sa place")
+
+    def test_les_temperatures(self):
+        import struct as st
+
+        def coretemp(temps, tjmax=100, delta=False, fahrenheit=False, charges=None, coeurs=None):
+            v = [0] * 256
+            for i, c in enumerate(charges or [10] * len(temps)):
+                v[i] = c
+            t = [0.0] * 256
+            t[:len(temps)] = temps
+            return st.pack("<256I128III256fffff100sBB", *v, *([tjmax] * 128), coeurs or len(temps), 1, *t,
+                           1.2, 3600.0, 100.0, 36.0, b"Intel Core i7-12700K", int(fahrenheit), int(delta))
+        cpu = J.lire_coretemp(coretemp([48.0, 52.0, 61.0, 50.0], charges=[10, 20, 30, 40]))
+        self.assertEqual(cpu["nom"], "Intel Core i7-12700K")
+        self.assertEqual(cpu["temperatures"], [48.0, 52.0, 61.0, 50.0])
+        self.assertEqual(J.lire_coretemp(coretemp([52.0, 39.0], delta=True))["temperatures"], [48.0, 61.0],
+                         "« distance a TjMax » : la vraie temperature")
+        self.assertEqual(J.lire_coretemp(coretemp([122.0], fahrenheit=True))["temperatures"], [50.0])
+        self.assertIsNone(J.lire_coretemp(b"\0" * J.CT_TAILLE), "Core Temp pas lance : rien")
+        self.assertIsNone(J.lire_coretemp(None))
+        gpus = J.lire_nvidia_smi("NVIDIA GeForce RTX 3070, 47, 5, 1228, 8192\nbad\n")
+        self.assertEqual(gpus, [{"nom": "NVIDIA GeForce RTX 3070", "temperature": 47.0, "charge": 5.0,
+                                 "memoire": 1228.0, "memoire_totale": 8192.0}])
+        texte = J.resume_temperatures(cpu, gpus, [("Intel Core i7-12700K", "CPU Package", 62.0),
+                                                  ("NVIDIA GeForce RTX 3070", "GPU Core", 47.0),
+                                                  ("Samsung SSD 980", "Temperature", 41.0)])
+        self.assertIn("Processeur (Intel Core i7-12700K, Core Temp) : 53 °C en moyenne, 61 °C pour le coeur le plus chaud, charge 25 %", texte)
+        self.assertIn("Carte graphique (NVIDIA GeForce RTX 3070, nvidia-smi) : 47 °C, charge 5 %, memoire 1.2 / 8 Go.", texte)
+        self.assertIn("Samsung SSD 980 : Temperature 41 °C", texte)
+        self.assertEqual(texte.count("RTX 3070"), 1, "pas deux fois la meme carte")
+        self.assertEqual(texte.count("i7-12700K"), 1)
+        radeon = J.resume_temperatures(None, [], [("AMD Radeon RX 6800", "GPU Core", 55.0), ("AMD Radeon RX 6800", "GPU Hot Spot", 71.0)])
+        self.assertIn("le plus chaud : GPU Hot Spot, 71 °C", radeon)
+        self.assertIn("lance Core Temp", J.resume_temperatures())
+
     def test_premiere_video_youtube(self):
         page = ('var ytInitialData = {"contents":[{"adSlotRenderer":{"videoId":"PUBLICITE01"}},'
                 '{"channelRenderer":{"title":{"simpleText":"Daft Punk"}}},'
@@ -1165,12 +1235,15 @@ class DansMachiTool(unittest.TestCase):
             return file_.pop(0)
         maison = tempfile.mkdtemp(dir=self.tmp)
         os.makedirs(os.path.join(maison, "Documents"))
-        vrais = {k: getattr(m, k) for k in ("_requete_bd", "bases_dossiers", "touche_media", "capturer_ecran")}
+        vrais = {k: getattr(m, k) for k in ("_requete_bd", "bases_dossiers", "touche_media", "capturer_ecran",
+                                            "capturer_ecrans")}
         self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
         m._requete_bd = bd
         m.bases_dossiers = lambda: {"home": maison, "documents": os.path.join(maison, "Documents")}
         m.touche_media = lambda action: "Piste suivante." if action == "suivant" else "Fait."
         m.capturer_ecran = lambda n: ("QUJD", int(n or 1), 2)
+        m.capturer_ecrans = lambda ns: [("QUFB" if n == 1 else "QUJD", n, 2) for n in
+                                        ([1, 2] if 0 in [int(x or 0) for x in ns] else [int(x) for x in ns])]
         m.envoyer_oreille = lambda o: True
         m.CFG.update(jarvis_pc=True, jarvis_ecran=ecran, jarvis_langue="fr", jarvis_code_actif=code_actif)
         m.poser_code(m.CFG, code)
@@ -1272,6 +1345,12 @@ class DansMachiTool(unittest.TestCase):
         self.phrase("4815")
         self.assertEqual(envoyes[1]["resultats"][0]["image"], "QUJD")
         self.assertEqual(self.dit[-1], "Vous perdez, et avec panache.")
+        # les deux d'un coup : « plutot que demander ce que vous faites »
+        r = self.m.executer_outil({"id": "x", "nom": "regarder_ecran", "entree": {"ecran": 0}}, self.m.CFG)
+        self.assertEqual(r["images"], ["QUFB", "QUJD"])
+        self.assertIn("ecran 1, ecran 2", r["texte"])
+        r = self.m.executer_outil({"id": "x", "nom": "regarder_ecran", "entree": {}}, self.m.CFG)
+        self.assertEqual(len(r["images"]), 2, "sans numero : les deux")
         # l'ecran decoche : meme demande, refus
         self.m.CFG["jarvis_ecran"] = False
         self.assertIn("pas permis", self.m.executer_outil({"id": "x", "nom": "regarder_ecran", "entree": {}},
@@ -1371,6 +1450,45 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("16 resultats", ex("affiner_recherche", {"retirer": "stage", "type": ""})["texte"])
         self.assertIn("unit 00.txt", ex("chercher_fichiers", {"nom": "unit 00", "dans": "Documents"})["texte"],
                       "l'ancien parametre « nom » marche encore")
+
+    def test_je_reste_a_l_ecoute(self):
+        # « ... ou demande meme au bout d'un moment : je dois me desactiver ? »
+        m = self.m
+        ordres = []
+        vrais = (m.oreille_vivante, m._en_fond)
+        self.addCleanup(lambda: (setattr(m, "oreille_vivante", vrais[0]), setattr(m, "_en_fond", vrais[1])))
+        m.oreille_vivante, m._en_fond = (lambda: True), (lambda f: None)
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        m.CFG["jarvis_langue"] = "fr"
+        vus = self.espions()
+        m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}] * 3
+        m.dire("Voila ce que j'en pense.", suite=True)
+        attente = [o for o in ordres if o.get("cmd") == "ecouter"][-1]["attente"]
+        self.assertEqual(attente, 8.0, "trois echanges : il ecoute plus longtemps")
+        m.traiter_evenement({"evt": "vide"})
+        self.assertEqual(self.dit[-1], "Je reste à l'écoute, ou je me mets en veille ?")
+        self.phrase("non merci")
+        self.assertEqual(vus["jarvis"], [], "« non » ne part pas au modele")
+        self.assertEqual(m.JARVIS["historique"], [], "il se met en veille")
+        # une autre fois : « reste »
+        m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}] * 3
+        m.JARVIS["veille_demandee"] = False
+        m.dire("Autre chose ?", suite=True)
+        m.traiter_evenement({"evt": "vide"})
+        self.phrase("reste")
+        self.assertEqual(self.dit[-1], "Je vous écoute.")
+        # il ne redemande pas dans la meme conversation : au silence suivant, il se rendort
+        n = len(self.dit)
+        m.traiter_evenement({"evt": "vide"})
+        self.assertEqual(len(self.dit), n)
+        self.assertEqual(m.JARVIS["etat"], "attente")
+        # une conversation courte : pas de question, il se rendort
+        m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}]
+        m.JARVIS["veille_demandee"] = False
+        m.dire("Il est 14 h.", suite=True)
+        n = len(self.dit)
+        m.traiter_evenement({"evt": "vide"})
+        self.assertEqual(len(self.dit), n)
 
     def test_il_se_souvient_de_vos_conversations(self):
         # « Il faut que Jarvis se souvienne des anciennes discussions, mais simplement. »
@@ -1667,6 +1785,18 @@ class DansMachiTool(unittest.TestCase):
                                                        dict(m.CFG, jarvis_pc=True))["erreur"])
         m.CFG.update(jarvis_pc=True, google_client_id="CID", google_refresh="R")
         self.assertTrue(m.capacites_jarvis(m.CFG)["agenda"])
+
+    def test_les_temperatures_dans_machi_tool(self):
+        m = self.m
+        vrais = (m.memoire_coretemp, m.sortie_nvidia_smi, m.capteurs_wmi)
+        self.addCleanup(lambda: (setattr(m, "memoire_coretemp", vrais[0]), setattr(m, "sortie_nvidia_smi", vrais[1]),
+                                 setattr(m, "capteurs_wmi", vrais[2])))
+        m.memoire_coretemp, m.sortie_nvidia_smi = (lambda: None), (lambda: "RTX 3070, 71, 98, 7000, 8192")
+        m.capteurs_wmi = lambda: []
+        envoyes, _ = self.mains([self.outil("temperatures", {}), {"texte": "71 degres, elle travaille.", "mode": "jarvis"}])
+        self.phrase("Jarvis, elle chauffe ma carte graphique ?")
+        self.assertNotIn("Code d'accès ?", self.dit, "lire des temperatures ne demande pas de code")
+        self.assertIn("RTX 3070, nvidia-smi) : 71 °C, charge 98 %", envoyes[1]["resultats"][0]["texte"])
 
     def test_le_pc_entier_sans_code(self):
         # « J'aimerais avoir un compagnon qui peut interagir le plus possible avec mon PC. »

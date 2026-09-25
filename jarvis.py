@@ -3504,3 +3504,183 @@ class GoogleAgenda:
         if statut not in (200, 201):
             raise ErreurSpotify("Google Agenda a repondu %s." % (((r or {}).get("error") or {}).get("message") or statut))
         return "Repere pose dans Google Agenda : %s." % dit
+
+
+# --------------------------- LES TEMPERATURES ---------------------------
+#
+# « Qu'il puisse avoir acces a Core Temp ou CPU-Z ou au gestionnaire de taches
+# pour voir la temperature de mon GPU ou de mon CPU. » Pas en lisant leurs
+# fenetres : par ce qu'ils publient. Core Temp partage ses mesures en memoire
+# (« CoreTempMappingObjectEx », son API documentee) ; le pilote NVIDIA donne
+# nvidia-smi ; LibreHardwareMonitor et OpenHardwareMonitor publient tout en
+# WMI. CPU-Z et le gestionnaire de taches n'ont rien de tel.
+
+_CT_BASE = struct.Struct("<256I128III256fffff100sBB")        # CoreTempSharedData
+CT_TAILLE = _CT_BASE.size
+
+
+def lire_coretemp(octets):
+    """La memoire partagee de Core Temp -> {"nom", "temperatures" (°C, par
+    coeur), "charges" (%), "tjmax"} ; None si elle est vide ou illisible."""
+    if not octets or len(octets) < CT_TAILLE:
+        return None
+    v = _CT_BASE.unpack_from(octets)
+    charges, tjmax = v[0:256], v[256:384]
+    coeurs, cpus = v[384], v[385]
+    temps = v[386:642]
+    nom = v[646].split(b"\0", 1)[0].decode("ascii", "replace").strip()
+    fahrenheit, delta = v[647], v[648]
+    n = coeurs * max(1, cpus)
+    if not (0 < n <= 256):
+        return None
+    t = []
+    for i in range(n):
+        x = temps[i]
+        if delta:
+            x = tjmax[min(i // max(1, coeurs), 127)] - x       # « distance a TjMax » -> la vraie
+        if fahrenheit:
+            x = (x - 32) * 5 / 9
+        t.append(round(x, 1))
+    if not any(0 < x < 150 for x in t):
+        return None
+    return {"nom": nom, "temperatures": t, "charges": list(charges[:n]), "tjmax": tjmax[0]}
+
+
+def lire_nvidia_smi(texte):
+    """« nom, temp, charge %, memoire utilisee, memoire totale » (csv sans
+    unites) -> [dict]."""
+    out = []
+    for ligne in str(texte or "").splitlines():
+        c = [x.strip() for x in ligne.split(",")]
+        if len(c) < 3 or not c[0]:
+            continue
+        nombre = lambda x: float(x) if re.fullmatch(r"-?\d+(?:\.\d+)?", x or "") else None
+        out.append({"nom": c[0], "temperature": nombre(c[1]), "charge": nombre(c[2]),
+                    "memoire": nombre(c[3]) if len(c) > 3 else None,
+                    "memoire_totale": nombre(c[4]) if len(c) > 4 else None})
+    return out
+
+
+def resume_temperatures(cpu=None, gpus=(), capteurs=()):
+    """Une phrase par composant, pour Jarvis. `capteurs` : [(materiel, nom,
+    valeur °C)] venus de LibreHardwareMonitor / OpenHardwareMonitor."""
+    lignes = []
+    if cpu:
+        t = cpu["temperatures"]
+        charge = sum(cpu["charges"]) / len(cpu["charges"]) if cpu["charges"] else None
+        lignes.append("Processeur (%s, Core Temp) : %.0f °C en moyenne, %.0f °C pour le coeur le plus chaud%s%s."
+                      % (cpu["nom"] or "?", sum(t) / len(t), max(t),
+                         ", charge %.0f %%" % charge if charge is not None else "",
+                         " (limite %d °C)" % cpu["tjmax"] if cpu.get("tjmax") else ""))
+    for g in gpus:
+        bouts = []
+        if g.get("temperature") is not None:
+            bouts.append("%.0f °C" % g["temperature"])
+        if g.get("charge") is not None:
+            bouts.append("charge %.0f %%" % g["charge"])
+        if g.get("memoire") is not None and g.get("memoire_totale"):
+            bouts.append("memoire %.1f / %.0f Go" % (g["memoire"] / 1024, g["memoire_totale"] / 1024))
+        lignes.append("Carte graphique (%s, nvidia-smi) : %s." % (g["nom"], ", ".join(bouts) or "rien de lisible"))
+    par_materiel = {}
+    for materiel, nom, valeur in capteurs:
+        if valeur is not None and 0 < float(valeur) < 150:
+            par_materiel.setdefault(materiel, []).append((nom, float(valeur)))
+    for materiel, mesures in par_materiel.items():
+        if cpu and re.search(r"cpu|ryzen|intel|core", materiel, re.I) and not re.search(r"gpu|radeon|geforce", materiel, re.I):
+            continue                                  # deja dit par Core Temp
+        if gpus and re.search(r"geforce|nvidia|rtx|gtx", materiel, re.I):
+            continue                                  # deja dit par nvidia-smi
+        chaud = max(mesures, key=lambda x: x[1])
+        lignes.append("%s : %s (le plus chaud : %s, %.0f °C)." % (
+            materiel, ", ".join("%s %.0f °C" % (n, v) for n, v in mesures[:6]), chaud[0], chaud[1]))
+    if not lignes:
+        return ("Aucune temperature lisible. Pour le processeur, lance Core Temp (ou LibreHardwareMonitor) ; "
+                "une carte NVIDIA se lit par nvidia-smi, installe avec son pilote ; pour une carte AMD, "
+                "LibreHardwareMonitor.")
+    return "\n".join(lignes)
+
+
+# --------------------------- LA BOULE DE JARVIS -------------------------
+#
+# « Quand Jarvis est active, montre une petite boule sur l'ecran, toujours
+# placee au meme endroit peu importe la resolution ; la boule se deplace la
+# ou Jarvis doit regarder l'ecran. » Sa place est une FRACTION de la zone de
+# travail de l'ecran principal (0,97 ; 0,90 : en bas a droite, au-dessus de
+# la barre des taches) -- la meme sur un 1080p et sur un 4K. Quand il regarde
+# un ecran, elle va en haut, au milieu de celui-la.
+
+BOULE_ETATS = {"ecoute", "comprend", "pense", "parle"}
+BOULE_COULEURS = {"jarvis": "#FF9A3C", "psy": "#4DA3FF", "erreur": "#FF5A5A"}
+
+
+def place_boule(zone, fx=0.97, fy=0.90, taille=44):
+    """(x, y) du coin haut-gauche de la boule dans `zone` (x, y, largeur,
+    hauteur), a la fraction (fx, fy), sans jamais deborder."""
+    x0, y0, l, h = zone
+    fx, fy = max(0.0, min(1.0, float(fx))), max(0.0, min(1.0, float(fy)))
+    x = x0 + int(round(fx * l - taille / 2))
+    y = y0 + int(round(fy * h - taille / 2))
+    return max(x0, min(x0 + l - taille, x)), max(y0, min(y0 + h - taille, y))
+
+
+def cible_boule(etat, mode, regard, zone, maintenant, fx=0.97, fy=0.90, taille=44):
+    """Ce que doit faire la boule : (visible, x, y, couleur, rythme). Elle
+    regarde (`regard` : l'ecran que Jarvis capture, jusqu'a quand), sinon elle
+    se tient a sa place tant que Jarvis ecoute, transcrit, reflechit ou parle."""
+    couleur = BOULE_COULEURS["erreur" if etat == "erreur" else ("psy" if mode == "psy" else "jarvis")]
+    rythme = {"ecoute": 1.2, "comprend": 3.0, "pense": 2.2, "parle": 4.0}.get(etat, 1.0)
+    if regard and regard.get("jusqua", 0) > maintenant and regard.get("ecran"):
+        e = regard["ecran"]
+        x = int(e["left"] + e["width"] / 2 - taille / 2)
+        y = int(e["top"] + max(8, e["height"] * 0.04))
+        return True, x, y, couleur, 2.5
+    x, y = place_boule(zone, fx, fy, taille)
+    return etat in BOULE_ETATS or etat == "erreur", x, y, couleur, rythme
+
+
+# --------------------------- L'ECOUTE QUI S'ADAPTE ----------------------
+#
+# « En fonction de la discussion, fais en sorte que Jarvis puisse prendre plus
+# de temps a se desactiver, ou demande meme au bout d'un moment : je dois me
+# desactiver ? » Apres sa reponse, il ecoute encore -- cinq secondes pour une
+# reponse seche, plus s'il vient de poser une question, plus a mesure que la
+# conversation dure, plus en mode psychologue. Et quand une vraie conversation
+# retombe dans le silence, il demande une fois s'il reste a l'ecoute.
+
+SUITE_BASE_S = 5.0
+SUITE_MAX_S = 15.0
+_RESTE = re.compile(r"^(?:(?:oui|ouais|ok|okay|yes|yeah)\s*)?(?:reste|restez|continue|continuez|je t'ecoute|"
+                    r"ecoute|j'ai pas fini|attends?|stay|keep listening|go on)\b")
+_VEILLE = re.compile(r"^(?:non|nan|no|nope|c'est bon|ca ira|merci c'est tout|c'est tout|pas besoin|"
+                     r"(?:tu peux )?(?:te |vous )?(?:desactiver?|eteindre|mettre en veille)|desactive toi|"
+                     r"eteins toi|mets toi en veille|va dormir|that's all|you can go)\b")
+
+
+def attente_suite(reponse, echanges=1, mode="jarvis"):
+    """Combien de secondes il ecoute encore apres `reponse`."""
+    t = SUITE_BASE_S
+    if str(reponse or "").rstrip().endswith("?"):
+        t += 7.0                                  # il vient de poser une question
+    t += 1.5 * max(0, int(echanges) - 1)          # la conversation dure
+    if mode == "psy":
+        t = max(t, 10.0)
+    return min(SUITE_MAX_S, t)
+
+
+def doit_demander_veille(echanges, deja_demande):
+    """Une vraie conversation (trois echanges et plus) qui retombe : il demande,
+    une fois."""
+    return int(echanges) >= 3 and not deja_demande
+
+
+def reponse_veille(texte):
+    """« Je reste a l'ecoute ? » -> "reste", "veille", ou None (c'est une
+    nouvelle question)."""
+    t = normaliser(texte).replace("-", " ").strip(" '")
+    if not t:
+        return None
+    if _RESTE.match(t) or t in ("oui", "ouais", "yes", "yeah", "oui reste", "oui s'il te plait"):
+        return "reste"
+    if _VEILLE.match(t):
+        return "veille"
+    return None

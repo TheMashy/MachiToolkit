@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.44.0"
+VERSION = "1.45.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -371,6 +371,11 @@ CONFIG_DEFAUT = {
     # GOOGLE AGENDA : l'acces « application de bureau » de la personne (console
     # Google Cloud) et le jeton de renouvellement de la connexion.
     "google_client_id": "",
+    # LA BOULE DE JARVIS a l'ecran quand il est reveille ; sa place en
+    # fractions de l'ecran principal (la meme a toutes les resolutions).
+    "jarvis_boule": True,
+    "jarvis_boule_x": 0.97,
+    "jarvis_boule_y": 0.90,
     "google_client_secret": "",
     "google_refresh": "",
     "spotify_refresh": "",
@@ -5238,6 +5243,12 @@ def traiter_evenement(ev):
         if ev.get("apres_coupure") and reprendre_apres_coupure():
             return
         if JARVIS["etat"] == "ecoute":
+            if JARVIS.get("suite_active"):
+                JARVIS["suite_active"] = False
+                if JARVIS.get("attend_veille"):
+                    JARVIS["attend_veille"] = False       # toujours rien : il se rendort
+                else:
+                    return silence_apres_suite(CFG)
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
     elif quoi == "phrase":
@@ -5399,6 +5410,8 @@ _PHRASES = {
     "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
     "code_refuse": ("Accès refusé.", "Access denied."),
     "verrouille": ("Accès verrouillé.", "Access locked."),
+    "rester": ("Je reste à l'écoute, ou je me mets en veille ?", "Shall I keep listening, or go on standby?"),
+    "j_ecoute": ("Je vous écoute.", "I'm listening."),
     "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
                       "My hands on the PC are closed: Settings, Jarvis."),
     "youtube_video": ("C'est parti.", "Here you go."),
@@ -5493,6 +5506,7 @@ def clore_historique(cfg=None):
     phrase (en arriere-plan), et on repart de zero."""
     historique = list(JARVIS.get("historique") or [])
     JARVIS["historique"] = []
+    JARVIS["veille_demandee"] = False
     if historique and JARVIS.get("mode", "jarvis") == "jarvis":
         cfg = CFG if cfg is None else cfg
         _en_fond(lambda: resumer_conversation(historique, cfg))
@@ -5604,6 +5618,26 @@ def quitter_psy(cfg):
         jouer_son("fin")
 
 
+def echanges_en_cours():
+    """Combien de fois la personne a parle dans cette conversation."""
+    if JARVIS.get("mode") == "psy":
+        return sum(1 for h in JARVIS.get("psy_echange") or [] if h.get("role") == "user")
+    return sum(1 for h in JARVIS.get("historique") or [] if h.get("role") == "user")
+
+
+def silence_apres_suite(cfg):
+    """Personne n'a parle pendant l'ecoute d'apres sa reponse. Une vraie
+    conversation qui retombe : il demande, une fois, s'il reste a l'ecoute.
+    Sinon il se rendort."""
+    if _jv.doit_demander_veille(echanges_en_cours(), JARVIS.get("veille_demandee")):
+        JARVIS.update(veille_demandee=True, attend_veille=True)
+        L = langue_du_mode(cfg)
+        return dire(phrase("rester", L), suite=True, langue=L)
+    JARVIS["attend_veille"] = False
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+
+
 def dire(texte, suite=False, langue=None):
     """Repond : a voix haute si on l'a voulu, sinon en notification. Ensuite,
     s'il y a une suite possible, on ecoute encore un peu -- sans mot d'eveil.
@@ -5616,8 +5650,9 @@ def dire(texte, suite=False, langue=None):
         if suite and CFG.get("jarvis_suite", True) and oreille_vivante():
             jouer_son("eveil")
             poser_led("ecoute")
-            JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.")
-            envoyer_oreille({"cmd": "ecouter", "attente": 5.0})
+            JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.", suite_active=True)
+            envoyer_oreille({"cmd": "ecouter", "attente": _jv.attente_suite(texte, echanges_en_cours(),
+                                                                            JARVIS.get("mode", "jarvis"))})
     if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
         poser_led("parle")
         JARVIS.update(etat="parle", message="Je reponds.")
@@ -5669,6 +5704,14 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
         octets = None
     brut = texte
     texte = _jv.retirer_mot_eveil(texte)
+    JARVIS["suite_active"] = False
+    if JARVIS.pop("attend_veille", False):
+        # la reponse a « Je reste a l'ecoute ? »
+        choix = _jv.reponse_veille(texte)
+        if choix == "reste":
+            return dire(phrase("j_ecoute", langue_du_mode(cfg)), suite=True, langue=langue_du_mode(cfg))
+        if choix == "veille":
+            return terminer_conversation()
     att = JARVIS.get("attente_code")
     if att:
         # LA REPONSE A « CODE D'ACCES ? » -- comparee ici, jamais journalisee
@@ -5846,7 +5889,7 @@ def parler_au_compagnon(texte, cfg):
 # mains restent ouvertes dix minutes ; trois faux, elles se ferment cinq.
 
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
-                    "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets",
+                    "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets", "temperatures",
                     "spotify_jouer", "spotify_en_cours", "spotify_aimer", "agenda_poser"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
@@ -6509,6 +6552,85 @@ def preparer_extension(cfg, dossier=None):
     return dossier
 
 
+# --- LES TEMPERATURES --------------------------------------------------
+
+def memoire_coretemp():
+    """Les octets que Core Temp partage (s'il tourne), ou None. Lecture
+    seule, en memoire."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenFileMappingW.restype = wintypes.HANDLE
+    k.OpenFileMappingW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.MapViewOfFile.restype = ctypes.c_void_p
+    k.MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
+    k.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    for nom in ("CoreTempMappingObjectEx", "CoreTempMappingObject"):
+        h = k.OpenFileMappingW(0x0004, False, nom)            # FILE_MAP_READ
+        if not h:
+            continue
+        try:
+            vue = k.MapViewOfFile(h, 0x0004, 0, 0, _jv.CT_TAILLE)
+            if not vue:
+                continue
+            try:
+                return ctypes.string_at(vue, _jv.CT_TAILLE)
+            finally:
+                k.UnmapViewOfFile(vue)
+        finally:
+            k.CloseHandle(h)
+    return None
+
+
+def sortie_nvidia_smi():
+    """Ce que dit nvidia-smi (installe avec le pilote NVIDIA), ou "". Une
+    commande fixe : rien de ce que dit le modele n'y entre."""
+    exe = shutil.which("nvidia-smi") or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                                                     "nvidia-smi.exe")
+    if not os.path.isfile(exe) and not shutil.which("nvidia-smi"):
+        return ""
+    try:
+        r = subprocess.run([exe, "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=6,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.stdout if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def capteurs_wmi():
+    """[(materiel, capteur, °C)] de LibreHardwareMonitor ou OpenHardwareMonitor,
+    s'ils tournent."""
+    if os.name != "nt":
+        return []
+    out = []
+    try:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        for espace in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
+            try:
+                w = win32com.client.GetObject("winmgmts:" + espace)
+            except Exception:
+                continue
+            materiels = {str(m.Identifier): str(m.Name) for m in w.ExecQuery("SELECT Identifier, Name FROM Hardware")}
+            for c in w.ExecQuery("SELECT Name, Value, Parent FROM Sensor WHERE SensorType = 'Temperature'"):
+                out.append((materiels.get(str(c.Parent), str(c.Parent)), str(c.Name), float(c.Value)))
+            if out:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def lire_temperatures():
+    return _jv.resume_temperatures(_jv.lire_coretemp(memoire_coretemp()),
+                                   _jv.lire_nvidia_smi(sortie_nvidia_smi()), capteurs_wmi())
+
+
 # --- YOUTUBE -----------------------------------------------------------
 
 def ouvrir_youtube(recherche):
@@ -6682,20 +6804,34 @@ def capturer_ecran(numero):
     """UNE capture de l'ecran 1 ou 2, en memoire, reduite (1280 px de large au
     plus) et en JPEG : rendue en base64 pour Jarvis, jamais ecrite sur le
     disque. Rien a voir avec la lumiere d'ecran, qui ne garde qu'une couleur."""
+    image, n, total = capturer_ecrans([numero])[0]
+    return image, n, total
+
+
+def capturer_ecrans(numeros=None):
+    """[(base64, numero, total)] : les ecrans demandes, ou tous (`None`, 0).
+    En memoire seulement, comme capturer_ecran. La boule de Jarvis va sur
+    chacun le temps de le regarder (JARVIS["regard"])."""
     import mss
     from PIL import Image
+    out = []
     with mss.mss() as sct:
         ecrans = sct.monitors[1:]
         if not ecrans:
             raise OSError("aucun ecran")
-        n = max(1, min(len(ecrans), int(numero or 1)))
-        brut = sct.grab(ecrans[n - 1])
-        im = Image.frombytes("RGB", brut.size, brut.rgb)
-    if im.width > 1280:
-        im = im.resize((1280, max(1, im.height * 1280 // im.width)), Image.BILINEAR)
-    tampon = io.BytesIO()
-    im.save(tampon, "JPEG", quality=70)
-    return base64.b64encode(tampon.getvalue()).decode("ascii"), n, len(ecrans)
+        voulus = [int(x or 0) for x in (numeros or [0])]
+        liste = list(range(1, len(ecrans) + 1)) if 0 in voulus else \
+            sorted({max(1, min(len(ecrans), n)) for n in voulus})
+        for n in liste:
+            JARVIS["regard"] = {"ecran": dict(ecrans[n - 1]), "jusqua": time.time() + 2.5}
+            brut = sct.grab(ecrans[n - 1])
+            im = Image.frombytes("RGB", brut.size, brut.rgb)
+            if im.width > 1280:
+                im = im.resize((1280, max(1, im.height * 1280 // im.width)), Image.BILINEAR)
+            tampon = io.BytesIO()
+            im.save(tampon, "JPEG", quality=70)
+            out.append((base64.b64encode(tampon.getvalue()).decode("ascii"), n, len(ecrans)))
+    return out
 
 
 def executer_outil(outil, cfg):
@@ -6752,6 +6888,8 @@ def executer_outil(outil, cfg):
             return {"id": ident, "erreur": "action inconnue : %s" % a}
         if nom == "youtube":
             return {"id": ident, "texte": ouvrir_youtube(e.get("recherche"))}
+        if nom == "temperatures":
+            return {"id": ident, "texte": lire_temperatures()}
         if nom == "onglets":
             return {"id": ident, "texte": agir_onglets(e.get("action") or "lister", e.get("cible") or "",
                                                        e.get("url") or "", e.get("recherche") or "",
@@ -6788,8 +6926,12 @@ def executer_outil(outil, cfg):
         if nom == "regarder_ecran":
             if not cfg.get("jarvis_ecran"):
                 return {"id": ident, "erreur": "Regarder l'ecran n'est pas permis dans Machi Tool."}
-            image, n, total = capturer_ecran(e.get("ecran", 1))
-            return {"id": ident, "image": image, "texte": "Ecran %d sur %d." % (n, total)}
+            vus = capturer_ecrans([e.get("ecran", 0)])
+            if len(vus) == 1:
+                image, n, total = vus[0]
+                return {"id": ident, "image": image, "texte": "Ecran %d sur %d." % (n, total)}
+            return {"id": ident, "images": [v[0] for v in vus],
+                    "texte": "Les %d ecrans, dans l'ordre : %s." % (len(vus), ", ".join("ecran %d" % v[1] for v in vus))}
         bases = bases_dossiers()
         if nom == "lister_dossier":
             ch = _jv.resoudre_chemin(e.get("chemin"), bases)
@@ -8552,6 +8694,9 @@ class Panneau:
 
         self.animer()
         self.rafraichir()
+        self.boule = None
+        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0}
+        self.root.after(500, self.boule_tic)
 
     def refaire_interface(self, echelle):
         """Refait l'interface a l'echelle du nouvel ecran.
@@ -8718,6 +8863,107 @@ class Panneau:
                 self.graphe_absent,
                 text="" if reelle else ("en pause" if ETAT.get("pause") else
                                         "la guirlande ne recoit rien"))
+
+    # ------------------------------------------------------------------
+    #  La boule de Jarvis : une petite fenetre ronde, toujours devant, que
+    #  les clics traversent. Elle ne vit que pendant qu'il est reveille --
+    #  rien ne se dessine le reste du temps (voir animer() : derriere un
+    #  jeu plein ecran, redessiner sans raison peut tuer Tk).
+
+    BOULE_TAILLE = 44
+    BOULE_CLE = "#010203"            # la couleur rendue transparente
+
+    def boule_tic(self):
+        delai = 400
+        try:
+            delai = self._boule_tic()
+        except Exception as e:
+            if not getattr(self, "_boule_erreur", False):
+                print("Jarvis : boule impossible (%s)" % e)
+                self._boule_erreur = True
+        self.root.after(delai, self.boule_tic)
+
+    def _boule_creer(self, taille):
+        tk = self.tk
+        b = tk.Toplevel(self.root)
+        b.overrideredirect(True)
+        b.configure(bg=self.BOULE_CLE)
+        b.attributes("-topmost", True)
+        try:
+            b.attributes("-transparentcolor", self.BOULE_CLE)
+        except Exception:
+            pass
+        toile = tk.Canvas(b, width=taille, height=taille, bg=self.BOULE_CLE, highlightthickness=0, bd=0)
+        toile.pack()
+        b.geometry("%dx%d+-10000+-10000" % (taille, taille))
+        b.update_idletasks()
+        if os.name == "nt":
+            # les clics la traversent ; pas de bouton dans la barre des taches ;
+            # elle ne prend jamais le focus
+            import ctypes
+            u = ctypes.WinDLL("user32")
+            h = int(b.wm_frame(), 16)
+            GWL_EXSTYLE = -20
+            u.SetWindowLongW(h, GWL_EXSTYLE, u.GetWindowLongW(h, GWL_EXSTYLE)
+                             | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
+        b.withdraw()
+        self.boule, self.boule_toile = b, toile
+
+    def _boule_zone(self):
+        """La zone de travail de l'ecran principal (sans la barre des taches)."""
+        if os.name == "nt":
+            try:
+                import win32api
+                x0, y0, x1, y1 = win32api.GetMonitorInfo(win32api.MonitorFromPoint((0, 0), 1))["Work"]
+                return x0, y0, x1 - x0, y1 - y0
+            except Exception:
+                pass
+        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+    def _boule_tic(self):
+        if not self.cfg.get("jarvis_boule", True) or not self.cfg.get("jarvis_actif"):
+            if self.boule is not None and self.boule.winfo_exists() and self.boule.state() != "withdrawn":
+                self.boule.withdraw()
+            return 500
+        taille = max(24, int(self.BOULE_TAILLE * getattr(self, "echelle", 1.0)))
+        visible, x, y, couleur, rythme = _jv.cible_boule(
+            JARVIS.get("etat"), JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), time.time(),
+            self.cfg.get("jarvis_boule_x", 0.97), self.cfg.get("jarvis_boule_y", 0.90), taille)
+        st = self.boule_etat
+        if not visible and (self.boule is None or not self.boule.winfo_exists() or self.boule.state() == "withdrawn"):
+            st["x"] = None
+            return 300                                     # rien a l'ecran : rien a dessiner
+        if self.boule is None or not self.boule.winfo_exists():
+            self._boule_creer(taille)
+        # elle glisse vers sa cible ; elle apparait et s'efface en douceur
+        if st["x"] is None:
+            st["x"], st["y"] = float(x), float(y)
+        st["x"] += (x - st["x"]) * 0.25
+        st["y"] += (y - st["y"]) * 0.25
+        st["alpha"] = min(1.0, st["alpha"] + 0.15) if visible else max(0.0, st["alpha"] - 0.12)
+        if st["alpha"] <= 0.0:
+            self.boule.withdraw()
+            st["x"] = None
+            return 300
+        st["phase"] += 0.08 * rythme
+        try:
+            self.boule.attributes("-alpha", 0.92 * st["alpha"])
+        except Exception:
+            pass
+        c = self.boule_toile
+        c.delete("all")
+        r0 = taille / 2.0
+        souffle = 0.5 + 0.5 * math.sin(st["phase"])
+        for k, frac in ((3, 1.0), (2, 0.82), (1, 0.64)):
+            r = r0 * (frac - 0.08 * (1 - souffle) * k / 3)
+            c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(couleur, "#000000", 0.25 * k), outline="")
+        r = r0 * (0.34 + 0.06 * souffle)
+        c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(couleur, "#FFFFFF", 0.45), outline="")
+        self.boule.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
+        if self.boule.state() == "withdrawn":
+            self.boule.deiconify()
+            self.boule.attributes("-topmost", True)
+        return 40
 
     def animer(self):
         g = self.generation
@@ -9923,13 +10169,18 @@ class Panneau:
                                 "Jarvis, bleu le mode psychologue ; elle respire quand il ecoute, "
                                 "pulse quand il transcrit, ondule quand il reflechit, vibre quand "
                                 "il parle ; vert c'est fait, rouge c'est rate"),
-                ("jarvis_suite", "Apres sa reponse, il ecoute encore 5 secondes sans qu'on "
-                                 "redise « Jarvis »"),
+                ("jarvis_suite", "Apres sa reponse, il ecoute encore sans qu'on redise « Jarvis » : 5 s "
+                                 "pour une reponse seche, plus s'il vient de poser une question ou si la "
+                                 "conversation dure (15 s au plus) ; quand une vraie conversation retombe, il "
+                                 "demande s'il reste a l'ecoute"),
                 ("jarvis_couper", "Lui couper la parole : parler par-dessus, aussi fort que lui, "
                                   "le fait taire et il t'ecoute ; si ce n'etait qu'un bruit, il "
                                   "reprend sa phrase (il apprend l'echo de tes haut-parleurs "
                                   "pendant sa premiere reponse)"),
-                ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)")):
+                ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
+                ("jarvis_boule", "Une petite boule a l'ecran quand il est reveille (en bas a droite, a la meme "
+                                 "place a toutes les resolutions ; elle va sur l'ecran qu'il regarde). Sa "
+                                 "place : jarvis_boule_x et jarvis_boule_y dans config.json, de 0 a 1")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
