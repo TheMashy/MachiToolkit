@@ -69,6 +69,17 @@ GABARIT_DEBUT = 3
 GABARIT_FIN = 4
 GABARIT_MIN = 4
 GABARIT_MAX = 30
+# « IL FAUT QU'IL REPONDE PLUS FACILEMENT A "JARVIS ?" ». Les premieres trames
+# d'un gabarit portent encore ce qui PRECEDAIT le mot (la fenetre du modele
+# couvre 775 ms) : appris dans le silence, « ok Jarvis », « euh Jarvis ? » ou
+# « dis Jarvis » s'en ecartaient de 0,07 a 0,08 -- au-dessus du seuil. Le mot est
+# donc aussi compare SANS ses 240 premieres ms, et la fenetre ecoutee est plus
+# longue, pour un « Jarviiis ? » qui traine. Mesure (espeak, gabarits appris a
+# la francaise, dont un dit comme une question) : quinze facons de l'appeler
+# toutes sous 0,047 ; vingt-neuf mots voisins dits par deux voix, rien sous
+# 0,055 sauf « Marvis » et « jars vides », qui sont presque son nom.
+GABARIT_SAUT = 3
+FENETRE_FACTEUR = 2.2
 
 # Parole : au-dessus de trois fois le bruit de fond de la piece, et au-dessus
 # d'un plancher absolu (en unites int16), pour qu'une piece silencieuse ne
@@ -193,6 +204,15 @@ def distance_gabarit(g, x):
     return prec_d[m] / max(1, prec_l[m])
 
 
+def distance_eveil(g, fen):
+    """Le gabarit entier, ou sans ses premieres trames -- celles qui portent
+    le silence d'avant (voir GABARIT_SAUT) ; la plus proche des deux."""
+    d = distance_gabarit(g, fen)
+    if len(g) - GABARIT_SAUT >= GABARIT_MIN:
+        d = min(d, distance_gabarit(g[GABARIT_SAUT:], fen))
+    return d
+
+
 class Detecteur:
     """Ecoute la piece et dit quand on a appele Jarvis.
 
@@ -252,10 +272,10 @@ class Detecteur:
         x_ = np.array(self.emps)
         meilleur = 9.0
         for g in self.gabarits:
-            fen = x_[-(int(1.6 * len(g)) + 1):]
+            fen = x_[-(int(FENETRE_FACTEUR * len(g)) + 1):]
             if len(fen) < len(g) // 2:
                 continue
-            meilleur = min(meilleur, distance_gabarit(g, fen))
+            meilleur = min(meilleur, distance_eveil(g, fen))
         if meilleur <= self.seuil:
             self.repos_jusqua = self.n + 25
             return ("voix", meilleur)
@@ -719,6 +739,33 @@ _FIN_EN = re.compile(
     r"end (?:the )?conversation|we're done|i'm done|all good|i'm good|no thanks|no thank you|"
     r"nothing thanks|it's nothing)"
     r"(?:\s+(?:thanks|thank you|jarvis|for now|that's all|then))*$")
+
+
+# LE RENVOYER. « Quand je lui dis "degage" il devrait partir, pareil pour
+# "pars" ou "get away" ou "stop" ou "re-pars". » Plus sec que la fin d'une
+# conversation : il se tait sur-le-champ, n'ecoute plus la suite, et meme au
+# psychologue il ne dit rien en partant (« au revoir », lui, laisse le
+# majordome placer un mot). Seul, ou presque seul : « degage » oui,
+# « je voudrais que tu degages ce bug » non. La transcription ecrit « pars »
+# comme elle l'entend -- « part », « par » -- et « degage » parfois en deux
+# mots ; une phrase faite de ce seul mot ne peut vouloir dire que ca.
+_RENVOI = re.compile(
+    r"^(?:(?:allez|aller|bon|ben|bah|hop|allez hop|ok|okay|non|oh|eh|jarvis|mais|maintenant|"
+    r"alright|okay|now|just|come on|oh|jarvis)\s+)*"
+    r"(?:degage[sz]?|degager|de gage|des gages|"
+    r"pars|part|par|repars|repart|re pars|re part|re par|vas y pars|va t'en|va t en|vas t'en|"
+    r"casse toi|barre toi|tire toi|fous le camp|fiche le camp|file|ouste|disparais|du balai|"
+    r"stop|stop stop|arrete tout|"
+    r"get away|go away|get lost|get out|leave|leave now|scram|beat it|begone|buzz off|"
+    r"off you go|piss off|shoo)"
+    r"(?:\s+(?:jarvis|maintenant|tout de suite|merci|s'il te plait|stp|now|please|thanks|"
+    r"right now|then|alors|allez|toi|d'ici|from here|la))*$")
+
+
+def renvoi(texte):
+    """« Degage », « pars », « get away », « stop », « re-pars » : il part."""
+    t = normaliser(texte).replace("-", " ").strip(" '")
+    return bool(t) and len(t.split()) <= 6 and bool(_RENVOI.match(t))
 
 
 def fin_de_conversation(texte):
@@ -1220,6 +1267,26 @@ VOIX_KOKORO = {
 }
 KOKORO_DEFAUT = "jarvis"
 
+# SA VOIX FRANCAISE, PAR KOKORO AUSSI. « Can you have a french voice for
+# jarvis ? » -- Piper lisait juste, mais il lisait. Kokoro-82M parle francais
+# (espeak-ng « fr » pour les phonemes) ; sa seule voix francaise, Siwis, est
+# une voix de femme. Melangee aux voix d'hommes britanniques du Jarvis anglais,
+# elle garde l'accent et prend leur timbre. MESURE (six phrases de Jarvis,
+# relues par Whisper small ; hauteur mediane) : Siwis seule 218 Hz, 14 % de
+# mots rates ; Lewis seul 103 Hz mais 42 % -- un Anglais qui lit du francais ;
+# Siwis 0,3 + Lewis 0,7 : 141 Hz, 17 %. Un homme, qu'on comprend.
+KOKORO_ESPEAK_FR = "fr"       # espeak-ng : lang/roa/fr, le francais de France
+VOIX_KOKORO_FR = {
+    "fr_jarvis": {"nom": "Jarvis -- homme, grave, pose (Siwis et Lewis)",
+                  "melange": {"ff_siwis": 0.3, "bm_lewis": 0.7}},
+    "fr_jarvis_clair": {"nom": "Jarvis clair -- homme, plus leger (Siwis, Fable et Lewis)",
+                        "melange": {"ff_siwis": 0.3, "bm_fable": 0.35, "bm_lewis": 0.35}},
+    "fr_daniel": {"nom": "Daniel -- homme, net (Siwis et Daniel)",
+                  "melange": {"ff_siwis": 0.2, "bm_daniel": 0.8}},
+    "fr_siwis": {"nom": "Siwis -- femme, la plus naturelle", "melange": {"ff_siwis": 1.0}},
+}
+KOKORO_FR_DEFAUT = "fr_jarvis"
+
 # LE VOCABULAIRE DU MODELE : un phoneme, un jeton. Recopie du config.json de
 # Kokoro-82M ; un test le compare au fichier quand il est la. Le tilde
 # combinant (U+0303, les nasales) est un symbole a lui seul.
@@ -1237,7 +1304,7 @@ KOKORO_VOCAB = dict(zip(_KOKORO_SYMBOLES, _KOKORO_IDS))
 def style_kokoro(pack, voix):
     """La table des styles d'une voix du catalogue : (510, 1, 256), un vecteur
     par longueur de phrase. Un melange est la moyenne ponderee des tables."""
-    entree = VOIX_KOKORO.get(voix) or VOIX_KOKORO[KOKORO_DEFAUT]
+    entree = VOIX_KOKORO.get(voix) or VOIX_KOKORO_FR.get(voix) or VOIX_KOKORO[KOKORO_DEFAUT]
     total = sum(entree["melange"].values())
     style = None
     for nom, poids in entree["melange"].items():
@@ -1277,14 +1344,25 @@ class SyntheseKokoro:
     """Kokoro-82M, charge UNE fois. Meme interface que `Synthese` : la Bouche
     ne sait pas laquelle elle fait parler."""
 
-    def __init__(self, modele, fichier_voix, phonemiseur, voix=KOKORO_DEFAUT, fils=4):
+    # UN MODELE POUR DEUX LANGUES : l'anglais et le francais de Jarvis sont le
+    # meme reseau de 310 Mo avec deux styles -- charge une fois par processus,
+    # pas une fois par langue.
+    _SESSIONS = {}
+    _VERROU = threading.Lock()
+
+    def __init__(self, modele, fichier_voix, phonemiseur, voix=KOKORO_DEFAUT, fils=4, langue="en"):
         import numpy as np
         import onnxruntime as rt
         self.np = np
-        o = rt.SessionOptions()
-        o.intra_op_num_threads = max(1, int(fils))
-        o.inter_op_num_threads = 1
-        self.session = rt.InferenceSession(modele, o, providers=["CPUExecutionProvider"])
+        with SyntheseKokoro._VERROU:
+            cle = os.path.abspath(modele)
+            self.session = SyntheseKokoro._SESSIONS.get(cle)
+            if self.session is None:
+                o = rt.SessionOptions()
+                o.intra_op_num_threads = max(1, int(fils))
+                o.inter_op_num_threads = 1
+                self.session = rt.InferenceSession(modele, o, providers=["CPUExecutionProvider"])
+                SyntheseKokoro._SESSIONS[cle] = self.session
         noms = {i.name for i in self.session.get_inputs()}
         # « tokens » dans l'export v1.0, « input_ids » dans les suivants
         self.entree = "input_ids" if "input_ids" in noms else "tokens"
@@ -1292,7 +1370,7 @@ class SyntheseKokoro:
             self.styles = style_kokoro(pack, voix)
         self.phonemiseur = phonemiseur
         self.frequence = KOKORO_FREQ
-        self.langue = "en"
+        self.langue = "fr" if langue == "fr" else "en"
 
     def jetons(self, phonemes):
         return [KOKORO_VOCAB[c] for c in phonemes if c in KOKORO_VOCAB]
@@ -1802,18 +1880,30 @@ def recevoir(s, plafond=8 * 1024 * 1024):
     return json.loads(exactement(n).decode("utf-8")) if n else None
 
 
-def micro_windows(nom=""):
+def choisir_micro(micros, voulu, defaut):
+    """LE MICRO CHOISI DANS LES REGLAGES, par son identifiant Windows (stable,
+    et deux micros peuvent porter le meme nom), a defaut par son nom -- ou
+    celui de Windows. Rend (micro, trouve) : `trouve` est faux quand le micro
+    choisi n'est plus branche, pour que Machi Tool le dise au lieu d'ecouter
+    ailleurs en silence."""
+    voulu = str(voulu or "")
+    if not voulu:
+        return defaut(), True
+    for cle in ("id", "name"):
+        for m in micros():
+            if str(getattr(m, cle, "")) == voulu:
+                return m, True
+    return defaut(), False
+
+
+def micro_windows(nom="", annoncer=None):
     """Les trames du micro, 1280 echantillons int16 a 16 kHz. WASAPI convertit
     lui-meme la frequence (soundcard ouvre le flux avec AUTOCONVERTPCM)."""
     import numpy as np
     import soundcard as sc
-    micro = None
-    if nom:
-        try:
-            micro = sc.get_microphone(nom)
-        except Exception:
-            micro = None
-    micro = micro or sc.default_microphone()
+    micro, trouve = choisir_micro(sc.all_microphones, nom, sc.default_microphone)
+    if annoncer:
+        annoncer(str(getattr(micro, "name", "")), trouve)
     with micro.recorder(samplerate=FREQ, channels=1, blocksize=TRAME) as r:
         while True:
             b = r.record(numframes=TRAME)
@@ -2034,10 +2124,25 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
     except Exception as e:
         sortie({"evt": "erreur", "message": "modeles illisibles : %s" % str(e)[:160]})
         return
-    while vivant.is_set():
+    # Le micro voulu : celui des reglages (Machi Tool l'envoie avec le reste),
+    # ou celui de Windows. Le premier `config` arrive juste apres la poignee de
+    # main : on l'attend un instant pour ne pas ouvrir le mauvais micro d'abord.
+    for _ in range(0 if source else 20):
         try:
-            flux = source() if source else micro_windows()
-            sortie({"evt": "pret"})
+            oreille.commande(commandes.get(timeout=0.05))
+            break
+        except queue.Empty:
+            continue
+    micro_voulu = lambda: str(oreille.reglages.get("micro") or "")
+    while vivant.is_set():
+        flux = None
+        try:
+            nom = micro_voulu()
+            if source:
+                flux = source()
+                sortie({"evt": "pret"})
+            else:
+                flux = micro_windows(nom, lambda n, ok: sortie({"evt": "pret", "micro": n, "trouve": ok}))
             for x in flux:
                 while True:
                     try:
@@ -2047,7 +2152,13 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
                     oreille.commande(c)
                 if not vivant.is_set():
                     break
+                # UN AUTRE MICRO A ETE CHOISI : on referme celui-ci et on
+                # ouvre l'autre, sans redemarrer l'oreille.
+                if not source and micro_voulu() != nom:
+                    break
                 oreille.trame(x)
+            if flux is not None and hasattr(flux, "close"):
+                flux.close()
             if source:
                 break
         except Exception as e:
@@ -2210,7 +2321,7 @@ def voix_enfant(port, secret, lecteur=None):
                 ph = Phonemiseur(c["bibliotheque"], c["donnees"], c.get("espeak", "fr"))
                 if c.get("moteur") == "kokoro":
                     syn = SyntheseKokoro(c["modele"], c["voix_fichier"], ph, c.get("voix", KOKORO_DEFAUT),
-                                         c.get("fils", 4))
+                                         c.get("fils", 4), c.get("langue", "en"))
                 else:
                     syn = Synthese(c["modele"], ph, c.get("fils", 2), c.get("locuteur", 0))
                 if etat["bouche"] is None:

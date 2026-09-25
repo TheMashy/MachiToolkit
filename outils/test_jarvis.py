@@ -159,6 +159,18 @@ class FinEtModes(unittest.TestCase):
                   "merci pour tout ce que tu fais, vraiment, ça compte beaucoup pour moi"):
             self.assertFalse(J.fin_de_conversation(t), t)
 
+    def test_le_renvoyer(self):
+        # « Quand je lui dis "degage" il devrait partir, pareil pour "pars" ou
+        # "get away" ou "stop" ou "re-pars". »
+        for t in ("Dégage !", "dégage", "Pars.", "Part.", "Re-pars !", "repars", "Get away!", "stop",
+                  "Stop.", "Jarvis, dégage.", "allez, dégage", "Va-t'en !", "go away Jarvis",
+                  "Des gages.", "Casse-toi.", "Get lost.", "leave", "stop, Jarvis"):
+            self.assertTrue(J.renvoi(t), t)
+        for t in ("je voudrais que tu dégages ce bug de mon code", "pars du principe que c'est vrai",
+                  "stop le minuteur", "une part de gâteau", "par exemple", "leave the lights on",
+                  "stop listening", "je pars demain à Lyon", "get away from the screen for an hour"):
+            self.assertFalse(J.renvoi(t), t)
+
     def test_vers_le_mode_psy(self):
         for t, reste in (("Psychologue.", ""), ("Passe en mode psy", ""), ("notes psy", ""),
                          ("Notes.", ""), ("Mets-toi en mode psychologue s'il te plaît", ""),
@@ -647,6 +659,95 @@ class DansMachiTool(unittest.TestCase):
         for k, v in self._origines.items():
             setattr(self.m, k, v)
 
+    def apprentissage(self, vecteurs, **kw):
+        """apprendre_voix, l'oreille remplacee : chaque « apprendre » recoit le
+        gabarit suivant de `vecteurs`. Rend (reussi, consignes, gabarits gardes)."""
+        m = self.m
+        file_ = list(vecteurs)
+        consignes = []
+
+        def oreille(o):
+            if o.get("cmd") == "apprendre":
+                consignes.append(m.JARVIS["apprentissage"]["message"])
+                m._GABARIT_RECU["evt"] = {"evt": "gabarit", "vecteurs": file_.pop(0)}
+                m._GABARIT_RECU["signal"].set()
+            return True
+
+        class SansAttente:
+            def __getattr__(self, n):
+                return getattr(time, n)
+
+            def sleep(self, s):
+                pass
+        vrais = (m.time, m.oreille_vivante, m.poser_led)
+        m.time, m.oreille_vivante, m.envoyer_oreille = SansAttente(), (lambda: True), oreille
+        m.poser_led = lambda *a, **k: None
+        try:
+            ok = m.apprendre_voix(**kw)
+        finally:
+            m.time, m.oreille_vivante, m.poser_led = vrais
+        return ok, consignes, m.gabarits_jarvis()
+
+    def test_quatre_fois_la_derniere_comme_une_question(self):
+        rng = np.random.default_rng(3)
+        base = rng.normal(size=(8, 96))
+        proche = lambda e: (base + rng.normal(scale=e, size=base.shape)).tolist()
+        ok, consignes, gardes = self.apprentissage([proche(0.3), proche(0.3), proche(0.3), proche(0.5)])
+        self.assertTrue(ok)
+        self.assertEqual(len(gardes), 4)
+        self.assertIn("question", consignes[-1])
+        # Une « question » qui est un autre mot : on garde les trois, sans tout refaire.
+        autre = rng.normal(size=(8, 96)).tolist()
+        ok, _, gardes = self.apprentissage([proche(0.3), proche(0.3), proche(0.3), autre])
+        self.assertTrue(ok)
+        self.assertEqual(len(gardes), 3)
+        # « Ajouter une facon » : une de plus, avec les autres ; pas un autre mot.
+        ok, _, gardes = self.apprentissage([proche(0.5)], total=1, ajouter=True)
+        self.assertTrue(ok)
+        self.assertEqual(len(gardes), 4)
+        ok, _, gardes = self.apprentissage([rng.normal(size=(8, 96)).tolist()], total=1, ajouter=True)
+        self.assertFalse(ok)
+        self.assertEqual(len(gardes), 4)
+
+    def test_sa_voix_francaise_par_kokoro_sinon_piper(self):
+        m = self.m
+        origines = (m.kokoro_present, m.bibli_espeak, m.piper_pret)
+        m.bibli_espeak = lambda: __file__           # un fichier qui existe
+        m.piper_pret = lambda cfg: {"nom": "fr_FR-tom-medium", "modele": "tom.onnx", "locuteur": 0}
+        try:
+            m.kokoro_present = lambda: True
+            m.CFG["jarvis_langue"] = "fr"
+            self.assertEqual(m.voix_fr_choisie(m.CFG), "fr_jarvis", "Kokoro par defaut")
+            (fr,) = m.charges_voix(m.CFG)
+            self.assertEqual((fr["cle"], fr["moteur"], fr["espeak"], fr["langue"], fr["voix"]),
+                             ("fr", "kokoro", "fr", "fr", "fr_jarvis"))
+            self.assertTrue(m.kokoro_voulu(m.CFG), "Jarvis en francais fait venir Kokoro")
+            # Kokoro pas encore la : Piper parle en attendant
+            m.kokoro_present = lambda: False
+            (fr,) = m.charges_voix(m.CFG)
+            self.assertEqual(fr["moteur"], "piper")
+            # Piper choisi : Kokoro ne sert plus, s'il ne parle pas anglais
+            m.kokoro_present = lambda: True
+            m.CFG["jarvis_voix_fr"] = "piper"
+            (fr,) = m.charges_voix(m.CFG)
+            self.assertEqual(fr["moteur"], "piper")
+            self.assertFalse(m.kokoro_voulu(m.CFG))
+            m.CFG["jarvis_voix_fr"] = "n'importe quoi"
+            self.assertEqual(m.voix_fr_choisie(m.CFG), "fr_jarvis")
+        finally:
+            m.kokoro_present, m.bibli_espeak, m.piper_pret = origines
+
+    def test_le_micro_choisi_part_a_l_oreille_et_revient(self):
+        m = self.m
+        self.assertEqual(m.config_oreille(m.CFG)["micro"], "", "par defaut, celui de Windows")
+        m.CFG["jarvis_micro"] = "{B}"
+        self.assertEqual(m.config_oreille(m.CFG)["micro"], "{B}")
+        m.traiter_evenement({"evt": "pret", "micro": "Micro casque", "trouve": False})
+        self.assertEqual(m.JARVIS["micro"], "Micro casque")
+        self.assertTrue(m.JARVIS["micro_absent"], "debranche : il le dit")
+        m.traiter_evenement({"evt": "pret", "micro": "Webcam", "trouve": True})
+        self.assertFalse(m.JARVIS["micro_absent"])
+
     def test_jarvis_est_eteint_par_defaut(self):
         self.assertFalse(self.m.CONFIG_DEFAUT["jarvis_actif"],
                          "un micro ouvert en permanence se decide, il ne s'impose pas")
@@ -706,6 +807,30 @@ class DansMachiTool(unittest.TestCase):
             self.assertEqual(self.m.JARVIS["mode"], "jarvis", fin)
             self.assertIn({"cmd": "annuler"}, envoye, "il n'ecoute plus la suite")
         self.assertEqual(self.dit, [], "on se tait, on ne repond pas « au revoir »")
+
+    def test_degage_pars_stop_le_renvoient_sans_un_mot(self):
+        # Meme au psychologue : « au revoir » laisse le majordome placer un
+        # mot, « degage » non -- BrainDebugger n'est meme pas appele.
+        demandes = []
+        vraie = self.m._requete_bd
+        self.m._requete_bd = lambda *a, **k: demandes.append(a) or {"texte": "Bonne soirée.", "mode": "jarvis"}
+        try:
+            for t in ("Dégage !", "Pars.", "Re-pars", "Get away!", "Stop."):
+                vus = self.espions()
+                self.m.poser_mode("psy")
+                self.m.JARVIS["psy_echange"] = [{"role": "user", "texte": "bonjour"},
+                                                {"role": "assistant", "texte": "Bonjour."}]
+                envoye = []
+                self.m.envoyer_oreille = lambda o, e=envoye: e.append(o) or True
+                self.phrase(t)
+                self.assertEqual(vus, {"jarvis": [], "psy": []}, t)
+                self.assertEqual(self.m.JARVIS["mode"], "jarvis", t)
+                self.assertEqual(self.m.JARVIS["psy_echange"], [], t)
+                self.assertIn({"cmd": "annuler"}, envoye, "il n'ecoute plus la suite")
+        finally:
+            self.m._requete_bd = vraie
+        self.assertEqual(demandes, [], "il part sans demander de mot de la fin")
+        self.assertEqual(self.dit, [])
 
     def test_oui_apres_la_proposition(self):
         vus = self.espions()
@@ -1227,6 +1352,37 @@ class PourDeVrai(unittest.TestCase):
             o, s = self.oreille(gabarits)
             self.assertEqual(self.reveils(o, s, dire(texte)), [], texte)
 
+    def test_jarvis_point_d_interrogation(self):
+        """« Il faut qu'il reponde plus facilement a "Jarvis ?" ». Appris quatre
+        fois, la derniere comme une question -- et il repond aussi quand le nom
+        vient apres un autre mot, ou qu'il traine."""
+        o, sorties = self.oreille()
+        gabarits = []
+        for texte, vitesse, hauteur in (("Jarvis", 130, 45), ("Jarvis", 150, 50), ("Jarvis", 170, 55),
+                                        ("Jarviis ?", 125, 55)):
+            sorties.clear()
+            for x in flux(np.zeros(1))[:10]:
+                o.trame(x)
+            o.commande({"cmd": "apprendre"})
+            for x in flux(dire(texte, vitesse=vitesse, hauteur=hauteur))[8:]:
+                o.trame(x)
+                if any(e["evt"] == "gabarit" for e in sorties):
+                    break
+            gabarits.append([e for e in sorties if e["evt"] == "gabarit"][0]["vecteurs"])
+        for texte, vitesse, hauteur in (("Jarvis ?", 170, 60), ("Jarvis ?", 120, 40), ("Jarviiis ?", 150, 50),
+                                        ("Jaaarvis ?", 150, 50), ("euh Jarvis ?", 150, 50),
+                                        ("ok Jarvis", 150, 50), ("bon, Jarvis ?", 150, 50),
+                                        ("hé Jarvis", 150, 50), ("dis Jarvis", 150, 50)):
+            o, s = self.oreille(gabarits)
+            r = self.reveils(o, s, dire(texte, vitesse=vitesse, hauteur=hauteur))
+            self.assertEqual([e["par"] for e in r], ["voix"], texte)
+        for texte in ("j'arrive", "Travis", "service", "jardin", "java", "bonjour comment ça va",
+                      "je vais dormir", "garage", "ça va vite", "j'avais dit", "il pleut sur la ville",
+                      "Jacques a dit", "j'ai un avis", "t'as vu ?", "Charles vise", "archives",
+                      "j'arrive vite", "Gervais", "tu arrives ?"):
+            o, s = self.oreille(gabarits)
+            self.assertEqual(self.reveils(o, s, dire(texte)), [], texte)
+
     def test_la_phrase_suit_l_eveil(self):
         o, s = self.oreille()
         son = np.concatenate([dire("hey jarvis", voix="en"), np.zeros(4000),
@@ -1237,6 +1393,85 @@ class PourDeVrai(unittest.TestCase):
         self.assertEqual(len(phrases), 1)
         with wave.open(io.BytesIO(base64.b64decode(phrases[0]["wav"]))) as w:
             self.assertGreater(w.getnframes() / 16000.0, 2.0)
+
+
+class LeMicroChoisi(unittest.TestCase):
+    """« Add a way to change the input audio » : le micro des reglages, par son
+    identifiant Windows, et l'oreille qui en change sans redemarrer."""
+
+    class Micro:
+        def __init__(self, ident, nom):
+            self.id, self.name = ident, nom
+
+    def test_par_identifiant_puis_par_nom_sinon_celui_de_windows(self):
+        a, b, c = self.Micro("{A}", "Micro casque"), self.Micro("{B}", "Webcam"), self.Micro("{C}", "Webcam")
+        tous = lambda: [a, b, c]
+        defaut = lambda: a
+        self.assertEqual(J.choisir_micro(tous, "", defaut), (a, True))
+        self.assertEqual(J.choisir_micro(tous, "{C}", defaut), (c, True),
+                         "deux micros du meme nom : l'identifiant les distingue")
+        self.assertEqual(J.choisir_micro(tous, "Webcam", defaut), (b, True))
+        self.assertEqual(J.choisir_micro(tous, "{Z}", defaut), (a, False),
+                         "debranche : celui de Windows, et on le sait")
+
+    def test_l_oreille_change_de_micro_sans_redemarrer(self):
+        ouverts = []
+
+        def faux_micro(nom="", annoncer=None):
+            ouverts.append(nom)
+            if annoncer:
+                annoncer("Micro " + (nom or "Windows"), nom != "absent")
+            while True:                   # un micro ne s'arrete pas tout seul
+                time.sleep(0.002)
+                yield b"\0" * (2 * J.TRAME)
+
+        class FausseOreille:
+            def __init__(self, *a):
+                self.reglages = {}
+
+            def commande(self, c):
+                if c.get("cmd") == "config":
+                    self.reglages.update({k: v for k, v in c.items() if k != "cmd"})
+
+            def trame(self, x):
+                pass
+
+        origines = (J.micro_windows, J.Oreille, J.Empreintes)
+        J.micro_windows, J.Oreille, J.Empreintes = faux_micro, FausseOreille, lambda d: None
+        serveur = socket.socket()
+        serveur.bind(("127.0.0.1", 0))
+        serveur.listen(1)
+        port = serveur.getsockname()[1]
+        fil = threading.Thread(target=J.oreille_enfant, args=(port, "secret", "."),
+                               kwargs={"jouer_son": lambda g: None}, daemon=True)
+        try:
+            fil.start()
+            conn, _ = serveur.accept()
+            conn.settimeout(10)
+            n = int.from_bytes(conn.recv(4), "big")
+            self.assertEqual(conn.recv(n), b"secret")
+            J.envoyer(conn, {"cmd": "config", "micro": "{A}"})
+            prets = []
+
+            def attendre_pret():
+                while True:
+                    ev = J.recevoir(conn)
+                    if ev.get("evt") == "pret":
+                        prets.append(ev)
+                        return ev
+            self.assertEqual(attendre_pret(), {"evt": "pret", "micro": "Micro {A}", "trouve": True},
+                             "le micro des reglages des la premiere ouverture")
+            J.envoyer(conn, {"cmd": "config", "micro": "{B}"})
+            self.assertEqual(attendre_pret()["micro"], "Micro {B}")
+            J.envoyer(conn, {"cmd": "config", "micro": "absent"})
+            self.assertFalse(attendre_pret()["trouve"])
+            conn.close()
+            fil.join(10)
+            self.assertFalse(fil.is_alive())
+            self.assertEqual(ouverts, ["{A}", "{B}", "absent"], "jamais le mauvais micro d'abord")
+        finally:
+            J.micro_windows, J.Oreille, J.Empreintes = origines
+            serveur.close()
 
 
 ENFANT = """
@@ -1849,6 +2084,58 @@ class DoubleTransmission(unittest.TestCase):
 KOKORO_DOSSIER = os.environ.get("JARVIS_KOKORO_DOSSIER", "")   # kokoro-v1.0.onnx et voices-v1.0.bin
 KOKORO = bool(NUMPY and ONNX and PIPER_DOSSIER and bibli_de_test()
               and all(os.path.isfile(os.path.join(KOKORO_DOSSIER, n)) for n in (J.KOKORO_MODELE, J.KOKORO_VOIX)))
+
+
+def hauteur_mediane(son, fr):
+    """La hauteur mediane d'une voix, par autocorrelation sur 40 ms (70-400 Hz)."""
+    x = son.astype(np.float64) / 32768
+    n, hauteurs = int(0.04 * fr), []
+    for i in range(0, len(x) - n, n // 2):
+        seg = x[i:i + n] - np.mean(x[i:i + n])
+        if np.sqrt(np.mean(seg ** 2)) < 0.05:
+            continue
+        ac = np.correlate(seg, seg, "full")[n - 1:]
+        lo, hi = int(fr / 400), int(fr / 70)
+        l_ = lo + int(np.argmax(ac[lo:hi]))
+        if ac[l_] > 0.4 * ac[0]:
+            hauteurs.append(fr / l_)
+    return float(np.median(hauteurs)) if hauteurs else 0.0
+
+
+@unittest.skipUnless(KOKORO, "JARVIS_KOKORO_DOSSIER / JARVIS_PIPER_DOSSIER absents")
+class VoixFrancaise(unittest.TestCase):
+    """« Can you have a french voice for jarvis ? » : Kokoro en francais, une
+    voix d'homme melangee a partir de Siwis -- et le meme modele que l'anglais."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fr = J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, J.KOKORO_ESPEAK_FR)
+        cls.modele = os.path.join(KOKORO_DOSSIER, J.KOKORO_MODELE)
+        cls.voix = os.path.join(KOKORO_DOSSIER, J.KOKORO_VOIX)
+
+    def test_les_melanges_existent(self):
+        with np.load(self.voix) as pack:
+            for cle, entree in J.VOIX_KOKORO_FR.items():
+                for nom in entree["melange"]:
+                    self.assertIn(nom, pack.files, cle)
+
+    def test_les_phonemes_francais(self):
+        p = J.phonemes_kokoro(self.fr.phrases("Bonjour. Que puis-je faire pour vous ?")[0])
+        self.assertIn("ʁ", p)
+        self.assertTrue(all(c in J.KOKORO_VOCAB for c in p), p)
+
+    def test_un_homme_et_le_meme_modele(self):
+        en = J.SyntheseKokoro(self.modele, self.voix, J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, "en"),
+                              "jarvis", 2)
+        homme = J.SyntheseKokoro(self.modele, self.voix, self.fr, "fr_jarvis", 2, "fr")
+        femme = J.SyntheseKokoro(self.modele, self.voix, self.fr, "fr_siwis", 2, "fr")
+        self.assertIs(homme.session, en.session, "un seul modele de 310 Mo pour les deux langues")
+        self.assertEqual(homme.langue, "fr")
+        texte = "Bonjour. Tous les systèmes sont opérationnels. Que puis-je faire pour vous ?"
+        h = hauteur_mediane(np.concatenate(list(homme.phrases(texte, 1.0))), J.KOKORO_FREQ)
+        f = hauteur_mediane(np.concatenate(list(femme.phrases(texte, 1.0))), J.KOKORO_FREQ)
+        self.assertLess(h, 160, "sa voix francaise est une voix d'homme (%.0f Hz)" % h)
+        self.assertGreater(f, 190, "Siwis seule, une voix de femme (%.0f Hz)" % f)
 
 
 @unittest.skipUnless(KOKORO, "JARVIS_KOKORO_DOSSIER / JARVIS_PIPER_DOSSIER absents")

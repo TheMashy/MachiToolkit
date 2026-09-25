@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.31.0"
+VERSION = "1.32.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -344,7 +344,9 @@ CONFIG_DEFAUT = {
     # voix d'homme britannique, pas celle d'un acteur. Le mode psy reste en
     # francais, avec la voix du dessus. "fr" remet Jarvis en francais.
     "jarvis_langue": "en",
+    "jarvis_micro": "",               # l'identifiant Windows du micro ; vide = celui de Windows
     "jarvis_voix_kokoro": "jarvis",   # sa voix anglaise, voir VOIX_KOKORO dans jarvis.py
+    "jarvis_voix_fr": "fr_jarvis",    # sa voix francaise : VOIX_KOKORO_FR, ou "piper" (jarvis_voix_modele)
     "jarvis_astuce_voix": False,      # il a deja dit comment l'appeler par « Jarvis » tout seul
     "jarvis_lenteur": 0.95,           # > 1 plus pose, < 1 plus vif (Piper et Kokoro)
     "jarvis_appellation": "",         # comment Jarvis vous appelle ; vide = ni Monsieur ni Madame
@@ -4648,6 +4650,30 @@ def fils_kokoro():
     return max(2, min(6, (os.cpu_count() or 4) // 2))
 
 
+def voix_fr_choisie(cfg):
+    """Sa voix francaise : une voix Kokoro (VOIX_KOKORO_FR), ou « piper » --
+    alors c'est `jarvis_voix_modele`, une voix Piper ou celle de Windows."""
+    v = str(cfg.get("jarvis_voix_fr") or _jv.KOKORO_FR_DEFAUT)
+    return v if v == "piper" or v in _jv.VOIX_KOKORO_FR else _jv.KOKORO_FR_DEFAUT
+
+
+def kokoro_voulu(cfg):
+    """Kokoro sert-il ? Pour parler anglais, ou pour sa voix francaise."""
+    return langue_jarvis(cfg) == "en" or voix_fr_choisie(cfg) != "piper"
+
+
+def kokoro_fr_pret(cfg):
+    """De quoi charger sa voix francaise par Kokoro, ou None (pas choisie, ou
+    pas encore la : Piper parle en attendant)."""
+    v = voix_fr_choisie(cfg)
+    if v == "piper" or not kokoro_present() or not os.path.isfile(bibli_espeak()):
+        return None
+    return {"cle": "fr", "moteur": "kokoro", "langue": "fr", "bibliotheque": bibli_espeak(),
+            "donnees": os.path.join(dossier_piper(), "piper"), "espeak": _jv.KOKORO_ESPEAK_FR,
+            "modele": fichier_kokoro(_jv.KOKORO_MODELE), "voix_fichier": fichier_kokoro(_jv.KOKORO_VOIX),
+            "voix": v, "fils": fils_kokoro()}
+
+
 def kokoro_pret(cfg):
     """De quoi charger la voix anglaise, ou None."""
     if langue_jarvis(cfg) != "en" or not kokoro_present() or not os.path.isfile(bibli_espeak()):
@@ -4682,21 +4708,26 @@ def preparer_kokoro(cfg, ouvrir=None):
             KOKORO.update(etat="pret", progres=1.0, message="")
             return True
         except Exception as e:
-            KOKORO.update(etat="erreur", message="Voix anglaise non telechargee : %s" % str(e)[:120])
-            print("Jarvis : voix anglaise indisponible (%s)" % e)
+            KOKORO.update(etat="erreur", message="Voix Kokoro non telechargee : %s" % str(e)[:120])
+            print("Jarvis : voix Kokoro indisponible (%s)" % e)
             return False
 
 
 def charges_voix(cfg):
     """Ce que porte le processus de la voix : l'anglais de Jarvis (Kokoro) et
-    le francais du mode psy (Piper), chacun s'il est la."""
+    son francais -- celui du mode psy aussi -- par Kokoro s'il est choisi et
+    la, sinon par Piper. Chacun s'il est la."""
     out = []
     k = kokoro_pret(cfg)
     if k:
         out.append(k)
-    p = piper_pret(cfg)
-    if p:
-        out.append(dict(p, cle="fr", moteur="piper", fils=2))
+    f = kokoro_fr_pret(cfg)
+    if f:
+        out.append(f)
+    else:
+        p = piper_pret(cfg)
+        if p:
+            out.append(dict(p, cle="fr", moteur="piper", fils=2))
     return out
 
 
@@ -4776,7 +4807,7 @@ def _lire_voix(sock):
         elif quoi == "pret":
             _VOIX_ENFANT["pretes"].add(str(ev.get("cle") or "fr"))
             _VOIX_ENFANT.update(pret=True, echecs=0)
-            if ev.get("cle") == "en":
+            if ev.get("cle") == "en" or (ev.get("cle") == "fr" and kokoro_fr_pret(CFG)):
                 KOKORO.update(etat="pret", message="")
         elif quoi == "fini":
             envoyer_oreille({"cmd": "parole", "actif": False})
@@ -4992,7 +5023,18 @@ def config_oreille(cfg):
             "sensibilite": float(cfg.get("jarvis_sensibilite", 0.5)),
             "hey": bool(cfg.get("jarvis_hey", True)),
             "son": bool(cfg.get("jarvis_son", True)),
-            "couper": bool(cfg.get("jarvis_couper", True))}
+            "couper": bool(cfg.get("jarvis_couper", True)),
+            "micro": str(cfg.get("jarvis_micro", "") or "")}
+
+
+def liste_micros():
+    """[(identifiant, nom)] des micros branches, sans les boucles des
+    haut-parleurs. Vide hors de Windows ou si la liste n'est pas lisible."""
+    try:
+        import soundcard as sc
+        return [(str(m.id), str(m.name)) for m in sc.all_microphones()]
+    except Exception:
+        return []
 
 
 def envoyer_oreille(objet):
@@ -5112,6 +5154,13 @@ def traiter_evenement(ev):
     if quoi == "pret":
         _OREILLE["echecs"] = 0
         JARVIS.update(etat="attente", message=message_attente())
+        if "micro" in ev:
+            # Le micro qu'il ecoute vraiment -- et s'il n'est pas celui choisi
+            # (debranche), on le dit plutot que d'ecouter ailleurs en silence.
+            JARVIS["micro"] = str(ev.get("micro") or "")
+            JARVIS["micro_absent"] = not ev.get("trouve", True)
+            if JARVIS["micro_absent"]:
+                print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
     elif quoi == "niveau":
         JARVIS["db"] = ev.get("db")
         JARVIS["coupure"] = ev.get("coupure")
@@ -5225,7 +5274,7 @@ def veiller_sur_jarvis(cfg):
             veut_voix = voulu and cfg.get("jarvis_voix", True)
             # La voix anglaise se telecharge des qu'elle manque, pas seulement
             # au demarrage de l'oreille : passer Jarvis en anglais la fait venir.
-            if (veut_voix and langue_jarvis(cfg) == "en" and KOKORO["etat"] == "absent"
+            if (veut_voix and kokoro_voulu(cfg) and KOKORO["etat"] == "absent"
                     and not kokoro_present()):
                 KOKORO["etat"] = "preparation"
                 threading.Thread(target=preparer_kokoro, args=(cfg,), daemon=True).start()
@@ -5334,8 +5383,9 @@ _PHRASES = {
     "rappel": ("Je vous rappelle : %s.", "A reminder: %s."),
     "minuteur_fini": ("Le minuteur de %s est terminé.", "Your timer for %s is up."),
     "apprendre": ("Très bien. Chaque fois que la guirlande s'allume, dites mon nom, comme vous "
-                  "m'appellerez. Trois fois.",
-                  "Very well. Each time the lights come on, say my name, the way you'll call me. Three times."),
+                  "m'appellerez. Quatre fois, la dernière comme une question.",
+                  "Very well. Each time the lights come on, say my name, the way you'll call me. "
+                  "Four times, the last one as a question."),
     "appris": ("C'est noté. Mon nom suffit, désormais.", "Noted. My name alone will do from now on."),
     "pas_appris": ("Je n'ai pas réussi à retenir votre voix. On réessaiera au calme.",
                    "I couldn't quite learn your voice. Let's try again somewhere quieter."),
@@ -5508,6 +5558,12 @@ def traiter_phrase(wav64, cfg, apres_coupure=False):
             sauver_config(cfg)
             return dire(phrase("astuce_voix", L), suite=True)
         return dire(phrase("oui", L), suite=True)
+    if _jv.renvoi(texte):
+        # « Degage », « pars », « stop » : il part, sans un mot, quel que soit
+        # le mode -- meme au psychologue, qui n'a pas le mot de la fin ici.
+        print("Jarvis : renvoye")
+        JARVIS.update(psy_echange=[], psy_grave=False)
+        return terminer_conversation()
     if _jv.fin_de_conversation(texte):
         print("Jarvis : fin de conversation")
         # « Au revoir » au psychologue : retour au majordome, qui se tait si
@@ -5800,7 +5856,7 @@ def apprendre_a_voix_haute(cfg):
     « fait en sorte qu'on puisse juste Jarvis pour lui parler ». Le modele
     d'openWakeWord ne connait que « Hey Jarvis » ; « Jarvis » tout seul, c'est
     la voix de la personne, apprise. Il l'explique a voix haute, se TAIT, et
-    ecoute trois fois son nom, la guirlande allumee a chaque fois : sa propre
+    ecoute quatre fois son nom, la guirlande allumee a chaque fois : sa propre
     voix dans l'empreinte serait une empreinte de lui-meme."""
     a = JARVIS.get("apprentissage")
     if a and not a.get("fini"):
@@ -5813,8 +5869,17 @@ def apprendre_a_voix_haute(cfg):
     return ok
 
 
-def apprendre_voix(total=3, essais_max=6):
-    """« Jarvis », trois fois, dit par la personne. A lancer dans un fil."""
+GABARITS_PLAFOND = 8          # au-dela, chaque mot entendu coute trop a comparer
+
+
+def apprendre_voix(total=4, essais_max=8, ajouter=False):
+    """« Jarvis », quatre fois, dit par la personne -- la derniere comme une
+    question : « Jarvis ? » monte et traine, et trois « Jarvis » dits a plat
+    ne le reconnaissaient pas (voir GABARIT_SAUT dans jarvis.py). A lancer
+    dans un fil.
+
+    `ajouter` : une seule facon de plus, gardee avec celles deja apprises --
+    « Ajouter une facon de l'appeler », pour celle qui ne passe pas."""
     if not oreille_vivante():
         JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": True,
                                    "message": "Coche d'abord « Ecouter Jarvis » : il faut le micro."}
@@ -5823,9 +5888,13 @@ def apprendre_voix(total=3, essais_max=6):
     JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": False, "message": ""}
     while len(appris) < total and essais < essais_max:
         essais += 1
-        JARVIS["apprentissage"].update(
-            n=len(appris), message="Dis « Jarvis » maintenant, comme tu l'appelleras (%d/%d)."
-            % (len(appris) + 1, total))
+        if ajouter:
+            consigne = "Dis-le maintenant, de la facon qu'il ne reconnait pas."
+        elif len(appris) == total - 1 and total >= 4:
+            consigne = "Et comme une question : « Jarvis ? » (%d/%d)." % (total, total)
+        else:
+            consigne = "Dis « Jarvis » maintenant, comme tu l'appelleras (%d/%d)." % (len(appris) + 1, total)
+        JARVIS["apprentissage"].update(n=len(appris), message=consigne)
         poser_led("apprend")
         _GABARIT_RECU["signal"].clear()
         _GABARIT_RECU["evt"] = None
@@ -5848,13 +5917,32 @@ def apprendre_voix(total=3, essais_max=6):
         poser_led(None)
         JARVIS["apprentissage"].update(fini=True, message="Pas assez d'essais reussis. Reessaie au calme.")
         return False
-    ecart = _jv.coherence(appris)
-    if ecart > 0.12:
-        poser_led("erreur", 1.2)
-        JARVIS["apprentissage"].update(
-            fini=True, message="Les trois ne se ressemblent pas assez (%.2f). Reessaie, "
-                               "en disant chaque fois « Jarvis » de la meme facon." % ecart)
-        return False
+    if ajouter:
+        deja = gabarits_jarvis()
+        # Une facon de plus, mais du meme mot : loin de toutes celles apprises,
+        # c'est un autre mot (ou un bruit), et il se reveillerait dessus.
+        if deja and min(_jv.distance_gabarit(_jv.normer(g), _jv.normer(appris[0])) for g in deja) > 0.16:
+            poser_led("erreur", 1.2)
+            JARVIS["apprentissage"].update(
+                fini=True, message="Ca ne ressemble a aucune des facons apprises. Reessaie, "
+                                   "ou reapprends tout.")
+            return False
+        appris = (deja + appris)[-GABARITS_PLAFOND:]
+    else:
+        # Les trois « Jarvis » a plat se ressemblent ; la question, un peu moins
+        # -- elle a le droit, mais pas d'etre un autre mot. Ratee, on garde les
+        # trois plutot que de tout refaire.
+        plats = appris[:3]
+        ecart = _jv.coherence(plats)
+        if ecart > 0.12:
+            poser_led("erreur", 1.2)
+            JARVIS["apprentissage"].update(
+                fini=True, message="Les trois premiers ne se ressemblent pas assez (%.2f). Reessaie, "
+                                   "en disant chaque fois « Jarvis » de la meme facon." % ecart)
+            return False
+        if len(appris) > 3 and max(_jv.distance_gabarit(_jv.normer(g), _jv.normer(appris[3]))
+                                   for g in plats) > 0.16:
+            appris = plats
     sauver_gabarits(appris)
     envoyer_oreille(config_oreille(CFG))
     poser_led("fait", 1.2)
@@ -8284,14 +8372,32 @@ class Panneau:
                    largeur=500).pack(fill="x", pady=(8, 0))
 
         self.separateur(f, 12, 8)
+        self.titre(f, "le micro").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Celui qu'il ecoute. Le niveau s'affiche plus haut (« micro -40 dB ») : "
+                      "parle, il doit monter. Il change de micro tout de suite, sans redemarrer.",
+                   BRUME, 8, largeur=500).pack(fill="x")
+        self.var_jarvis_micro = tk.StringVar(value=str(self.cfg.get("jarvis_micro", "") or ""))
+        self.boite_micros = tk.Frame(f, bg=NUIT)
+        self.boite_micros.pack(fill="x")
+        self.remplir_micros()
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.bouton(ligne, "Actualiser la liste", self.remplir_micros, compact=True).pack(side="left")
+        self.var_jarvis_micro.trace_add("write", lambda *_: self.choisir_micro())
+
+        self.separateur(f, 12, 8)
         self.titre(f, "ta voix").pack(fill="x", pady=(0, 4))
         self.texte(f, "« Hey Jarvis » marche tout de suite, dit a l'anglaise. Pour que "
-                      "« Jarvis » tout seul marche, avec ton accent, dis-le trois fois ici, "
-                      "quand la guirlande s'allume. On garde une empreinte (des nombres), pas "
-                      "le son.", BRUME, 8, largeur=500).pack(fill="x")
+                      "« Jarvis » tout seul marche, avec ton accent, dis-le quatre fois ici, "
+                      "quand la guirlande s'allume -- la derniere comme une question, « Jarvis ? ». "
+                      "Une facon de l'appeler ne passe pas ? « Ajouter une facon » l'apprend en "
+                      "plus. On garde une empreinte (des nombres), pas le son.",
+                   BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
         self.bouton(ligne, "Apprendre ma voix", self.apprendre_jarvis, compact=True).pack(side="left")
+        self.bouton(ligne, "Ajouter une facon", self.ajouter_facon_jarvis,
+                    compact=True).pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Oublier ma voix", self.oublier_jarvis, compact=True).pack(side="left", padx=(8, 0))
         self.txt_jarvis_appris = self.texte(f, "", CRAIE, 9, largeur=500)
         self.txt_jarvis_appris.pack(fill="x", pady=(6, 4))
@@ -8304,13 +8410,14 @@ class Panneau:
         self.titre(f, "sa langue et sa voix").pack(fill="x", pady=(0, 4))
         self.texte(f, "En anglais, Jarvis parle avec Kokoro : une voix d'homme britannique, "
                       "calculee sur ce PC (rien ne part sur Internet), telechargee une fois "
-                      "(340 Mo). Tu peux lui parler en francais ou en anglais : il comprend "
-                      "les deux. Le mode psychologue, lui, reste en francais.",
+                      "(340 Mo). En francais aussi, avec sa voix francaise ci-dessous. Tu peux "
+                      "lui parler en francais ou en anglais : il comprend les deux. Le mode "
+                      "psychologue, lui, reste en francais.",
                    BRUME, 8, largeur=500).pack(fill="x")
         self.var_jarvis_langue = tk.StringVar(value=langue_jarvis(self.cfg))
         self.radio(f, "English -- Jarvis repond en anglais (voix Kokoro)", self.var_jarvis_langue,
                    "en").pack(fill="x")
-        self.radio(f, "Francais -- Jarvis repond en francais (voix Piper, ci-dessous)",
+        self.radio(f, "Francais -- Jarvis repond en francais (sa voix francaise, ci-dessous)",
                    self.var_jarvis_langue, "fr").pack(fill="x")
         self.var_jarvis_langue.trace_add("write", lambda *_: self.choisir_langue())
         self.var_voix_kokoro = tk.StringVar(value=voix_kokoro_choisie(self.cfg))
@@ -8322,13 +8429,17 @@ class Panneau:
 
         self.separateur(f, 12, 8)
         self.titre(f, "sa voix francaise").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Une vraie voix (Piper), calculee sur ce PC : rien ne part sur Internet. "
-                      "Telechargee une fois (20 a 80 Mo). C'est celle du mode psychologue, et "
-                      "de Jarvis s'il parle francais. En attendant, c'est la voix de Windows.",
+        self.texte(f, "C'est celle de Jarvis s'il parle francais, et du mode psychologue. "
+                      "Kokoro, comme sa voix anglaise : calculee sur ce PC, rien ne part sur "
+                      "Internet, le meme telechargement (340 Mo, une fois). Piper est plus "
+                      "petit (20 a 80 Mo) et plus mecanique ; il parle en attendant Kokoro.",
                    BRUME, 8, largeur=500).pack(fill="x")
-        self.var_voix_modele = tk.StringVar(value=voix_choisie(self.cfg))
-        for cle, entree in _jv.VOIX_PIPER.items():
+        v_fr = voix_fr_choisie(self.cfg)
+        self.var_voix_modele = tk.StringVar(value=v_fr if v_fr != "piper" else voix_choisie(self.cfg))
+        for cle, entree in _jv.VOIX_KOKORO_FR.items():
             self.radio(f, entree["nom"], self.var_voix_modele, cle).pack(fill="x")
+        for cle, entree in _jv.VOIX_PIPER.items():
+            self.radio(f, "Piper : " + entree["nom"], self.var_voix_modele, cle).pack(fill="x")
         self.radio(f, "Voix de Windows -- rien a telecharger", self.var_voix_modele,
                    "windows").pack(fill="x")
         self.var_voix_modele.trace_add("write", lambda *_: self.choisir_voix())
@@ -8408,13 +8519,55 @@ class Panneau:
             return
         threading.Thread(target=apprendre_voix, daemon=True).start()
 
+    def ajouter_facon_jarvis(self):
+        a = JARVIS.get("apprentissage")
+        if a and not a.get("fini"):
+            return
+        if not gabarits_jarvis():
+            return self.apprendre_jarvis()
+        threading.Thread(target=apprendre_voix, kwargs={"total": 1, "ajouter": True}, daemon=True).start()
+
     def oublier_jarvis(self):
         oublier_voix()
-        JARVIS["apprentissage"] = {"n": 0, "total": 3, "fini": True,
+        JARVIS["apprentissage"] = {"n": 0, "total": 4, "fini": True,
                                    "message": "Oublie. Seul « Hey Jarvis » le reveille."}
 
+    def remplir_micros(self):
+        """Les micros branches, un bouton chacun ; « celui de Windows » d'abord.
+        Un micro choisi puis debranche reste dans la liste, marque comme tel,
+        pour qu'on voie pourquoi il ecoute ailleurs."""
+        for w in self.boite_micros.winfo_children():
+            w.destroy()
+        micros = liste_micros()
+        choisi = self.var_jarvis_micro.get()
+        self.radio(self.boite_micros, "Celui de Windows (par defaut)", self.var_jarvis_micro,
+                   "").pack(fill="x")
+        for ident, nom in micros:
+            self.radio(self.boite_micros, nom, self.var_jarvis_micro, ident).pack(fill="x")
+        if choisi and choisi not in {i for i, _ in micros}:
+            self.radio(self.boite_micros, "Le micro choisi, debranche -- il ecoute celui de Windows",
+                       self.var_jarvis_micro, choisi).pack(fill="x")
+        if not micros:
+            self.texte(self.boite_micros, "Aucun micro trouve (ou la liste n'est pas lisible ici).",
+                       BRUME, 8, largeur=500).pack(fill="x")
+
+    def choisir_micro(self):
+        self.cfg["jarvis_micro"] = self.var_jarvis_micro.get()
+        sauver_config(self.cfg)
+        envoyer_oreille(config_oreille(self.cfg))
+
     def choisir_voix(self):
-        self.cfg["jarvis_voix_modele"] = self.var_voix_modele.get()
+        v = self.var_voix_modele.get()
+        if v in _jv.VOIX_KOKORO_FR:
+            # la veille recharge la voix (sa signature change) et, s'il le
+            # faut, fait venir Kokoro
+            self.cfg["jarvis_voix_fr"] = v
+            sauver_config(self.cfg)
+            if not kokoro_present() and KOKORO["etat"] != "preparation":
+                KOKORO["etat"] = "absent"
+            return
+        self.cfg["jarvis_voix_fr"] = "piper"
+        self.cfg["jarvis_voix_modele"] = v
         sauver_config(self.cfg)
         if self.cfg["jarvis_voix_modele"] != "windows" and not voix_presente(self.cfg["jarvis_voix_modele"]):
             PIPER["etat"] = "absent"
@@ -8423,7 +8576,7 @@ class Panneau:
     def choisir_langue(self):
         self.cfg["jarvis_langue"] = self.var_jarvis_langue.get()
         sauver_config(self.cfg)
-        if langue_jarvis(self.cfg) == "en" and not kokoro_present() and KOKORO["etat"] != "preparation":
+        if kokoro_voulu(self.cfg) and not kokoro_present() and KOKORO["etat"] != "preparation":
             KOKORO["etat"] = "absent"        # la veille le fait venir
 
     def choisir_voix_kokoro(self):
@@ -8449,6 +8602,8 @@ class Panneau:
         details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
         if JARVIS.get("db") is not None and etat != "eteint":
             details.append("micro %.0f dB" % JARVIS["db"])
+        if JARVIS.get("micro_absent") and etat != "eteint":
+            details.append("le micro choisi est debranche : j'ecoute celui de Windows")
         d = etat_dictee()
         details.append("transcription : " + {"pret": "prete", "preparation": "preparation %d %%" % (d["progres"] * 100),
                                              "absent": "pas encore installee", "erreur": "erreur"}.get(d["etat"], d["etat"]))
@@ -8461,7 +8616,19 @@ class Panneau:
         self.txt_jarvis_detail.configure(text=" · ".join(details))
         a = JARVIS.get("apprentissage")
         self.txt_jarvis_appris.configure(text=(a or {}).get("message", ""))
-        if voix_choisie(self.cfg) == "windows":
+        if voix_fr_choisie(self.cfg) != "piper":
+            if voix_prete("fr") and kokoro_fr_pret(self.cfg):
+                piper = "Voix Kokoro chargee : elle repond tout de suite."
+            elif KOKORO["etat"] == "preparation":
+                piper = "Telechargement de Kokoro : %d %% (Piper parle en attendant)." % (
+                    KOKORO["progres"] * 100)
+            elif KOKORO["etat"] == "erreur":
+                piper = KOKORO.get("message") or "Kokoro n'a pas pu venir : Piper parle a sa place."
+            elif kokoro_present():
+                piper = "Voix Kokoro telechargee ; elle se charge quand Jarvis ecoute."
+            else:
+                piper = "Kokoro se telecharge quand Jarvis ecoute (340 Mo, une fois)."
+        elif voix_choisie(self.cfg) == "windows":
             piper = "Voix de Windows."
         elif PIPER["etat"] == "preparation":
             piper = "Telechargement de la voix : %d %%" % (PIPER["progres"] * 100)
