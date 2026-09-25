@@ -1094,11 +1094,58 @@ class OreilleSansMicro(unittest.TestCase):
             self.o.trame(trame(parole=True))
         for _ in range(20):
             self.o.trame(trame())
-        self.assertEqual(self.evts(), ["reveil", "phrase"])
+        # reveille par « Hey Jarvis », et on lui a vraiment parle ensuite : cette
+        # facon de l'appeler est gardee (l'etalonnage au fil de l'eau)
+        self.assertEqual(self.evts(), ["reveil", "phrase", "gabarit_auto"])
+        self.assertEqual(len(self.sorties[2]["vecteurs"][0]), 96)
         with wave.open(io.BytesIO(base64.b64decode(self.sorties[1]["wav"]))) as w:
             # Les deux secondes d'avant l'eveil sont la : « Jarvis » y est, et
             # la transcription le retire.
             self.assertGreater(w.getnframes() / 16000.0, 2.5)
+
+    def test_un_appel_sans_suite_n_apprend_rien(self):
+        for _ in range(15):
+            self.o.trame(trame())
+        self.o.trame(trame(parole=True, marque=True))
+        for _ in range(80):
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["reveil", "vide"], "personne n'a parle apres : rien a garder")
+
+    def test_sans_etalonnage_rien_n_est_garde(self):
+        self.o.commande({"cmd": "config", "auto": False})
+        for _ in range(15):
+            self.o.trame(trame())
+        self.o.trame(trame(parole=True, marque=True))
+        for _ in range(8):
+            self.o.trame(trame())
+        for _ in range(12):
+            self.o.trame(trame(parole=True))
+        for _ in range(20):
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["reveil", "phrase"])
+
+    def test_le_nom_a_la_fin_de_la_demande(self):
+        # « baisse le son de Spotify, Jarvis » : la demande est AVANT le nom ;
+        # rien ne suit -- c'est une phrase, pas « vide » cinq secondes plus tard
+        for _ in range(15):
+            self.o.trame(trame())
+        for _ in range(28):
+            self.o.trame(trame(parole=True))
+        self.o.trame(trame(parole=True, marque=True))
+        n = 0
+        while self.evts()[-1] == "reveil" and n < 100:
+            self.o.trame(trame())
+            n += 1
+        self.assertEqual(self.evts()[:2], ["reveil", "phrase"])
+        self.assertLessEqual(n * J.TRAME_S, J.PHRASE_DEJA_DITE_S + 0.2)
+
+    def test_le_nom_seul_attend_la_suite(self):
+        for _ in range(40):
+            self.o.trame(trame())
+        self.o.trame(trame(parole=True, marque=True))
+        for _ in range(35):                    # 2,8 s de silence : il attend encore
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["reveil"])
 
     def test_sans_son_si_on_l_a_coupe(self):
         self.o.commande({"cmd": "config", "son": False})
@@ -1139,6 +1186,88 @@ class OreilleSansMicro(unittest.TestCase):
         self.assertEqual(self.sorties[0].get("erreur"), "rien entendu")
 
 
+class EmpreintesEcrites:
+    """Des empreintes dictees par le test, trame apres trame (pas de modele)."""
+    hey_m = None
+
+    def __init__(self):
+        self.a_venir = []
+        self.rng = np.random.default_rng(11) if NUMPY else None
+
+    def trame(self, x):
+        if self.a_venir:
+            return 0.0, self.a_venir.pop(0)
+        return 0.0, self.rng.normal(size=96).astype(np.float32)
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class EtalonnageAuFilDeLEau(unittest.TestCase):
+    """« Mieux etalonner les Jarvis, de sorte que je puisse l'appeler avec
+    beaucoup de tons differents. » Un appel rate de peu, puis repete et
+    reconnu : la facon ratee est gardee -- si on lui parle vraiment ensuite."""
+
+    def setUp(self):
+        rng = np.random.default_rng(7)
+        self.g = J.normer(rng.normal(size=(9, 96)))
+        # le meme mot dit autrement : assez loin pour ne pas passer, assez pres
+        # pour etre « presque »
+        seuil = J.seuil_gabarit(0.5)
+        bruit = rng.normal(size=self.g.shape)
+        bas, haut = 0.0, 2.0
+        for _ in range(40):                          # vise 1,4 fois le seuil
+            eps = (bas + haut) / 2
+            if J.distance_eveil(self.g, J.normer(self.g + eps * bruit)) > 1.4 * seuil:
+                haut = eps
+            else:
+                bas = eps
+        self.autrement = v = J.normer(self.g + eps * bruit)
+        self.assertTrue(seuil < J.distance_eveil(self.g, v) < seuil * J.PRESQUE_FACTEUR)
+        self.e = EmpreintesEcrites()
+        self.sorties = []
+        self.o = J.Oreille(self.e, self.sorties.append)
+        self.o.niveau_vu = float("inf")
+        self.o.commande({"cmd": "config", "gabarits": [self.g.tolist()], "son": False})
+
+    def dire(self, vecteurs, parole=True):
+        for v in vecteurs:
+            self.e.a_venir.append(np.asarray(v, dtype=np.float32))
+            self.o.trame(trame(parole=parole))
+
+    def silence(self, n):
+        self.dire([np.random.default_rng(n).normal(size=96) for _ in range(n)], parole=False)
+
+    def evts(self):
+        return [e["evt"] for e in self.sorties]
+
+    def test_l_appel_rate_puis_repete_est_appris(self):
+        self.silence(20)
+        self.dire(self.autrement)                    # « Jarviiis ? » : rate de peu
+        self.silence(15)
+        self.assertNotIn("reveil", self.evts())
+        self.dire(self.g)                            # « Jarvis ! » : reconnu
+        self.assertIn("reveil", self.evts())
+        self.silence(4)
+        self.dire([np.random.default_rng(99).normal(size=96)] * 12)      # la demande
+        self.silence(20)
+        self.assertEqual([e for e in self.evts() if e != "presque"], ["reveil", "phrase", "gabarit_auto"])
+        appris = J.normer([e for e in self.sorties if e["evt"] == "gabarit_auto"][0]["vecteurs"])
+        self.assertLess(J.distance_gabarit(appris, self.autrement), 0.02, "c'est la facon ratee qu'il garde")
+        # et desormais, dite ainsi, elle passe
+        self.o.commande({"cmd": "config", "gabarits": [self.g.tolist(), appris.tolist()]})
+        self.silence(30)
+        n = len(self.sorties)
+        self.dire(self.autrement)
+        self.assertIn("reveil", [e["evt"] for e in self.sorties[n:]])
+
+    def test_rate_mais_rien_ne_suit_rien_n_est_garde(self):
+        self.silence(20)
+        self.dire(self.autrement)
+        self.silence(15)
+        self.dire(self.g)
+        self.silence(80)                             # reveille, mais personne ne parle
+        self.assertNotIn("gabarit_auto", self.evts())
+
+
 class Alignement(unittest.TestCase):
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_un_mot_contre_lui_meme(self):
@@ -1153,6 +1282,25 @@ class Alignement(unittest.TestCase):
     def test_seuils(self):
         self.assertAlmostEqual(J.seuil_gabarit(0.5), 0.05)
         self.assertLess(J.seuil_gabarit(0), J.seuil_gabarit(1))
+        self.assertEqual((J.seuil_hey(0.5), J.seuil_hey(1.0), J.seuil_hey(0.0), J.seuil_hey(0.5, False)),
+                         (0.5, 0.35, 0.65, 9.0), "« Hey Jarvis » suit la meme sensibilite")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_dans_une_phrase(self):
+        # « Jarvis baisse le son » d'une traite : les deux dernieres trames du
+        # gabarit (le silence d'apres) sont remplacees par la suite de la phrase
+        rng = np.random.default_rng(5)
+        g = J.normer(rng.normal(size=(12, 96)))
+        avant = J.normer(rng.normal(size=(6, 96)))
+        q = J.GABARIT_QUEUE
+        suite = J.normer(rng.normal(size=(q, 96)))
+        fen = np.vstack((avant, g[:-q], suite))
+        # au moment ou le mot vient de finir, la suite arrive deja
+        entier = J.distance_gabarit(g, fen)
+        self.assertGreater(entier, J.seuil_gabarit(1.0), "le gabarit entier ne le reconnait pas")
+        d, queue = J.distance_eveil(g, fen[:-q], detail=True)
+        self.assertLess(d, 0.01, "sans sa queue, si -- avant que la suite l'efface")
+        self.assertEqual(queue, q, "et l'on sait combien de trames du mot restent a venir")
 
 
 class Protocole(unittest.TestCase):
@@ -1284,26 +1432,65 @@ class DansMachiTool(unittest.TestCase):
             m.time, m.oreille_vivante, m.poser_led = vrais
         return ok, consignes, m.gabarits_jarvis()
 
-    def test_quatre_fois_la_derniere_comme_une_question(self):
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_l_etalonnage_au_fil_de_l_eau(self):
+        m = self.m
+        m.envoyer_oreille = lambda c: self.envoye.append(c)
+        rng = np.random.default_rng(3)
+        g = J.normer(rng.normal(size=(9, 96)))
+        m.sauver_gabarits([g.tolist()])
+        proche = lambda k: J.normer(g + 0.03 * np.random.default_rng(100 + k).normal(size=g.shape)).tolist()
+        self.assertTrue(m.ajouter_gabarit_auto(proche(0)))
+        self.assertEqual(len(m.gabarits_auto()), 1)
+        self.assertFalse(m.ajouter_gabarit_auto(proche(0)), "deja connue")
+        self.assertFalse(m.ajouter_gabarit_auto(J.normer(rng.normal(size=(9, 96))).tolist()), "un autre mot")
+        self.assertFalse(m.ajouter_gabarit_auto([[0.1] * 96] * 2), "trop court")
+        cfg = m.config_oreille(m.CFG)
+        self.assertEqual((len(cfg["gabarits"]), cfg["auto"]), (2, True))
+        for k in range(1, 10):
+            m.ajouter_gabarit_auto(proche(k))
+        self.assertEqual(len(m.gabarits_auto()), J.AUTO_PLAFOND, "les plus anciennes s'en vont")
+        self.assertEqual(len(m.gabarits_jarvis()), 1, "celles apprises a la main ne bougent pas")
+        # par l'evenement de l'oreille : gardee, et l'oreille la recoit
+        m.sauver_gabarits([g.tolist()], garder_auto=False)
+        self.assertEqual(m.gabarits_auto(), [], "tout reappris : ce qu'il avait garde seul s'en va")
+        m.traiter_evenement({"evt": "gabarit_auto", "vecteurs": proche(20)})
+        self.assertEqual(len(m.gabarits_auto()), 1)
+        self.assertEqual(len(self.envoye[-1]["gabarits"]), 2)
+        m.sauver_gabarits([g.tolist(), proche(30)], garder_auto=True)
+        self.assertEqual(len(m.gabarits_auto()), 1, "une facon de plus : on garde le reste")
+        # coupe : plus rien n'est garde, et l'oreille ne recoit que celles apprises
+        m.CFG["jarvis_auto_etalonnage"] = False
+        self.assertFalse(m.ajouter_gabarit_auto(proche(40)))
+        cfg = m.config_oreille(m.CFG)
+        self.assertEqual((len(cfg["gabarits"]), cfg["auto"]), (2, False))
+
+    def test_six_fois_sur_des_tons_differents(self):
+        # « que je puisse l'appeler avec beaucoup de tons differents » : trois
+        # fois a plat, puis la question, plus fort, plus bas
         rng = np.random.default_rng(3)
         base = rng.normal(size=(8, 96))
         proche = lambda e: (base + rng.normal(scale=e, size=base.shape)).tolist()
-        ok, consignes, gardes = self.apprentissage([proche(0.3), proche(0.3), proche(0.3), proche(0.5)])
+        tons = [proche(0.3), proche(0.3), proche(0.3), proche(0.5), proche(0.5), proche(0.5)]
+        ok, consignes, gardes = self.apprentissage(tons)
         self.assertTrue(ok)
-        self.assertEqual(len(gardes), 4)
-        self.assertIn("question", consignes[-1])
-        # Une « question » qui est un autre mot : on garde les trois, sans tout refaire.
+        self.assertEqual(len(gardes), 6)
+        self.assertEqual(len(consignes), 6)
+        self.assertIn("question", consignes[3])
+        self.assertIn("fort", consignes[4])
+        self.assertIn("bas", consignes[5])
+        # Un ton qui est un autre mot (un raclement) : on garde les autres, sans tout refaire.
         autre = rng.normal(size=(8, 96)).tolist()
-        ok, _, gardes = self.apprentissage([proche(0.3), proche(0.3), proche(0.3), autre])
+        ok, _, gardes = self.apprentissage([proche(0.3), proche(0.3), proche(0.3), proche(0.5), autre, proche(0.5)])
         self.assertTrue(ok)
-        self.assertEqual(len(gardes), 3)
+        self.assertEqual(len(gardes), 5)
         # « Ajouter une facon » : une de plus, avec les autres ; pas un autre mot.
         ok, _, gardes = self.apprentissage([proche(0.5)], total=1, ajouter=True)
         self.assertTrue(ok)
-        self.assertEqual(len(gardes), 4)
+        self.assertEqual(len(gardes), 6)
         ok, _, gardes = self.apprentissage([rng.normal(size=(8, 96)).tolist()], total=1, ajouter=True)
         self.assertFalse(ok)
-        self.assertEqual(len(gardes), 4)
+        self.assertEqual(len(gardes), 6)
 
     def test_sa_voix_francaise_par_kokoro_sinon_piper(self):
         m = self.m
@@ -2720,6 +2907,43 @@ class PourDeVrai(unittest.TestCase):
                       "j'arrive vite", "Gervais", "tu arrives ?"):
             o, s = self.oreille(gabarits)
             self.assertEqual(self.reveils(o, s, dire(texte)), [], texte)
+
+    def test_des_tons_differents_et_dans_une_phrase(self):
+        """« Mieux etalonner les Jarvis, que je puisse l'appeler avec beaucoup
+        de tons differents ou dans une phrase. » Six tons appris (a plat, en
+        question, fort, bas) ; puis appele sur d'autres tons, en debut ou en
+        fin de phrase -- et toujours rien sur les mots voisins."""
+        o, sorties = self.oreille()
+        gabarits = []
+        for texte, vitesse, hauteur, fort in (("Jarvis", 130, 45, 1), ("Jarvis", 150, 50, 1), ("Jarvis", 170, 55, 1),
+                                              ("Jarviis ?", 125, 55, 1), ("Jarvis !", 165, 65, 1.8),
+                                              ("jarvis", 150, 35, 0.35)):
+            sorties.clear()
+            for x in flux(np.zeros(1))[:10]:
+                o.trame(x)
+            o.commande({"cmd": "apprendre"})
+            for x in flux(dire(texte, vitesse=vitesse, hauteur=hauteur) * fort)[8:]:
+                o.trame(x)
+                if any(e["evt"] == "gabarit" for e in sorties):
+                    break
+            gabarits.append([e for e in sorties if e["evt"] == "gabarit"][0]["vecteurs"])
+
+        def entendu(texte, vitesse=150, hauteur=50):
+            o, s = self.oreille(gabarits)
+            o.configurer({"hey": False})
+            for x in flux(dire(texte, vitesse=vitesse, hauteur=hauteur)) + flux(np.zeros(40000)):
+                o.trame(x)
+            return [e["evt"] for e in s if e["evt"] in ("reveil", "phrase", "vide")]
+        for texte, vitesse, hauteur in (("Jarvis", 120, 30), ("Jarvis", 190, 70), ("Jarvis ?", 140, 75),
+                                        ("JARVIS", 160, 60), ("Jaaarvis", 130, 50), ("Jarvis", 200, 50)):
+            self.assertEqual(entendu(texte, vitesse, hauteur)[:1], ["reveil"], (texte, vitesse, hauteur))
+        for texte in ("baisse le son de Spotify, Jarvis", "Jarvis baisse le son", "tu peux baisser le son Jarvis ?",
+                      "mets la musique Jarvis"):
+            self.assertEqual(entendu(texte, 165), ["reveil", "phrase"], texte)
+        for texte in ("j'arrive", "Travis", "service", "jardin", "java", "garage", "j'avais dit", "Jacques a dit",
+                      "Charles vise", "archives", "Gervais", "tu arrives ?", "on part en vacances demain",
+                      "j'ai vu Marvin hier"):
+            self.assertEqual(entendu(texte), [], texte)
 
     def test_la_phrase_suit_l_eveil(self):
         o, s = self.oreille()

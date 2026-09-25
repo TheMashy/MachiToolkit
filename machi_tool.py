@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.49.0"
+VERSION = "1.50.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -336,6 +336,7 @@ CONFIG_DEFAUT = {
     "jarvis_actif": False,
     "jarvis_sensibilite": 0.5,        # 0 strict .. 1 permissif (le mot appris)
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
+    "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
     "jarvis_son": True,               # le petit son quand il s'allume
     "jarvis_leds": True,              # la guirlande dit ou il en est
     "jarvis_voix": True,              # il repond a voix haute
@@ -4493,6 +4494,63 @@ def gabarits_jarvis():
         return []
 
 
+def gabarits_auto():
+    """Les facons de l'appeler qu'il a gardees seul (voir AUTO_* dans jarvis.py)."""
+    try:
+        with open(_fichier_gabarits(), encoding="utf-8") as f:
+            g = json.load(f).get("auto", [])
+        return [x for x in g if isinstance(x, list) and len(x) >= _jv.GABARIT_MIN]
+    except Exception:
+        return []
+
+
+def ajouter_gabarit_auto(vecteurs):
+    """Une facon de plus, gardee seule apres un vrai appel. Refusee si elle ne
+    ressemble a aucune de celles apprises (ce serait un autre mot) ; au plus
+    AUTO_PLAFOND, les plus anciennes s'en vont. Rend True si gardee."""
+    if not CFG.get("jarvis_auto_etalonnage", True):
+        return False
+    if not isinstance(vecteurs, list) or len(vecteurs) < _jv.GABARIT_MIN or len(vecteurs) > _jv.GABARIT_MAX:
+        return False
+    try:
+        v = _jv.normer(vecteurs)
+        if v.shape[1] != 96:
+            return False
+    except Exception:
+        return False
+    connus = gabarits_jarvis()
+    if connus and min(_jv.distance_gabarit(_jv.normer(g), v) for g in connus) > _jv.AUTO_ECART_MAX:
+        return False
+    auto = gabarits_auto()
+    # deja connue a peu pres telle quelle : rien a ajouter
+    if any(_jv.distance_gabarit(_jv.normer(g), v) < 0.01 for g in connus + auto):
+        return False
+    auto = (auto + [[[round(float(x), 5) for x in ligne] for ligne in v]])[-_jv.AUTO_PLAFOND:]
+    _ecrire_voix(connus, auto)
+    return True
+
+
+def _ecrire_voix(gabarits, auto):
+    os.makedirs(dossier_jarvis(), exist_ok=True)
+    chemin = _fichier_gabarits()
+    ancien = {}
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            ancien = json.load(f)
+    except Exception:
+        pass
+    with open(chemin + ".part", "w", encoding="utf-8") as f:
+        json.dump({"gabarits": gabarits, "auto": auto,
+                   "appris_le": ancien.get("appris_le") or time.strftime("%Y-%m-%d %H:%M"),
+                   "micro": ancien.get("micro") or str(JARVIS.get("micro") or "")}, f)
+    os.replace(chemin + ".part", chemin)
+
+
+def oublier_gabarits_auto():
+    _ecrire_voix(gabarits_jarvis(), [])
+    envoyer_oreille(config_oreille(CFG))
+
+
 def micro_des_gabarits():
     """Le micro avec lequel la voix a ete apprise ('' si inconnu : avant 1.35)."""
     try:
@@ -4502,12 +4560,15 @@ def micro_des_gabarits():
         return ""
 
 
-def sauver_gabarits(gabarits):
+def sauver_gabarits(gabarits, garder_auto=False):
+    """`garder_auto` : une facon de plus ; sinon (tout reappris : une autre
+    voix, un autre micro), ce qu'il avait garde seul s'en va aussi."""
+    auto = gabarits_auto() if garder_auto else []
     os.makedirs(dossier_jarvis(), exist_ok=True)
     chemin = _fichier_gabarits()
     with open(chemin + ".part", "w", encoding="utf-8") as f:
         # le micro avec lequel on l'a appris : un autre micro entend une autre voix
-        json.dump({"gabarits": gabarits, "appris_le": time.strftime("%Y-%m-%d %H:%M"),
+        json.dump({"gabarits": gabarits, "auto": auto, "appris_le": time.strftime("%Y-%m-%d %H:%M"),
                    "micro": str(JARVIS.get("micro") or "")}, f)
     os.replace(chemin + ".part", chemin)
 
@@ -5096,7 +5157,9 @@ def _commande_oreille(port, secret):
 
 
 def config_oreille(cfg):
-    return {"cmd": "config", "gabarits": gabarits_jarvis(),
+    auto = bool(cfg.get("jarvis_auto_etalonnage", True))
+    return {"cmd": "config", "gabarits": gabarits_jarvis() + (gabarits_auto() if auto else []),
+            "auto": auto,
             "sensibilite": float(cfg.get("jarvis_sensibilite", 0.5)),
             "hey": bool(cfg.get("jarvis_hey", True)),
             "son": bool(cfg.get("jarvis_son", True)),
@@ -5287,6 +5350,14 @@ def traiter_evenement(ev):
     elif quoi == "gabarit":
         _GABARIT_RECU["evt"] = ev
         _GABARIT_RECU["signal"].set()
+    elif quoi == "gabarit_auto":
+        # un appel qu'il avait rate de peu, puis une vraie conversation : il le garde
+        try:
+            if ajouter_gabarit_auto(ev.get("vecteurs")):
+                print("Jarvis : une facon de plus de l'appeler, gardee seule (%d)" % len(gabarits_auto()))
+                envoyer_oreille(config_oreille(CFG))
+        except Exception as e:
+            print("Jarvis : facon non gardee (%s)" % type(e).__name__)
     elif quoi == "erreur":
         print("Jarvis : %s" % str(ev.get("message"))[:200])
         JARVIS.update(etat="erreur", message=str(ev.get("message") or "")[:200])
@@ -5490,9 +5561,11 @@ _PHRASES = {
     "rappel": ("Je vous rappelle : %s.", "A reminder: %s."),
     "minuteur_fini": ("Le minuteur de %s est terminé.", "Your timer for %s is up."),
     "apprendre": ("Très bien. Chaque fois que la guirlande s'allume, dites mon nom, comme vous "
-                  "m'appellerez. Quatre fois, la dernière comme une question.",
+                  "m'appellerez. Six fois : trois normalement, puis comme une question, plus fort, "
+                  "et plus bas. L'écran vous guide.",
                   "Very well. Each time the lights come on, say my name, the way you'll call me. "
-                  "Four times, the last one as a question."),
+                  "Six times: three normally, then as a question, louder, and softer. The screen "
+                  "will guide you."),
     "appris": ("C'est noté. Mon nom suffit, désormais.", "Noted. My name alone will do from now on."),
     "pas_appris": ("Je n'ai pas réussi à retenir votre voix. Nous réessaierons au calme.",
                    "I couldn't quite learn your voice. Let's try again somewhere quieter."),
@@ -7447,14 +7520,25 @@ def apprendre_a_voix_haute(cfg):
     return ok
 
 
-GABARITS_PLAFOND = 8          # au-dela, chaque mot entendu coute trop a comparer
+GABARITS_PLAFOND = 10         # au-dela, chaque mot entendu coute trop a comparer
+# « L'APPELER AVEC BEAUCOUP DE TONS DIFFERENTS. » Trois fois a plat (qui
+# fondent la voix), puis les tons qui s'en ecartent le plus : la question, de
+# loin et fort, bas et en passant. Chacun peut s'ecarter des trois premiers --
+# pas au point d'etre un autre mot.
+TONS_APPRENTISSAGE = (
+    None, None, None,
+    "Comme une question : « Jarvis ? »",
+    "Plus fort, comme depuis l'autre bout de la piece : « JARVIS ! »",
+    "Plus bas, en passant, comme dans une phrase : « ...jarvis... »",
+)
+TON_ECART_MAX = 0.2
 
 
-def apprendre_voix(total=4, essais_max=8, ajouter=False):
-    """« Jarvis », quatre fois, dit par la personne -- la derniere comme une
-    question : « Jarvis ? » monte et traine, et trois « Jarvis » dits a plat
-    ne le reconnaissaient pas (voir GABARIT_SAUT dans jarvis.py). A lancer
-    dans un fil.
+def apprendre_voix(total=len(TONS_APPRENTISSAGE), essais_max=12, ajouter=False):
+    """« Jarvis », six fois, dit par la personne -- trois fois a plat, puis
+    sur les tons de TONS_APPRENTISSAGE : « Jarvis ? » monte et traine, et trois
+    « Jarvis » dits a plat ne le reconnaissaient pas (voir GABARIT_SAUT dans
+    jarvis.py) ; fort ou bas, c'est la meme chose. A lancer dans un fil.
 
     `ajouter` : une seule facon de plus, gardee avec celles deja apprises --
     « Ajouter une facon de l'appeler », pour celle qui ne passe pas."""
@@ -7466,10 +7550,11 @@ def apprendre_voix(total=4, essais_max=8, ajouter=False):
     JARVIS["apprentissage"] = {"n": 0, "total": total, "fini": False, "message": ""}
     while len(appris) < total and essais < essais_max:
         essais += 1
+        ton = TONS_APPRENTISSAGE[len(appris)] if len(appris) < len(TONS_APPRENTISSAGE) else None
         if ajouter:
             consigne = "Dis-le maintenant, de la facon qu'il ne reconnait pas."
-        elif len(appris) == total - 1 and total >= 4:
-            consigne = "Et comme une question : « Jarvis ? » (%d/%d)." % (total, total)
+        elif ton:
+            consigne = "%s (%d/%d)." % (ton, len(appris) + 1, total)
         else:
             consigne = "Dis « Jarvis » maintenant, comme tu l'appelleras (%d/%d)." % (len(appris) + 1, total)
         JARVIS["apprentissage"].update(n=len(appris), message=consigne)
@@ -7506,6 +7591,7 @@ def apprendre_voix(total=4, essais_max=8, ajouter=False):
                                    "ou reapprends tout.")
             return False
         appris = (deja + appris)[-GABARITS_PLAFOND:]
+        sauver_gabarits(appris, garder_auto=True)
     else:
         # Les trois « Jarvis » a plat se ressemblent ; la question, un peu moins
         # -- elle a le droit, mais pas d'etre un autre mot. Ratee, on garde les
@@ -7518,10 +7604,12 @@ def apprendre_voix(total=4, essais_max=8, ajouter=False):
                 fini=True, message="Les trois premiers ne se ressemblent pas assez (%.2f). Reessaie, "
                                    "en disant chaque fois « Jarvis » de la meme facon." % ecart)
             return False
-        if len(appris) > 3 and max(_jv.distance_gabarit(_jv.normer(g), _jv.normer(appris[3]))
-                                   for g in plats) > 0.16:
-            appris = plats
-    sauver_gabarits(appris)
+        # chaque ton garde a part : trop loin des trois premiers, il n'etait
+        # probablement pas « Jarvis » (un bruit, un raclement) -- on s'en passe
+        tons = [t for t in appris[3:]
+                if min(_jv.distance_gabarit(_jv.normer(g), _jv.normer(t)) for g in plats) <= TON_ECART_MAX]
+        appris = plats + tons
+        sauver_gabarits(appris)
     envoyer_oreille(config_oreille(CFG))
     poser_led("fait", 1.2)
     jouer_son("fait")
@@ -10725,10 +10813,13 @@ class Panneau:
         self.separateur(f, 12, 8)
         self.titre(f, "ta voix").pack(fill="x", pady=(0, 4))
         self.texte(f, "« Hey Jarvis » marche tout de suite, dit a l'anglaise. Pour que "
-                      "« Jarvis » tout seul marche, avec ton accent, dis-le quatre fois ici, "
-                      "quand la guirlande s'allume -- la derniere comme une question, « Jarvis ? ». "
-                      "Une facon de l'appeler ne passe pas ? « Ajouter une facon » l'apprend en "
-                      "plus. On garde une empreinte (des nombres), pas le son.",
+                      "« Jarvis » tout seul marche, avec ton accent, dis-le six fois ici, "
+                      "quand la guirlande s'allume : trois fois normalement, puis comme une question, "
+                      "plus fort, et plus bas -- l'ecran te guide. Une facon de l'appeler ne passe "
+                      "pas ? « Ajouter une facon » l'apprend en plus ; et s'il te rate de peu puis "
+                      "t'entend a la deuxieme, il garde seul la facon ratee (voir plus bas). On garde "
+                      "une empreinte (des nombres), pas le son. Tu peux aussi l'appeler en fin de "
+                      "phrase : « baisse le son de Spotify, Jarvis ».",
                    BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
@@ -10913,6 +11004,10 @@ class Panneau:
                                   "reprend sa phrase (il apprend l'echo de tes haut-parleurs "
                                   "pendant sa premiere reponse)"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
+                ("jarvis_auto_etalonnage", "S'etalonner seul : quand il te rate de peu puis t'entend "
+                                           "juste apres, et que vous parlez vraiment ensuite, il garde "
+                                           "cette facon de l'appeler (6 au plus ; « Oublier ma voix » "
+                                           "les efface)"),
                 ("jarvis_panneau", "Son panneau en haut au milieu de l'ecran quand il est actif -- le "
                                    "contenu Jarvis du panneau LED : LISTENING, THINKING, SPEAKING avec sa "
                                    "reponse qui defile. Fixe, sans bordure, les clics le traversent"),
@@ -10960,7 +11055,7 @@ class Panneau:
     def regler_jarvis(self, cle):
         self.cfg[cle] = bool(self.vars_jarvis[cle].get())
         sauver_config(self.cfg)
-        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper"):
+        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper", "jarvis_auto_etalonnage"):
             envoyer_oreille(config_oreille(self.cfg))
         if cle == "jarvis_leds" and not self.cfg[cle]:
             poser_led(None)
@@ -11177,7 +11272,9 @@ class Panneau:
         d = etat_dictee()
         details.append("transcription : " + {"pret": "prete", "preparation": "preparation %d %%" % (d["progres"] * 100),
                                              "absent": "pas encore installee", "erreur": "erreur"}.get(d["etat"], d["etat"]))
-        details.append("voix apprise" if gabarits_jarvis() else "voix pas encore apprise")
+        n_voix, n_auto = len(gabarits_jarvis()), len(gabarits_auto())
+        details.append(("voix apprise (%d facons%s)" % (n_voix, ", + %d gardees seul" % n_auto if n_auto else ""))
+                       if n_voix else "voix pas encore apprise")
         if JARVIS.get("coupure") and etat != "eteint":
             details.append("couper la parole : " + str(JARVIS["coupure"]))
         n = len(JARVIS.get("minuteurs") or [])

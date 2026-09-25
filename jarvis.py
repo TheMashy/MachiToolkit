@@ -79,8 +79,25 @@ GABARIT_MAX = 30
 # toutes sous 0,047 ; vingt-neuf mots voisins dits par deux voix, rien sous
 # 0,055 sauf « Marvis » et « jars vides », qui sont presque son nom.
 GABARIT_SAUT = 3
+# « QUE JE PUISSE L'APPELER DANS UNE PHRASE. » Les dernieres trames d'un
+# gabarit portent le silence d'APRES le mot (GABARIT_FIN) ; dans « Jarvis
+# baisse le son » dit d'une traite, la suite arrive dedans et l'ecarte. Le mot
+# est donc aussi compare sans elles : reconnu avant que la suite ne l'efface.
+# Mesure (espeak, six tons appris) : « Jarvis baisse le son » d'une traite
+# passe de 0,062 a 0,036 pour un seuil de 0,05 ; le plus proche des vingt-deux
+# mots et phrases voisins reste a 0,065.
+GABARIT_QUEUE = 4
 PRESQUE_FACTEUR = 1.7         # jusqu'ou un mot « presque reconnu » est signale
 FENETRE_FACTEUR = 2.2
+# L'ETALONNAGE AU FIL DE L'EAU. Un appel rate de peu (« Jarvis ? »... puis
+# « JARVIS ! » qui passe) ou reconnu de justesse est une facon de l'appeler
+# qu'il ne connaissait pas encore : quand la conversation qui suit est bien
+# reelle (on lui a parle apres), il la garde. Au plus AUTO_PLAFOND, les plus
+# anciennes s'en vont.
+AUTO_PLAFOND = 6
+AUTO_RATE_TRAMES = 100        # un appel rate au plus 8 s avant celui qui passe
+AUTO_JUSTESSE = 0.6           # reconnu au-dela de 60 % du seuil : de justesse
+AUTO_ECART_MAX = 0.2          # plus loin que ca de ce qu'il connait : un autre mot
 
 # Parole : au-dessus de trois fois le bruit de fond de la piece, et au-dessus
 # d'un plancher absolu (en unites int16), pour qu'une piece silencieuse ne
@@ -95,6 +112,15 @@ def seuil_gabarit(sensibilite):
     dit ») au-dessus de 0,07. 0,05 au milieu."""
     s = max(0.0, min(1.0, float(sensibilite)))
     return 0.03 + 0.04 * s
+
+
+def seuil_hey(sensibilite, actif=True):
+    """Le seuil du modele « Hey Jarvis » suit la meme sensibilite : 0,5 au
+    milieu (celui d'openWakeWord), 0,35 tout en haut, 0,65 tout en bas."""
+    if not actif:
+        return 9.0
+    s = max(0.0, min(1.0, float(sensibilite)))
+    return round(0.65 - 0.3 * s, 3)
 
 
 # ======================================================================
@@ -205,13 +231,20 @@ def distance_gabarit(g, x):
     return prec_d[m] / max(1, prec_l[m])
 
 
-def distance_eveil(g, fen):
-    """Le gabarit entier, ou sans ses premieres trames -- celles qui portent
-    le silence d'avant (voir GABARIT_SAUT) ; la plus proche des deux."""
-    d = distance_gabarit(g, fen)
-    if len(g) - GABARIT_SAUT >= GABARIT_MIN:
-        d = min(d, distance_gabarit(g[GABARIT_SAUT:], fen))
-    return d
+def distance_eveil(g, fen, detail=False):
+    """Le gabarit entier, sans ses premieres trames -- celles qui portent le
+    silence d'avant (voir GABARIT_SAUT) --, sans ses dernieres -- le silence
+    d'apres, qu'une phrase qui continue remplace (GABARIT_QUEUE) --, ou sans
+    les deux ; la plus proche. `detail` : (distance, trames de queue non
+    encore entendues -- la fin du mot, qui va encore arriver)."""
+    d, queue = distance_gabarit(g, fen), 0
+    n = len(g)
+    for a, b in ((GABARIT_SAUT, n), (0, n - GABARIT_QUEUE), (GABARIT_SAUT, n - GABARIT_QUEUE)):
+        if b - a >= GABARIT_MIN:
+            x = distance_gabarit(g[a:b], fen)
+            if x < d:
+                d, queue = x, n - b
+    return (d, queue) if detail else d
 
 
 class Detecteur:
@@ -234,6 +267,33 @@ class Detecteur:
         self.repos_jusqua = 0
         self.derniere_parole = -999
         self.plus_proche = None       # la distance du dernier mot compare, pour « presque »
+        self.long_proche = 12         # la longueur (en trames) du gabarit le plus proche
+        self.queue_proche = 0         # reconnu avant sa fin : combien de trames du mot restent a venir
+
+    def longueur_mot(self):
+        """La longueur d'un « Jarvis », en trames : celle du gabarit le plus
+        proche a l'instant, la mediane de ceux appris, ou une seconde."""
+        if self.plus_proche is not None:
+            return self.long_proche
+        if self.gabarits:
+            return sorted(len(g) for g in self.gabarits)[len(self.gabarits) // 2]
+        return 12
+
+    def extrait(self, longueur=None):
+        """Les `longueur` dernieres empreintes, normees : ce qui vient d'etre
+        dit, sous la forme d'un gabarit (None si trop peu)."""
+        n = int(longueur or self.longueur_mot())
+        if n < GABARIT_MIN or len(self.emps) < n:
+            return None
+        return [[round(float(v), 5) for v in ligne] for ligne in list(self.emps)[-n:]]
+
+    def parlait_avant(self, longueur=None, avant=12, minimum=3):
+        """Quelqu'un parlait-il juste AVANT le mot (« baisse le son, Jarvis ») ?
+        Au moins `minimum` trames de parole dans la seconde qui le precede."""
+        n = int(longueur or self.longueur_mot())
+        niv = list(self.niveaux)
+        zone = niv[max(0, len(niv) - n - avant):max(0, len(niv) - n)]
+        return sum(1 for r in zone if self.parle(r)) >= minimum
 
     def parle(self, rms):
         return rms > max(PAROLE_FACTEUR * (self.plancher or PAROLE_MIN), PAROLE_MIN)
@@ -278,7 +338,9 @@ class Detecteur:
             fen = x_[-(int(FENETRE_FACTEUR * len(g)) + 1):]
             if len(fen) < len(g) // 2:
                 continue
-            meilleur = min(meilleur, distance_eveil(g, fen))
+            d, queue = distance_eveil(g, fen, detail=True)
+            if d < meilleur:
+                meilleur, self.long_proche, self.queue_proche = d, len(g), queue
         self.plus_proche = meilleur if meilleur < 9.0 else None
         if meilleur <= self.seuil:
             self.repos_jusqua = self.n + 25
@@ -317,6 +379,9 @@ def coherence(gabarits):
 #  LA FIN DE PHRASE
 # ======================================================================
 
+PHRASE_DEJA_DITE_S = 2.0      # le nom a la fin de la demande : on attend ca, puis c'est fini
+
+
 class Phrase:
     """Ce qui suit l'eveil, jusqu'a ce que la personne se taise.
 
@@ -327,9 +392,15 @@ class Phrase:
     si ce n'etait que le carillon."""
 
     def __init__(self, parle, avant=None, attente=5.0, silence_fin=0.9,
-                 duree_max=15.0, ignorer=0.3):
+                 duree_max=15.0, ignorer=0.3, deja_dit=False, fin_du_mot=0):
         import numpy as np
         self.np = np
+        # Reconnu avant la fin du mot (« Jarvis » en pleine phrase) : ses
+        # dernieres trames arrivent encore ; ce n'est pas la demande qui commence.
+        self.fin_du_mot = int(fin_du_mot)
+        # « Baisse le son, Jarvis » : la demande est deja dans `avant`. Si rien
+        # ne suit, c'est fini -- pas « vide » apres cinq secondes.
+        self.deja_dit = deja_dit
         self.parle = parle
         self.morceaux = [avant] if avant is not None and len(avant) else []
         self.t = 0.0
@@ -343,6 +414,9 @@ class Phrase:
         """Rend None tant que ca continue, « fini » ou « vide »."""
         self.morceaux.append(self.np.asarray(x, dtype=self.np.int16))
         self.t += TRAME_S
+        if self.fin_du_mot > 0:
+            self.fin_du_mot -= 1
+            return None
         p = self.parle(rms)
         if self.t <= self.ignorer:
             self.precoce += 1 if p else 0
@@ -354,6 +428,8 @@ class Phrase:
         if self.parole and self.silence >= self.silence_fin:
             return "fini"
         if not self.parole and self.precoce >= 2 and self.silence >= self.silence_fin + 0.5:
+            return "fini"
+        if not self.parole and self.deja_dit and self.t >= PHRASE_DEJA_DITE_S:
             return "fini"
         if not self.parole and self.t >= self.attente:
             return "vide"
@@ -503,18 +579,34 @@ def normaliser(texte):
 _EVEIL = re.compile(r"^(?:d?[jg]h?[ae]r+v[iy]+[sc]*e?|jarvi|jervis|arvis)$")
 
 
+_POLITESSE = re.compile(r"^(?:s'? ?il (?:te|vous) plait|stp|svp|merci|please|ok|hein|allez|vas-y)$")
+_AMORCES = re.compile(r"^(?:(?:ok|okay|hey|he|eh|dis|dites|euh|bon|alors|allez)(?:[\s,!.]+|$))+", re.I)
+
+
 def retirer_mot_eveil(texte):
     """« Hey Jarvis, allume la lumiere. » -> « allume la lumiere. »
 
     La phrase part de deux secondes AVANT l'eveil : le mot y est, parfois
     precede d'un bout de conversation. On coupe tout jusqu'au mot, s'il est
-    dans les huit premiers ; sinon on ne touche a rien."""
+    dans les huit premiers. S'il FINIT la demande (« baisse le son, Jarvis »,
+    « tu peux mettre de la musique Jarvis s'il te plait ? »), c'est ce qui le
+    precede qu'on garde -- depuis le debut de la derniere phrase. Sinon on ne
+    touche a rien."""
     mots = str(texte or "").split()
-    for i, m in enumerate(mots[:8]):
+    for i, m in enumerate(mots):
         brut = normaliser(m).replace("'", "")
-        if _EVEIL.match(brut):
-            reste = " ".join(mots[i + 1:])
-            return re.sub(r"^[\s,.;:!?…-]+", "", reste).strip()
+        if not _EVEIL.match(brut):
+            continue
+        reste = re.sub(r"^[\s,.;:!?…-]+", "", " ".join(mots[i + 1:])).strip()
+        utile = [w for w in normaliser(reste).split() if w]
+        if utile and not _POLITESSE.match(" ".join(utile)) and not all(_POLITESSE.match(w) for w in utile):
+            return reste if i < 8 else str(texte or "").strip()
+        avant = " ".join(mots[:i])
+        avant = re.split(r"[.!?…]\s+", avant)[-1] if avant else ""
+        avant = _AMORCES.sub("", avant.strip()).strip(" ,;:-")
+        if not avant:
+            return reste if i < 8 else str(texte or "").strip()      # « Jarvis, merci »
+        return " ".join(avant.split()[-20:])
     return str(texte or "").strip()
 
 
@@ -2041,6 +2133,8 @@ class Oreille:
         self.coupure = None
         self.parole = False
         self.apres_coupure = False
+        self.candidat = None          # l'appel rate de peu le plus recent
+        self.auto_attente = []        # les facons de l'appeler a garder si la conversation est reelle
 
     def _arreter_parole(self):
         self.parole = False
@@ -2079,7 +2173,7 @@ class Oreille:
         self.det.gabarits = [normer(g) for g in self.reglages.get("gabarits") or []
                              if len(g) >= GABARIT_MIN]
         self.det.seuil = seuil_gabarit(self.reglages.get("sensibilite", 0.5))
-        self.det.seuil_hey = 0.5 if self.reglages.get("hey", True) else 9.0
+        self.det.seuil_hey = seuil_hey(self.reglages.get("sensibilite", 0.5), self.reglages.get("hey", True))
 
     def commande(self, c):
         cmd = (c or {}).get("cmd")
@@ -2098,6 +2192,7 @@ class Oreille:
                 self.coupure.fausse_coupure()
         elif cmd == "annuler":  # l'oreille : on laisse tomber ce qu'on ecoutait
             self.phrase, self.appris, self.etat = None, None, "veille"
+            self.auto_attente = []
         elif cmd == "parole":
             # Jarvis commence ou finit de parler (le processus de la voix le dit)
             if c.get("actif") and self.reglages.get("couper", True) and self.loopback is not None:
@@ -2116,25 +2211,63 @@ class Oreille:
             self.appris = {"emps": [], "niveaux": [], "t": 0.0, "parole": False, "silence": 0.0}
             self.etat = "apprendre"
 
+    def _a_prendre(self):
+        """L'empreinte du mot qu'on vient d'entendre, prise quand il est FINI :
+        reconnu sans sa queue, ses dernieres trames arrivent encore."""
+        return {"long": self.det.longueur_mot(), "prise": self.det.n + self.det.queue_proche, "v": None}
+
+    def _prendre(self, a):
+        if a.get("v") is None and self.det.n >= a["prise"]:
+            a["v"] = self.det.extrait(a["long"])
+        return a
+
+    def _facons_a_garder(self, ev):
+        """Au reveil : l'appel rate juste avant (s'il y en a un), et celui-ci
+        s'il n'est passe que de justesse (ou par « Hey Jarvis »). Gardes
+        seulement si une vraie phrase suit (voir AUTO_*)."""
+        if not self.reglages.get("auto", True):
+            return []
+        out = []
+        c = self.candidat
+        if c is not None and c.get("v") is not None and 3 < self.det.n - c["n"] <= AUTO_RATE_TRAMES:
+            out.append(c)
+        if ev[0] == "hey" or ev[1] > AUTO_JUSTESSE * self.det.seuil:
+            out.append(self._prendre(self._a_prendre() if ev[0] == "voix" else
+                                     {"long": self.det.longueur_mot(), "prise": self.det.n, "v": None}))
+        return out
+
     def trame(self, x):
         import numpy as np
         rms = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
         ev = self.det.trame(x, chercher=(self.etat == "veille"))
+        for a in self.auto_attente + ([self.candidat] if self.candidat else []):
+            self._prendre(a)
         # « IL SEMBLE AVOIR OUBLIE MON JARVIS » : quand le mot appris passe PRES
         # du seuil sans le franchir, on le dit -- un NOMBRE, rien d'autre ne
         # sort d'ici avant l'eveil. Machi Tool l'affiche : monter la
         # sensibilite, ou reapprendre avec ce micro.
         d = getattr(self.det, "plus_proche", None)
-        if (ev is None and d is not None and self.etat == "veille" and d < self.det.seuil * PRESQUE_FACTEUR
-                and self.det.n - getattr(self, "_presque_n", -999) > 40):
-            self._presque_n = self.det.n
-            self.sortie({"evt": "presque", "distance": round(float(d), 4), "seuil": round(float(self.det.seuil), 4)})
+        if ev is None and d is not None and self.etat == "veille" and d < self.det.seuil * PRESQUE_FACTEUR:
+            # le meilleur « presque » de ce moment-ci ; un nouveau moment le remplace
+            c = self.candidat
+            if c is None or self.det.n - c["n"] > 12 or d < c["d"]:
+                # la fin du mot arrive encore (reconnu sans sa queue) : on la prendra
+                self.candidat = self._a_prendre()
+                self.candidat.update(d=float(d), n=self.det.n)
+            if self.det.n - getattr(self, "_presque_n", -999) > 40:
+                self._presque_n = self.det.n
+                self.sortie({"evt": "presque", "distance": round(float(d), 4),
+                             "seuil": round(float(self.det.seuil), 4)})
         if ev is not None:
             self._arreter_parole()
             if self.reglages.get("son", True):
                 self.jouer("eveil")
+            self.auto_attente = self._facons_a_garder(ev)
+            self.candidat = None
             avant = self.det.son_d_avant()
-            self.phrase = Phrase(self.det.parle, avant=avant[:-TRAME] if len(avant) > TRAME else None)
+            self.phrase = Phrase(self.det.parle, avant=avant[:-TRAME] if len(avant) > TRAME else None,
+                                 deja_dit=self.det.parlait_avant(),
+                                 fin_du_mot=self.det.queue_proche if ev[0] == "voix" else 0)
             # La trame courante est dans « avant » : on ne la compte pas deux fois,
             # mais elle ne fait pas partie de la fenetre d'apres-carillon non plus.
             self.phrase.morceaux.append(np.asarray(x, dtype=np.int16))
@@ -2163,10 +2296,15 @@ class Oreille:
                     ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii")}
                 elif apres and self.coupure is not None:
                     self.coupure.fausse_coupure()      # personne n'a parle : c'etait de l'echo
+                # on lui a vraiment parle : ces facons de l'appeler etaient bien des appels
+                a_garder, self.auto_attente = (self.auto_attente if fin == "fini" else []), []
                 if apres:
                     ev["apres_coupure"] = True
                 self.phrase, self.etat = None, "veille"
                 self.sortie(ev)
+                for a in a_garder:
+                    if a.get("v") is not None:
+                        self.sortie({"evt": "gabarit_auto", "vecteurs": a["v"]})
         elif self.etat == "apprendre" and self.appris is not None:
             a = self.appris
             a["emps"].append(self.det.emps[-1])
