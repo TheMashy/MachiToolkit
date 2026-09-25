@@ -1515,6 +1515,17 @@ class LeNomDansLaTranscription(unittest.TestCase):
         self.assertFalse(J.contient_nom("travis mets de la musique"))
         self.assertEqual(J.noms_entendus("et oh"), [], "pas les tout petits mots")
 
+    def test_une_phrase_de_calibration_n_apprend_que_le_nom(self):
+        # « au bout d'un moment il s'active tout seul » : « Calibrer encore »
+        # fait dire le nom au milieu d'une phrase ; seuls les mots proches de
+        # « jarvis » deviennent son nom, jamais « lumiere » ni « musique »
+        self.assertEqual(J.noms_entendus("Allume la lumiere et Travis mets la musique"), ["travis"])
+        self.assertEqual(J.noms_entendus("allume la lumiere et mets la musique"), [])
+        self.assertEqual(J.noms_entendus("bon jar vis"), ["jarvis"])
+        self.assertFalse(J.contient_nom("mets la musique", ["musique", "lumiere"]),
+                         "des noms pollues (v1.59) ne confirment plus rien")
+        self.assertEqual(J.nom_trouve("euh Jervis la lumiere"), "jervis")
+
 
 @unittest.skipUnless(NUMPY, "numpy absent")
 class SeuilsDeTaVoix(unittest.TestCase):
@@ -2144,6 +2155,26 @@ class DansMachiTool(unittest.TestCase):
         r = m.executer_outil({"id": "s", "nom": "spotify_jouer", "entree": {"recherche": "get lucky"}}, m.CFG)
         self.assertEqual(r["erreur"], "Spotify refuse (403 : Restriction violated).", "sans « ErreurSpotify : »")
         self.assertIn("Restriction violated", m.JARVIS["spotify_message"], "et on le voit sous « Spotify »")
+
+    def test_les_noms_pollues_sont_ecartes_a_la_lecture(self):
+        m = self.m
+        m.sauver_gabarits([[[0.1] * 96] * 8] * 3, noms=["travis", "lumiere", "musique", "jarvi"])
+        self.assertEqual(m.noms_appris(), ["travis", "jarvi"])
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        m.transcrire = lambda o: "mets la musique"
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+
+    def test_le_chien_de_garde_de_l_oreille(self):
+        m = self.m
+        t = time.time()
+        m.JARVIS["niveau_t"] = t
+        self.assertFalse(m.oreille_muette(t + 10))
+        self.assertTrue(m.oreille_muette(t + m.OREILLE_MUETTE_S + 1))
+        m.traiter_evenement({"evt": "niveau", "db": -40})
+        self.assertFalse(m.oreille_muette(), "chaque seconde, elle dit qu'elle vit")
+        m.JARVIS.pop("niveau_t")
+        self.assertFalse(m.oreille_muette(), "pas encore demarree : rien a surveiller")
 
     def test_l_indicateur_garde_les_derniers_essais(self):
         m = self.m
@@ -3785,6 +3816,58 @@ class LeMicroChoisi(unittest.TestCase):
     class Micro:
         def __init__(self, ident, nom):
             self.id, self.name = ident, nom
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_un_micro_muet_ou_change_est_rouvert(self):
+        """« Au bout d'un moment il ne se detecte plus » : un micro qui ne rend
+        que des zeros, ou le micro de Windows qui change, et le flux s'arrete
+        -- l'oreille le rouvre."""
+        import types
+        etat = {"defaut": self.Micro("{A}", "Casque"), "son": 0.0}
+        test = self
+
+        class Enregistreur:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def record(self, numframes):
+                return np.full((numframes, 1), etat["son"], dtype=np.float32)
+
+        test.Micro.recorder = lambda self, **k: Enregistreur()
+        self.addCleanup(lambda: delattr(test.Micro, "recorder"))
+        faux = types.SimpleNamespace(all_microphones=lambda: [etat["defaut"]],
+                                     default_microphone=lambda: etat["defaut"])
+        vrai = sys.modules.get("soundcard")
+        sys.modules["soundcard"] = faux
+        self.addCleanup(lambda: sys.modules.__setitem__("soundcard", vrai) if vrai else sys.modules.pop("soundcard"))
+        horloge = {"t": 0.0}
+        vraie = J.time.monotonic
+        J.time.monotonic = lambda: horloge["t"]
+        self.addCleanup(lambda: setattr(J.time, "monotonic", vraie))
+
+        def lire(n):
+            flux, lus = J.micro_windows(""), 0
+            for _ in flux:
+                lus += 1
+                horloge["t"] += 0.08
+                if lus >= n:
+                    return lus, False
+            return lus, True                   # le flux s'est arrete de lui-meme
+        etat["son"] = 0.1
+        self.assertEqual(lire(1000), (1000, False), "un vrai son : il continue")
+        etat["son"] = 0.0
+        lus, fini = lire(10000)
+        self.assertTrue(fini)
+        self.assertAlmostEqual(lus * 0.08, J.MICRO_MUET_S, delta=1.0)
+        etat["son"] = 0.1
+        flux = J.micro_windows("")
+        next(flux)
+        horloge["t"] += J.MICRO_VERIFIE_S + 1
+        etat["defaut"] = self.Micro("{B}", "Webcam")      # Windows a change de micro
+        self.assertEqual(list(flux), [], "il s'arrete pour rouvrir le nouveau")
 
     def test_par_identifiant_puis_par_nom_sinon_celui_de_windows(self):
         a, b, c = self.Micro("{A}", "Micro casque"), self.Micro("{B}", "Webcam"), self.Micro("{C}", "Webcam")
