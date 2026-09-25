@@ -1312,6 +1312,59 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("unit 00.txt", ex("chercher_fichiers", {"nom": "unit 00", "dans": "Documents"})["texte"],
                       "l'ancien parametre « nom » marche encore")
 
+    def test_il_se_souvient_de_vos_conversations(self):
+        # « Il faut que Jarvis se souvienne des anciennes discussions, mais simplement. »
+        m = self.m
+        vrais = (m._en_fond, m._requete_bd)
+        self.addCleanup(lambda: (setattr(m, "_en_fond", vrais[0]), setattr(m, "_requete_bd", vrais[1])))
+        m._en_fond = lambda f: f()
+        envoyes, reponses = [], []
+
+        def bd(chemin, charge, cfg, delai):
+            envoyes.append(json.loads(json.dumps(charge)))
+            return reponses.pop(0)
+        m._requete_bd = bd
+        m.CFG["jarvis_souvenirs"] = []
+        reponses += [{"texte": "Un italien ouvert lundi ? Aucun, je le crains.", "mode": "jarvis"},
+                     {"texte": "A cherche un restaurant italien ouvert le lundi a Lyon, sans succes."}]
+        self.phrase("Jarvis, un italien ouvert lundi à Lyon ?")
+        self.assertEqual(envoyes[0]["souvenirs"], [])
+        self.phrase("Jarvis, non rien, merci")          # fin de la conversation
+        self.assertEqual(envoyes[1]["transition"], "resume")
+        self.assertEqual([h["role"] for h in envoyes[1]["historique"]], ["user", "assistant"])
+        self.assertEqual(len(m.CFG["jarvis_souvenirs"]), 1)
+        self.assertEqual(m.CFG["jarvis_souvenirs"][0]["texte"],
+                         "A cherche un restaurant italien ouvert le lundi a Lyon, sans succes.")
+        reponses += [{"texte": "Mardi, oui : Da Marco.", "mode": "jarvis"}]
+        self.phrase("Jarvis, et mardi ?")
+        self.assertRegex(envoyes[2]["souvenirs"][0], r"^\d\d/\d\d : A cherche un restaurant italien")
+        # rien a retenir : pas de souvenir vide
+        reponses += [{"texte": ""}]
+        m.clore_historique()
+        self.assertEqual(len(m.CFG["jarvis_souvenirs"]), 1)
+        # grave : bascule au compagnon, et cette conversation-la n'est pas resumee
+        reponses += [{"texte": "Je suis la.", "mode": "psy"}]
+        n = len(envoyes)
+        self.phrase("Jarvis, je n'en peux plus")
+        self.assertEqual(len(envoyes), n + 1, "aucune demande de resume")
+        self.assertEqual(m.JARVIS["historique"], [])
+        # le mode psychologue ne laisse pas de souvenir
+        m.JARVIS["historique"] = [{"role": "user", "texte": "x"}]
+        m.clore_historique()
+        self.assertEqual(len(envoyes), n + 1)
+        # 30 au plus, 15 envoyes
+        m.CFG["jarvis_souvenirs"] = [{"date": "2026-09-%02d" % (1 + i % 28), "texte": "s%d" % i} for i in range(30)]
+        m.JARVIS["mode"] = "jarvis"
+        m.JARVIS["historique"] = [{"role": "user", "texte": "y"}]
+        reponses += [{"texte": "Nouveau."}]
+        m.clore_historique()
+        self.assertEqual(len(m.CFG["jarvis_souvenirs"]), 30)
+        self.assertEqual(m.CFG["jarvis_souvenirs"][-1]["texte"], "Nouveau.")
+        self.assertEqual(len(m.capacites_jarvis(m.CFG)["souvenirs"]), 15)
+        r = m.executer_outil({"id": "x", "nom": "oublier", "entree": {"conversations": True}}, m.CFG)
+        self.assertIn("30 souvenirs", r["texte"])
+        self.assertEqual(m.CFG["jarvis_souvenirs"], [])
+
     def test_les_onglets_par_l_extension(self):
         # « Il faut qu'il puisse fermer ou ouvrir des onglets. »
         m = self.m

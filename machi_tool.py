@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.40.0"
+VERSION = "1.41.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -356,6 +356,9 @@ CONFIG_DEFAUT = {
     # CE QU'IL RETIENT DE TOI : des phrases courtes, dictees (« retiens que... »),
     # envoyees avec chaque question. Reglages > Jarvis les montre et les efface.
     "jarvis_preferences": [],
+    # SES SOUVENIRS DE VOS CONVERSATIONS : une phrase par conversation en mode
+    # Jarvis, ecrite a la fin de celle-ci. Jamais le mode psychologue.
+    "jarvis_souvenirs": [],
     # L'HISTORIQUE DU NAVIGATEUR, pour retrouver une video ou un lien : lu sur
     # le poste a la demande ; seules les pages qui correspondent partent.
     "jarvis_historique": False,
@@ -5447,9 +5450,53 @@ def phrase(cle, langue, *args):
     return t % args if args else t
 
 
+SOUVENIRS_MAX = 30          # gardes sur le PC
+SOUVENIRS_ENVOYES = 15      # envoyes avec chaque question
+
+
+def _en_fond(f):
+    threading.Thread(target=f, daemon=True).start()
+
+
+def resumer_conversation(historique, cfg):
+    """Une phrase sur la conversation qui vient de finir, ecrite par
+    BrainDebugger, gardee dans la config. Rien si c'etait une commande, un
+    bonjour, ou si quelque chose de grave y est passe (BrainDebugger le voit)."""
+    if not _cle_presente(cfg) or not any(h.get("role") == "user" for h in historique):
+        return None
+    try:
+        donnees = _requete_bd("/api/machitool/jarvis", {"transition": "resume", "historique": historique[-12:],
+                                                        "langue": langue_jarvis(cfg)}, cfg, 60)
+    except Exception:
+        return None
+    texte = " ".join(str((donnees or {}).get("texte") or "").split())[:200]
+    if not texte:
+        return None
+    souvenir = {"date": time.strftime("%Y-%m-%d"), "texte": texte}
+    cfg["jarvis_souvenirs"] = (list(cfg.get("jarvis_souvenirs") or []) + [souvenir])[-SOUVENIRS_MAX:]
+    sauver_config(cfg)
+    return souvenir
+
+
+def clore_historique(cfg=None):
+    """La conversation en mode Jarvis se termine : on s'en souvient en une
+    phrase (en arriere-plan), et on repart de zero."""
+    historique = list(JARVIS.get("historique") or [])
+    JARVIS["historique"] = []
+    if historique and JARVIS.get("mode", "jarvis") == "jarvis":
+        cfg = CFG if cfg is None else cfg
+        _en_fond(lambda: resumer_conversation(historique, cfg))
+
+
+def souvenirs_a_envoyer(cfg):
+    return ["%s : %s" % (time.strftime("%d/%m", time.strptime(s_["date"], "%Y-%m-%d")), s_["texte"])
+            for s_ in (cfg.get("jarvis_souvenirs") or [])[-SOUVENIRS_ENVOYES:]
+            if isinstance(s_, dict) and s_.get("texte") and s_.get("date")]
+
+
 def poser_mode(mode):
     if mode != JARVIS.get("mode"):
-        JARVIS["historique"] = []
+        clore_historique()
         if mode == "psy":
             # ce qui se dit au psychologue, gardé en memoire le temps de la
             # seance -- pour savoir, a l'au revoir, s'il faut se taire
@@ -5462,8 +5509,8 @@ def mode_courant(maintenant=None):
     t = time.time() if maintenant is None else maintenant
     if JARVIS.get("mode") == "psy" and t - JARVIS.get("mode_vu", 0.0) > PSY_DUREE_S:
         poser_mode("jarvis")
-    if t - JARVIS.get("vu", 0.0) > CONVERSATION_S:
-        JARVIS["historique"] = []
+    if t - JARVIS.get("vu", 0.0) > CONVERSATION_S and JARVIS.get("historique"):
+        clore_historique()
         JARVIS["propose_psy"] = False
     return JARVIS.get("mode", "jarvis")
 
@@ -5474,7 +5521,7 @@ def terminer_conversation():
     VOIX.taire()
     envoyer_oreille({"cmd": "annuler"})
     poser_mode("jarvis")
-    JARVIS["historique"] = []
+    clore_historique()
     JARVIS["attente_code"] = None
     poser_led(None)
     JARVIS.update(etat="attente", message=message_attente())
@@ -5497,7 +5544,7 @@ def dire_adieu(mot, cfg):
     L = langue_jarvis(cfg)
     envoyer_oreille({"cmd": "annuler"})
     poser_mode("jarvis")
-    JARVIS["historique"] = []
+    clore_historique(cfg)
     if mot in _ADIEUX:
         fr, en = _ADIEUX[mot]
     else:
@@ -6521,6 +6568,11 @@ def executer_outil(outil, cfg):
             cfg["jarvis_preferences"] = _jv.ajouter_preference(cfg.get("jarvis_preferences"), e.get("preference"))
             sauver_config(cfg)
             return {"id": ident, "texte": "Retenu : %s" % cfg["jarvis_preferences"][-1]}
+        if nom == "oublier" and e.get("conversations"):
+            n = len(cfg.get("jarvis_souvenirs") or [])
+            cfg["jarvis_souvenirs"] = []
+            sauver_config(cfg)
+            return {"id": ident, "texte": "Oublie : %d souvenir%s de conversations." % (n, "s" if n > 1 else "")}
         if nom == "oublier":
             reste, retirees = _jv.retirer_preference(cfg.get("jarvis_preferences"), e.get("preference", ""),
                                                      tout=bool(e.get("tout")))
@@ -6702,6 +6754,7 @@ def capacites_jarvis(cfg):
             "navigation": pc and bool(cfg.get("jarvis_historique")),
             "spotify": pc and spotify_connecte(cfg),
             "onglets": pc and extension_branchee(),
+            "souvenirs": souvenirs_a_envoyer(cfg),
             "memoire": True, "preferences": [str(p)[:_jv.PREFERENCE_LONGUEUR]
                                              for p in (cfg.get("jarvis_preferences") or [])][-_jv.PREFERENCES_MAX:]}
 
@@ -6762,6 +6815,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1):
         # Grave : c'est le compagnon qui a repondu, et on reste avec lui. Et
         # a l'au revoir, Jarvis se taira : `psy_grave`.
         print("Jarvis : bascule en mode psychologue")
+        JARVIS["historique"] = []          # grave : cette conversation-la, on ne la resume pas
         poser_mode("psy")
         JARVIS.update(psy_grave=True, psy_echange=[{"role": "user", "texte": texte},
                                                    {"role": "assistant", "texte": reponse}])
@@ -9652,6 +9706,16 @@ class Panneau:
         self.boite_preferences = tk.Frame(f, bg=NUIT)
         self.boite_preferences.pack(fill="x", pady=(4, 0))
         self.remplir_preferences()
+        self.texte(f, "Et vos conversations : a la fin de chacune (en mode Jarvis seulement, jamais le "
+                      "psychologue), il en garde une phrase -- de quoi on a parle, ce qui a ete fait. Rien de "
+                      "sante ni d'intime, rien apres un message grave. Les %d dernieres partent avec chaque "
+                      "question. « Oublie nos conversations » les efface." % SOUVENIRS_ENVOYES,
+                   BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(4, 0))
+        self.bouton(ligne, "Oublier les conversations", self.oublier_souvenirs, compact=True).pack(side="left")
+        self.txt_souvenirs = self.texte(ligne, "", BRUME, 8, largeur=360)
+        self.txt_souvenirs.pack(side="left", padx=(10, 0))
 
         self.separateur(f, 12, 8)
         self.titre(f, "ce qu'il fait").pack(fill="x", pady=(0, 4))
@@ -9777,6 +9841,10 @@ class Panneau:
         self.bouton(self.boite_preferences, "Tout oublier", lambda: self.oublier_preference(None),
                     compact=True).pack(anchor="w", pady=(6, 0))
 
+    def oublier_souvenirs(self):
+        self.cfg["jarvis_souvenirs"] = []
+        sauver_config(self.cfg)
+
     def oublier_preference(self, i):
         prefs = list(self.cfg.get("jarvis_preferences") or [])
         self.cfg["jarvis_preferences"] = [] if i is None else prefs[:i] + prefs[i + 1:]
@@ -9887,6 +9955,12 @@ class Panneau:
             text=titres.get(etat, etat) + ("  " + JARVIS["message"] if JARVIS.get("message") else ""),
             fg=ALERTE if etat == "erreur" else VIF if etat not in ("eteint", "preparation", "demarrage") else BRUME)
         details = ["mode " + ("psychologue" if JARVIS.get("mode") == "psy" else "Jarvis")]
+        if hasattr(self, "txt_souvenirs"):
+            sv = self.cfg.get("jarvis_souvenirs") or []
+            etat_sv = ("%d conversation%s en memoire ; la derniere : %s" % (
+                len(sv), "s" if len(sv) > 1 else "", sv[-1].get("texte", "")[:90]) if sv else "Aucune pour l'instant.")
+            if self.txt_souvenirs.cget("text") != etat_sv:
+                self.txt_souvenirs.configure(text=etat_sv)
         if hasattr(self, "txt_onglets"):
             etat_on = "Branchee." if extension_branchee() else (JARVIS.get("onglets_message") or "Pas branchee.")
             if self.txt_onglets.cget("text") != etat_on:
