@@ -608,6 +608,17 @@ class SesMains(unittest.TestCase):
         liste = J.ranger_routine([], r0)
         self.assertEqual(len(J.ranger_routine(liste, dict(r0, replique="Ciao"))), 1, "meme nom : remplacee")
 
+    def test_une_explication_longue_ne_montre_que_sa_premiere_phrase(self):
+        # « une passe de simplicite partout »
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mt_aide", os.path.join(RACINE, "machi_tool.py"))
+        src = open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8").read()
+        self.assertIn("def aide_courte(", src)
+        self.assertNotIn("def page_calendrier(", src, "les pages mortes sont parties")
+        self.assertEqual(src.count("    def peindre_journal("), 1)
+        corps = src[src.index("    def page_jarvis(self):"):src.index("    def basculer_jarvis(self):")]
+        self.assertGreaterEqual(corps.count("self.repli(page, "), 7, "le detail de Jarvis est replie")
+
     def test_poser_un_rappel_a_la_main(self):
         a = "2026-09-25"                                    # un vendredi
         for tape, attendu in (("", a), ("demain", "2026-09-26"), ("Après-demain", "2026-09-27"), ("+3", "2026-09-28"),
@@ -1493,6 +1504,16 @@ class DansMachiTool(unittest.TestCase):
         return ok, consignes, m.gabarits_jarvis()
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_l_aide_courte(self):
+        m = self.m
+        long = ("Avant le mot d'eveil, rien ne sort du micro. Apres, la phrase est transcrite sur ce PC, "
+                "par le moteur de la dictee, telecharge une fois quand tu coches la case.")
+        self.assertEqual(m.aide_courte(long), "Avant le mot d'eveil, rien ne sort du micro.   plus \u203a")
+        self.assertIsNone(m.aide_courte("Court."), "court : entier")
+        tres_long = "mot " * 80
+        c = m.aide_courte(tres_long)
+        self.assertTrue(c.endswith("\u2026   plus \u203a") and len(c) < m.AIDE_LONGUE + 15)
+
     def test_jamais_eteindre_redemarrer_mettre_en_veille_ni_fermer_la_session(self):
         m = self.m
         m.CFG["jarvis_pc"] = True

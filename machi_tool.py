@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.53.0"
+VERSION = "1.54.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -9002,6 +9002,25 @@ GRAPHE_HAUTEUR = 74       # le graphe de la guirlande, en tete
 GRAPHE_PAS = 3            # largeur d'une image dans le graphe
 
 
+AIDE_LONGUE = 150         # au-dela, une explication ne montre que sa premiere phrase
+
+
+def aide_courte(txt, limite=AIDE_LONGUE):
+    """La premiere phrase d'une longue explication, et « plus › » ; None si
+    elle est deja courte (on la montre entiere)."""
+    t = " ".join(str(txt or "").split())
+    if len(t) <= limite:
+        return None
+    m = re.match(r"(.+?[.!?\u00bb])(?=\s+[A-Z\u00ab(\"]|\s+--\s)", t)
+    premiere = m.group(1) if m else t
+    if len(premiere) > limite:
+        coupe = t[:limite].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        premiere = coupe + "\u2026"
+    if len(premiere) >= len(t) - 3:
+        return None
+    return premiere + "   plus \u203a"
+
+
 class Panneau:
     def __init__(self, cfg, quitter_tout):
         import tkinter as tk
@@ -9086,7 +9105,6 @@ class Panneau:
         self.zone = tk.Frame(corps, bg=NUIT)
         self.zone.pack(side="left", fill="both", expand=True)
         self.construire_bandeau()
-        self.construire_bandeau_pont()
 
         self.page_accueil()
         self.page_etat()
@@ -9096,8 +9114,6 @@ class Panneau:
         self.page_reglages()
         self.page_maj()
         self.page_passerelle()
-        self.page_calendrier()
-        self.page_moi()
         self.page_activite()
         self.page_appairage()
         self.page_jarvis()
@@ -10130,11 +10146,8 @@ class Panneau:
             p.pack_forget()
         # Le bandeau ne concerne que la lampe, et doit rester au-dessus.
         self.bandeau.pack_forget()
-        self.bandeau_pont.pack_forget()
         if GROUPE_DE.get(cle) == "lampe":
             self.bandeau.pack(fill="x")
-        elif cle in ("calendrier", "moi"):
-            self.bandeau_pont.pack(fill="x")
         self.pages[cle].pack(fill="both", expand=True)
 
     def nouvelle_page(self, cle, marge_x=24, marge_y=18, defilante=False):
@@ -10197,9 +10210,46 @@ class Panneau:
     def texte(self, parent, txt, couleur=BRUME, taille=9, gras=False, largeur=520):
         # largeur est pensee en 96 ppp comme le reste : sans mise a l'echelle,
         # les paragraphes se replieraient beaucoup trop tot sur un 4K.
-        return self.tk.Label(parent, text=txt, bg=parent["bg"], fg=couleur,
-                             font=(self.f_ui, taille, "bold" if gras else "normal"),
-                             anchor="w", justify="left", wraplength=self.px(largeur))
+        lab = self.tk.Label(parent, text=txt, bg=parent["bg"], fg=couleur,
+                            font=(self.f_ui, taille, "bold" if gras else "normal"),
+                            anchor="w", justify="left", wraplength=self.px(largeur))
+        # « UNE PASSE DE SIMPLICITE PARTOUT » : une longue explication ne montre
+        # que sa premiere phrase ; « plus › » deplie le reste, « moins ‹ » le replie.
+        court = aide_courte(txt) if couleur == BRUME and not gras else None
+        if court:
+            etat = {"long": False}
+
+            def basculer(_=None):
+                etat["long"] = not etat["long"]
+                lab.configure(text=(txt + "   moins \u2039") if etat["long"] else court)
+            lab.configure(text=court, cursor="hand2")
+            lab.bind("<Button-1>", basculer)
+        return lab
+
+    def repli(self, parent, titre, ouvert=False):
+        """Une section repliee : son titre, cliquable, et ce qu'elle contient
+        (le cadre rendu), cache tant qu'on ne l'ouvre pas. Reste ouverte ou
+        fermee d'une reconstruction a l'autre."""
+        tk = self.tk
+        memo = self.__dict__.setdefault("replis_ouverts", {})
+        ouvert = memo.get(titre, ouvert)
+        bloc = tk.Frame(parent, bg=parent["bg"])
+        bloc.pack(fill="x", pady=(self.px(10), 0))
+        tete = tk.Label(bloc, bg=parent["bg"], fg=BRUME, font=(self.f_mono, 8), anchor="w", cursor="hand2")
+        tete.pack(fill="x")
+        tk.Frame(bloc, bg=FIL, height=1).pack(fill="x", pady=(self.px(4), 0))
+        corps = tk.Frame(bloc, bg=parent["bg"])
+
+        def montrer(o):
+            memo[titre] = o
+            tete.configure(text=("\u25be  " if o else "\u25b8  ") + titre.upper())
+            if o:
+                corps.pack(fill="x", pady=(self.px(6), 0))
+            else:
+                corps.pack_forget()
+        tete.bind("<Button-1>", lambda _e: montrer(not memo.get(titre, False)))
+        montrer(ouvert)
+        return corps
 
     def champ(self, parent, valeur, largeur=18):
         e = self.tk.Entry(parent, bg=ENCRE, fg=CRAIE, insertbackground=CRAIE,
@@ -10361,27 +10411,6 @@ class Panneau:
         # faire dans le pied, ou il suivait jusqu'aux pages du site.
         self.bouton(self.bandeau, "Reconnecter", self.reconnecter,
                     compact=True).pack(anchor="w", pady=(self.px(8), 0))
-
-    def construire_bandeau_pont(self):
-        """Relever et ouvrir le site valaient pour Calendrier comme pour
-        Moi : les repeter sur chaque page en faisait quatre boutons pour
-        deux actions. Ils coiffent le groupe, comme l'etat coiffe la
-        lampe."""
-        tk = self.tk
-        self.bandeau_pont = tk.Frame(self.zone, bg=NUIT, padx=self.px(24),
-                                     pady=self.px(14))
-        barre = tk.Frame(self.bandeau_pont, bg=NUIT)
-        barre.pack(fill="x")
-        self.bouton(barre, "Relever", self.relever_pont,
-                    compact=True).pack(side="left")
-        self.bouton(barre, "Ouvrir le site", self.ouvrir_site,
-                    compact=True).pack(side="left", padx=self.px(8))
-        self.btn_lu = self.bouton(barre, "Tout marquer comme lu",
-                                  self.vider_rappels, compact=True)
-        self.txt_pont = tk.Label(self.bandeau_pont, text="", bg=NUIT, fg=BRUME,
-                                 font=(self.f_ui, 9), anchor="w",
-                                 justify="left", wraplength=self.px(520))
-        self.txt_pont.pack(fill="x", pady=(self.px(8), 0))
 
     # ------------------------------------------------------------------
     #  Page Accueil
@@ -10714,13 +10743,9 @@ class Panneau:
 
     def page_ecran(self):
         tk = self.tk
-        f = self.nouvelle_page("ecran", defilante=True)
-
-        self.texte(f, "Le controleur n'accepte qu'une seule couleur pour tout le brin : "
-                      "le gauche bleu et le droit vert sont impossibles. En revanche "
-                      "l'ecran choisi pilote l'ensemble.", BRUME, 8, largeur=490).pack(fill="x")
-
-        self.separateur(f, 14, 10)
+        # l'essentiel en haut (le mode, l'ecran, deux reglettes) ; l'etalonnage replie
+        page = self.nouvelle_page("ecran", defilante=True)
+        f = page
         self.titre(f, "mode").pack(fill="x", pady=(0, 4))
         self.var_mode = tk.StringVar(value=self.cfg.get("mode", "applications"))
         self.radio(f, "Regles — couleur fixe par programme ou site",
@@ -10763,17 +10788,8 @@ class Panneau:
         self.var_douceur_ecran = self.reglette(f, "douceur_ecran", "Reactivite",
                                                0.05, 1.0, 0.05,
                                                "Haut = colle a l'image. Bas = fondu doux.")
-        self.var_finesse = self.reglette(
-            f, "ecran_finesse", "Finesse de la capture", 2, 16, 1,
-            "Colonnes de la vignette lue sur l'ecran. 4 donne une douzaine "
-            "de pixels moyennes, largement assez pour une couleur dominante. "
-            "Monter affine le vote des petites zones colorees ; le cout reste "
-            "negligeable, c'est la vignette elle-meme qui fait la vitesse.",
-            entier=True)
 
-        self.separateur(f, 14, 10)
-        self.titre(f, "ce que la luminosite de l'ecran fait bouger").pack(
-            fill="x", pady=(0, 4))
+        f = self.repli(page, "ce que la luminosite de l'ecran fait bouger")
         self.var_cible_ecran = tk.StringVar(
             value=self.cfg.get("ecran_cible", "luminosite"))
         for cle, libelle in (
@@ -10783,9 +10799,12 @@ class Panneau:
                 ("les_deux",   "Les deux"),
                 ("rien",       "Rien — la guirlande garde la luminosite de base")):
             self.radio(f, libelle, self.var_cible_ecran, cle).pack(fill="x")
+        self.var_finesse = self.reglette(
+            f, "ecran_finesse", "Finesse de la capture", 2, 16, 1,
+            "Colonnes de la vignette lue sur l'ecran ; 4 suffit pour une couleur dominante.",
+            entier=True)
 
-        self.separateur(f, 14, 8)
-        self.titre(f, "etalonnage de l'ecran").pack(fill="x", pady=(0, 6))
+        f = self.repli(page, "etalonnage de l'ecran")
         self.texte(f, "Un ecran ne descend jamais au noir absolu ni ne monte au "
                       "blanc pur. Ces trois reglages disent ce qui compte comme "
                       "noir, ce qui compte comme blanc, et comment se repartit "
@@ -10811,8 +10830,7 @@ class Panneau:
             "Luminosite tenue quand l'ecran ne pilote pas l'eclat — quand "
             "seule la saturation le suit, ou quand il ne pilote rien.")
 
-        self.separateur(f, 14, 8)
-        self.titre(f, "balance des blancs").pack(fill="x", pady=(0, 6))
+        f = self.repli(page, "balance des blancs")
         self.texte(f, "Le soir, un filtre de lumiere bleue comme f.lux jaunit "
                       "l'ecran sans que la capture le voie : la guirlande resterait "
                       "blanche devant un ecran ambre. On relit alors la teinte "
@@ -10853,8 +10871,7 @@ class Panneau:
             "l'ecran ; 1,3 met en general la guirlande d'accord avec lui ; plus, "
             "pour une guirlande vue de cote.")
 
-        self.separateur(f, 14, 8)
-        self.titre(f, "effet de l'ecran en direct").pack(fill="x", pady=(0, 6))
+        f = self.repli(page, "effet de l'ecran en direct")
         self.jauge_ecran_entree = self.jauge(f, "Luminosite lue sur l'ecran")
         self.jauge_ecran_lum = self.jauge(f, "Luminosite envoyee")
         self.jauge_ecran_sat = self.jauge(f, "Saturation envoyee")
@@ -10867,15 +10884,14 @@ class Panneau:
 
     def page_son(self):
         tk = self.tk
-        f = self.nouvelle_page("son", defilante=True)
+        page = self.nouvelle_page("son", defilante=True)
+        f = page
 
         self.radio(f, "Son \u2014 la musique pilote la guirlande",
                    self.var_mode, "son").pack(fill="x")
         self.txt_audio = self.texte(f, "", BRUME, 8)
         self.txt_audio.pack(fill="x", pady=(4, 0))
-        self.texte(f, "Capte la sortie des haut-parleurs, pas le micro. "
-                      "Monte la cadence a 15-20 images par seconde dans Reglages "
-                      "pour que ca colle au rythme.", BRUME, 8,
+        self.texte(f, "Ecoute la sortie des haut-parleurs, pas le micro.", BRUME, 8,
                    largeur=500).pack(fill="x", pady=(4, 0))
 
         self.separateur(f, 12, 8)
@@ -10909,8 +10925,11 @@ class Panneau:
                 ("regle",       "Couleur de la regle \u2014 le son ne fait que la luminosite")):
             self.radio(f, libelle, self.var_palette, cle).pack(fill="x")
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "ce que le son fait bouger").pack(fill="x", pady=(0, 4))
+        self.separateur(f, 12, 6)
+        self.var_sens = self.reglette(f, "son_sensibilite", "Sensibilite", 0.3, 3.0, 0.1,
+                                      "Plus haut : la guirlande reagit a des sons plus faibles.")
+
+        f = self.repli(page, "ce que le son fait bouger")
         self.var_cible = tk.StringVar(value=self.cfg.get("son_cible", "luminosite"))
         for cle, libelle in (
                 ("luminosite", "La luminosite \u2014 couleur franche en permanence, "
@@ -10921,7 +10940,6 @@ class Panneau:
                                "ensemble")):
             self.radio(f, libelle, self.var_cible, cle).pack(fill="x")
 
-        self.separateur(f, 12, 6)
         self.var_sat_fixe = self.reglette(
             f, "son_saturation_fixe", "Saturation", 0.0, 1.0, 0.02,
             "Valeur tenue quand le son ne pilote pas la saturation. Quand il "
@@ -10930,17 +10948,16 @@ class Panneau:
             f, "son_luminosite_fixe", "Luminosite", 0.05, 1.0, 0.05,
             "Valeur tenue quand le son ne pilote pas la luminosite.")
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "effet du son en direct").pack(fill="x", pady=(0, 6))
+        f = self.repli(page, "effet du son en direct")
         self.jauge_lum = self.jauge(f, "Luminosite envoyee")
         self.jauge_sat = self.jauge(f, "Saturation envoyee")
         self.texte(f, "Barre en couleur : le son la pilote. Barre sourde : "
                       "elle est tenue a sa valeur fixe.", BRUME, 8,
                    largeur=500).pack(fill="x")
 
-        self.separateur(f, 12, 6)
-        self.var_sens = self.reglette(f, "son_sensibilite", "Sensibilite", 0.3, 3.0, 0.1,
-                                      "Multiplie le niveau apres gain automatique.")
+        f = self.repli(page, "rythme")
+        self.texte(f, "Pour coller au rythme, monte aussi les images par seconde (15-20) dans Reglages.",
+                   BRUME, 8, largeur=500).pack(fill="x")
         self.var_attaque = self.reglette(f, "son_attaque", "Attaque", 0.1, 1.0, 0.05,
                                          "Vitesse de montee. Eleve = coup sec sur le beat.")
         self.var_chute = self.reglette(f, "son_chute", "Chute", 0.02, 0.6, 0.02,
@@ -10974,8 +10991,11 @@ class Panneau:
     # ------------------------------------------------------------------
 
     def page_jarvis(self):
+        # « UNE PASSE DE SIMPLICITE » : en haut ce qui sert tous les jours -- l'ecouter,
+        # ta voix, ses mains ; le reste est replie, une section a la fois.
         tk = self.tk
-        f = self.nouvelle_page("jarvis", defilante=True)
+        page = self.nouvelle_page("jarvis", defilante=True)
+        f = page
         self.var_jarvis = tk.IntVar(value=1 if self.cfg.get("jarvis_actif") else 0)
         self.case(f, "Ecouter « Jarvis » — le micro reste ouvert, sur ce PC",
                   self.var_jarvis, self.basculer_jarvis).pack(fill="x")
@@ -10983,40 +11003,17 @@ class Panneau:
         self.txt_jarvis.pack(fill="x", pady=(6, 0))
         self.txt_jarvis_detail = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_jarvis_detail.pack(fill="x", pady=(2, 0))
-        self.texte(f, "Avant le mot d'eveil, rien ne sort du micro : un petit modele compare "
-                      "chaque instant au mot « Jarvis », sans transcrire. Apres, la phrase "
-                      "est transcrite sur ce PC (le moteur de la dictee). Une commande reste ici ; "
-                      "le reste va au compagnon de BrainDebugger, comme si tu l'avais ecrit. "
-                      "Le son n'est jamais enregistre. Clic droit sur l'icone › « Jarvis "
-                      "ecoute » pour couper en un geste. La transcription est celle de la "
-                      "dictee : reprise de Handy s'il est installe, sinon telechargee une fois "
-                      "(456 Mo) quand tu coches.", BRUME, 8,
-                   largeur=500).pack(fill="x", pady=(8, 0))
-
-        self.separateur(f, 12, 8)
-        self.titre(f, "le micro").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Celui qu'il ecoute. Le niveau s'affiche plus haut (« micro -40 dB ») : "
-                      "parle, il doit monter. Il change de micro tout de suite, sans redemarrer.",
-                   BRUME, 8, largeur=500).pack(fill="x")
-        self.var_jarvis_micro = tk.StringVar(value=str(self.cfg.get("jarvis_micro", "") or ""))
-        self.boite_micros = tk.Frame(f, bg=NUIT)
-        self.boite_micros.pack(fill="x")
-        self.remplir_micros()
-        ligne = tk.Frame(f, bg=NUIT)
-        ligne.pack(fill="x", pady=(6, 0))
-        self.bouton(ligne, "Actualiser la liste", self.remplir_micros, compact=True).pack(side="left")
-        self.var_jarvis_micro.trace_add("write", lambda *_: self.choisir_micro())
+        self.texte(f, "Dis « Jarvis », puis ta demande -- ou a la fin : « baisse le son, Jarvis ». Avant son nom, "
+                      "rien ne sort du micro : un petit modele compare chaque instant a ton « Jarvis », sans "
+                      "transcrire. Apres, la phrase est transcrite sur ce PC (le moteur de la dictee, telecharge "
+                      "une fois, 456 Mo) ; le son n'est jamais enregistre. Clic droit sur l'icone › « Jarvis "
+                      "ecoute » pour couper en un geste.", BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
 
         self.separateur(f, 12, 8)
         self.titre(f, "ta voix").pack(fill="x", pady=(0, 4))
-        self.texte(f, "« Hey Jarvis » marche tout de suite, dit a l'anglaise. Pour que "
-                      "« Jarvis » tout seul marche, avec ton accent, dis-le huit fois ici, "
-                      "quand la guirlande s'allume : cinq fois normalement, puis comme une question, "
-                      "plus fort, et plus bas -- l'ecran te guide. Une facon de l'appeler ne passe "
-                      "pas ? « Ajouter une facon » l'apprend en plus ; et s'il te rate de peu puis "
-                      "t'entend a la deuxieme, il garde seul la facon ratee (voir plus bas). On garde "
-                      "une empreinte (des nombres), pas le son. Tu peux aussi l'appeler en fin de "
-                      "phrase : « baisse le son de Spotify, Jarvis ».",
+        self.texte(f, "Dis « Jarvis » huit fois quand la guirlande s'allume : l'ecran te guide (normal, en "
+                      "question, fort, bas). Une facon ne passe pas ? « Ajouter une facon ». S'il te rate de peu "
+                      "puis t'entend juste apres, il garde seul la facon ratee. On garde des nombres, pas le son.",
                    BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
@@ -11028,45 +11025,67 @@ class Panneau:
         self.txt_jarvis_appris.pack(fill="x", pady=(6, 4))
         self.var_jarvis_sens = self.reglette(
             f, "jarvis_sensibilite", "Sensibilite", 0.0, 1.0, 0.05,
-            "S'il ne t'entend pas, monte. S'il se reveille tout seul, descends. "
-            "Enregistrer pour appliquer.")
+            "Il ne t'entend pas : monte. Il se reveille tout seul : descends.")
 
         self.separateur(f, 12, 8)
-        self.titre(f, "sa langue et sa voix").pack(fill="x", pady=(0, 4))
-        self.texte(f, "En anglais, Jarvis parle avec Kokoro : une voix d'homme britannique, "
-                      "calculee sur ce PC (rien ne part sur Internet), telechargee une fois "
-                      "(340 Mo). En francais aussi, avec sa voix francaise ci-dessous. Tu peux "
-                      "lui parler en francais ou en anglais : il comprend les deux. Le mode "
-                      "psychologue, lui, reste en francais.",
+        self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
+        self.texte(f, "Musique, Spotify, applis et jeux, fenetres, son, luminosite, onglets, notes, dossiers et "
+                      "fichiers. Il ne supprime, ne deplace ni ne modifie jamais un fichier existant, et ne peut "
+                      "ni eteindre, ni redemarrer, ni mettre en veille le PC, ni fermer ta session. Il agit sans "
+                      "code : quiconque l'appelle dans la piece peut lui demander tes dossiers (le code d'acces, "
+                      "plus bas, l'evite). Noms de dossiers et captures partent le temps de la reponse, sans "
+                      "etre gardes.", BRUME, 8, largeur=500).pack(fill="x")
+        self.var_jarvis_pc = tk.IntVar(value=1 if self.cfg.get("jarvis_pc") else 0)
+        self.case(f, "Il peut agir sur le PC",
+                  self.var_jarvis_pc, lambda: self.regler_mains("jarvis_pc", self.var_jarvis_pc)).pack(fill="x")
+        self.var_jarvis_ecran = tk.IntVar(value=1 if self.cfg.get("jarvis_ecran") else 0)
+        self.case(f, "Il peut regarder tes ecrans",
+                  self.var_jarvis_ecran, lambda: self.regler_mains("jarvis_ecran", self.var_jarvis_ecran)).pack(fill="x")
+        self.var_jarvis_historique = tk.IntVar(value=1 if self.cfg.get("jarvis_historique") else 0)
+        self.case(f, "Il peut chercher dans l'historique du navigateur (lu sur le PC, seules les pages trouvees partent)",
+                  self.var_jarvis_historique,
+                  lambda: self.regler_mains("jarvis_historique", self.var_jarvis_historique)).pack(fill="x")
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(8, 0))
+        self.bouton(ligne, "Ouvrir l'agenda", self.ouvrir_agenda, compact=True).pack(side="left")
+        self.texte(ligne, "« mets-moi dentiste jeudi a 14 h », « qu'est-ce que j'ai demain ? »", BRUME, 8,
+                   largeur=380).pack(side="left", padx=(10, 0))
+
+        f = self.repli(page, "le micro")
+        self.texte(f, "Celui qu'il ecoute ; le niveau s'affiche en haut (« micro -40 dB ») et doit monter quand "
+                      "tu parles.", BRUME, 8, largeur=500).pack(fill="x")
+        self.var_jarvis_micro = tk.StringVar(value=str(self.cfg.get("jarvis_micro", "") or ""))
+        self.boite_micros = tk.Frame(f, bg=NUIT)
+        self.boite_micros.pack(fill="x")
+        self.remplir_micros()
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x", pady=(6, 0))
+        self.bouton(ligne, "Actualiser la liste", self.remplir_micros, compact=True).pack(side="left")
+        self.var_jarvis_micro.trace_add("write", lambda *_: self.choisir_micro())
+
+        f = self.repli(page, "sa langue et sa voix")
+        self.texte(f, "Il comprend le francais et l'anglais ; il repond dans la langue choisie. Ses voix sont "
+                      "calculees sur ce PC (Kokoro, 340 Mo une fois) ; le mode psychologue parle francais.",
                    BRUME, 8, largeur=500).pack(fill="x")
         self.var_jarvis_langue = tk.StringVar(value=langue_jarvis(self.cfg))
-        self.radio(f, "English -- Jarvis repond en anglais (voix Kokoro)", self.var_jarvis_langue,
-                   "en").pack(fill="x")
-        self.radio(f, "Francais -- Jarvis repond en francais (sa voix francaise, ci-dessous)",
-                   self.var_jarvis_langue, "fr").pack(fill="x")
+        self.radio(f, "English", self.var_jarvis_langue, "en").pack(fill="x")
+        self.radio(f, "Francais", self.var_jarvis_langue, "fr").pack(fill="x")
         self.var_jarvis_langue.trace_add("write", lambda *_: self.choisir_langue())
+        self.titre(f, "voix anglaise").pack(fill="x", pady=(8, 2))
         self.var_voix_kokoro = tk.StringVar(value=voix_kokoro_choisie(self.cfg))
         for cle, entree in _jv.VOIX_KOKORO.items():
-            self.radio(f, entree["nom"], self.var_voix_kokoro, cle).pack(fill="x", padx=(18, 0))
+            self.radio(f, entree["nom"], self.var_voix_kokoro, cle).pack(fill="x")
         self.var_voix_kokoro.trace_add("write", lambda *_: self.choisir_voix_kokoro())
         self.txt_kokoro = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_kokoro.pack(fill="x", pady=(4, 0))
-
-        self.separateur(f, 12, 8)
-        self.titre(f, "sa voix francaise").pack(fill="x", pady=(0, 4))
-        self.texte(f, "C'est celle de Jarvis s'il parle francais, et du mode psychologue. "
-                      "Kokoro, comme sa voix anglaise : calculee sur ce PC, rien ne part sur "
-                      "Internet, le meme telechargement (340 Mo, une fois). Piper est plus "
-                      "petit (20 a 80 Mo) et plus mecanique ; il parle en attendant Kokoro.",
-                   BRUME, 8, largeur=500).pack(fill="x")
+        self.titre(f, "voix francaise").pack(fill="x", pady=(8, 2))
         v_fr = voix_fr_choisie(self.cfg)
         self.var_voix_modele = tk.StringVar(value=v_fr if v_fr != "piper" else voix_choisie(self.cfg))
         for cle, entree in _jv.VOIX_KOKORO_FR.items():
             self.radio(f, entree["nom"], self.var_voix_modele, cle).pack(fill="x")
         for cle, entree in _jv.VOIX_PIPER.items():
             self.radio(f, "Piper : " + entree["nom"], self.var_voix_modele, cle).pack(fill="x")
-        self.radio(f, "Voix de Windows -- rien a telecharger", self.var_voix_modele,
-                   "windows").pack(fill="x")
+        self.radio(f, "Voix de Windows", self.var_voix_modele, "windows").pack(fill="x")
         self.var_voix_modele.trace_add("write", lambda *_: self.choisir_voix())
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
@@ -11074,46 +11093,18 @@ class Panneau:
         self.txt_piper = self.texte(ligne, "", BRUME, 8, largeur=380)
         self.txt_piper.pack(side="left", padx=(10, 0))
         self.var_jarvis_lenteur = self.reglette(
-            f, "jarvis_lenteur", "Debit", 0.8, 1.4, 0.02,
-            "Plus haut = plus pose. Enregistrer pour appliquer.")
+            f, "jarvis_lenteur", "Debit", 0.8, 1.4, 0.02, "Plus haut = plus pose.")
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Ouvert, Jarvis peut piloter la musique (lecture, pause, piste suivante, volume), "
-                      "ouvrir Spotify sur une recherche, ouvrir une recherche Google, un lien ou une "
-                      "video YouTube dans Chrome, lancer une appli ou un jeu Steam, gerer les fenetres "
-                      "(premier plan, reduire, agrandir, fermer), regler le son (general ou d'une appli) "
-                      "et la luminosite, verrouiller le PC, ecrire une note (dans "
-                      "Documents > Notes de Jarvis) ou creer un fichier texte neuf, parcourir tes dossiers, chercher un fichier, "
-                      "creer un dossier et ouvrir un dossier ou un fichier. Il ne peut ni supprimer, ni "
-                      "deplacer, ni renommer, ni modifier un fichier existant (sauf completer ses notes), "
-                      "ni ecrire un script ou un programme ; ni eteindre, ni redemarrer, ni mettre en "
-                      "veille le PC, ni fermer ta session. Il agit directement, sans code : quiconque l'appelle dans "
-                      "la piece peut lui demander tes dossiers. Si tu preferes, coche le code d'acces "
-                      "plus bas : il le demandera a voix haute avant les dossiers, les fichiers et "
-                      "l'ecran. Les noms de dossiers et les captures partent a BrainDebugger et a "
-                      "Claude le temps de la reponse, et ne sont gardes nulle part.",
-                   BRUME, 8, largeur=500).pack(fill="x")
-        self.var_jarvis_pc = tk.IntVar(value=1 if self.cfg.get("jarvis_pc") else 0)
-        self.case(f, "Jarvis peut agir sur le PC : musique, Spotify, dossiers, fichiers",
-                  self.var_jarvis_pc, lambda: self.regler_mains("jarvis_pc", self.var_jarvis_pc)).pack(fill="x")
-        self.var_jarvis_ecran = tk.IntVar(value=1 if self.cfg.get("jarvis_ecran") else 0)
-        self.case(f, "Et regarder un ecran quand tu le lui demandes (« regarde mon ecran 2 »)",
-                  self.var_jarvis_ecran, lambda: self.regler_mains("jarvis_ecran", self.var_jarvis_ecran)).pack(fill="x")
-        self.var_jarvis_historique = tk.IntVar(value=1 if self.cfg.get("jarvis_historique") else 0)
-        self.case(f, "Et chercher dans l'historique du navigateur, pour retrouver une video ou un lien "
-                     "(Chrome, Edge, Brave, Firefox : lu sur le PC, seules les pages trouvees partent)",
-                  self.var_jarvis_historique,
-                  lambda: self.regler_mains("jarvis_historique", self.var_jarvis_historique)).pack(fill="x")
+        f = self.repli(page, "code d'acces")
         self.var_jarvis_code_actif = tk.IntVar(value=1 if self.cfg.get("jarvis_code_actif") else 0)
-        self.case(f, "Demander un code d'acces avant les dossiers, les fichiers et l'ecran (facultatif)",
+        self.case(f, "Le demander a voix haute avant les dossiers, les fichiers et l'ecran",
                   self.var_jarvis_code_actif,
                   lambda: self.regler_mains("jarvis_code_actif", self.var_jarvis_code_actif)).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
-        self.texte(ligne, "Code d'acces", CRAIE, 9).pack(side="left")
+        self.texte(ligne, "Code", CRAIE, 9).pack(side="left")
         self.champ_code = self.champ(ligne, "", 14)
-        self.champ_code.configure(show="\u2022")
+        self.champ_code.configure(show="•")
         self.champ_code.pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Enregistrer le code", self.enregistrer_code, compact=True).pack(side="left", padx=(8, 0))
         self.bouton(ligne, "Retirer", self.retirer_code, compact=True).pack(side="left", padx=(8, 0))
@@ -11121,15 +11112,11 @@ class Panneau:
         self.txt_code.pack(fill="x", pady=(4, 0))
         self.afficher_code()
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "spotify").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Pour qu'il lance exactement le titre, l'album ou la playlist demande (« mets ma "
-                      "playlist Sport », « ajoute Get Lucky a la file », « like ce titre »). Il faut "
-                      "Spotify Premium. Une fois : sur developer.spotify.com/dashboard, « Create app », "
-                      "Redirect URI : http://127.0.0.1:%d/callback, coche « Web API », enregistre ; "
-                      "copie le Client ID ici, puis « Connecter ». Le jeton de Spotify reste sur ce PC. "
-                      "Sans Spotify connecte, il passe par YouTube." % _jv.SPOTIFY_PORT,
-                   BRUME, 8, largeur=500).pack(fill="x")
+        f = self.repli(page, "spotify")
+        self.texte(f, "Pour qu'il lance le titre, l'album ou la playlist exact (Spotify Premium). Une fois : sur "
+                      "developer.spotify.com/dashboard, « Create app », Redirect URI http://127.0.0.1:%d/callback, "
+                      "coche « Web API » ; copie le Client ID ici, puis « Connecter ». Sans Spotify, il passe par "
+                      "YouTube." % _jv.SPOTIFY_PORT, BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
         self.texte(ligne, "Client ID", CRAIE, 9).pack(side="left")
@@ -11140,51 +11127,32 @@ class Panneau:
         self.txt_spotify = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_spotify.pack(fill="x", pady=(4, 0))
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "agenda").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Tes rendez-vous vivent dans BrainDebugger : les reperes « Agenda » (les « Psy » restent "
-                      "ton journal, Machi Tool et Jarvis ne les voient jamais). « Jarvis, mets-moi dentiste "
-                      "jeudi a 14 h », « qu'est-ce que j'ai demain ? », « montre-moi mon agenda ». Aussi dans "
-                      "le menu de l'icone.", BRUME, 8, largeur=500).pack(fill="x")
-        self.bouton(f, "Ouvrir l'agenda", self.ouvrir_agenda, compact=True).pack(anchor="w", pady=(6, 0))
-
-        self.separateur(f, 12, 8)
-        self.titre(f, "les onglets de chrome").pack(fill="x", pady=(0, 4))
-        self.texte(f, "Pour qu'il liste, ouvre, affiche, coupe et ferme des onglets (« ferme les onglets "
-                      "YouTube », « ouvre un onglet sur la meteo »). Une petite extension de Machi Tool, a "
-                      "installer une fois : « Preparer l'extension » ouvre son dossier et la page des "
-                      "extensions ; la, active le « Mode developpeur » (en haut a droite), clique « Charger "
-                      "l'extension non empaquetee » et choisis ce dossier. Marche aussi dans Edge et Brave. "
-                      "Elle ne parle qu'a Machi Tool, sur ce PC ; vers Jarvis ne partent que les titres "
-                      "et les domaines des onglets.", BRUME, 8, largeur=500).pack(fill="x")
+        f = self.repli(page, "les onglets de chrome")
+        self.texte(f, "Pour lister, ouvrir, fermer et couper des onglets. Une extension a installer une fois : "
+                      "« Preparer l'extension », puis dans la page des extensions : « Mode developpeur » et "
+                      "« Charger l'extension non empaquetee » sur ce dossier (aussi Edge et Brave). Seuls les "
+                      "titres et les sites des onglets partent vers Jarvis.", BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(6, 0))
         self.bouton(ligne, "Preparer l'extension", self.preparer_extension, compact=True).pack(side="left")
         self.txt_onglets = self.texte(ligne, "", BRUME, 8, largeur=360)
         self.txt_onglets.pack(side="left", padx=(10, 0))
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "ce qu'il retient de toi").pack(fill="x", pady=(0, 4))
-        self.texte(f, "« Jarvis, retiens que je prefere les reponses courtes. » -- « oublie que... ». "
-                      "Ces phrases restent sur le PC et partent avec chaque question a Jarvis : c'est "
-                      "comme ca qu'il s'en souvient. Rien de ton journal n'y entre.",
-                   BRUME, 8, largeur=500).pack(fill="x")
+        f = self.repli(page, "ce qu'il retient")
+        self.texte(f, "« Jarvis, retiens que... », « oublie que... » : ces phrases restent sur le PC et partent "
+                      "avec chaque question. Rien de ton journal n'y entre.", BRUME, 8, largeur=500).pack(fill="x")
         self.boite_preferences = tk.Frame(f, bg=NUIT)
         self.boite_preferences.pack(fill="x", pady=(4, 0))
         self.remplir_preferences()
-        self.texte(f, "Et vos conversations : a la fin de chacune (en mode Jarvis seulement, jamais le "
-                      "psychologue), il en garde une phrase -- de quoi on a parle, ce qui a ete fait. Rien de "
-                      "sante ni d'intime, rien apres un message grave. Les %d dernieres partent avec chaque "
-                      "question. « Oublie nos conversations » les efface." % SOUVENIRS_ENVOYES,
+        self.texte(f, "Vos conversations : une phrase par conversation (jamais le psychologue, rien d'intime) ; "
+                      "les %d dernieres partent avec chaque question." % SOUVENIRS_ENVOYES,
                    BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(4, 0))
         self.bouton(ligne, "Oublier les conversations", self.oublier_souvenirs, compact=True).pack(side="left")
         self.txt_souvenirs = self.texte(ligne, "", BRUME, 8, largeur=360)
         self.txt_souvenirs.pack(side="left", padx=(10, 0))
-        self.texte(f, "Ses routines de lumiere : des habitudes et des running gags qu'il pose lui-meme (« quand "
-                      "je dis bonne nuit, tamise en ambre », « a 23 h 30 », « quand League of Legends s'ouvre »). "
-                      "Demande-lui de les changer, ou efface-les ici.",
+        self.texte(f, "Ses routines de lumiere : des habitudes et des running gags qu'il pose lui-meme.",
                    BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(4, 0))
@@ -11192,35 +11160,18 @@ class Panneau:
         self.txt_routines = self.texte(ligne, "", BRUME, 8, largeur=360)
         self.txt_routines.pack(side="left", padx=(10, 0))
 
-        self.separateur(f, 12, 8)
-        self.titre(f, "ce qu'il fait").pack(fill="x", pady=(0, 4))
+        f = self.repli(page, "options")
         self.vars_jarvis = {}
         for cle, libelle in (
                 ("jarvis_voix", "Repondre a voix haute (sinon : une notification)"),
                 ("jarvis_son", "Un petit son quand il s'allume"),
-                ("jarvis_leds", "La guirlande dit a qui tu parles et ou il en est : orange "
-                                "Jarvis, bleu le mode psychologue ; elle respire quand il ecoute, "
-                                "pulse quand il transcrit, ondule quand il reflechit, vibre quand "
-                                "il parle ; vert c'est fait, rouge c'est rate"),
-                ("jarvis_suite", "Apres sa reponse, il ecoute encore sans qu'on redise « Jarvis » : 5 s "
-                                 "pour une reponse seche, plus s'il vient de poser une question ou si la "
-                                 "conversation dure (15 s au plus) ; quand une vraie conversation retombe, il "
-                                 "demande s'il reste a l'ecoute"),
-                ("jarvis_couper", "Lui couper la parole : parler par-dessus, aussi fort que lui, "
-                                  "le fait taire et il t'ecoute ; si ce n'etait qu'un bruit, il "
-                                  "reprend sa phrase (il apprend l'echo de tes haut-parleurs "
-                                  "pendant sa premiere reponse)"),
+                ("jarvis_leds", "La guirlande montre ou il en est (ecoute, reflechit, parle, fait)"),
+                ("jarvis_suite", "Il ecoute encore apres sa reponse, sans qu'on redise « Jarvis »"),
+                ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
-                ("jarvis_auto_etalonnage", "S'etalonner seul : quand il te rate de peu puis t'entend "
-                                           "juste apres, et que vous parlez vraiment ensuite, il garde "
-                                           "cette facon de l'appeler (6 au plus ; « Oublier ma voix » "
-                                           "les efface)"),
-                ("jarvis_panneau", "Son panneau en haut au milieu de l'ecran quand il est actif -- le "
-                                   "contenu Jarvis du panneau LED : LISTENING, THINKING, SPEAKING avec sa "
-                                   "reponse qui defile. Fixe, sans bordure, les clics le traversent"),
-                ("jarvis_boule", "Une petite boule qui va sur l'ecran qu'il regarde (sans le panneau : aussi "
-                                 "quand il est reveille, en bas a droite). Sa place : jarvis_boule_x et "
-                                 "jarvis_boule_y dans config.json, de 0 a 1")):
+                ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
+                ("jarvis_panneau", "Son panneau en haut de l'ecran quand il est actif"),
+                ("jarvis_boule", "Une petite boule sur l'ecran qu'il regarde")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
@@ -11229,30 +11180,18 @@ class Panneau:
         self.texte(ligne, "Il t'appelle", CRAIE, 9).pack(side="left")
         self.champ_appellation = self.champ(ligne, self.cfg.get("jarvis_appellation", ""), 16)
         self.champ_appellation.pack(side="left", padx=(8, 0))
-        self.texte(ligne, "vide = ni Monsieur ni Madame. Enregistrer pour appliquer.", BRUME, 8,
-                   largeur=260).pack(side="left", padx=(8, 0))
-        self.texte(f, "Deux modes. JARVIS (orange) : le majordome du PC, a la maniere d'Iron Man "
-                      "-- Sonnet, effort bas, rien dans ton journal. PSYCHOLOGUE (bleu) : le "
-                      "compagnon de BrainDebugger, avec ton journal ; dis « psychologue », "
-                      "« notes psy » ou « note pour le psy » (« therapist », « take a note ») pour y "
-                      "passer. « Note que... » : avec ses mains ouvertes, Jarvis l'ecrit dans ses notes "
-                      "(Documents > Notes de Jarvis) ; elle ne va aussi au psychologue que si tu le "
-                      "demandes. Mains fermees, elle part directement au psychologue. Pour revenir : « Jarvis ? Re ! », « mode Jarvis », ou simplement "
-                      "le rappeler -- il se reveille toujours en mode Jarvis. « Au revoir » au "
-                      "psychologue : retour au majordome, qui se tait si c'etait lourd, ou dit "
-                      "un mot leger. Un message grave part toujours au compagnon. « Non rien », "
-                      "« oublie », « never mind » : fin de la conversation.",
-                   BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
-        self.texte(f, "Commandes, en francais ou en anglais : « allume / eteins la lumiere » "
-                      "(« lights on / off »), « mets la lumiere en bleu » (« make the lights "
-                      "blue »), « lumiere normale », « mode ecran / son / applications », "
-                      "« minuteur de 10 minutes » (« set a timer for ten minutes »), "
-                      "« rappelle-moi dans 20 minutes de sortir le linge » (« remind me in 20 "
-                      "minutes to... »), « annule les minuteurs », « quelle heure est-il » "
-                      "(« what time is it »), « quel jour on est », « ouvre BrainDebugger », "
-                      "« ouvre Machi Tool », « synchronise », « stop », « arrete d'ecouter », "
-                      "« apprends ma voix » (« learn my voice »). Tout le reste va a Jarvis. "
-                      "Tes propres raccourcis : jarvis_raccourcis dans config.json.",
+        self.texte(ligne, "vide = ni Monsieur ni Madame", BRUME, 8, largeur=260).pack(side="left", padx=(8, 0))
+
+        f = self.repli(page, "ce qu'on peut lui dire")
+        self.texte(f, "Deux modes : JARVIS (orange), le majordome du PC ; PSYCHOLOGUE (bleu), le compagnon de "
+                      "BrainDebugger, avec ton journal -- « psychologue », ou il y passe seul s'il comprend que "
+                      "tu veux parler. Pour revenir : « Jarvis ? Re ! », ou le rappeler. Un message grave part "
+                      "toujours au compagnon. « Non rien », « oublie », « degage » : fin de la conversation.",
+                   BRUME, 8, largeur=500).pack(fill="x")
+        self.texte(f, "Sans passer par Internet : « allume / eteins la lumiere », « mets la lumiere en bleu », "
+                      "« mode ecran / son / applications », « minuteur de 10 minutes », « rappelle-moi dans 20 "
+                      "minutes de... », « quelle heure est-il », « ouvre BrainDebugger », « stop », « arrete "
+                      "d'ecouter », « apprends ma voix ». Tout le reste va a Jarvis.",
                    BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
 
     def basculer_jarvis(self):
@@ -11542,55 +11481,46 @@ class Panneau:
     # ------------------------------------------------------------------
 
     def page_reglages(self):
+        # l'essentiel en haut ; le reglage fin de la lumiere et l'affichage, replies
         tk = self.tk
-        f = self.nouvelle_page("reglages", defilante=True)
+        page = self.nouvelle_page("reglages", defilante=True)
+        f = page
         self.curseurs = {}
-        self.curseurs["douceur"] = self.reglette(
-            f, "douceur", "Douceur du fondu", 0.01, 0.4, 0.01,
-            "Mode Regles. Bas = transition lente et fluide, haut = changement sec.")
-        self.curseurs["luminosite_min"] = self.reglette(
-            f, "luminosite_min", "Luminosite au repos", 0.05, 1.0, 0.05,
-            "Niveau quand le processeur ne fait rien.")
-        self.curseurs["luminosite_max"] = self.reglette(
-            f, "luminosite_max", "Luminosite a pleine charge", 0.1, 1.0, 0.05,
-            "Niveau quand le processeur est a 100 %.")
-        self.curseurs["amplitude_respiration"] = self.reglette(
-            f, "amplitude_respiration", "Respiration", 0.0, 0.4, 0.02,
-            "Oscillation lente permanente. Ignoree en mode Ecran.")
-        self.curseurs["veille_minutes"] = self.reglette(
-            f, "veille_minutes", "Veille apres", 1, 60, 1,
-            "Minutes sans clavier ni souris avant de basculer en braise sourde.",
-            entier=True)
-        self.curseurs["images_par_seconde"] = self.reglette(
-            f, "images_par_seconde", "Images par seconde", 2, 60, 1,
-            "Cadence de capture et d'ecriture. La capture par vignette tient "
-            "60 sans effort ; c'est le controleur Bluetooth qui plafonne, "
-            "souvent vers 30. Au dela, les trames s'accumulent et la "
-            "guirlande retarde au lieu d'aller plus vite. Monte "
-            "progressivement et redescends des que ca saccade.",
-            entier=True)
-
-        self.separateur(f, 14, 8)
-        self.titre(f, "affichage").pack(fill="x", pady=(0, 6))
-        self.texte(f, "Detectee sur l'ecran au demarrage. A forcer seulement si "
-                      "l'interface sort trop petite ou trop grande — un ecran 4K "
-                      "qui se declare a tort en 96 points par pouce, par exemple. "
-                      "Le changement prend effet au prochain lancement.",
-                   BRUME, 8, largeur=490).pack(fill="x", pady=(0, 10))
-        self.var_echelle = self.reglette(
-            f, "echelle_interface", "Echelle de l'interface", 0.0, 3.0, 0.25,
-            "0 = automatique. 1.00 = ecran classique, 1.50 = 4K a 150 %%, "
-            "2.00 = 4K a 200 %%. Detectee ici : %.2f." % self.echelle)
-
-        self.separateur(f, 14, 8)
         self.var_eteindre = tk.IntVar(
             value=1 if self.cfg.get("eteindre_en_partant", True) else 0)
         self.case(f, "Eteindre la guirlande en quittant et a l'arret de Windows",
-                  self.var_eteindre).pack(fill="x", pady=(0, 8))
-
+                  self.var_eteindre).pack(fill="x", pady=(0, 4))
         self.var_cpu = tk.IntVar(value=1 if self.cfg.get("reaction_processeur", True) else 0)
-        self.case(f, "La charge du processeur module la luminosite — mode Regles",
-                  self.var_cpu).pack(fill="x")
+        self.case(f, "Plus le processeur travaille, plus elle brille (mode Regles)",
+                  self.var_cpu).pack(fill="x", pady=(0, 10))
+        self.curseurs["veille_minutes"] = self.reglette(
+            f, "veille_minutes", "Veille apres", 1, 60, 1,
+            "Minutes sans clavier ni souris avant la braise sourde.", entier=True)
+
+        f = self.repli(page, "la lumiere, en detail")
+        self.curseurs["douceur"] = self.reglette(
+            f, "douceur", "Douceur du fondu", 0.01, 0.4, 0.01,
+            "Bas = transition lente, haut = changement sec.")
+        self.curseurs["luminosite_min"] = self.reglette(
+            f, "luminosite_min", "Luminosite au repos", 0.05, 1.0, 0.05,
+            "Quand le processeur ne fait rien.")
+        self.curseurs["luminosite_max"] = self.reglette(
+            f, "luminosite_max", "Luminosite a pleine charge", 0.1, 1.0, 0.05,
+            "Quand le processeur est a 100 %.")
+        self.curseurs["amplitude_respiration"] = self.reglette(
+            f, "amplitude_respiration", "Respiration", 0.0, 0.4, 0.02,
+            "Oscillation lente permanente (pas en mode Ecran).")
+        self.curseurs["images_par_seconde"] = self.reglette(
+            f, "images_par_seconde", "Images par seconde", 2, 60, 1,
+            "Le Bluetooth plafonne souvent vers 30 : au-dela, la guirlande retarde. Monte "
+            "doucement, redescends si ca saccade.",
+            entier=True)
+
+        f = self.repli(page, "affichage")
+        self.var_echelle = self.reglette(
+            f, "echelle_interface", "Echelle de l'interface", 0.0, 3.0, 0.25,
+            "0 = automatique (detectee ici : %.2f). A forcer seulement si l'interface sort trop "
+            "petite ou trop grande ; effet au prochain lancement." % self.echelle)
 
     # ------------------------------------------------------------------
     #  Apercu de la couleur — le meme objet sur l'accueil et sur Ecran
@@ -11625,156 +11555,12 @@ class Panneau:
     # ------------------------------------------------------------------
     #  Page Calendrier
     # ------------------------------------------------------------------
-
-    def page_calendrier(self):
-        tk = self.tk
-        f = self.nouvelle_page("calendrier", defilante=True)
-
-        self.texte(f, "Les journees et les reperes viennent de BrainDebugger. "
-                      "L'application ne les invente pas et ne les stocke pas : "
-                      "elle affiche ce que le site lui a envoye.",
-                   BRUME, 9, largeur=500).pack(fill="x")
-
-        self.separateur(f)
-        self.titre(f, "journees").pack(fill="x", pady=(0, 6))
-        self.liste_jours = tk.Frame(f, bg=NUIT)
-        self.liste_jours.pack(fill="x")
-
-        self.separateur(f)
-        self.titre(f, "reperes").pack(fill="x", pady=(0, 6))
-        self.liste_reperes = tk.Frame(f, bg=NUIT)
-        self.liste_reperes.pack(fill="x")
-
-        self._signature_journal = None
-
-    def peindre_journal(self):
-        """Ne redessine que si le contenu a change : la boucle passe ici
-        deux fois par seconde."""
-        signature = (len(PONT["jours"]), len(PONT["reperes"]),
-                     PONT["vu_le"])
-        if signature == getattr(self, "_signature_journal", None):
-            return
-        self._signature_journal = signature
-        tk = self.tk
-
-        for cadre, source, cles, vide in (
-                (self.liste_jours, PONT["jours"], ("date", "note"),
-                 "Aucune journee recue. Le site n'a encore rien envoye."),
-                (self.liste_reperes, PONT["reperes"], ("date", "titre"),
-                 "Aucun repere recu.")):
-            for enfant in cadre.winfo_children():
-                enfant.destroy()
-            if not source:
-                self.texte(cadre, vide, FIL, 9).pack(fill="x")
-                continue
-            for entree in source[:40]:
-                rang = tk.Frame(cadre, bg=ENCRE)
-                rang.pack(fill="x", pady=(0, self.px(3)))
-                teinte = str(entree.get("couleur") or "").strip()
-                pastille = tk.Frame(rang, bg=teinte if teinte.startswith("#") else FIL,
-                                    width=self.px(4))
-                pastille.pack(side="left", fill="y")
-                tk.Label(rang, text=str(entree.get(cles[0], ""))[:16], bg=ENCRE,
-                         fg=BRUME, font=(self.f_mono, 9), anchor="w",
-                         padx=self.px(10), pady=self.px(7)).pack(side="left")
-                tk.Label(rang, text=str(entree.get(cles[1], ""))[:90], bg=ENCRE,
-                         fg=CRAIE, font=(self.f_ui, 9), anchor="w",
-                         justify="left").pack(side="left", fill="x", expand=True)
-
-    # ------------------------------------------------------------------
-    #  Page Moi
-    # ------------------------------------------------------------------
-
-    def page_moi(self):
-        tk = self.tk
-        f = self.nouvelle_page("moi", defilante=True)
-
-        carte = tk.Frame(f, bg=VELOURS, padx=18, pady=16)
-        carte.pack(fill="x")
-        self.titre(carte, "humeur du moment").pack(fill="x")
-        haut = tk.Frame(carte, bg=VELOURS)
-        haut.pack(fill="x", pady=(6, 0))
-        self.txt_humeur = tk.Label(haut, text="\u2014", bg=VELOURS, fg=CRAIE,
-                                   font=(self.f_titre, 20), anchor="w")
-        self.txt_humeur.pack(side="left")
-        self.apercu_humeur = self.apercu_couleur(haut, 52, VELOURS)
-        self.apercu_humeur.pack(side="right")
-        self.txt_humeur_date = tk.Label(carte, text="", bg=VELOURS, fg=BRUME,
-                                        font=(self.f_mono, 8), anchor="w")
-        self.txt_humeur_date.pack(fill="x", pady=(6, 0))
-
-        self.separateur(f)
-        self.titre(f, "rappels du site").pack(fill="x", pady=(0, 6))
-        self.liste_rappels = tk.Frame(f, bg=NUIT)
-        self.liste_rappels.pack(fill="x")
-        self._signature_rappels = None
-
-
-
-    def peindre_moi(self):
-        humeur = PONT.get("humeur") or {}
-        libelle = str(humeur.get("libelle") or "").strip()
-        self.txt_humeur.configure(text=libelle or "\u2014")
-        self.txt_humeur_date.configure(
-            text=str(humeur.get("date") or "") if libelle
-            else "Le site n'a pas encore envoye d'humeur.")
-
-        signature = (len(PONT["rappels"]),
-                     PONT["rappels"][0]["id"] if PONT["rappels"] else None)
-        if signature != getattr(self, "_signature_rappels", None):
-            self._signature_rappels = signature
-            tk = self.tk
-            for enfant in self.liste_rappels.winfo_children():
-                enfant.destroy()
-            if not PONT["rappels"]:
-                self.texte(self.liste_rappels, "Aucun rappel en attente.",
-                           FIL, 9).pack(fill="x")
-            for rappel in PONT["rappels"]:
-                bloc = tk.Frame(self.liste_rappels, bg=ENCRE, padx=self.px(12),
-                                pady=self.px(9))
-                bloc.pack(fill="x", pady=(0, self.px(4)))
-                tk.Label(bloc, text=rappel["titre"], bg=ENCRE, fg=CRAIE,
-                         font=(self.f_ui, 9, "bold"), anchor="w").pack(fill="x")
-                tk.Label(bloc, text=rappel["texte"], bg=ENCRE, fg=BRUME,
-                         font=(self.f_ui, 9), anchor="w", justify="left",
-                         wraplength=self.px(460)).pack(fill="x")
-
-    def peindre_pont(self):
-        """Le bandeau du pont, commun a Calendrier et a Moi."""
-        self.txt_pont.configure(
-            text=PONT["message"],
-            fg=ALERTE if PONT["etat"] == "erreur" else BRUME)
-        # Un bouton qui n'a rien a effacer est du bruit.
-        if PONT["rappels"]:
-            self.btn_lu.pack(side="left", padx=self.px(8))
-        else:
-            self.btn_lu.pack_forget()
-
-    # ------------------------------------------------------------------
-    #  Actions du pont
-    # ------------------------------------------------------------------
-
-    def relever_pont(self):
-        threading.Thread(target=relever_le_site, args=(self.cfg,),
-                         daemon=True).start()
-
-    def vider_rappels(self):
-        PONT["rappels"].clear()
-        self._signature_rappels = None
-
-    def ouvrir_site(self):
-        import webbrowser
-        adresse = str(self.cfg.get("pont_site", "")).strip()
-        if adresse:
-            webbrowser.open(adresse)
-
-    # ------------------------------------------------------------------
     #  Page Mises a jour
     # ------------------------------------------------------------------
 
     def page_maj(self):
         tk = self.tk
-        f = self.nouvelle_page("maj", defilante=True)
+        page = f = self.nouvelle_page("maj", defilante=True)
 
         carte = tk.Frame(f, bg=VELOURS, padx=18, pady=16)
         carte.pack(fill="x")
@@ -11810,18 +11596,14 @@ class Panneau:
                   self.var_maj_verifier, self.options_maj).pack(fill="x")
         self.var_maj_auto = tk.IntVar(
             value=1 if self.cfg.get("maj_installation_auto", True) else 0)
-        self.case(f, "Poser la mise a jour sans rien demander — l'application "
-                     "se ferme et redemarre seule, les reglages sont conserves",
+        self.case(f, "L'installer toute seule (tes reglages sont gardes)",
                   self.var_maj_auto, self.options_maj).pack(fill="x", pady=(4, 0))
         self.var_maj_pre = tk.IntVar(
             value=1 if self.cfg.get("maj_prereleases", False) else 0)
-        self.case(f, "Accepter les builds de developpement — chaque fusion "
-                     "sur main en produit un, sans attendre une version "
-                     "stable. Decoche pour ne recevoir que les stables.",
+        self.case(f, "Recevoir aussi les versions de developpement",
                   self.var_maj_pre, self.options_maj).pack(fill="x", pady=(4, 0))
 
-        self.separateur(f)
-
+        f = self.repli(page, "depannage")
         """
         LE JOURNAL, A PORTEE DE CLIC.
 
@@ -11851,14 +11633,12 @@ class Panneau:
                     self.action_ouvrir_dossier, compact=True).pack(side="left", padx=(8, 0))
         self.peindre_journal()
 
-        self.separateur(f)
-
         self.texte(f, "Les versions viennent des publications de github.com/"
                       + DEPOT_GITHUB + ". La verification est une simple lecture "
                       "de l'API publique de GitHub : rien de la machine n'est "
                       "envoye. Le nouvel exe remplace l'ancien dans "
                       + DOSSIER + " et config.json n'est jamais touche.",
-                   BRUME, 8, largeur=460).pack(fill="x")
+                   BRUME, 8, largeur=460).pack(fill="x", pady=(10, 0))
 
     def peindre_journal(self):
         """Ce que pese le journal, et depuis quand. Sans ca, « ouvrir le
@@ -12366,7 +12146,8 @@ class Panneau:
 
         self.txt_statut.configure(text=ETAT["message"],
                                   fg=VIF if ETAT["connecte"] else ALERTE)
-        self.txt_trame.configure(text=f"55 07 01 {r:02x} {v:02x} {b:02x}   {hexa}")
+        # une pastille de la couleur envoyee, plutot que les octets de la trame
+        self.txt_trame.configure(text="\u25cf", fg=hexa if max(r, v, b) > 8 else FIL)
         self.txt_titre.configure(fg=CRAIE)
         self.txt_regle.configure(text=ETAT["regle"])
         self.txt_contexte.configure(text=(ETAT["contexte"] or "aucune fenetre detectee")[:64])
@@ -12387,12 +12168,6 @@ class Panneau:
 
         self.peindre_apercus()
         self.txt_apercu_ecran.configure(text=hexa)
-        if self.section == "calendrier":
-            self.peindre_journal()
-        if self.section == "moi":
-            self.peindre_moi()
-        if self.section in ("calendrier", "moi"):
-            self.peindre_pont()
         if self.section == "passerelle":
             self.peindre_etat_pont()
         if self.section == "jarvis":
