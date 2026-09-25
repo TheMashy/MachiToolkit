@@ -87,7 +87,11 @@ GABARIT_SAUT = 3
 # passe de 0,062 a 0,036 pour un seuil de 0,05 ; le plus proche des vingt-deux
 # mots et phrases voisins reste a 0,065.
 GABARIT_QUEUE = 4
+GABARIT_RACCOURCI_MIN = 8     # trames : en dessous, une variante raccourcie ne compte pas
 PRESQUE_FACTEUR = 1.7         # jusqu'ou un mot « presque reconnu » est signale
+# UN MOT, PAS UN BRUIT : sur la duree du gabarit, au moins tant de trames de
+# vraie parole (un clic, une porte, un clavier en donnent une ou deux).
+TRAMES_VOISEES_MIN = 3
 FENETRE_FACTEUR = 2.2
 # L'ETALONNAGE AU FIL DE L'EAU. Un appel rate de peu (« Jarvis ? »... puis
 # « JARVIS ! » qui passe) ou reconnu de justesse est une facon de l'appeler
@@ -97,7 +101,7 @@ FENETRE_FACTEUR = 2.2
 AUTO_PLAFOND = 6
 AUTO_RATE_TRAMES = 100        # un appel rate au plus 8 s avant celui qui passe
 AUTO_JUSTESSE = 0.6           # reconnu au-dela de 60 % du seuil : de justesse
-AUTO_ECART_MAX = 0.2          # plus loin que ca de ce qu'il connait : un autre mot
+AUTO_ECART_MAX = 0.09         # plus loin que ca de ce que TU lui as appris : pas ton « Jarvis »
 
 # Parole : au-dessus de trois fois le bruit de fond de la piece, et au-dessus
 # d'un plancher absolu (en unites int16), pour qu'une piece silencieuse ne
@@ -123,6 +127,7 @@ def seuil_gabarit(sensibilite):
 # Un mot voisin (« j'arrive », « Travis ») coute une transcription, pas un
 # reveil.
 TOLERANCE_FACTEUR = 1.9
+TOLERANCE_PLAFOND = 0.11        # la zone tolerante ne va jamais plus loin, meme sensibilite a fond
 TOLERANCE_HEY = 0.5
 TOLERANCE_ATTENTE = 4           # trames : un « presque » attend de voir s'il devient net
 PAROLE_DOUCE_FACTEUR = 1.8      # un « jarvis » dit bas compte aussi comme de la parole
@@ -255,7 +260,10 @@ def distance_eveil(g, fen, detail=False):
     d, queue = distance_gabarit(g, fen), 0
     n = len(g)
     for a, b in ((GABARIT_SAUT, n), (0, n - GABARIT_QUEUE), (GABARIT_SAUT, n - GABARIT_QUEUE)):
-        if b - a >= GABARIT_MIN:
+        # « IL SE DECLENCHE DES QU'IL Y A UN BRUIT » : un gabarit raccourci a
+        # cinq trames ressemble a n'importe quel bruit. Il en garde au moins
+        # GABARIT_RACCOURCI_MIN (plus d'un demi-mot).
+        if b - a >= max(GABARIT_MIN, GABARIT_RACCOURCI_MIN):
             x = distance_gabarit(g[a:b], fen)
             if x < d:
                 d, queue = x, n - b
@@ -297,13 +305,16 @@ class Detecteur:
             return sorted(len(g) for g in self.gabarits)[len(self.gabarits) // 2]
         return 12
 
-    def extrait(self, longueur=None):
-        """Les `longueur` dernieres empreintes, normees : ce qui vient d'etre
-        dit, sous la forme d'un gabarit (None si trop peu)."""
+    def extrait(self, longueur=None, retard=0):
+        """Les `longueur` empreintes qui finissent `retard` trames avant
+        maintenant, normees : ce qui vient d'etre dit, sous la forme d'un
+        gabarit (None si trop peu)."""
         n = int(longueur or self.longueur_mot())
-        if n < GABARIT_MIN or len(self.emps) < n:
+        emps = list(self.emps)
+        fin = len(emps) - max(0, int(retard))
+        if n < GABARIT_MIN or fin < n:
             return None
-        return [[round(float(v), 5) for v in ligne] for ligne in list(self.emps)[-n:]]
+        return [[round(float(v), 5) for v in ligne] for ligne in emps[fin - n:fin]]
 
     def parlait_avant(self, longueur=None, avant=12, minimum=3):
         """Quelqu'un parlait-il juste AVANT le mot (« baisse le son, Jarvis ») ?
@@ -385,11 +396,16 @@ class Detecteur:
             if d < meilleur:
                 meilleur, self.long_proche, self.queue_proche = d, len(g), queue
         self.plus_proche = meilleur if meilleur < 9.0 else None
-        if meilleur <= self.seuil:
+        # un mot a une duree : assez de trames de parole sur la longueur du gabarit
+        niv = list(self.niveaux)[-(self.long_proche + 2):]
+        voise = sum(1 for r in niv if self.parle(r)) >= TRAMES_VOISEES_MIN
+        voise_doux = sum(1 for r in niv if self.parle_doucement(r)) >= TRAMES_VOISEES_MIN
+        if meilleur <= self.seuil and voise:
             self.repos_jusqua = self.n + 25
             self.en_doute = None
             return ("voix", meilleur)
-        if self.tolerance and meilleur <= self.seuil * self.tolerance:
+        if self.tolerance and voise_doux and meilleur <= min(self.seuil * self.tolerance,
+                                                             max(self.seuil, TOLERANCE_PLAFOND)):
             self._doute("voix", meilleur)
         return self._rendre_doute()
 
@@ -2355,11 +2371,13 @@ class Oreille:
     def _a_prendre(self):
         """L'empreinte du mot qu'on vient d'entendre, prise quand il est FINI :
         reconnu sans sa queue, ses dernieres trames arrivent encore."""
-        return {"long": self.det.longueur_mot(), "prise": self.det.n + self.det.queue_proche, "v": None}
+        a = {"long": self.det.longueur_mot(), "prise": self.det.n + self.det.queue_proche, "v": None}
+        return self._prendre(a)
 
     def _prendre(self, a):
+        # exactement les trames du mot, meme si on les prend une trame plus tard
         if a.get("v") is None and self.det.n >= a["prise"]:
-            a["v"] = self.det.extrait(a["long"])
+            a["v"] = self.det.extrait(a["long"], retard=self.det.n - a["prise"])
         return a
 
     def _facons_a_garder(self, ev):
@@ -2481,12 +2499,23 @@ class Oreille:
                     self.sortie({"evt": "gabarit", "erreur": "trop court ou trop long -- dis juste « Jarvis »"})
                 else:
                     self.sortie({"evt": "gabarit", "vecteurs": g})
+        # « FAIRE REAGIR LE LISTENING A LA VOIX » : pendant qu'il t'ecoute (apres
+        # l'eveil seulement), le niveau de ta voix, a chaque trame -- un nombre.
+        if self.etat == "phrase" and self.phrase is not None:
+            self.sortie({"evt": "voix_niveau", "v": niveau_voix(rms, self.det.plancher)})
         # Un niveau par seconde : le panneau montre que le micro vit.
         now = time.time()
         if now - self.niveau_vu >= 1.0:
             self.niveau_vu = now
             db = 20 * math.log10(max(rms, 1.0) / 32768.0)
             self.sortie({"evt": "niveau", "db": round(db, 1), "etat": self.etat, "coupure": self.etat_coupure()})
+
+
+def niveau_voix(rms, plancher):
+    """0 (le bruit de fond) a 1 (quarante fois plus fort), en echelle log : ce
+    que l'oreille percoit d'une voix."""
+    rapport = max(1.0, float(rms) / max(20.0, float(plancher or 20.0)))
+    return round(min(1.0, math.log(rapport) / math.log(40.0)), 3)
 
 
 def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=None):
@@ -4755,7 +4784,7 @@ def _fois(c, f):
     return (c[0] * f, c[1] * f, c[2] * f)
 
 
-def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre=""):
+def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None):
     """L'image 64 x 64 (uint8) du panneau pour cet etat, au temps t (s).
     ecoute / comprend : LISTENING, l'anneau qui respire ; pense : THINKING,
     l'arc qui tourne ; parle : les barres, et la reponse qui defile ; fait :
@@ -4766,8 +4795,26 @@ def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre=""):
     cyan = (90, 150, 255) if mode == "psy" else C["cyan"]
     if etat in ("ecoute", "comprend"):
         c = cyan
-        m.anneau(32, 26, 14 + math.sin(t * (6 if etat == "comprend" else 3)) * 2, c, 1.4)
-        m.disque(32, 26, 3, _fois(c, 0.7))
+        if niveau is None:
+            m.anneau(32, 26, 14 + math.sin(t * (6 if etat == "comprend" else 3)) * 2, c, 1.4)
+            m.disque(32, 26, 3, _fois(c, 0.7))
+        else:
+            # IL T'ENTEND : l'anneau enfle avec ta voix, des rayons en jaillissent,
+            # le coeur grossit ; au silence, il respire a peine.
+            n = max(0.0, min(1.0, float(niveau)))
+            r = 13 + math.sin(t * 3) * 0.8 + 4 * n
+            m.anneau(32, 26, r, _fois(c, 0.55 + 0.45 * n), 1.4)
+            if n > 0.03:
+                for k in range(24):
+                    a = 2 * math.pi * k / 24
+                    long_ = n * (2 + 5 * abs(math.sin(t * 7 + k * 1.7) * math.sin(t * 3.1 + k * 0.6)))
+                    d = r + 2
+                    while d < r + 2 + long_:
+                        y = 26 + math.sin(a) * d
+                        if y < 46:
+                            m.set(32 + math.cos(a) * d, y, _fois(c, 0.9 - 0.5 * (d - r - 2) / max(1.0, long_)))
+                        d += 0.5
+            m.disque(32, 26, 2.5 + 3 * n, _fois(c, 0.5 + 0.4 * n))
         mot = "LISTENING"
     elif etat == "pense":
         c = C["violet"]
