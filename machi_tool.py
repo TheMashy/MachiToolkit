@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.46.1"
+VERSION = "1.47.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -371,6 +371,10 @@ CONFIG_DEFAUT = {
     # LA BOULE DE JARVIS a l'ecran quand il est reveille ; sa place en
     # fractions de l'ecran principal (la meme a toutes les resolutions).
     "jarvis_boule": True,
+    # LE PANNEAU DE JARVIS : le contenu « Jarvis » du panneau LED 64 x 64, en
+    # haut au milieu de l'ecran quand il est actif. Avec lui, la boule ne sort
+    # plus que pour aller sur l'ecran qu'il regarde.
+    "jarvis_panneau": True,
     "jarvis_boule_x": 0.97,
     "jarvis_boule_y": 0.90,
     "spotify_refresh": "",
@@ -703,6 +707,37 @@ def hex_vers_rgb(h):
 
 def rgb_vers_hex(rgb):
     return "#" + "".join(f"{max(0, min(255, int(c))):02X}" for c in rgb)
+
+
+def _chemin_du_processus(pid):
+    """Le chemin complet de l'executable d'un PID (meme derriere un anti-triche,
+    comme _nom_du_processus), ou ""."""
+    try:
+        import psutil
+        return psutil.Process(pid).exe()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        h = k.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            n = wintypes.DWORD(len(buf))
+            k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                     ctypes.POINTER(wintypes.DWORD)]
+            if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return buf.value
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
 
 
 def _nom_du_processus(pid):
@@ -5412,6 +5447,7 @@ _PHRASES = {
     "youtube_video": ("C'est parti.", "Here you go."),
     "youtube_resultats": ("Je vous ai ouvert les résultats sur YouTube.", "I've opened the YouTube results."),
     "youtube_rate": ("YouTube ne répond pas.", "YouTube isn't answering."),
+    "son_rate": ("Je n'arrive pas à régler le son.", "I can't set the volume."),
     "oui": ("Oui ?", "Yes?"),
     "mode_psy": ("Mode psychologue. Je vous écoute.", None),
     "mode_jarvis": ("Mode Jarvis. À votre service.", "At your service."),
@@ -5646,6 +5682,7 @@ def dire(texte, suite=False, langue=None):
     s'il y a une suite possible, on ecoute encore un peu -- sans mot d'eveil.
     La langue est celle du mode, sauf si on la donne."""
     langue = langue or langue_du_mode()
+    JARVIS["reponse_affichee"] = str(texte or "")
 
     def fin():
         poser_led(None)
@@ -6211,37 +6248,85 @@ def _volume_general():
     return cast(haut_parleurs.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None), POINTER(IAudioEndpointVolume))
 
 
+def sessions_audio():
+    """[(session pycaw, nom de l'exe, chemin)] des applis qui ont du son --
+    y compris les jeux qu'un anti-triche cache a psutil (la session garde son
+    PID : on lit son nom autrement)."""
+    from pycaw.pycaw import AudioUtilities
+    out = []
+    for sess in AudioUtilities.GetAllSessions():
+        pid = int(getattr(sess, "ProcessId", 0) or 0)
+        if not pid:
+            continue                                   # les sons du systeme
+        try:
+            nom = sess.Process.name() if sess.Process else ""
+        except Exception:
+            nom = ""
+        nom = nom or _nom_du_processus(pid)
+        if nom:
+            out.append((sess, nom, _chemin_du_processus(pid)))
+    return out
+
+
+def _joli(nom):
+    base = os.path.splitext(os.path.basename(nom))[0]
+    return {"msedge": "Edge", "chrome": "Chrome", "firefox": "Firefox"}.get(base.lower(),
+                                                                          base[:1].upper() + base[1:])
+
+
 def regler_son(action, appli="", niveau=None):
+    """Le volume general (sans appli) ou celui d'applis precises -- « le jeu »,
+    « le navigateur », « la musique » compris. Rend une phrase."""
     if os.name != "nt":
         raise OSError("le volume ne se regle que sous Windows")
     if not appli:
         v = _volume_general()
         if action in ("couper", "remettre"):
             v.SetMute(1 if action == "couper" else 0, None)
-            return "Son coupe." if action == "couper" else "Son remis."
+            return "Son coupé." if action == "couper" else "Son remis."
         n = _jv.nouveau_niveau(v.GetMasterVolumeLevelScalar() * 100, action, niveau)
         v.SetMasterVolumeLevelScalar(n / 100.0, None)
         v.SetMute(0, None)
-        return "Volume a %d %%." % n
-    from pycaw.pycaw import AudioUtilities
-    sessions = [s for s in AudioUtilities.GetAllSessions() if s.Process]
-    trouves = _jv.choisir(appli, sessions, nom=lambda s: s.Process.name().replace(".exe", ""), seuil=40)
-    if not trouves:
-        ouvertes = sorted({s.Process.name().replace(".exe", "") for s in sessions})
-        raise LookupError("Aucune appli qui fait du son ne s'appelle « %s » (en ce moment : %s)."
-                          % (appli, ", ".join(ouvertes) or "aucune"))
-    nom = trouves[0].Process.name().replace(".exe", "")
-    for s in trouves:
-        vol = s.SimpleAudioVolume
+        return "Volume général à %d %%." % n
+    sessions = sessions_audio()
+    indices = _jv.cibles_son(appli, [(nom, chemin) for _, nom, chemin in sessions])
+    if not indices:
+        ouvertes = sorted({_joli(nom) for _, nom, _ in sessions})
+        raise LookupError("Rien ne fait du son sous ce nom (%s) ; en ce moment : %s."
+                          % (appli, ", ".join(ouvertes) or "aucune appli"))
+    noms, faits = [], []
+    for i in indices:
+        sess, nom, _ = sessions[i]
+        vol = sess.SimpleAudioVolume
         if action in ("couper", "remettre"):
             vol.SetMute(1 if action == "couper" else 0, None)
         else:
             n = _jv.nouveau_niveau(vol.GetMasterVolume() * 100, action, niveau)
             vol.SetMasterVolume(n / 100.0, None)
             vol.SetMute(0, None)
-    if action in ("couper", "remettre"):
-        return ("Son de %s coupe." if action == "couper" else "Son de %s remis.") % nom
-    return "Volume de %s a %d %%." % (nom, n)
+            faits.append(n)
+        if _joli(nom) not in noms:
+            noms.append(_joli(nom))
+    qui = " et ".join(noms)
+    if action == "couper":
+        return "Son de %s coupé." % qui
+    if action == "remettre":
+        return "Son de %s remis." % qui
+    return "Volume de %s à %d %%." % (qui, faits[0])
+
+
+def lister_sons():
+    """« Qu'est-ce qui fait du son ? » : chaque appli et son volume."""
+    if os.name != "nt":
+        raise OSError("le volume ne se lit que sous Windows")
+    vus = {}
+    for sess, nom, chemin in sessions_audio():
+        vol = sess.SimpleAudioVolume
+        cle = _joli(nom) + (" (jeu)" if _jv.est_un_jeu(chemin, nom) else "")
+        vus.setdefault(cle, "coupé" if vol.GetMute() else "%d %%" % round(vol.GetMasterVolume() * 100))
+    if not vus:
+        return "Aucune appli ne fait de son."
+    return "En ce moment : " + ", ".join("%s %s" % (k, v) for k, v in vus.items()) + "."
 
 
 # --- LE PC : VERROUILLER, VEILLE, LUMINOSITE ----------------------------
@@ -6875,6 +6960,8 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": agir_fenetre(e.get("action") or "lister", e.get("cible") or "",
                                                        bool(e.get("tout")))}
         if nom == "son":
+            if e.get("action") == "lister":
+                return {"id": ident, "texte": lister_sons()}
             return {"id": ident, "texte": regler_son(e.get("action"), e.get("appli") or "", e.get("niveau"))}
         if nom == "pc":
             a = e.get("action")
@@ -7187,6 +7274,15 @@ def executer_commande(a, cfg, maintenant=None):
     if quoi == "silence":
         VOIX.taire()
         return None
+    if quoi in ("volume", "sons"):
+        if not cfg.get("jarvis_pc"):
+            return phrase("mains_fermees", langue_jarvis(cfg))
+        try:
+            if quoi == "sons":
+                return lister_sons()
+            return regler_son(a.get("sens"), a.get("cible") or "", a.get("niveau"))
+        except Exception as e:
+            return str(e) if isinstance(e, LookupError) else phrase("son_rate", langue_jarvis(cfg))
     if quoi == "youtube":
         if not cfg.get("jarvis_pc"):
             return phrase("mains_fermees", langue_jarvis(cfg))
@@ -8955,8 +9051,82 @@ class Panneau:
     BOULE_TAILLE = 44
     BOULE_CLE = "#010203"            # la couleur rendue transparente
 
+    # ------------------------------------------------------------------
+    #  Le panneau de Jarvis : « le meme qu'ici » -- le contenu Jarvis du
+    #  panneau LED, en haut au milieu de l'ecran, fixe, sans bordure, que les
+    #  clics traversent. Il vit le temps que Jarvis est actif ; sa reponse y
+    #  defile pendant qu'il parle.
+
+    def _panneau_creer(self, taille):
+        tk = self.tk
+        f = tk.Toplevel(self.root)
+        f.overrideredirect(True)
+        f.configure(bg="#08090C")
+        f.attributes("-topmost", True)
+        lab = tk.Label(f, bg="#08090C", bd=0, highlightthickness=0)
+        lab.pack()
+        f.geometry("%dx%d+-10000+-10000" % (taille, taille))
+        f.update_idletasks()
+        if os.name == "nt":
+            import ctypes
+            u = ctypes.WinDLL("user32")
+            h = int(f.wm_frame(), 16)
+            u.SetWindowLongW(h, -20, u.GetWindowLongW(h, -20) | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
+        f.withdraw()
+        self.fen_led, self.fen_led_image = f, lab
+
+    def _panneau_tic(self):
+        f = getattr(self, "fen_led", None)
+        cache = lambda: f is not None and f.winfo_exists() and f.state() != "withdrawn" and f.withdraw()
+        if not self.cfg.get("jarvis_panneau", True) or not self.cfg.get("jarvis_actif"):
+            cache()
+            return 500
+        maintenant = time.time()
+        st = self.__dict__.setdefault("panneau_etat", {"prev": None, "fait": 0.0, "alpha": 0.0})
+        etat = JARVIS.get("etat")
+        if st["prev"] == "parle" and etat not in ("parle", "erreur"):
+            st["fait"] = maintenant + 1.4                 # DONE, un instant
+        st["prev"] = etat
+        montre = etat in _jv.BOULE_ETATS or etat == "erreur"
+        if not montre and maintenant < st["fait"]:
+            montre, etat = True, "fait"
+        if not montre and (f is None or not f.winfo_exists() or f.state() == "withdrawn"):
+            st["alpha"] = 0.0
+            return 300
+        pas = max(4, min(9, int(round(5 * getattr(self, "echelle", 1.0)))))
+        taille = pas * _jv.LED_N
+        if f is None or not f.winfo_exists():
+            self._panneau_creer(taille)
+            f = self.fen_led
+        st["alpha"] = min(1.0, st["alpha"] + 0.2) if montre else max(0.0, st["alpha"] - 0.15)
+        if st["alpha"] <= 0.0:
+            f.withdraw()
+            return 300
+        from PIL import Image, ImageTk
+        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, JARVIS.get("reponse_affichee", "") if etat == "parle" else "",
+                                             JARVIS.get("mode", "jarvis")), pas)
+        photo = ImageTk.PhotoImage(Image.fromarray(img))
+        self.fen_led_image.configure(image=photo)
+        self.fen_led_image.image = photo
+        x0, y0, l, _ = self._boule_zone()
+        f.geometry("%dx%d+%d+%d" % (taille, taille, x0 + (l - taille) // 2, y0 + max(8, int(12 * getattr(self, "echelle", 1.0)))))
+        try:
+            f.attributes("-alpha", 0.96 * st["alpha"])
+        except Exception:
+            pass
+        if f.state() == "withdrawn":
+            f.deiconify()
+            f.attributes("-topmost", True)
+        return 50
+
     def boule_tic(self):
         delai = 400
+        try:
+            delai = min(delai, self._panneau_tic())
+        except Exception as e:
+            if not getattr(self, "_panneau_erreur", False):
+                print("Jarvis : panneau impossible (%s)" % e)
+                self._panneau_erreur = True
         demande = JARVIS.get("montrer_agenda") or 0
         if demande > getattr(self, "_agenda_montre", 0):
             self._agenda_montre = demande
@@ -8965,12 +9135,12 @@ class Panneau:
             except Exception as e:
                 print("Agenda : fenetre impossible (%s)" % e)
         try:
-            delai = self._boule_tic()
+            delai = min(delai, self._boule_tic())
         except Exception as e:
             if not getattr(self, "_boule_erreur", False):
                 print("Jarvis : boule impossible (%s)" % e)
                 self._boule_erreur = True
-        self.root.after(delai, self.boule_tic)
+        self.root.after(max(20, delai), self.boule_tic)
 
     def _boule_creer(self, taille):
         tk = self.tk
@@ -9015,8 +9185,9 @@ class Panneau:
                 self.boule.withdraw()
             return 500
         taille = max(24, int(self.BOULE_TAILLE * getattr(self, "echelle", 1.0)))
+        etat_boule = "attente" if self.cfg.get("jarvis_panneau", True) else JARVIS.get("etat")
         visible, x, y, couleur, rythme = _jv.cible_boule(
-            JARVIS.get("etat"), JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), time.time(),
+            etat_boule, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), time.time(),
             self.cfg.get("jarvis_boule_x", 0.97), self.cfg.get("jarvis_boule_y", 0.90), taille)
         st = self.boule_etat
         if not visible and (self.boule is None or not self.boule.winfo_exists() or self.boule.state() == "withdrawn"):
@@ -10249,9 +10420,12 @@ class Panneau:
                                   "reprend sa phrase (il apprend l'echo de tes haut-parleurs "
                                   "pendant sa premiere reponse)"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
-                ("jarvis_boule", "Une petite boule a l'ecran quand il est reveille (en bas a droite, a la meme "
-                                 "place a toutes les resolutions ; elle va sur l'ecran qu'il regarde). Sa "
-                                 "place : jarvis_boule_x et jarvis_boule_y dans config.json, de 0 a 1")):
+                ("jarvis_panneau", "Son panneau en haut au milieu de l'ecran quand il est actif -- le "
+                                   "contenu Jarvis du panneau LED : LISTENING, THINKING, SPEAKING avec sa "
+                                   "reponse qui defile. Fixe, sans bordure, les clics le traversent"),
+                ("jarvis_boule", "Une petite boule qui va sur l'ecran qu'il regarde (sans le panneau : aussi "
+                                 "quand il est reveille, en bas a droite). Sa place : jarvis_boule_x et "
+                                 "jarvis_boule_y dans config.json, de 0 a 1")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")

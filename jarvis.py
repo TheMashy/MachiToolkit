@@ -1024,6 +1024,10 @@ def comprendre(texte, raccourcis=()):
         if q and len(q.split()) <= 14:
             return {"action": "youtube", "recherche": q}
 
+    v = comprendre_volume(t)
+    if v:
+        return v
+
     en = _comprendre_en(t, mots)
     if en:
         return en
@@ -3603,3 +3607,279 @@ def agenda_par_jour(rendez_vous, aujourdhui):
         jours.setdefault(jour, []).append((str(r.get("heure") or ""), str(r["label"]), fin))
     return [(nom_du_jour(j, aujourdhui), sorted(v, key=lambda x: (x[0] == "", x[0])))
             for j, v in sorted(jours.items())]
+
+
+
+# --------------------------- LE SON, APPLI PAR APPLI -----------------------
+#
+# « Il faudrait que Jarvis puisse mettre le son de differentes applications de
+# maniere differente : baisser le son de Spotify, de Discord, du jeu... » Le
+# melangeur de Windows le permet deja (pycaw) ; ici, comprendre QUI on vise --
+# « le jeu », « le navigateur », « la musique » -- et le dire en une commande
+# qui ne passe pas par le modele.
+
+_JEUX_CHEMINS = re.compile(
+    r"[\\/](?:steamapps[\\/]common|epic games|riot games|gog games|gog galaxy[\\/]games|xboxgames|"
+    r"ubisoft game launcher[\\/]games|ea games|origin games|rockstar games|battle\.net|blizzard|"
+    r"world of warcraft|minecraft|itch[\\/]apps)[\\/]", re.I)
+_LANCEURS = {"steam", "steamwebhelper", "epicgameslauncher", "riotclientservices", "battle.net",
+             "galaxyclient", "eadesktop", "upc", "ubisoftconnect"}
+
+
+def est_un_jeu(chemin, nom=""):
+    """Un processus de jeu : il vit dans un dossier de jeux (Steam, Epic, Riot,
+    GOG, Xbox...), et ce n'est pas le lanceur lui-meme."""
+    base = os.path.splitext(os.path.basename(str(nom or chemin or "")))[0].lower()
+    if base in _LANCEURS:
+        return False
+    return bool(_JEUX_CHEMINS.search(str(chemin or "")))
+
+
+ALIAS_SON = {
+    "navigateur": {"chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc"},
+    "musique": {"spotify", "deezer", "music.ui", "itunes", "applemusic", "vlc", "wmplayer", "foobar2000",
+                "aimp", "tidal", "musicbee"},
+    "appel": {"discord", "teams", "ms-teams", "zoom", "skype", "slack"},
+}
+for _a, _cible in (("youtube", "navigateur"), ("internet", "navigateur"), ("chrome", "navigateur"),
+                   ("la musique", "musique"), ("music", "musique"), ("vocal", "appel"), ("l'appel", "appel"),
+                   ("browser", "navigateur")):
+    ALIAS_SON[_a] = ALIAS_SON[_cible]
+_MOTS_JEU = re.compile(r"^(?:(?:le|mon|du|the|my)\s+)?(?:jeu|jeux|game|games)(?:\s+video)?$")
+
+
+def cibles_son(demande, sessions):
+    """Les indices des sessions audio visees. `sessions` : [(nom de l'exe,
+    chemin complet)]. « le jeu » -> les jeux ; « le navigateur », « la
+    musique », « l'appel » -> leurs familles ; sinon le nom."""
+    d = normaliser(demande).strip()
+    d = re.sub(r"^(?:le |la |les |l'|du |de la |de |des |d')", "", d).strip()
+    if _MOTS_JEU.match(d):
+        return [i for i, (n, c) in enumerate(sessions) if est_un_jeu(c, n)]
+    base = lambda n: os.path.splitext(os.path.basename(str(n)))[0].lower()
+    for alias in (d, "la " + d, "l'" + d):
+        if alias in ALIAS_SON and not (alias == "chrome" and any(base(n) == "chrome" for n, _ in sessions)):
+            return [i for i, (n, _) in enumerate(sessions) if base(n) in ALIAS_SON[alias]]
+    trouves = choisir(d, list(enumerate(sessions)), nom=lambda e: base(e[1][0]), seuil=40)
+    return [i for i, _ in trouves]
+
+
+_VERBES_SON = (("baisser", r"baisse|diminue|descends|reduis|turn down|lower"),
+               ("monter", r"monte|augmente|hausse|turn up|raise"),
+               ("couper", r"coupe|mute|silence sur"),
+               ("remettre", r"remets|reactive|retablis|unmute"),
+               ("regler", r"mets|regle|met|set"))
+_AUDIO_CONNU = re.compile(r"^(?:(?:le|la|les|l'|du|de la|de|des|d'|mon|ma)\s*)?(?:jeu|jeux|game|spotify|discord|"
+                          r"navigateur|chrome|firefox|edge|brave|opera|youtube|musique|music|vlc|deezer|teams|zoom|"
+                          r"skype|obs|steam|appel|vocal|l'appel|internet)$")
+
+
+def comprendre_volume(t):
+    """« baisse Spotify », « monte le son de Discord », « coupe le jeu », « mets
+    Spotify a 30 », « baisse le son » -> {"action": "volume", ...} ; None si ce
+    n'est pas une affaire de son (« baisse la lumiere » n'en est pas une)."""
+    if re.match(r"^(?:qu'est[ -]ce qui|qu est ce qui|qui) fait du (?:son|bruit)|^what(?:'s| is) (?:playing sound|making noise)", t):
+        return {"action": "sons"}
+    for sens, verbes in _VERBES_SON:
+        m = re.match(r"^(?:%s)(?: moi)?(?: (un peu|beaucoup|a fond))?(?: (.*))?$" % verbes, t)
+        if not m:
+            continue
+        force, reste = m.group(1), (m.group(2) or "").strip()
+        niveau = None
+        explicite = False
+        n = re.search(r"\s*(?:\ba\b|\bà\b|\bto\b)\s*(\d{1,3})\s*(?:%|pour ?cent|percent)?$", reste)
+        if n:
+            niveau, reste, sens = int(n.group(1)), reste[:n.start()].strip(), "regler"
+        else:
+            n = re.search(r"\s*(?:\bde\b|\bby\b)\s*(\d{1,3})\s*(?:%|pour ?cent|percent|points?)?$", reste)
+            if n:
+                niveau, reste = int(n.group(1)), reste[:n.start()].strip()
+        s2 = re.sub(r"^(?:le son|le volume|la musique du|the volume|the sound|volume|son)\b\s*"
+                    r"(?:(?:de la|de|du|des|d'|of|on)\s*)?", "", reste)
+        explicite = s2 != reste or reste in ("le son", "le volume", "son", "volume")
+        cible = s2.strip()
+        if sens == "regler" and niveau is None:
+            return None                                   # « mets ... » sans niveau : pas pour nous
+        if not explicite and not _AUDIO_CONNU.match(cible):
+            return None
+        if cible in ("tout", "general", "everything", "all"):
+            cible = ""
+        if niveau is None and force in ("beaucoup", "a fond") and sens in ("baisser", "monter"):
+            niveau = 100 if force == "a fond" else 25
+        elif niveau is None and force == "un peu":
+            niveau = 5
+        return {"action": "volume", "sens": sens, "cible": cible, "niveau": niveau}
+    return None
+
+
+# --------------------------- LE PANNEAU DE JARVIS ------------------------
+#
+# « Tu peux montrer ca quand Jarvis est actif ? Fenetre pas bougeable, au
+# milieu en haut de l'ecran, seamless, sans bordure » -- « le meme qu'ici » :
+# le contenu « Jarvis » de la page du panneau LED 64 x 64, a l'identique
+# (meme police 5 x 7, memes couleurs, meme anneau, meme arc, memes barres).
+# « Et les choses se notent aussi la-dessus lorsque Jarvis repond » : pendant
+# qu'il parle, sa reponse defile en bas.
+
+LED_N = 64
+_GLYPHES = {
+    "0": ".###.|#...#|#..##|#.#.#|##..#|#...#|.###.", "1": "..#..|.##..|..#..|..#..|..#..|..#..|.###.",
+    "2": ".###.|#...#|....#|...#.|..#..|.#...|#####", "3": "#####|...#.|..#..|...#.|....#|#...#|.###.",
+    "4": "...#.|..##.|.#.#.|#..#.|#####|...#.|...#.", "5": "#####|#....|####.|....#|....#|#...#|.###.",
+    "6": "..##.|.#...|#....|####.|#...#|#...#|.###.", "7": "#####|....#|...#.|..#..|.#...|.#...|.#...",
+    "8": ".###.|#...#|#...#|.###.|#...#|#...#|.###.", "9": ".###.|#...#|#...#|.####|....#|...#.|.##..",
+    "A": ".###.|#...#|#...#|#####|#...#|#...#|#...#", "B": "####.|#...#|#...#|####.|#...#|#...#|####.",
+    "C": ".###.|#...#|#....|#....|#....|#...#|.###.", "D": "####.|#...#|#...#|#...#|#...#|#...#|####.",
+    "E": "#####|#....|#....|####.|#....|#....|#####", "F": "#####|#....|#....|####.|#....|#....|#....",
+    "G": ".###.|#...#|#....|#.###|#...#|#...#|.####", "H": "#...#|#...#|#...#|#####|#...#|#...#|#...#",
+    "I": ".###.|..#..|..#..|..#..|..#..|..#..|.###.", "J": "..###|...#.|...#.|...#.|...#.|#..#.|.##..",
+    "K": "#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#", "L": "#....|#....|#....|#....|#....|#....|#####",
+    "M": "#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#", "N": "#...#|#...#|##..#|#.#.#|#..##|#...#|#...#",
+    "O": ".###.|#...#|#...#|#...#|#...#|#...#|.###.", "P": "####.|#...#|#...#|####.|#....|#....|#....",
+    "Q": ".###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#", "R": "####.|#...#|#...#|####.|#.#..|#..#.|#...#",
+    "S": ".####|#....|#....|.###.|....#|....#|####.", "T": "#####|..#..|..#..|..#..|..#..|..#..|..#..",
+    "U": "#...#|#...#|#...#|#...#|#...#|#...#|.###.", "V": "#...#|#...#|#...#|#...#|#...#|.#.#.|..#..",
+    "W": "#...#|#...#|#...#|#.#.#|#.#.#|#.#.#|.#.#.", "X": "#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#",
+    "Y": "#...#|#...#|.#.#.|..#..|..#..|..#..|..#..", "Z": "#####|....#|...#.|..#..|.#...|#....|#####",
+    ":": ".|.|#|.|#|.|.", ".": ".|.|.|.|.|.|#", "-": "...|...|...|###|...|...|...",
+    "°": ".#.|#.#|.#.|...|...|...|...", " ": "...|...|...|...|...|...|...", "!": "#|#|#|#|#|.|#",
+    ",": ".|.|.|.|.|#|#", "?": ".###.|#...#|....#|...#.|..#..|.....|..#..", "'": "#|#|.|.|.|.|.",
+    "%": "##..#|##..#|...#.|..#..|.#...|#..##|#..##", "/": "....#|...#.|...#.|..#..|.#...|.#...|#....",
+    "(": ".#|#.|#.|#.|#.|#.|.#", ")": "#.|.#|.#|.#|.#|.#|#.",
+}
+_FONTE = {c: v.split("|") for c, v in _GLYPHES.items()}
+LED_COULEURS = {"blanc": (255, 238, 212), "cyan": (64, 214, 255), "violet": (168, 112, 255),
+                "ambre": (255, 168, 48), "vert": (72, 226, 132), "rouge": (255, 84, 60), "gris": (150, 162, 186)}
+
+
+def _glyphe(c):
+    return _FONTE.get(c) or _FONTE[" "]
+
+
+def texte_led(texte):
+    """Ce que la police sait ecrire : majuscules sans accents, le reste en espace."""
+    t = sans_accents(str(texte or "")).upper().replace("’", "'").replace("…", "...")
+    return re.sub(r"\s+", " ", "".join(c if c in _FONTE else " " for c in t)).strip()
+
+
+def largeur_led(s):
+    return max(0, sum(len(_glyphe(c)[0]) + 1 for c in s) - 1)
+
+
+class Matrice:
+    """Une image 64 x 64 (numpy), et les gestes de la page : point, bloc,
+    texte, disque, anneau, trait."""
+
+    def __init__(self):
+        import numpy as np
+        self.px = np.zeros((LED_N, LED_N, 3), dtype=np.float32)
+
+    def set(self, x, y, c):
+        x, y = int(round(x)), int(round(y))
+        if 0 <= x < LED_N and 0 <= y < LED_N:
+            self.px[y, x] = c
+
+    def bloc(self, x, y, w, h, c):
+        for j in range(int(h)):
+            for i in range(int(w)):
+                self.set(x + i, y + j, c)
+
+    def texte(self, s, x, y, c):
+        cx = x
+        for ch in s:
+            g = _glyphe(ch)
+            for r in range(7):
+                for q, v in enumerate(g[r]):
+                    if v == "#":
+                        self.set(cx + q, y + r, c)
+            cx += len(g[0]) + 1
+
+    def disque(self, cx, cy, r, c):
+        for y in range(math.floor(cy - r), math.ceil(cy + r) + 1):
+            for x in range(math.floor(cx - r), math.ceil(cx + r) + 1):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                    self.set(x, y, c)
+
+    def anneau(self, cx, cy, r, c, e=1.0):
+        for y in range(math.floor(cy - r - e), math.ceil(cy + r + e) + 1):
+            for x in range(math.floor(cx - r - e), math.ceil(cx + r + e) + 1):
+                if abs(math.hypot(x - cx, y - cy) - r) <= e / 2 + 0.35:
+                    self.set(x, y, c)
+
+    def trait(self, x0, y0, x1, y1, c, e=2):
+        n = math.ceil(math.hypot(x1 - x0, y1 - y0) * 2)
+        for i in range(n + 1):
+            x, y = x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n
+            self.bloc(round(x - (e - 1) / 2), round(y - (e - 1) / 2), e, e, c)
+
+
+def _fois(c, f):
+    return (c[0] * f, c[1] * f, c[2] * f)
+
+
+def image_jarvis(etat, t, reponse="", mode="jarvis"):
+    """L'image 64 x 64 (uint8) du panneau pour cet etat, au temps t (s).
+    ecoute / comprend : LISTENING, l'anneau qui respire ; pense : THINKING,
+    l'arc qui tourne ; parle : les barres, et la reponse qui defile ; fait :
+    DONE ; erreur : ERROR. En mode psychologue, le cyan devient bleu."""
+    import numpy as np
+    C = LED_COULEURS
+    m = Matrice()
+    cyan = (90, 150, 255) if mode == "psy" else C["cyan"]
+    if etat in ("ecoute", "comprend"):
+        c = cyan
+        m.anneau(32, 26, 14 + math.sin(t * (6 if etat == "comprend" else 3)) * 2, c, 1.4)
+        m.disque(32, 26, 3, _fois(c, 0.7))
+        mot = "LISTENING"
+    elif etat == "pense":
+        c = C["violet"]
+        a = 0.0
+        while a < math.pi * 1.1:
+            aa = t * 4 + a
+            m.set(32 + math.cos(aa) * 14, 26 + math.sin(aa) * 14, _fois(c, 0.25 + 0.75 * a / (math.pi * 1.1)))
+            a += 0.04
+        m.disque(32, 26, 2, _fois(c, 0.5))
+        mot = "THINKING"
+    elif etat == "parle":
+        c = C["ambre"]
+        haut = 12 if reponse else 14
+        for i in range(12):
+            h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * haut)
+            m.bloc(9 + i * 4, (22 if reponse else 26) - h, 2, 2 * h + 1, c)
+        mot = "SPEAKING"
+    elif etat == "erreur":
+        c = C["rouge"]
+        m.trait(22, 16, 42, 36, c, 3)
+        m.trait(42, 16, 22, 36, c, 3)
+        mot = "ERROR"
+    else:
+        c = C["vert"]
+        m.trait(21, 26, 28, 33, c, 3)
+        m.trait(28, 33, 43, 18, c, 3)
+        mot = "DONE"
+    ecrit = texte_led(reponse) if etat == "parle" else ""
+    if ecrit:
+        # la reponse, qui defile sous les barres (24 points par seconde, comme la page)
+        w = largeur_led(ecrit)
+        x = LED_N - int((t * 24) % (w + LED_N + 8))
+        m.texte(ecrit, x, 50, _fois(C["blanc"], 0.9))
+        for i in range(LED_N):
+            m.set(i, 45, (70, 56, 18))
+            m.set(i, 58, (70, 56, 18))
+    else:
+        m.texte(mot, (LED_N - largeur_led(mot)) // 2, 50, _fois(c, 0.85))
+    return np.clip(m.px, 0, 255).astype(np.uint8)
+
+
+def dalle_led(image, pas=5, eteinte=(18, 20, 26), fond=(8, 9, 12)):
+    """L'image 64 x 64 dessinee comme la page : chaque LED un point rond
+    (rayon 0,4 du pas), les eteintes a peine visibles, sur un fond noir."""
+    import numpy as np
+    yy, xx = np.mgrid[0:pas, 0:pas]
+    rond = (xx + 0.5 - pas / 2) ** 2 + (yy + 0.5 - pas / 2) ** 2 <= (pas * 0.4) ** 2
+    img = image.astype(np.int16)
+    allume = img.max(axis=2, keepdims=True) > 0
+    couleurs = np.where(allume, img, np.array(eteinte, dtype=np.int16)).astype(np.uint8)
+    grand = couleurs.repeat(pas, axis=0).repeat(pas, axis=1)
+    masque = np.tile(rond, (LED_N, LED_N))[..., None]
+    return np.where(masque, grand, np.array(fond, dtype=np.uint8)).astype(np.uint8)

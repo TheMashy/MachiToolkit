@@ -444,6 +444,69 @@ class SesMains(unittest.TestCase):
         self.assertEqual(J.cible_boule("pense", "jarvis", regard, zone, 106)[1:3], J.place_boule(zone),
                          "regard fini : elle revient a sa place")
 
+    def test_le_son_appli_par_appli(self):
+        # « baisser le son de Spotify, baisser le son de Discord, baisser le son du jeu »
+        attendu = {
+            "baisse spotify": ("baisser", "spotify", None), "baisse le son de discord": ("baisser", "discord", None),
+            "monte le son du jeu": ("monter", "jeu", None), "coupe le jeu": ("couper", "le jeu", None),
+            "mets spotify à 30": ("regler", "spotify", 30), "baisse le son": ("baisser", "", None),
+            "baisse un peu la musique": ("baisser", "la musique", 5), "remets le son de discord": ("remettre", "discord", None),
+            "baisse le son de minecraft de 20": ("baisser", "minecraft", 20), "monte chrome à 80 %": ("regler", "chrome", 80),
+            "baisse beaucoup le jeu": ("baisser", "le jeu", 25)}
+        for dit, (sens, cible, niveau) in attendu.items():
+            self.assertEqual(J.comprendre(dit), {"action": "volume", "sens": sens, "cible": cible, "niveau": niveau}, dit)
+        self.assertEqual(J.comprendre("qu'est-ce qui fait du son ?"), {"action": "sons"})
+        for dit in ("baisse la lumière", "mets le minuteur à 10", "coupe la lumière", "baisse les bras"):
+            self.assertNotEqual((J.comprendre(dit) or {}).get("action"), "volume", dit)
+        jeu = r"D:\SteamLibrary\steamapps\common\ELDEN RING\Game\eldenring.exe"
+        self.assertTrue(J.est_un_jeu(jeu))
+        self.assertTrue(J.est_un_jeu(r"C:\Riot Games\VALORANT\live\VALORANT.exe"))
+        self.assertFalse(J.est_un_jeu(r"C:\Program Files (x86)\Steam\steam.exe"))
+        self.assertFalse(J.est_un_jeu(r"C:\Program Files (x86)\Steam\steamapps\common\x\steamwebhelper.exe",
+                                      "steamwebhelper.exe"), "le lanceur n'est pas le jeu")
+        sessions = [("Spotify.exe", r"C:\Users\a\AppData\Roaming\Spotify\Spotify.exe"),
+                    ("Discord.exe", r"C:\Users\a\AppData\Local\Discord\app-1\Discord.exe"),
+                    ("eldenring.exe", jeu), ("chrome.exe", r"C:\Program Files\Google\Chrome\chrome.exe"),
+                    ("msedge.exe", r"C:\Program Files (x86)\Microsoft\Edge\msedge.exe")]
+        self.assertEqual(J.cibles_son("le jeu", sessions), [2])
+        self.assertEqual(J.cibles_son("jeu", sessions), [2])
+        self.assertEqual(J.cibles_son("spotify", sessions), [0])
+        self.assertEqual(J.cibles_son("discord", sessions), [1])
+        self.assertEqual(J.cibles_son("le navigateur", sessions), [3, 4])
+        self.assertEqual(J.cibles_son("youtube", sessions), [3, 4])
+        self.assertEqual(J.cibles_son("chrome", sessions), [3], "« chrome » ouvert : Chrome seulement")
+        self.assertEqual(J.cibles_son("la musique", sessions), [0])
+        self.assertEqual(J.cibles_son("minecraft", sessions), [])
+
+    def test_le_panneau_de_jarvis(self):
+        # « le meme qu'ici » : le contenu Jarvis du panneau LED, et sa reponse qui defile
+        import numpy as np
+        C = J.LED_COULEURS
+        allumes = lambda im, c: int(np.all(im == np.array([round(x) for x in c], dtype=np.uint8), axis=2).sum())
+        ecoute = J.image_jarvis("ecoute", 0.0)
+        self.assertEqual(ecoute.shape, (64, 64, 3))
+        self.assertGreater(allumes(ecoute, C["cyan"]), 60, "l'anneau cyan")
+        self.assertGreater(int((ecoute[50:57].max(axis=2) > 0).sum()), 40, "LISTENING en bas")
+        pense = J.image_jarvis("pense", 0.7)
+        self.assertGreater(int((pense[:44].max(axis=2) > 0).sum()), 40)
+        arc = pense[:44].reshape(-1, 3).astype(int)
+        arc = arc[arc.max(axis=1) > 0]
+        self.assertTrue(np.all((arc[:, 2] > arc[:, 0]) & (arc[:, 0] > arc[:, 1])), "l'arc, en degrade de violet")
+        parle = J.image_jarvis("parle", 1.0, "Bonjour")
+        parle2 = J.image_jarvis("parle", 2.0, "Bonjour")
+        self.assertFalse(np.array_equal(parle[48:59], parle2[48:59]), "la reponse defile")
+        self.assertTrue(np.any(np.all(parle[:44] == np.array(C["ambre"], dtype=np.uint8), axis=2)), "les barres")
+        muet = J.image_jarvis("parle", 1.0, "")
+        self.assertGreater(int((muet[50:57].max(axis=2) > 0).sum()), 40, "SPEAKING sans reponse")
+        psy = J.image_jarvis("ecoute", 0.0, mode="psy")
+        self.assertEqual(allumes(psy, C["cyan"]), 0, "en mode psychologue, pas le cyan de Jarvis")
+        self.assertEqual(J.texte_led("Il fait 21 °C à Lyon — super ! (≈)"), "IL FAIT 21 °C A LYON SUPER ! ( )")
+        self.assertEqual(J.largeur_led("AB"), 11)
+        dalle = J.dalle_led(ecoute, 5)
+        self.assertEqual(dalle.shape, (320, 320, 3))
+        self.assertEqual(tuple(dalle[0, 0]), (8, 9, 12), "le fond entre les LED")
+        self.assertEqual(tuple(dalle[2, 2]), (18, 20, 26), "une LED eteinte, a peine visible")
+
     def test_l_agenda_jour_par_jour(self):
         rdv = [{"date": "2026-10-02", "heure": "", "label": "Anniversaire de Paul"},
                {"date": "2026-10-02", "heure": "14:30", "label": "Dentiste"},
@@ -1791,6 +1854,32 @@ class DansMachiTool(unittest.TestCase):
         corps.clear()
         self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
         self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502.", "un 502 de Railway, sans JSON")
+
+    def test_baisse_spotify_sans_le_modele(self):
+        m = self.m
+        faits = []
+        vrai = m.regler_son
+        self.addCleanup(lambda: setattr(m, "regler_son", vrai))
+        m.regler_son = lambda sens, cible, niveau: faits.append((sens, cible, niveau)) or "Volume de Spotify à 40 %."
+        envoyes, _ = self.mains([], code_actif=True)
+        self.phrase("Jarvis, baisse Spotify")
+        self.phrase("Jarvis, coupe le jeu")
+        self.assertEqual(faits, [("baisser", "spotify", None), ("couper", "le jeu", None)])
+        self.assertEqual(envoyes, [], "rien ne part au modele")
+        self.assertNotIn("Code d'accès ?", self.dit, "le son ne demande pas de code")
+        m.regler_son = lambda *a: (_ for _ in ()).throw(LookupError("Rien ne fait du son sous ce nom (jeu) ; en ce moment : Spotify."))
+        self.phrase("Jarvis, baisse le jeu")
+        self.assertIn("Rien ne fait du son", self.dit[-1] if self.dit else m.JARVIS.get("message", ""))
+        m.CFG["jarvis_pc"] = False
+        n = len(faits)
+        self.phrase("Jarvis, baisse Spotify")
+        self.assertEqual(len(faits), n, "mains fermees : rien")
+
+    def test_sa_reponse_va_au_panneau(self):
+        m = self.m
+        m.dire("Il fait 21 degrés à Lyon.")
+        self.assertEqual(m.JARVIS["reponse_affichee"], "Il fait 21 degrés à Lyon.")
+        self.assertTrue(m.CONFIG_DEFAUT["jarvis_panneau"])
 
     def test_jarvis_montre_l_agenda(self):
         # « L'agenda de Machi Tool pourra etre visible et montre par Jarvis (fenetre qui s'ouvre). »
