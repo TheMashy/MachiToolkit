@@ -1280,6 +1280,21 @@ class MiseAJourQuiDisparait(unittest.TestCase):
         self.assertEqual(mt.attente_apres_session(mt.SESSION_TENUE + 1), 10.0)
         self.assertEqual(mt.ETAT["echecs_ble"], 0)
 
+    def test_la_raison_de_l_echec_s_affiche(self):
+        """« Il ne trouve plus la guirlande » : l'ecran disait « injoignable »,
+        la raison n'etait que dans le journal."""
+        mt = self.mt
+        self.assertIn("HiLighting", mt.raison_ble(Exception("Device with address AA:BB was not found.")))
+        self.assertIn("Bluetooth du PC", mt.raison_ble(OSError("The Bluetooth radio is turned off")))
+        self.assertIn("a temps", mt.raison_ble(TimeoutError()))
+        mt.ETAT["echecs_ble"] = 0
+        mt.ETAT["erreur_ble"] = mt.raison_ble(Exception("Device with address AA:BB was not found."))
+        mt.attente_apres_session(0.4)
+        mt.attente_apres_session(0.4)
+        self.assertIn("HiLighting", mt.ETAT["message"])
+        self.assertIn("nouvelle tentative", mt.ETAT["message"])
+        mt.ETAT["erreur_ble"] = None
+
     def test_on_ne_renonce_jamais_a_la_guirlande(self):
         """Une guirlande eteinte parce qu'elle etait hors de portee doit
         revenir quand elle rentre : l'attente plafonne, elle ne s'arrete pas."""

@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.63.0"
+VERSION = "1.63.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -9318,6 +9318,7 @@ async def une_session(cfg):
 
     except Exception as e:
         ETAT["message"] = f"Deconnectee ({str(e)[:55]})"
+        ETAT["erreur_ble"] = raison_ble(e)
         """
         ET ON L'ECRIT DANS LE JOURNAL, pas seulement dans le panneau.
 
@@ -9427,6 +9428,21 @@ SESSION_TENUE = 20.0
 ATTENTE_BLE = [10.0, 10.0, 25.0, 60.0]
 
 
+def raison_ble(e):
+    """Pourquoi la guirlande ne repond pas, en une phrase qu'on peut suivre."""
+    t = "%s %s" % (type(e).__name__, e)
+    n = t.lower()
+    if "not found" in n or "introuvable" in n or "was not found" in n:
+        return "pas vue (eteinte, trop loin, ou tenue par l'appli HiLighting du telephone)"
+    if "timeout" in n or "timed out" in n or "delai" in n:
+        return "elle ne repond pas a temps (appli HiLighting ouverte ? trop loin ?)"
+    if "radio" in n or "adapter" in n or "bluetooth is" in n or "turned off" in n or "not available" in n:
+        return "le Bluetooth du PC est coupe ou indisponible"
+    if "unreachable" in n or "access" in n or "denied" in n:
+        return "Windows refuse la connexion (relance le Bluetooth du PC)"
+    return str(e).strip()[:70] or type(e).__name__
+
+
 def attente_apres_session(tenue):
     """Combien attendre avant de retenter, d'apres la duree de la session.
 
@@ -9440,8 +9456,10 @@ def attente_apres_session(tenue):
     else:
         ETAT["echecs_ble"] = min(ETAT.get("echecs_ble", 0) + 1, len(ATTENTE_BLE) - 1)
         if ETAT["echecs_ble"] >= 2:
-            ETAT["message"] = ("Guirlande injoignable, nouvelle tentative dans %d s"
-                               % int(ATTENTE_BLE[ETAT["echecs_ble"]]))
+            # la RAISON, a l'ecran : elle n'etait que dans le journal
+            raison = ETAT.get("erreur_ble") or ""
+            ETAT["message"] = ("Guirlande injoignable%s, nouvelle tentative dans %d s"
+                               % ((" : " + raison) if raison else "", int(ATTENTE_BLE[ETAT["echecs_ble"]])))
     return ATTENTE_BLE[ETAT.get("echecs_ble", 0)]
 
 
