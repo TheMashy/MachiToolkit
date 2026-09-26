@@ -318,19 +318,108 @@ def distance_eveil(g, fen, detail=False):
     return (d, queue) if detail else d
 
 
+# ======================================================================
+#  LA VOIX HUMAINE -- Silero VAD
+#
+#  « Il galere a comprendre quand je parle. » Le volume seul ne dit pas si
+#  c'est une voix : le carillon de Jarvis, un clavier, une porte, la musique
+#  passaient pour de la parole -- une phrase fermee trop tot, ou jamais, ou
+#  une ecoute qui s'etire. Silero VAD (MIT, 2 Mo, 0,1 ms par tranche de
+#  32 ms sur le processeur) donne la probabilite qu'une voix HUMAINE parle.
+#  Mesure : parole (espeak) 0,79 des tranches au-dessus de 0,5 ; carillon,
+#  bruit blanc, clavier, clic, musique synthetique : jamais au-dessus de 0,12.
+#  Rien ne sort du poste : c'est un calcul, comme le mot d'eveil. Sans le
+#  modele (pas encore telecharge), on retombe sur le volume.
+# ======================================================================
+
+VAD_MODELE = "silero_vad.onnx"
+VAD_SOURCE = "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2/src/silero_vad/data/silero_vad.onnx"
+# la version 6.2, et pas une autre : le fichier telecharge doit avoir cette empreinte
+VAD_SHA256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+VAD_OCTETS_MIN = 1000000           # un fichier plus petit est une page d'erreur, pas le modele
+VAD_SEUIL = 0.5                    # une voix commence
+VAD_SEUIL_SUITE = 0.3              # ... et continue (une syllabe douce, une fin de mot)
+
+
+class Vad:
+    """Silero VAD en flux : `trame(x)` (1280 echantillons int16, 16 kHz) rend
+    la probabilite de voix la plus haute des tranches de 512 echantillons
+    completees par cette trame. Garde son etat d'une trame a l'autre."""
+    BLOC = 512
+    CONTEXTE = 64
+
+    def __init__(self, chemin=None, session=None):
+        import numpy as np
+        self.np = np
+        if session is None:
+            import onnxruntime as rt
+            session = rt.InferenceSession(chemin, _options(), providers=["CPUExecutionProvider"])
+        self.s = session
+        self.sr = np.array(FREQ, dtype=np.int64)
+        self.remettre()
+
+    def remettre(self):
+        np = self.np
+        self.etat = np.zeros((2, 1, 128), np.float32)
+        self.ctx = np.zeros((1, self.CONTEXTE), np.float32)
+        self.reste = np.zeros(0, np.float32)
+
+    def trame(self, x):
+        np = self.np
+        buf = np.concatenate([self.reste, np.asarray(x, np.float32).reshape(-1) / 32768.0])
+        p, i = 0.0, 0
+        while i + self.BLOC <= len(buf):
+            entree = np.concatenate([self.ctx, buf[None, i:i + self.BLOC]], axis=1)
+            sortie, self.etat = self.s.run(None, {"input": entree, "state": self.etat, "sr": self.sr})
+            self.ctx = entree[:, -self.CONTEXTE:]
+            p = max(p, float(np.asarray(sortie).reshape(-1)[0]))
+            i += self.BLOC
+        self.reste = buf[i:]
+        return p
+
+
+def charger_vad(dossier):
+    """Le VAD s'il est la et lisible, sinon None (on ecoute alors au volume)."""
+    try:
+        chemin = os.path.join(dossier, VAD_MODELE)
+        if os.path.getsize(chemin) < VAD_OCTETS_MIN:
+            return None
+        return Vad(chemin)
+    except Exception:
+        return None
+
+
+# « Surtout qu'il n'apparaisse pas pour rien. » Quand la transcription est
+# prete, ce qui ne vient pas d'un « Jarvis » que TU as appris -- « Hey
+# Jarvis » (le modele anglais, qui ne connait pas ta voix), une facon apprise
+# seul -- est d'abord verifie en silence par transcription. (Pas tes propres
+# « Jarvis » : la transcription lit mal un nom dit seul, et « j'ai galere a ce
+# qu'il s'allume ».) Sans verdict, le score tranche (VERIF_REPLI_FACTEUR).
+VERIF_ATTENTE_TRAMES = 250         # 20 s pour le verdict (un moteur de transcription qui demarre a froid)
+VERIF_REPLI_FACTEUR = 1.3          # sans transcription, un appel pas net passe s'il est sous 1,3 fois le seuil direct
+AVANT_TRAMES = 50                  # 4 s de son avant l'eveil (la demande dite avant le nom)
+VERIF_TRAMES = 32                  # ce qu'on transcrit pour verifier un appel : 2,6 s
+
+
 class Detecteur:
     """Ecoute la piece et dit quand on a appele Jarvis.
 
-    Garde aussi les deux dernieres secondes de son : c'est de la que part la
+    Garde aussi les dernieres secondes de son : c'est de la que part la
     phrase, pour que « Jarvis, allume la lumiere » dit d'une traite ne perde
     pas son debut."""
 
-    def __init__(self, empreintes, gabarits=(), sensibilite=0.5, seuil_hey=0.5):
+    def __init__(self, empreintes, gabarits=(), sensibilite=0.5, seuil_hey=0.5, vad=None):
         self.e = empreintes
         self.gabarits = [normer(g) for g in gabarits if len(g) >= GABARIT_MIN]
+        self.n_manuels = None         # les gabarits au-dela sont ceux appris seul (jamais un reveil direct)
         self.seuil = seuil_gabarit(sensibilite)
         self.seuil_hey = seuil_hey
-        self.avant = deque(maxlen=25)           # 2 s de son
+        self.vad = vad
+        self.p_voix = None            # la probabilite de voix de la derniere trame (None : pas de VAD)
+        self.voix = deque(maxlen=48)
+        self.verifier_tout = False    # la transcription est prete : un appel pas tout pres se verifie
+        self.proche_manuel = True     # le gabarit le plus proche est un de ceux appris a la main
+        self.avant = deque(maxlen=AVANT_TRAMES)
         self.emps = deque(maxlen=48)
         self.niveaux = deque(maxlen=48)
         self.plancher = None
@@ -367,13 +456,35 @@ class Detecteur:
             return None
         return [[round(float(v), 5) for v in ligne] for ligne in emps[fin - n:fin]]
 
-    def parlait_avant(self, longueur=None, avant=12, minimum=3):
+    def parlait_avant(self, longueur=None, avant=8, minimum=3):
         """Quelqu'un parlait-il juste AVANT le mot (« baisse le son, Jarvis ») ?
-        Au moins `minimum` trames de parole dans la seconde qui le precede."""
+        Au moins `minimum` trames de voix dans le bon demi-seconde qui le
+        precede -- en sautant le DEBUT du mot : un gabarit commence
+        GABARIT_DEBUT trames apres l'attaque, et « Jarvis » dit seul comptait
+        ses propres « Ja- » comme une demande deja dite (la phrase se fermait
+        au bout de 2 s). Pas plus loin non plus : un « Jarvis ? » rate une
+        seconde plus tot n'est pas une demande."""
         n = int(longueur or self.longueur_mot())
-        niv = list(self.niveaux)
-        zone = niv[max(0, len(niv) - n - avant):max(0, len(niv) - n)]
-        return sum(1 for r in zone if self.parle(r)) >= minimum
+        niv, pv = list(self.niveaux), list(self.voix)
+        fin = max(0, len(niv) - n - GABARIT_DEBUT - 3)
+        zone = range(max(0, fin - avant), fin)
+        return sum(1 for i in zone if pv[i] >= VAD_SEUIL and self.parle(niv[i])) >= minimum
+
+    def humaine(self, seuil=VAD_SEUIL):
+        """La derniere trame est-elle une voix ? (Sans VAD : on ne sait pas, oui.)"""
+        return self.p_voix is None or self.p_voix >= seuil
+
+    def parle_phrase(self, rms):
+        """Pour la phrase : une voix humaine, assez forte (pas la tele au loin)."""
+        if self.p_voix is None:
+            return self.parle(rms)
+        return self.p_voix >= VAD_SEUIL and self.parle_doucement(rms)
+
+    def parle_phrase_doux(self, rms):
+        """... qui CONTINUE : une syllabe plus basse, une fin de mot."""
+        if self.p_voix is None:
+            return self.parle_doucement(rms)
+        return self.p_voix >= VAD_SEUIL_SUITE and rms > max(1.2 * (self.plancher or 0.0), 40.0)
 
     def parle(self, rms):
         # le plancher absolu se cale sur TON micro : un micro faible ne passait jamais 300
@@ -410,27 +521,44 @@ class Detecteur:
             self.plancher *= 1.0005
 
     def trame(self, x, chercher=True):
-        """Rend None, ou (« hey » | « voix », score) quand Jarvis est appele."""
+        """Rend None, ou (« hey » | « voix », score) quand Jarvis est appele
+        (« ..._a_verifier » : pas net, a verifier par transcription)."""
         import numpy as np
         self.n += 1
         rms = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
         self._suivre_plancher(rms)
         score, e = self.e.trame(x)
+        p = None
+        if self.vad is not None:
+            try:
+                p = float(self.vad.trame(x))
+            except Exception:
+                self.vad = None                   # un VAD qui casse : on ecoute au volume
+        self.p_voix = p
+        self.voix.append(1.0 if p is None else p)
         self.avant.append(np.asarray(x, dtype=np.int16))
         self.emps.append(normer(e))
         self.niveaux.append(rms)
-        if self.parle(rms):
+        # de la PAROLE : du volume, et une voix humaine (pas un clic, une porte, la musique)
+        if self.parle(rms) and self.humaine():
             self.derniere_parole = self.n
-        if self.parle_doucement(rms):
+        if self.parle_doucement(rms) and self.humaine():
             self.derniere_parole_douce = self.n
         if not chercher or self.n < self.repos_jusqua:
             self.en_doute = None
             return None
-        if self.e.hey_m is not None and score >= self.seuil_hey:
-            self.repos_jusqua = self.n + 25
-            self.en_doute = None
-            return ("hey", score)
-        if self.e.hey_m is not None and self.tolerance and score >= self.seuil_hey * TOLERANCE_HEY:
+        # « Hey Jarvis » : le modele anglais ne connait pas ta voix et n'exige
+        # pas un mot -- il faut qu'on vienne de PARLER, et, ta voix apprise, il
+        # se verifie par transcription (la tele, un film, un jeu en anglais)
+        recente = self.n - self.derniere_parole_douce <= GABARIT_FIN + 3
+        if self.e.hey_m is not None and score >= self.seuil_hey and recente:
+            if self.verifier_tout and self.gabarits:
+                self._doute("hey", score, meilleur_si_plus_petit=False)
+            else:
+                self.repos_jusqua = self.n + 25
+                self.en_doute = None
+                return ("hey", score)
+        elif self.e.hey_m is not None and self.tolerance and recente and score >= self.seuil_hey * TOLERANCE_HEY:
             self._doute("hey", score, meilleur_si_plus_petit=False)
         if not self.gabarits:
             return self._rendre_doute()
@@ -442,20 +570,28 @@ class Detecteur:
         x_ = np.array(self.emps)
         meilleur = 9.0
         self.plus_proche = None
-        for g in self.gabarits:
+        for i, g in enumerate(self.gabarits):
             fen = x_[-(int(FENETRE_FACTEUR * len(g)) + 1):]
             if len(fen) < len(g) // 2:
                 continue
             d, queue = distance_eveil(g, fen, detail=True)
             if d < meilleur:
                 meilleur, self.long_proche, self.queue_proche = d, len(g), queue
+                self.proche_manuel = self.n_manuels is None or i < self.n_manuels
         self.plus_proche = meilleur if meilleur < 9.0 else None
         self.compare_n = self.n           # plus_proche vaut pour CETTE trame
-        # un mot a une duree : assez de trames de parole sur la longueur du gabarit
-        niv = list(self.niveaux)[-(self.long_proche + 2):]
-        voise = sum(1 for r in niv if self.parle(r)) >= TRAMES_VOISEES_MIN
-        voise_doux = sum(1 for r in niv if self.parle_doucement(r)) >= TRAMES_VOISEES_MIN
+        # un mot a une duree : assez de trames de VOIX sur la longueur du gabarit
+        k = self.long_proche + 2
+        niv, pv = list(self.niveaux)[-k:], list(self.voix)[-k:]
+        voise = sum(1 for r, q in zip(niv, pv) if q >= VAD_SEUIL and self.parle(r)) >= TRAMES_VOISEES_MIN
+        voise_doux = sum(1 for r, q in zip(niv, pv)
+                         if q >= VAD_SEUIL and self.parle_doucement(r)) >= TRAMES_VOISEES_MIN
         if meilleur <= self.seuil and voise:
+            # un « Jarvis » que TU as appris : il se reveille ; une facon apprise
+            # seul se verifie d'abord (quand la transcription est prete)
+            if self.verifier_tout and not self.proche_manuel:
+                self._doute("voix", meilleur)
+                return self._rendre_doute()
             self.repos_jusqua = self.n + 25
             self.en_doute = None
             return ("voix", meilleur)
@@ -463,9 +599,13 @@ class Detecteur:
             self._doute("voix", meilleur)
         return self._rendre_doute()
 
-    def son_d_avant(self):
+    def son_d_avant(self, trames=None):
+        """Les dernieres secondes de son (toutes, ou les `trames` dernieres)."""
         import numpy as np
-        return np.concatenate(list(self.avant)) if self.avant else np.zeros(0, np.int16)
+        morceaux = list(self.avant)
+        if trames is not None:
+            morceaux = morceaux[-max(1, int(trames)):]
+        return np.concatenate(morceaux) if morceaux else np.zeros(0, np.int16)
 
 
 def gabarit_depuis(emps, niveaux, parle):
@@ -538,6 +678,15 @@ def choisir_gabarits(essais, n_normaux):
 # ======================================================================
 
 PHRASE_DEJA_DITE_S = 2.0      # le nom a la fin de la demande : on attend ca, puis c'est fini
+# « IL GALERE A COMPRENDRE QUAND JE PARLE. » Une pause pour chercher ses mots
+# (« mets la musique de... Daft Punk ») fermait la phrase a 0,9 s : on laisse
+# 1,2 s tant qu'on vient de commencer, 0,9 s ensuite.
+PHRASE_PAUSE_DEBUT_S = 1.2
+PHRASE_PAUSE_S = 0.9
+PHRASE_DEBUT_S = 2.0          # « on vient de commencer » : moins de 2 s de parole
+PHRASE_MAX_S = 30.0           # une demande ; le mode psychologue en laisse plus (voir PHRASE_PSY_MAX_S)
+PHRASE_PSY_MAX_S = 60.0
+PAROLE_MIN_TRAMES = 2         # moins que ca, ce n'etait pas une phrase (une touche, une porte)
 
 
 class Phrase:
@@ -547,10 +696,15 @@ class Phrase:
     premieres 300 ms ne DECLENCHENT donc pas la parole. Mais « Jarvis stop »
     dit d'une traite tombe justement dedans -- une parole precoce compte,
     avec une attente plus longue ensuite pour laisser le temps de commencer
-    si ce n'etait que le carillon."""
+    si ce n'etait que le carillon.
 
-    def __init__(self, parle, avant=None, attente=5.0, silence_fin=0.9,
-                 duree_max=15.0, ignorer=0.3, deja_dit=False, fin_du_mot=0):
+    `parle(rms)` dit si la trame est de la parole ; `doux(rms)`, si elle la
+    CONTINUE (une syllabe plus basse) -- avec le VAD, le carillon, un clavier,
+    une porte ou la musique ne sont pas de la parole. Et un mot a une duree :
+    une trame isolee (un clic) ne compte pas -- deux sur les trois dernieres."""
+
+    def __init__(self, parle, avant=None, attente=5.0, silence_fin=None,
+                 duree_max=PHRASE_MAX_S, ignorer=0.3, deja_dit=False, fin_du_mot=0, doux=None):
         import numpy as np
         self.np = np
         # Reconnu avant la fin du mot (« Jarvis » en pleine phrase) : ses
@@ -559,7 +713,7 @@ class Phrase:
         # « Baisse le son, Jarvis » : la demande est deja dans `avant`. Si rien
         # ne suit, c'est fini -- pas « vide » apres cinq secondes.
         self.deja_dit = deja_dit
-        self.parle = parle
+        self.parle, self.doux = parle, doux
         self.morceaux = [avant] if avant is not None and len(avant) else []
         self.t = 0.0
         self.attente, self.silence_fin = attente, silence_fin
@@ -567,6 +721,13 @@ class Phrase:
         self.parole = False
         self.precoce = 0
         self.silence = 0.0
+        self.n_parole = 0             # trames de parole comptees
+        self.recents = deque([False, False], maxlen=3)
+
+    def pause_permise(self):
+        if self.silence_fin is not None:
+            return self.silence_fin
+        return PHRASE_PAUSE_DEBUT_S if self.n_parole * TRAME_S < PHRASE_DEBUT_S else PHRASE_PAUSE_S
 
     def trame(self, x, rms):
         """Rend None tant que ca continue, « fini » ou « vide »."""
@@ -575,17 +736,20 @@ class Phrase:
         if self.fin_du_mot > 0:
             self.fin_du_mot -= 1
             return None
-        p = self.parle(rms)
+        fort = bool(self.parle(rms))
+        p = fort or bool(self.parole and self.doux is not None and self.doux(rms))
         if self.t <= self.ignorer:
-            self.precoce += 1 if p else 0
+            self.precoce += 1 if fort else 0
             return None
-        if p:
+        self.recents.append(p)
+        if p and sum(self.recents) >= 2:
             self.parole, self.silence = True, 0.0
+            self.n_parole += 1
         else:
             self.silence += TRAME_S
-        if self.parole and self.silence >= self.silence_fin:
-            return "fini"
-        if not self.parole and self.precoce >= 2 and self.silence >= self.silence_fin + 0.5:
+        if self.parole and self.silence >= self.pause_permise():
+            return "fini" if (self.n_parole >= PAROLE_MIN_TRAMES or self.deja_dit) else "vide"
+        if not self.parole and self.precoce >= 2 and self.silence >= self.pause_permise() + 0.5:
             return "fini"
         if not self.parole and self.deja_dit and self.t >= PHRASE_DEJA_DITE_S:
             return "fini"
@@ -621,6 +785,10 @@ SONS = {
     "erreur":   [(440, 0.09), (330, 0.12)],
     "bip":      [(1000, 0.09)],
     "fin":      [(990, 0.05), (660, 0.07)],
+    # « JE GALERE A COMPRENDRE QUAND IL M'ECOUTE » : la phrase est prise, il
+    # n'ecoute plus -- un petit « toc » grave, distinct du carillon qui monte
+    # (a vous) et de la fin qui descend (je m'en vais)
+    "capte":    [(520, 0.045)],
     "minuteur": [(880, 0.12), (0, 0.08), (1175, 0.12), (0, 0.25)] * 3,
 }
 
@@ -700,7 +868,9 @@ def couleur_etat(etat, t, couleurs=None, mode="jarvis"):
     else:
         return None
     if etat in ("ecoute", "apprend"):
-        gain = 0.78 + 0.22 * math.sin(2 * math.pi * 0.8 * t)
+        # IL T'ECOUTE : vif et presque fixe -- il paraissait plus eteint a
+        # l'ecoute qu'en parlant, et on ne savait plus s'il ecoutait encore
+        gain = 0.9 + 0.1 * math.sin(2 * math.pi * 0.8 * t)
     elif etat == "comprend":
         gain = 0.55 + 0.45 * abs(math.sin(math.pi * 1.4 * t))
     elif etat == "pense":
@@ -796,35 +966,119 @@ def contient_nom(texte, noms=()):
     return nom_trouve(texte, noms) is not None
 
 
+# « J'AI GALERE A CE QU'IL S'ALLUME. » Parakeet ecrit un « Jarvis » dit seul
+# « Javi », « Chavis », « Harvis », « É Javi », « Charvi » : sans le r, un j
+# devenu ch/y/h, un v devenu b. Pour CONFIRMER un appel que l'empreinte a deja
+# trouve proche (jamais pour apprendre une facon de l'appeler), cette forme
+# suffit. Jamais « j'avais », « j'ai vu », « j'avoue », « je vis », « j'avise ».
+_NOM_ECORCHE = re.compile(
+    r"^(?:a|e|he|hey|eh)?"                    # une interjection collee : « Ajarvis », « Ejarvis »
+    r"(?:dj|dz|j|g|ch|sh|zh|y|h)"             # le J
+    r"(?:a+h?r*|a+i?r+e?|e+r+|ea?r+)"         # le A ; le r ne tombe qu'apres « a »
+    r"h?[vbw]"                                # le V
+    r"(?:i+|y|ie|ei)"                         # le I -- jamais « ai », « e », « ou », « u »
+    r"(?:s|ss|z|x)?$")                        # le S, souvent perdu -- pas « se »
+_PAS_LUI = frozenset({"javel", "java", "jarrive", "javais", "jaivu", "javoue", "jevis", "harvey", "javier"})
+
+
+def nom_verifie(texte, noms=()):
+    """nom_trouve, plus la forme ecorchee : pour trancher un appel pas net."""
+    m = nom_trouve(texte, noms)
+    if m is not None:
+        return m
+    mots = [normaliser(x).replace("'", "").strip(" -") for x in str(texte or "").split()]
+    mots = [x for x in mots if x]
+    for w in mots + [a + b for a, b in zip(mots, mots[1:])]:
+        if 4 <= len(w) <= 10 and w not in _PAS_LUI and _NOM_ECORCHE.match(w):
+            return w
+    return None
+
+
 _POLITESSE = re.compile(r"^(?:s'? ?il (?:te|vous) plait|stp|svp|merci|please|ok|hein|allez|vas-y)$")
 _AMORCES = re.compile(r"^(?:(?:ok|okay|hey|he|eh|dis|dites|euh|bon|alors|allez)(?:[\s,!.]+|$))+", re.I)
+_REMPLISSAGE = frozenset("euh heu hum hmm bah ben bon alors dis dites hey he eh".split())
 
 
-def retirer_mot_eveil(texte):
+def _est_le_nom(mot, noms=()):
+    """Ce mot est-il son nom (« Jarvis », « Charvis », ou tel que la
+    transcription l'a ecrit quand tu l'as appris) ?"""
+    m = normaliser(mot).replace("'", "").strip(" -")
+    if not m:
+        return False
+    return bool(_EVEIL.match(m)) or (m in {str(n) for n in noms or () if n and nom_plausible(n)}) or \
+        (4 <= len(m) <= 9 and _distance_mots(m, "jarvis") <= 2 and m[0] in "jgcdzs"
+         and "r" in m and ("v" in m or "w" in m))
+
+
+def retirer_mot_eveil(texte, noms=(), garder_avant=True):
     """« Hey Jarvis, allume la lumiere. » -> « allume la lumiere. »
 
-    La phrase part de deux secondes AVANT l'eveil : le mot y est, parfois
-    precede d'un bout de conversation. On coupe tout jusqu'au mot, s'il est
-    dans les huit premiers. S'il FINIT la demande (« baisse le son, Jarvis »,
-    « tu peux mettre de la musique Jarvis s'il te plait ? »), c'est ce qui le
-    precede qu'on garde -- depuis le debut de la derniere phrase. Sinon on ne
-    touche a rien."""
+    La phrase part d'un peu AVANT l'eveil : le nom y est, parfois precede
+    d'un bout de conversation. On coupe tout jusqu'au nom, et ce qui le suit
+    est la demande -- sans les « Jarvis » repetes (« Jarvis ? Jarvis ! Allume
+    la lumiere ») ni les « euh ». S'il FINIT la demande (« baisse le son,
+    Jarvis »), c'est ce qui le precede qu'on garde -- depuis le debut de la
+    derniere phrase, et seulement si on parlait vraiment avant le nom
+    (`garder_avant`) : sinon, c'etait la fin de sa reponse d'avant, ou la
+    tele. Le nom s'entend aussi « Charvis », ou tel qu'appris (`noms`)."""
     mots = str(texte or "").split()
     for i, m in enumerate(mots):
-        brut = normaliser(m).replace("'", "")
-        if not _EVEIL.match(brut):
+        if not _est_le_nom(m, noms):
             continue
-        reste = re.sub(r"^[\s,.;:!?…-]+", "", " ".join(mots[i + 1:])).strip()
+        suite = mots[i + 1:]
+        # les « Jarvis » repetes, les « euh », un « ? » isole : ce n'est pas
+        # encore la demande
+        while suite and (_est_le_nom(suite[0], noms)
+                         or normaliser(suite[0]).replace("'", "").strip(" -") in _REMPLISSAGE | {""}):
+            suite = suite[1:]
+        reste = re.sub(r"^[\s,.;:!?…-]+", "", " ".join(suite)).strip()
         utile = [w for w in normaliser(reste).split() if w]
         if utile and not _POLITESSE.match(" ".join(utile)) and not all(_POLITESSE.match(w) for w in utile):
-            return reste if i < 8 else str(texte or "").strip()
+            return reste
+        if not garder_avant:
+            return ""
         avant = " ".join(mots[:i])
-        avant = re.split(r"[.!?…]\s+", avant)[-1] if avant else ""
+        avant = re.split(r"[.!?…]\s*", avant.strip())
+        avant = [x for x in avant if x.strip()]
+        avant = avant[-1] if avant else ""
+        # « Hé Jarvis » : les amorces se lisent sans accents
+        amorces = [w for w in avant.split()
+                   if normaliser(w).replace("'", "").strip(" ,;:!-") in _REMPLISSAGE | {"ok", "okay", "allez"}]
+        if len(amorces) == len(avant.split()):
+            avant = ""
         avant = _AMORCES.sub("", avant.strip()).strip(" ,;:-")
         if not avant:
-            return reste if i < 8 else str(texte or "").strip()      # « Jarvis, merci »
+            return ""                   # « Jarvis, merci » / « Jarvis ? Jarvis ! »
         return " ".join(avant.split()[-20:])
     return str(texte or "").strip()
+
+
+# UNE MENTION, PAS UN APPEL. « J'ai l'impression que Jarvis ecoute tout le
+# temps », « le Jarvis que j'ai code », « Jarvis a encore plante » : on parle DE
+# lui -- rien a repondre. Le nom suivi d'une ponctuation (« Jarvis, ... »), ou en
+# fin de phrase (« baisse le son, Jarvis »), reste un appel.
+_AVANT_MENTION = frozenset("que qu le la les de du des a au aux avec sur pour et mon ton son ce cet "
+                           "connais appelle dit parle parler contre sans par ton ta".split())
+_APRES_MENTION = frozenset("il elle etait fait marche marchait apparait apparaissait sait peut "
+                           "plante bugue beugue m'a m'enerve s'est comprend comprenait".split())
+
+
+def est_une_mention(texte, noms=()):
+    mots = str(texte or "").split()
+    for i, m in enumerate(mots):
+        if not _est_le_nom(m, noms):
+            continue
+        if i == len(mots) - 1 or re.search(r"[,.;:!?…]$", m):
+            return False                        # « ..., Jarvis » / « Jarvis, ... » : un appel
+        avant = normaliser(mots[i - 1]).replace("'", " ").split()[-1:] if i else []
+        apres = normaliser(mots[i + 1]).strip(" -")
+        suivant = normaliser(mots[i + 2]).strip(" -") if i + 2 < len(mots) else ""
+        if avant and avant[0] in _AVANT_MENTION:
+            return True
+        if apres in _APRES_MENTION or (apres == "est" and not suivant.startswith("ce")):
+            return True
+        return False
+    return False
 
 
 _UNITES = {"zero": 0, "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5,
@@ -1035,14 +1289,17 @@ _SILENCE = {"stop", "tais toi", "tais-toi", "chut", "silence", "arrete", "ca suf
 # COURTE, faite de ces mots-la et de politesses autour -- « non merci c'est
 # tout » oui, « j'ai rien fait de la journee » non.
 _FIN = re.compile(
-    r"^(?:(?:non|bon|ben|euh|ah|oh|finalement|en fait|merci|pardon|ok|okay|d'accord|"
-    r"c'est bon|jarvis|bah)\s+)*"
+    r"^(?:(?:non|bon|ben|euh|ah|oh|finalement|en fait|merci|merci beaucoup|pardon|ok|okay|d'accord|"
+    r"c'est bon|jarvis|bah|et)\s+)*"
     r"(?:non|merci|rien(?: du tout)?|c'est rien|oublie(?: ca| tout| c'est pas grave)?|"
     r"laisse(?: tomber| beton| moi)?|degage|casse toi|va t'en|dehors|du vent|"
     r"c'est tout|c'est bon|ca ira|ca va aller|pas besoin|au revoir|a plus|salut|bye|"
     r"fin de (?:la )?conversation|termine|annule|annuler|fausse alerte|non merci|"
-    r"rien merci|rien de rien|c'est fini)"
-    r"(?:\s+(?:merci|jarvis|c'est bon|ca ira|c'est tout|laisse|pour l'instant|pour le moment))*$")
+    r"rien merci|rien de rien|c'est fini|fin|pas maintenant|plus tard|une autre fois|"
+    r"c'est tout pour (?:l'instant|le moment|aujourd'hui|ce soir|moi|maintenant)|"
+    r"on (?:a|en a) (?:fini|termine)|j'ai (?:fini|termine)|tu peux y aller|"
+    r"on (?:s'arrete|arrete) la|arrete toi|arrete ca)"
+    r"(?:\s+(?:merci|jarvis|c'est bon|ca ira|c'est tout|laisse|pour l'instant|pour le moment|alors))*$")
 # Et en anglais : « never mind », « forget it », « that'll be all »...
 _FIN_EN = re.compile(
     r"^(?:(?:no|well|oh|um|uh|actually|thanks|thank you|okay|ok|sorry|jarvis|right)\s+)*"
@@ -1050,7 +1307,8 @@ _FIN_EN = re.compile(
     r"cancel|that's all|that is all|that'll be all|that will be all|that's it|go away|leave it|"
     r"leave me alone|dismissed|goodbye|good bye|bye(?: bye)?|see you(?: later)?|false alarm|"
     r"end (?:the )?conversation|we're done|i'm done|all good|i'm good|no thanks|no thank you|"
-    r"nothing thanks|it's nothing)"
+    r"nothing thanks|it's nothing|thanks|thank you|thanks a lot|not now|maybe later|later|"
+    r"that's it for now|that's all for now|we're good|you can go)"
     r"(?:\s+(?:thanks|thank you|jarvis|for now|that's all|then))*$")
 
 
@@ -1072,7 +1330,7 @@ _RENVOI = re.compile(
     r"(?:fous|fiche|foutez|fichez) moi la paix|laisse moi(?: tranquille| en paix| seul)?|laissez moi(?: tranquille)?|"
     r"lache moi(?: la grappe)?|ta gueule|ferme la|la ferme|"
     r"(?:tu peux|vous pouvez) (?:partir|disposer|te retirer|vous retirer|t'en aller|vous en aller)|"
-    r"stop|stop stop|arrete tout|"
+    r"stop(?: stop)*|stoppe|stop ca|arrete tout|arrete toi|"
     r"get away|go away|get lost|get out|leave|leave now|leave me alone|scram|beat it|begone|buzz off|"
     r"off you go|piss off|shoo|shut up|you may go|you can go|dismissed)"
     r"(?:\s+(?:jarvis|maintenant|tout de suite|merci|s'il te plait|stp|now|please|thanks|"
@@ -1099,7 +1357,8 @@ def renvoi(texte):
 # `adieu` rend ce qu'on lui a dit, pour qu'il reponde sur le meme ton : une
 # bonne nuit appelle une bonne nuit.
 _ADIEU = re.compile(
-    r"^(?:(?:bon|ben|allez|ok|okay|alors|bah|merci|thanks|thank you|well|right|jarvis)\s+)*"
+    r"^(?:(?:bon|ben|allez|ok|okay|alors|bah|merci|merci beaucoup|merci bien|et|and|thanks|thank you|"
+    r"thanks a lot|well|right|jarvis)\s+)*"
     r"(au revoir|salut|bye|bye bye|a plus(?: tard)?|a tout(?: a l'heure)?|a bientot|a demain|bonne nuit|"
     r"bonne soiree|bonne journee|ciao|tchao|goodbye|good bye|good night|goodnight|see you(?: later| soon)?|"
     r"see ya|later|farewell)"
@@ -1154,19 +1413,25 @@ _VERS_NOTES_PSY = re.compile(r"^(?:mes\s+|les\s+|my\s+)?(?:notes?\s+(?:psy|psych
                              r"(?:psy|psychologue|therapist|therapy))\b")
 # UNE NOTE, SI ON LA DEMANDE : « note que... », « prends une note », « take a
 # note » -- pas « notes de frais » ni « noter les courses ».
+# « Noté. » tout seul est un acquittement, pas une note a prendre.
 _VERS_NOTES = re.compile(
-    r"^(?:notes?" + _POLI + r"$|note (?:que|qu'|ca|cela|dans mon journal|pour moi|that)\b|"
+    r"^(?:mes notes" + _POLI + r"$|note (?:que|qu'|ca|cela|dans mon journal|pour moi|that)\b|"
     r"prends? note\b|(?:prends|prend|fais|ajoute|ecris|take|make|add|write)\s+"
     r"(?:une\s+|des\s+|a\s+|some\s+)?notes?\b)")
 # ET ON EN SORT FACILEMENT : « retourne au mode Jarvis », « pars du mode
 # psychologue », « sors du psy », « plus de psy », « back to Jarvis ».
-_AVANT = r"^(?:(?:ok|okay|bon|allez|bah|ben|euh|jarvis|non|alors|maintenant|stp|please)\s+)*"
+_AVANT = (r"^(?:(?:ok|okay|bon|allez|bah|ben|euh|jarvis|non|alors|maintenant|stp|please|hey|he|eh|mais|oh|ah|"
+          r"ca va|c'est bon)\s+)*")
+_VERS_QUOI = (r"(?:passe|reviens|repasse|retour|retourne|bascule|on repasse|redeviens|reprends|remets toi|"
+              r"je veux|je veux parler a|go|switch|change|get|go back|come back|take me back)\s+"
+              r"(?:back\s+)?(?:en\s+|a\s+|au\s+|le\s+|to\s+)?")
+_EN_MODE = r"(?:le\s+|the\s+)?mode\s+"
 _VERS_JARVIS = re.compile(
     _AVANT + r"(?:"
-    r"(?:(?:passe|reviens|repasse|retour|retourne|bascule|on repasse|redeviens|reprends|remets toi|"
-    r"je veux|je veux parler a|go|switch|change|get|go back|come back|take me back)\s+"
-    r"(?:back\s+)?(?:en\s+|a\s+|au\s+|le\s+|to\s+)?)?(?:(?:le\s+|the\s+)?mode\s+)?"
-    r"(?:jarvis|normal)(?:\s+mode)?"
+    r"(?:" + _VERS_QUOI + r")?(?:" + _EN_MODE + r")?jarvis(?:\s+mode)?"
+    # « Normal. » tout seul est une reponse (« Comment s'est passee ta
+    # journee ? ») : il faut « mode normal », « redeviens normal »
+    r"|(?:" + _VERS_QUOI + r"(?:" + _EN_MODE + r")?|" + _EN_MODE + r")normale?(?:\s+mode)?"
     r"|(?:quitte|quitter|sors|sort|sortir|pars|part|partir|arrete|arreter|stop|ferme|fermer|termine|"
     r"fin|laisse tomber|oublie|exit|leave|quit|close|end)\s+(?:du\s+|de\s+|le\s+|la\s+|avec le\s+|"
     r"the\s+)?(?:mode\s+)?(?:psy|psychologue|psychologie|therapeute|therapist|therapy|psych)(?:\s+mode)?"
@@ -1176,6 +1441,26 @@ _VERS_JARVIS = re.compile(
     # retire -- il reste « re »)
     r"|re|re jarvis|jarvis re|me revoila|je suis de retour|c'est re moi|i'm back|im back|"
     r"back to jarvis|back to normal|normal mode|jarvis mode)" + _POLI + "$")
+# NE PLUS VOULOIR LE PSY, C'EST EN SORTIR -- jamais y entrer. « Mode psy off »
+# y faisait entrer (et « off » partait au psychologue) ; « je veux plus parler
+# au psy », « change de mode » lui etaient envoyes.
+_NON_PSY = re.compile(
+    _AVANT + r"(?:(?:non\s+)?(?:pas|plus)\s+(?:de\s+|le\s+|la\s+|du\s+|au\s+)?(?:mode\s+)?" + _MOT_PSY + r"\b"
+    r"|je (?:ne\s+)?(?:veux|voulais|voudrais)\s+(?:plus|pas)\s+(?:parler\s+(?:a|au)\s+|du\s+|de\s+|le\s+|la\s+|au\s+)"
+    r"(?:la\s+|le\s+)?(?:mode\s+)?" + _MOT_PSY + r"\b"
+    r"|(?:je t'ai|je vous ai|j'ai|t'ai|ai)\s+(?:pas|jamais|rien)\s+demande\b.{0,20}\b" + _MOT_PSY + r"\b"
+    r"|(?:j'ai|je n'ai|j'en ai|je n'en ai)\s+pas\s+besoin\s+(?:de|d'un|d'une|du)\s+(?:mode\s+)?" + _MOT_PSY + r"\b"
+    r"|(?:desactive|enleve|coupe|annule|eteins|stoppe|arrete)\s+(?:le\s+|la\s+)?(?:mode\s+)?" + _MOT_PSY + r"\b"
+    r"|(?:arrete|stop)\s+(?:d'etre|de faire (?:le|la)|de jouer (?:le|la|au)|being(?: a| the)?)\s+" + _MOT_PSY + r"\b"
+    r"|je veux (?:sortir|partir) du (?:mode\s+)?" + _MOT_PSY + r"\b"
+    r"|comment (?:on |je |tu )?(?:sort|sors|sortir|quitte|quitter|arrete|arreter|desactive)\s+"
+    r"(?:de\s+|du\s+|le\s+|la\s+|ce\s+)?(?:mode\s+)?" + _MOT_PSY + r"\b"
+    r"|(?:le\s+|la\s+)?(?:mode\s+)?" + _MOT_PSY + r"(?:\s+mode)?\s+(?:off|non|no|stop|arrete|termine|fini|desactive|"
+    r"de merde|nul)\b"
+    r"|(?:je veux\s+)?(?:change|changer|changeons)\s+de\s+mode|(?:un\s+)?autre\s+mode|mode\s+(?:majordome|butler)|"
+    r"butler\s+mode|(?:retour|retourne|reviens|repasse)\s+(?:au|en)\s+(?:mode\s+)?majordome"
+    r"|i (?:don't|do not) (?:want|need)(?:\s+(?:to talk to|any|the|a|more))*\s+" + _MOT_PSY + r"\b"
+    r"|(?:no|not|stop|quit|exit|leave|end)\s+(?:the\s+)?(?:therapist|therapy|psych)(?:\s+mode)?)")
 
 
 def _apres(texte, n_mots):
@@ -1199,13 +1484,16 @@ def changement_de_mode(texte):
     t = normaliser(texte).strip(" -'")
     if not t:
         return None
-    if _VERS_JARVIS.match(t):
+    if _VERS_JARVIS.match(t) or _NON_PSY.match(t.replace("-", " ")):
         return ("jarvis", "")
     if _VERS_PSY_SEUL.match(t):
         return ("psy", "")
     m = _APOSTROPHE_PSY.match(str(texte))
     if m:
         reste = str(texte)[m.end():].strip()
+        # « Psy... non rien », « Psychologue ? Non. », « Psy, au revoir » : pas une demande
+        if reste and (fin_de_conversation(reste) or renvoi(reste) or adieu(reste)):
+            return None
         return ("psy", "" if normaliser(reste) in ("", "s'il te plait", "stp", "merci") else reste)
     for motif, garder in ((_VERS_PSY_VERBE, False), (_VERS_NOTES_PSY, False), (_VERS_NOTES, True)):
         m = motif.match(t)
@@ -1219,6 +1507,102 @@ def changement_de_mode(texte):
             if normaliser(reste) in ("", "s'il te plait", "stp", "merci", "s'il vous plait", "svp"):
                 reste = ""
             return ("psy", reste)
+    return None
+
+
+# SORTIR DU PSYCHOLOGUE. « Il est rentre en mode psychologue et j'ai pas reussi
+# a en sortir. » Chez le psy, la phrase arrive pendant l'ecoute de suite :
+# l'oreille ne cherche pas le mot d'eveil, son nom n'est qu'un mot de la
+# transcription -- et on le retirait AVANT de lire la demande (« reviens en
+# mode Jarvis » devenait « reviens en mode », envoye au psychologue). On lit
+# donc la phrase BRUTE, avant tout le reste. Seulement des phrases COURTES :
+# « je veux que ca s'arrete », « j'en peux plus » restent au psychologue.
+_AMORCE_PSY = r"(?:(?:hey|he|eh|ok|okay|dis|euh|bon|non|mais|allez|oh|ah|alors)\s+)*"
+_VERS_JARVIS_BRUT = re.compile(
+    r"^" + _AMORCE_PSY + r"(?:jarvis\s+)?(?:"
+    r"(?:" + _VERS_QUOI + r"|je voudrais parler a\s+|i want(?: to talk to)?\s+|back\s+(?:to\s+)?)?"
+    r"(?:" + _EN_MODE + r")?(?:c'est\s+(?=jarvis que je veux))?(?:jarvis|majordome|butler)"
+    r"|(?:" + _VERS_QUOI + r"(?:" + _EN_MODE + r")?|" + _EN_MODE + r")normale?)"
+    r"(?:\s+mode)?(?:\s+que je veux)?(?:\s+pas (?:au|le|la|du) " + _MOT_PSY + r")?" + _POLI + r"(?:\s+jarvis)?$")
+# le nom en tete, et ce qui reste veut dire « reviens »
+_RETOUR_PSY = re.compile(
+    r"^(?:(?:non|bon|ok|okay|allez|mais|oh|he|hey|eh|stp|please)\s+)*"
+    r"(?:(?:reviens|revient|repasse|retourne|retour|passe|remets toi|redeviens|reprends|bascule|je veux|"
+    r"je veux parler a|je voudrais|je voudrais parler a|c'est|come back|go back|switch|switch back|back|"
+    r"i want|i want to talk to|get me|give me|take me back)"
+    r"(?:\s+(?:en|a|au|le|la|to|back|mode|into|the|que je veux))*"
+    r"|mode|t'es la|tu es la|c'est toi|t'es ou|are you there|you there)?" + _POLI + "$")
+# « reviens » tout court, sans le nom
+_REVIENS_PSY = re.compile(r"^(?:(?:non|bon|allez|mais|oh|he|hey|eh)\s+)*(?:reviens|revient|come back|re)"
+                          + _POLI + "$")
+# il se tait, et la seance est finie
+_TAIS_TOI_PSY = re.compile(
+    r"^(?:(?:non|bon|ben|mais|ok|okay|allez|c'est bon|ca va|oh|ah|bah|he|eh)\s+)*"
+    r"(?:arrete(?: ca| tout| la| maintenant)?|arrete arrete|stop(?: stop)*(?: it| that)?|on arrete(?: la| tout| ca)?|"
+    r"tais toi|taisez vous|chut|silence|ca suffit|assez|quitte|quitter|sors|sortir|sors de la|fin|"
+    r"quit|exit|enough|that's enough|be quiet|shut up|get me out(?: of here)?)"
+    r"(?:\s+(?:jarvis|merci|stp|s'il te plait|maintenant|la|please|now))*$")
+# « c'est pas ce que je voulais » : seulement juste apres une bascule que la
+# personne n'a pas demandee -- plus tard, c'est une phrase de seance
+_REJET_PSY = re.compile(r"^(?:non\s+)?(?:c'est pas|ce n'est pas|c'etait pas) (?:ce que je (?:voulais|veux|demandais)|"
+                        r"le psy)$|^(?:no\s+)?(?:that's not what i (?:wanted|asked for)|i didn't ask for (?:the )?"
+                        r"(?:therapy|therapist))$")
+_AMORCES_APPEL = frozenset("hey he eh ok okay dis euh bon non mais allez oh ah alors".split())
+_NOMS_PSY = ("travis", "trevis")          # comme la transcription ecrit parfois « Jarvis »
+
+
+def _nom_psy(m, noms=()):
+    return _est_le_nom(m, noms) or normaliser(m).replace("'", "").strip(" -") in _NOMS_PSY
+
+
+def appel_du_nom(brut, noms=()):
+    """Le nom dit COMME UN APPEL : en tete (apres « hey », « ok », « non »...),
+    en dernier mot apres une ponctuation (« reviens, Jarvis »), ou dans une
+    phrase de trois mots au plus. Pas « j'ai galere a allumer Jarvis ce matin »."""
+    brut = str(brut or "")
+    mots = [m for m in (normaliser(w).replace("'", "").strip(" -") for w in brut.replace("-", " ").split()) if m]
+    if not any(_nom_psy(m, noms) for m in mots):
+        return False
+    if len(mots) <= 3:
+        return True
+    i = 0
+    while i < len(mots) and mots[i] in _AMORCES_APPEL:
+        i += 1
+    if i < len(mots) and _nom_psy(mots[i], noms):
+        return True
+    return _nom_psy(mots[-1], noms) and bool(re.search(r"[,.;:!?…]\s*\S+\W*$", brut))
+
+
+def _canonique(brut, noms=()):
+    """La phrase normalisee, son nom (meme ecorche) ecrit « jarvis »."""
+    mots = normaliser(brut).replace("-", " ").split()
+    return " ".join("jarvis" if _nom_psy(m, noms) else m for m in mots).strip(" '")
+
+
+def sortie_du_psy(brut, noms=(), debut_de_seance=False):
+    """En mode psychologue, sur la transcription BRUTE (le nom y est encore) :
+    « retour » (au majordome, qui le dit), « stop » (il se tait, seance
+    finie), « appel » (le nom en tete, puis une demande : c'est pour le
+    majordome), ou None (pour le psychologue)."""
+    t = _canonique(brut, noms)
+    if not t or len(t.split()) > 12:
+        return None
+    reste = " ".join(m for m in t.split() if m not in ("jarvis", "hey", "he", "eh")).strip(" '")
+    if _VERS_JARVIS_BRUT.match(t) or changement_de_mode(t) == ("jarvis", ""):
+        return "retour"
+    if appel_du_nom(brut, noms) and (not reste or _RETOUR_PSY.match(reste)):
+        return "retour"
+    if _REVIENS_PSY.match(t):
+        return "retour"
+    if _TAIS_TOI_PSY.match(reste) or renvoi(t):
+        return "stop"
+    if debut_de_seance and _REJET_PSY.match(reste):
+        return "retour"
+    # « Jarvis, quelle heure est-il ? » : l'appeler, c'est revenir au
+    # majordome -- mais « Jarvis m'enerve », c'est au psychologue qu'on le dit
+    if (appel_du_nom(brut, noms) and retirer_mot_eveil(brut, noms, garder_avant=False)
+            and not est_une_mention(brut, noms)):
+        return "appel"
     return None
 
 
@@ -1257,8 +1641,10 @@ def _comprendre_en(t, mots):
             return {"action": "minuteurs_annuler"}
     if len(mots) > 12:
         return None
-    if re.match(r"^(?:stop listening|go to sleep|sleep mode|go to standby|mute yourself|"
-                r"turn off (?:the )?(?:microphone|mic))$", t):
+    if re.match(r"^(?:go to sleep|go back to sleep|sleep|sleep mode|go to standby|standby)$", t):
+        return {"action": "fin"}
+    if re.match(r"^(?:stop listening|mute yourself|turn (?:yourself )?off|deactivate yourself|"
+                r"turn off (?:the |your )?(?:microphone|mic))$", t):
         return {"action": "dormir"}
     if re.match(r"^(?:what time is it|what's the time|what is the time|tell me the time|do you have the time|"
                 r"time please|current time)\b", t):
@@ -1379,9 +1765,16 @@ def comprendre(texte, raccourcis=()):
     if len(mots) > 12:
         return None
 
-    if re.match(r"^(?:arrete|arreter|desactive|coupe|mets toi en veille|va dormir)\b.*"
-                r"\b(?:d'ecouter|ecouter|l'ecoute|le micro|jarvis)$", t) or \
-            t in ("va dormir", "mets toi en veille", "dors", "arrete d'ecouter"):
+    # « Va dormir », « mets-toi en veille » : la conversation est finie, il
+    # retourne attendre son nom (il s'eteignait pour de bon, et il fallait le
+    # rallumer dans Machi Tool). « Arrete d'ecouter », « coupe le micro »,
+    # « desactive-toi » : la, il n'ecoute plus du tout.
+    th = t.replace("-", " ")
+    if re.match(r"^(?:va (?:dormir|te coucher|te reposer)|dors|rendors toi|repose toi|mets toi en veille|"
+                r"retourne en veille|(?:en |mode )?veille)$", th):
+        return {"action": "fin"}
+    if re.match(r"^(?:arrete|arreter|desactive|coupe|eteins)\b.*\b(?:d'ecouter|ecouter|l'ecoute|le micro|ton micro)$", th) \
+            or th in ("desactive toi", "desactive", "eteins toi", "arrete toi d'ecouter"):
         return {"action": "dormir"}
 
     if re.match(r"^(?:quelle heure|il est quelle heure|l'heure|donne moi l'heure|t'as l'heure|tu as l'heure)", t):
@@ -2323,7 +2716,9 @@ def micro_windows(nom="", annoncer=None):
     if annoncer:
         annoncer(str(getattr(micro, "name", "")), trouve)
     ident = getattr(micro, "id", None)
-    with micro.recorder(samplerate=FREQ, channels=1, blocksize=TRAME) as r:
+    # un tampon de 640 ms : la verification du micro (toutes les 10 s) peut
+    # prendre plus que les 80 ms d'une trame sans couper ce qu'on dit
+    with micro.recorder(samplerate=FREQ, channels=1, blocksize=TRAME * 8) as r:
         vu, muet = time.monotonic(), None
         while True:
             b = r.record(numframes=TRAME)
@@ -2410,8 +2805,12 @@ class Oreille:
 
     def configurer(self, r):
         self.reglages.update({k: v for k, v in r.items() if k != "cmd"})
-        self.det.gabarits = [normer(g) for g in self.reglages.get("gabarits") or []
-                             if len(g) >= GABARIT_MIN]
+        manuels = [normer(g) for g in self.reglages.get("gabarits") or [] if len(g) >= GABARIT_MIN]
+        auto = [normer(g) for g in self.reglages.get("gabarits_auto") or [] if len(g) >= GABARIT_MIN]
+        self.det.gabarits = manuels + auto
+        # les facons apprises seul ne reveillent jamais directement (voir VERIF_REPLI_FACTEUR)
+        self.det.n_manuels = len(manuels) if "gabarits_auto" in self.reglages else None
+        self.det.verifier_tout = bool(self.reglages.get("verifier_tout", False))
         tolerant = self.reglages.get("tolerant", True)
         self.det.seuil, self.det.seuil_verifie = seuils_detection(
             self.reglages.get("sensibilite", 0.5), self.reglages.get("seuil_perso"), tolerant)
@@ -2425,11 +2824,16 @@ class Oreille:
         if cmd == "config":
             self.configurer(c)
         elif cmd == "ecouter":
-            # La suite d'une conversation : on ecoute sans mot d'eveil.
-            self.phrase = Phrase(self.det.parle, attente=float(c.get("attente", 5.0)),
-                                 ignorer=float(c.get("ignorer", 0.35)))
+            # La suite d'une conversation : on ecoute sans mot d'eveil. (Si on
+            # est deja en train de lui parler, on ne jette pas ce qui se dit.)
+            if self.etat == "phrase" and self.phrase is not None and self.phrase.parole:
+                return
+            self.phrase = self._nouvelle_phrase(attente=float(c.get("attente", 5.0)),
+                                                ignorer=float(c.get("ignorer", 0.35)),
+                                                duree_max=float(c.get("duree_max", PHRASE_MAX_S)))
             self.etat = "phrase"
             self.apres_coupure = False
+            self.doute = None             # un appel pas net en attente ne mange plus la suite
         elif cmd == "fausse_coupure":
             # La phrase d'apres la coupure etait vide de mots (Machi Tool l'a
             # transcrite) : c'etait de l'echo, qui s'apprend.
@@ -2440,8 +2844,13 @@ class Oreille:
             self.auto_attente = []
             self.doute = None
         elif cmd == "verifie":
-            # Machi Tool a transcrit l'appel pas net : c'etait « Jarvis », ou pas
-            self._verdict(bool(c.get("ok")))
+            # Machi Tool a transcrit l'appel pas net : c'etait « Jarvis », ou pas.
+            # Un verdict en retard, pour un AUTRE appel, ne compte pas.
+            n = c.get("n")
+            if n is not None and self.doute is not None and int(n) != int(self.doute["n"]):
+                return
+            ok = c.get("ok")
+            self._verdict(None if ok is None else bool(ok))
         elif cmd == "parole":
             # Jarvis commence ou finit de parler (le processus de la voix le dit)
             if c.get("actif") and self.reglages.get("couper", True) and self.loopback is not None:
@@ -2453,6 +2862,12 @@ class Oreille:
                 self.parole = True
             else:
                 self._arreter_parole()
+        elif cmd == "vad":
+            # le detecteur de voix vient d'arriver sur le disque : on le prend
+            # sans relancer l'oreille
+            if getattr(self.det, "vad", None) is None and getattr(self, "dossier", None):
+                self.det.vad = charger_vad(self.dossier)
+            self.sortie({"evt": "vad", "ok": self.det.vad is not None})
         elif cmd == "apprendre":
             # PAS DE BIP ICI : la fenetre du modele couvre 775 ms, un bip juste
             # avant le mot entrerait dans le gabarit -- et il n'y est jamais
@@ -2466,21 +2881,50 @@ class Oreille:
                      "par": par.replace("_a_verifier", ""), "direct": round(float(self.det.seuil), 4),
                      "verifie": round(float(self.det.seuil_verifie), 4)})
 
+    def _nouvelle_phrase(self, **kw):
+        kw.setdefault("duree_max", float(self.reglages.get("duree_max", PHRASE_MAX_S)))
+        return Phrase(self.det.parle_phrase, doux=self.det.parle_phrase_doux, **kw)
+
     def _verdict(self, ok):
         d, self.doute = self.doute, None
         if d is None:
             return
+        if ok is None:
+            # PERSONNE N'A PU LIRE (transcription pas prete, memoire, moteur froid
+            # trop long) : le score tranche -- tout pres du seuil, c'etait lui
+            ok = d["reveil"]["par"] == "voix" and d["reveil"]["score"] <= VERIF_REPLI_FACTEUR * self.det.seuil
+        fin = d.get("fin")
         if not ok:
-            if self.etat == "phrase":
+            # seulement SA phrase : pas celle d'un appel net arrive depuis
+            if self.etat == "phrase" and self.phrase is d.get("phrase"):
                 self.phrase, self.etat = None, "veille"
             self.auto_attente = []
             return
-        # c'etait bien lui : le carillon, maintenant, et le reveil
+        if fin is None and self.phrase is not d.get("phrase"):
+            return                        # sa phrase a ete remplacee entre-temps : trop tard
+        # C'ETAIT BIEN LUI. Deux cas, deux sons -- pour que tu saches ou il en est :
+        if fin is not None and fin[0].get("evt") != "phrase":
+            # la verification a pris plus que l'attente : on ecoute a nouveau
+            fin = None
+            self.phrase, self.etat = self._nouvelle_phrase(attente=5.0), "phrase"
+        reveil = dict(d["reveil"], verifie=True)
+        if fin is not None:
+            # tu as deja tout dit pendant qu'il verifiait : « capte », il s'en occupe
+            reveil["deja_fini"] = True
+            son = "capte"
+        else:
+            # « a vous » : le carillon, et une attente entiere a partir de lui
+            son = "eveil"
+            if self.phrase is not None and not self.phrase.parole:
+                self.phrase.attente = self.phrase.t + 5.0
+                self.phrase.ignorer = self.phrase.t + 0.3
+                self.phrase.precoce = 0
+                reveil["attente"] = 5.0
         if self.reglages.get("son", True):
-            self.jouer("eveil")
-        self.sortie(dict(d["reveil"], verifie=True))
-        if d.get("fin") is not None:
-            self._sortir_phrase(*d["fin"])
+            self.jouer(son)
+        self.sortie(reveil)
+        if fin is not None:
+            self._sortir_phrase(*fin)
 
     def _sortir_phrase(self, ev, a_garder):
         self.sortie(ev)
@@ -2519,7 +2963,22 @@ class Oreille:
     def trame(self, x):
         import numpy as np
         rms = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
-        ev = self.det.trame(x, chercher=(self.etat == "veille"))
+        # PENDANT QU'IL PARLE, SA PROPRE VOIX dit parfois « Jarvis » : quand la
+        # double transmission est prete, c'est elle qui l'interrompt (« Jarvis,
+        # stop » compris) -- le mot d'eveil ne cherche pas.
+        lui = (self.parole and self.coupure is not None and self.coupure.pret()
+               and self.reglages.get("couper", True))
+        # UN APPEL PAS NET EN COURS DE VERIFICATION : on continue de chercher. Un
+        # « JARVIS ! » net pendant qu'on verifie le premier le reveille tout de
+        # suite (la phrase en cours continue) ; sinon ce second appel etait avale.
+        en_doute = (self.doute is not None and self.etat == "phrase"
+                    and self.phrase is not None and self.phrase is self.doute.get("phrase"))
+        ev = self.det.trame(x, chercher=((self.etat == "veille" and not lui) or en_doute))
+        if ev is not None and en_doute:
+            if not ev[0].endswith("_a_verifier"):
+                self._signaler_essai(ev[1] if ev[0] == "voix" else None, "reveil", ev[0])
+                self._verdict(True)
+            ev = None
         for a in self.auto_attente + ([self.candidat] if self.candidat else []):
             self._prendre(a)
         # « IL SEMBLE AVOIR OUBLIE MON JARVIS » : quand le mot appris passe PRES
@@ -2544,8 +3003,8 @@ class Oreille:
                 self._presque_n = self.det.n
                 self.sortie({"evt": "presque", "distance": round(float(d), 4),
                              "seuil": round(float(self.det.seuil), 4)})
-        if self.doute is not None and self.det.n - self.doute["n"] > 90:
-            self._verdict(False)          # pas de reponse de Machi Tool : on laisse tomber
+        if self.doute is not None and self.det.n - self.doute["n"] > VERIF_ATTENTE_TRAMES:
+            self._verdict(None)           # pas de reponse de Machi Tool : le score tranche
         # L'INDICATEUR DE DETECTION : a chaque mot entendu, a quelle distance de
         # ton « Jarvis » il etait, et ce qui en est sorti -- des nombres, rien d'autre.
         if self.etat == "veille" and ev is None:
@@ -2565,23 +3024,30 @@ class Oreille:
                 self.jouer("eveil")
             self.auto_attente = self._facons_a_garder(ev)
             self.candidat = self.candidat_avant = None
-            avant = self.det.son_d_avant()
-            self.phrase = Phrase(self.det.parle, avant=avant[:-TRAME] if len(avant) > TRAME else None,
-                                 deja_dit=self.det.parlait_avant(),
-                                 fin_du_mot=self.det.queue_proche if ev[0] == "voix" else 0)
+            # Ce qui PRECEDE le nom : toute la demande quand on parlait avant
+            # (« tu peux mettre la musique de Daft Punk, Jarvis »), sinon juste
+            # le mot -- pas la tele ou la fin de sa reponse d'avant.
+            deja = self.det.parlait_avant()
+            avant = self.det.son_d_avant(None if deja else self.det.longueur_mot() + GABARIT_DEBUT + 8)
+            self.phrase = self._nouvelle_phrase(avant=avant[:-TRAME] if len(avant) > TRAME else None,
+                                                deja_dit=deja,
+                                                fin_du_mot=self.det.queue_proche if ev[0] == "voix" else 0)
             # La trame courante est dans « avant » : on ne la compte pas deux fois,
             # mais elle ne fait pas partie de la fenetre d'apres-carillon non plus.
             self.phrase.morceaux.append(np.asarray(x, dtype=np.int16))
             self.etat = "phrase"
             self.apres_coupure = False
-            reveil = {"evt": "reveil", "par": ev[0], "score": round(float(ev[1]), 4)}
+            reveil = {"evt": "reveil", "par": ev[0], "score": round(float(ev[1]), 4),
+                      "attente": PHRASE_DEJA_DITE_S if deja else self.phrase.attente}
             if doute:
                 # PAS NET : on ecoute en silence, et Machi Tool transcrit ces
                 # secondes-la (l'appel et ce qui l'entoure) pour trancher
-                self.doute = {"n": self.det.n, "reveil": reveil, "fin": None}
-                self.sortie({"evt": "verifier", "wav": base64.b64encode(wav_de(avant)).decode("ascii"),
-                             "par": ev[0], "score": reveil["score"]})
+                self.doute = {"n": self.det.n, "reveil": reveil, "fin": None, "phrase": self.phrase}
+                wav = wav_de(self.det.son_d_avant(VERIF_TRAMES))
+                self.sortie({"evt": "verifier", "wav": base64.b64encode(wav).decode("ascii"),
+                             "par": ev[0], "score": reveil["score"], "n": self.det.n})
             else:
+                self.doute = None             # un appel net remplace un appel pas net encore en cours
                 self.sortie(reveil)
             return
         if self.parole and self.etat == "veille" and self._coupe(x):
@@ -2592,7 +3058,7 @@ class Oreille:
             self._arreter_parole()
             self.sortie({"evt": "coupure"})
             avant = self.det.son_d_avant()
-            self.phrase = Phrase(self.det.parle, avant=avant[-int(0.6 * FREQ):], attente=1.5, ignorer=0.0)
+            self.phrase = self._nouvelle_phrase(avant=avant[-int(0.6 * FREQ):], attente=1.5, ignorer=0.0)
             self.etat = "phrase"
             self.apres_coupure = True
             return
@@ -2602,18 +3068,26 @@ class Oreille:
                 apres, self.apres_coupure = self.apres_coupure, False
                 ev = {"evt": "vide"}
                 if fin == "fini":
-                    ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii")}
-                elif apres and self.coupure is not None:
-                    self.coupure.fausse_coupure()      # personne n'a parle : c'etait de l'echo
+                    ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii"),
+                          "deja_dit": bool(self.phrase.deja_dit)}
+                elif apres:
+                    # « STOP » DIT PAR-DESSUS SA VOIX : le mot est souvent deja fini
+                    # quand la coupure se decide, et il ne restait que du silence.
+                    # On le transcrit quand meme ; Machi Tool n'y lit qu'un conge --
+                    # sinon, c'etait de l'echo : il le dit a l'oreille, et reprend.
+                    ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii"),
+                          "breve": True}
                 # on lui a vraiment parle : ces facons de l'appeler etaient bien des appels
                 a_garder, self.auto_attente = (self.auto_attente if fin == "fini" else []), []
-                if self.doute is not None:
+                if self.doute is not None and self.doute.get("phrase") is self.phrase:
                     # la phrase est finie avant le verdict : elle l'attend
                     self.doute["fin"] = (ev, a_garder)
                     self.phrase, self.etat = None, "veille"
                     return
                 if apres:
                     ev["apres_coupure"] = True
+                elif fin == "fini" and self.reglages.get("son", True):
+                    self.jouer("capte")        # je t'ai entendu : je n'ecoute plus, je m'en occupe
                 self.phrase, self.etat = None, "veille"
                 self._sortir_phrase(ev, a_garder)
         elif self.etat == "apprendre" and self.appris is not None:
@@ -2645,13 +3119,15 @@ class Oreille:
         # « FAIRE REAGIR LE LISTENING A LA VOIX » : pendant qu'il t'ecoute (apres
         # l'eveil seulement), le niveau de ta voix, a chaque trame -- un nombre.
         if self.etat == "phrase" and self.phrase is not None:
-            self.sortie({"evt": "voix_niveau", "v": niveau_voix(rms, self.det.plancher)})
+            self.sortie({"evt": "voix_niveau", "v": niveau_voix(rms, self.det.plancher),
+                         "p": bool(self.phrase.parole)})
         # Un niveau par seconde : le panneau montre que le micro vit.
         now = time.time()
         if now - self.niveau_vu >= 1.0:
             self.niveau_vu = now
             db = 20 * math.log10(max(rms, 1.0) / 32768.0)
-            self.sortie({"evt": "niveau", "db": round(db, 1), "etat": self.etat, "coupure": self.etat_coupure()})
+            self.sortie({"evt": "niveau", "db": round(db, 1), "etat": self.etat, "coupure": self.etat_coupure(),
+                         "vad": self.det.vad is not None})
 
 
 def niveau_voix(rms, plancher):
@@ -2705,6 +3181,11 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
     except Exception as e:
         sortie({"evt": "erreur", "message": "modeles illisibles : %s" % str(e)[:160]})
         return
+    # la voix humaine (Silero VAD), si le modele est la ; sinon, le volume
+    oreille.dossier = dossier
+    if getattr(oreille, "det", None) is not None:
+        oreille.det.vad = charger_vad(dossier)
+    avec_vad = lambda: getattr(getattr(oreille, "det", None), "vad", None) is not None
     # Le micro voulu : celui des reglages (Machi Tool l'envoie avec le reste),
     # ou celui de Windows. Le premier `config` arrive juste apres la poignee de
     # main : on l'attend un instant pour ne pas ouvrir le mauvais micro d'abord.
@@ -2721,9 +3202,10 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
             nom = micro_voulu()
             if source:
                 flux = source()
-                sortie({"evt": "pret"})
+                sortie({"evt": "pret", "vad": avec_vad()})
             else:
-                flux = micro_windows(nom, lambda n, ok: sortie({"evt": "pret", "micro": n, "trouve": ok}))
+                flux = micro_windows(nom, lambda n, ok: sortie({"evt": "pret", "micro": n, "trouve": ok,
+                                                                "vad": avec_vad()}))
             for x in flux:
                 while True:
                     try:
@@ -4258,9 +4740,10 @@ def attente_suite(reponse, echanges=1, mode="jarvis"):
 # reponse lui convient, la conversation est finie. Seulement quand il n'a
 # pas pose de question : « Je le lance ? » -- « ok », c'est un oui.
 _ACQUIT = re.compile(
-    r"^(?:(?:ah|oh|bon|ben|bah|alors|jarvis|well|oh|ah)\s+)*"
+    r"^(?:(?:ah|oh|bon|ben|bah|alors|jarvis|well|ok|okay|merci|thanks)\s+)*"
     r"(?:ok|okay|ok ok|d'accord|dac|entendu|compris|ca marche|parfait|super|top|nickel|genial|cool|"
     r"impec|impeccable|tres bien|c'est parfait|c'est note|note|bien recu|merci beaucoup|merci bien|"
+    r"c'est gentil|je te remercie|je vous remercie|thanks|thank you|thanks a lot|many thanks|"
     r"great|perfect|got it|awesome|nice|cool|alright|all right|sounds good|cheers|noted|brilliant|"
     r"understood|lovely|fine|good|very good|excellent)"
     r"(?:\s+(?:merci|merci beaucoup|merci jarvis|jarvis|thanks|thank you|thanks jarvis|c'est tout|"
@@ -4751,6 +5234,13 @@ def routines_declenchees(routines, genre, valeur, maintenant=None):
     return out
 
 
+def phrase_de_routine(texte, routine):
+    """La phrase n'est-elle (presque) QUE le declencheur de la routine ? Alors
+    sa replique suffit ; sinon c'est une demande, qui suit son chemin."""
+    motif = normaliser((routine.get("declencheur") or {}).get("valeur", "")).replace("-", " ").split()
+    return len(normaliser(texte).replace("-", " ").split()) <= len(motif) + 3
+
+
 def peut_jouer(routine, derniere_fois, maintenant, alea):
     """Un running gag reste drole : pas plus souvent que `pause_min`, et
     seulement une fois sur 1/`chance`."""
@@ -5079,19 +5569,63 @@ def _fois(c, f):
     return (c[0] * f, c[1] * f, c[2] * f)
 
 
-def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None):
+def etat_panneau(etat, maintenant, fait_jusqua=0.0, erreur_jusqua=0.0):
+    """Ce que le panneau montre : l'etat de la conversation (il ecoute, il a
+    recu, il reflechit, il parle), une erreur ou une commande faite le temps
+    de les lire -- sinon None, et il s'efface. (Il montrait « DONE » chaque
+    fois qu'il s'effacait, et une erreur de fond restait a l'ecran.)"""
+    if etat in BOULE_ETATS:
+        return etat
+    if maintenant < float(erreur_jusqua or 0):
+        return "erreur"
+    if maintenant < float(fait_jusqua or 0):
+        return "fait"
+    return None
+
+
+# ce que le panneau ecrit, dans la langue de Jarvis
+MOTS_PANNEAU = {"fr": {"ecoute": "A VOUS", "comprend": "RECU", "pense": "REFLEXION", "parle": "REPONSE",
+                       "erreur": "ERREUR", "fait": "FAIT"},
+                "en": {"ecoute": "LISTENING", "comprend": "GOT IT", "pense": "THINKING", "parle": "SPEAKING",
+                       "erreur": "ERROR", "fait": "DONE"}}
+
+
+def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None, langue="en", reste=None,
+                 entendu="", croix=True):
     """L'image 64 x 64 (uint8) du panneau pour cet etat, au temps t (s).
-    ecoute / comprend : LISTENING, l'anneau qui respire ; pense : THINKING,
-    l'arc qui tourne ; parle : les barres, et la reponse qui defile ; fait :
-    DONE ; erreur : ERROR. En mode psychologue, le cyan devient bleu."""
+
+    ecoute : A VOUS, l'anneau qui respire avec ta voix, et sous le mot le
+    temps qu'il t'attend encore (`reste`, de 1 a 0) ; comprend : RECU,
+    l'anneau immobile et trois points -- il n'ecoute plus, il lit ce que tu
+    as dit ; pense : l'arc qui tourne, et ce qu'il a entendu (`entendu`) ;
+    parle : les barres, et sa reponse qui s'ecrit ; fait / erreur : un
+    instant. Un autre etat : rien. En mode psychologue, le cyan devient bleu.
+    La petite croix, en haut a droite : un clic sur le panneau le congedie."""
     import numpy as np
     C = LED_COULEURS
     m = Matrice()
+    if etat not in BOULE_ETATS and etat not in ("fait", "erreur"):
+        return np.zeros((LED_N, LED_N, 3), dtype=np.uint8)
+    mots = MOTS_PANNEAU["fr" if langue == "fr" else "en"]
     cyan = (90, 150, 255) if mode == "psy" else C["cyan"]
-    if etat in ("ecoute", "comprend"):
+    if croix:
+        gris = _fois(C["gris"], 0.55)
+        for k in range(4):
+            m.set(58 + k, 2 + k, gris)
+            m.set(61 - k, 2 + k, gris)
+    entendu = texte_led(entendu)
+    if etat == "comprend":
+        # IL N'ECOUTE PLUS : l'anneau s'arrete, trois points vont et viennent
+        c = cyan
+        m.anneau(32, 26, 14, _fois(c, 0.45), 1.4)
+        for k in range(3):
+            h = max(0.0, math.sin(t * 7 - k * 0.9))
+            m.disque(25 + 7 * k, 26 - 2 * h, 1.6, _fois(c, 0.45 + 0.55 * h))
+        mot = mots["comprend"]
+    elif etat == "ecoute":
         c = cyan
         if niveau is None:
-            m.anneau(32, 26, 14 + math.sin(t * (6 if etat == "comprend" else 3)) * 2, c, 1.4)
+            m.anneau(32, 26, 14 + math.sin(t * 3) * 2, c, 1.4)
             m.disque(32, 26, 3, _fois(c, 0.7))
         else:
             # IL T'ENTEND : l'anneau enfle avec ta voix, des rayons en jaillissent,
@@ -5110,16 +5644,30 @@ def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None)
                             m.set(32 + math.cos(a) * d, y, _fois(c, 0.9 - 0.5 * (d - r - 2) / max(1.0, long_)))
                         d += 0.5
             m.disque(32, 26, 2.5 + 3 * n, _fois(c, 0.5 + 0.4 * n))
-        mot = "LISTENING"
+        mot = mots["ecoute"]
+        if reste is not None:
+            # LE TEMPS QU'IL T'ATTEND ENCORE : une ligne qui se vide
+            r = max(0.0, min(1.0, float(reste)))
+            w = int(round(48 * r))
+            m.bloc(8, 60, 48, 1, _fois(c, 0.18))
+            if w:
+                m.bloc(8, 60, w, 1, _fois(c, 0.8))
     elif etat == "pense":
         c = C["violet"]
+        cy, rayon = (13, 9) if entendu else (26, 14)
         a = 0.0
         while a < math.pi * 1.1:
             aa = t * 4 + a
-            m.set(32 + math.cos(aa) * 14, 26 + math.sin(aa) * 14, _fois(c, 0.25 + 0.75 * a / (math.pi * 1.1)))
+            m.set(32 + math.cos(aa) * rayon, cy + math.sin(aa) * rayon, _fois(c, 0.25 + 0.75 * a / (math.pi * 1.1)))
             a += 0.04
-        m.disque(32, 26, 2, _fois(c, 0.5))
-        mot = "THINKING"
+        m.disque(32, cy, 2, _fois(c, 0.5))
+        if entendu:
+            # CE QU'IL A ENTENDU, pendant qu'il y reflechit : s'il a mal
+            # compris, ca se voit tout de suite
+            for k, ligne in enumerate(lignes_led(entendu, LED_N)[-4:]):
+                m.texte(ligne, (LED_N - largeur_led(ligne)) // 2, 27 + k * 9, _fois(C["blanc"], 0.62))
+            return np.clip(m.px, 0, 255).astype(np.uint8)
+        mot = mots["pense"]
     elif etat == "parle" and sous_titre:
         # « le texte ecrit en meme temps que Jarvis l'enonce, comme un
         # sous-titre, dans la case du panneau uniquement » : les barres
@@ -5139,17 +5687,24 @@ def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None)
         for i in range(12):
             h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * haut)
             m.bloc(9 + i * 4, 26 - h, 2, 2 * h + 1, c)
-        mot = "SPEAKING"
+        mot = mots["parle"]
     elif etat == "erreur":
         c = C["rouge"]
         m.trait(22, 16, 42, 36, c, 3)
         m.trait(42, 16, 22, 36, c, 3)
-        mot = "ERROR"
+        mot = mots["erreur"]
     else:
         c = C["vert"]
+        if entendu:
+            # la commande faite, et ce qu'il avait compris
+            m.trait(25, 12, 29, 16, c, 2)
+            m.trait(29, 16, 38, 7, c, 2)
+            for k, ligne in enumerate(lignes_led(entendu, LED_N)[-4:]):
+                m.texte(ligne, (LED_N - largeur_led(ligne)) // 2, 24 + k * 9, _fois(C["blanc"], 0.62))
+            return np.clip(m.px, 0, 255).astype(np.uint8)
         m.trait(21, 26, 28, 33, c, 3)
         m.trait(28, 33, 43, 18, c, 3)
-        mot = "DONE"
+        mot = mots["fait"]
     # Quand il parle et qu'on a son texte, c'est la branche du sous-titre, plus haut.
     m.texte(mot, (LED_N - largeur_led(mot)) // 2, 50, _fois(c, 0.85))
     return np.clip(m.px, 0, 255).astype(np.uint8)
