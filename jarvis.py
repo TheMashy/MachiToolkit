@@ -679,10 +679,13 @@ def choisir_gabarits(essais, n_normaux):
 
 PHRASE_DEJA_DITE_S = 2.0      # le nom a la fin de la demande : on attend ca, puis c'est fini
 # « IL GALERE A COMPRENDRE QUAND JE PARLE. » Une pause pour chercher ses mots
-# (« mets la musique de... Daft Punk ») fermait la phrase a 0,9 s : on laisse
-# 1,2 s tant qu'on vient de commencer, 0,9 s ensuite.
-PHRASE_PAUSE_DEBUT_S = 1.2
-PHRASE_PAUSE_S = 0.9
+# (« mets la musique de... Daft Punk ») fermait la phrase a 0,9 s. Puis « REND-
+# LE PLUS FLUIDE » : il attendait trop a la fin de chaque phrase. La pause est
+# plus courte (1 s tant qu'on vient de commencer, 0,75 s ensuite), et une
+# phrase restee EN SUSPENS (« mets la musique de ») ne part pas : il attend la
+# suite (voir `phrase_suspendue`).
+PHRASE_PAUSE_DEBUT_S = 1.0
+PHRASE_PAUSE_S = 0.75
 PHRASE_DEBUT_S = 2.0          # « on vient de commencer » : moins de 2 s de parole
 PHRASE_MAX_S = 30.0           # une demande ; le mode psychologue en laisse plus (voir PHRASE_PSY_MAX_S)
 PHRASE_PSY_MAX_S = 60.0
@@ -4723,6 +4726,47 @@ def cible_boule(etat, mode, regard, zone, maintenant, fx=0.97, fy=0.90, taille=4
 SUITE_BASE_S = 4.0
 SUITE_MAX_S = 10.0
 SUITE_PSY_S = 10.0
+
+
+# LA PHRASE EN SUSPENS : elle finit sur un mot qui en annonce d'autres. Pas
+# « un », « une », « qui » (« j'en prends une », « c'est qui ») ; pas un
+# pronom accroche au verbe (« mets-la », « fais-le »).
+_SUSPENS_FR = frozenset("""de du des d' le la les l' et ou mais pour avec à au aux sur dans par
+    chez vers sans sous entre que qu' parce puisque comme si euh heu hum bah ben""".split())
+_SUSPENS_EN = frozenset("""the a an and or but to of for with in on at by from into about my your
+    his her their some because that um uh er erm""".split())
+SUSPENS_ECOUTE_S = 3.0        # le temps de reprendre sa phrase
+SUSPENS_MAX = 2               # deux reprises au plus, puis elle part telle quelle
+
+
+def phrase_suspendue(texte, langue="fr"):
+    """« Mets la musique de... » : la phrase n'est pas finie."""
+    t = str(texte or "").strip().lower()
+    if t.endswith("?"):
+        return False                              # une question est finie
+    t = t.rstrip(" .,;:!\u2026")
+    if not t:
+        return False
+    mots = t.replace("\u2019", "'").split()
+    dernier = mots[-1]
+    if "-" in dernier:
+        return False                              # « mets-la », « donne-le »
+    if dernier.endswith("'"):
+        return True                               # « l' », « d' », « qu' »
+    return dernier in _SUSPENS_FR or (langue == "en" and dernier in _SUSPENS_EN)
+
+
+def reste_a_dire(reponse, deja):
+    """Ce qui reste a dire d'une reponse dont la premiere phrase (`deja`) est
+    dite en avance. Si elle ne commence pas par elle (ce qui ne devrait pas
+    arriver), toute la reponse : mieux vaut une phrase redite qu'une perdue."""
+    tout = " ".join(str(reponse or "").split())
+    debut = " ".join(str(deja or "").split())
+    if not debut:
+        return tout
+    if tout.startswith(debut):
+        return tout[len(debut):].strip()
+    return tout
 
 
 def attente_suite(reponse, echanges=1, mode="jarvis"):

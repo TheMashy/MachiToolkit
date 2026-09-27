@@ -1264,14 +1264,15 @@ class FinDePhrase(unittest.TestCase):
 
     def test_une_phrase_normale(self):
         # « il galere a comprendre quand je parle » : on vient de commencer, une
-        # pause pour chercher ses mots est permise (1,2 s)
+        # pause pour chercher ses mots est permise (1 s) ; « plus fluide » : il
+        # n'attend plus 1,2 s a la fin de chaque phrase
         fin, t = self.jouer("......" + "p" * 15 + "." * 30)
         self.assertEqual(fin, "fini")
-        self.assertAlmostEqual(t, (6 + 15 + 15) * 0.08, delta=0.09)
-        # passe deux secondes de parole : 0,9 s suffit
+        self.assertAlmostEqual(t, (6 + 15 + 13) * 0.08, delta=0.09)
+        # passe deux secondes de parole : 0,75 s suffit
         fin, t = self.jouer("......" + "p" * 30 + "." * 30)
         self.assertEqual(fin, "fini")
-        self.assertAlmostEqual(t, (6 + 30 + 12) * 0.08, delta=0.09)
+        self.assertAlmostEqual(t, (6 + 30 + 10) * 0.08, delta=0.09)
 
     def test_une_pause_pour_chercher_ses_mots(self):
         # « mets la musique de... Daft Punk » : 0,9 s de pause au debut
@@ -1965,7 +1966,7 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False)
+                        transcription_absente_dite=False, suspens=None)
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -2235,7 +2236,7 @@ class DansMachiTool(unittest.TestCase):
         envois, sondes = [], [{"etat": "en_cours"}, {}, {"etat": "fini", "resume": "La 5070.",
                                                         "texte": "## Comparatif\nDetail."}]
 
-        def bd(chemin, charge, cfg, delai):
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
             envois.append((chemin, charge))
             if charge is not None:
                 return {"id": "T1", "etat": "en_cours"}
@@ -2378,7 +2379,7 @@ class DansMachiTool(unittest.TestCase):
         envoyes = []
         file_ = list(reponses)
 
-        def bd(chemin, charge, cfg, delai):
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
             envoyes.append(json.loads(json.dumps(charge)))
             return file_.pop(0)
         maison = tempfile.mkdtemp(dir=self.tmp)
@@ -2624,12 +2625,20 @@ class DansMachiTool(unittest.TestCase):
         m.CFG["jarvis_langue"] = "fr"
         vus = self.espions()
         m.JARVIS["historique"] = [{"role": "user", "texte": "a"}, {"role": "assistant", "texte": "b"}] * 3
-        # « je galere a comprendre quand il m'ecoute » : apres une simple
-        # reponse, il n'ecoute plus (la tele devenait une demande) ...
+        # « rend-le plus fluide » : devoir redire « Jarvis » a chaque phrase --
+        # il ecoute la suite apres chaque reponse, compte a rebours au panneau
+        m.dire("Voila ce que j'en pense.", suite=True)
+        self.assertEqual([o for o in ordres if o.get("cmd") == "ecouter"][-1]["attente"], 6.0)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        self.assertGreater(m.JARVIS["ecoute_fin"], time.time())
+        m.traiter_evenement({"evt": "vide"})
+        # ... ou, si on le prefere, seulement apres une question
+        m.CFG["jarvis_suite_questions"] = True
+        self.addCleanup(lambda: m.CFG.pop("jarvis_suite_questions", None))
+        del ordres[:]
         m.dire("Voila ce que j'en pense.", suite=True)
         self.assertEqual([o for o in ordres if o.get("cmd") == "ecouter"], [])
         self.assertEqual(m.JARVIS["etat"], "attente")
-        # ... seulement s'il vient de poser une question
         m.dire("Voila ce que j'en pense. On essaie ?", suite=True)
         attente = [o for o in ordres if o.get("cmd") == "ecouter"][-1]["attente"]
         self.assertEqual(attente, 10.0, "une question, trois echanges : il ecoute un peu plus longtemps")
@@ -2657,7 +2666,7 @@ class DansMachiTool(unittest.TestCase):
         m._en_fond = lambda f: f()
         envoyes, reponses = [], []
 
-        def bd(chemin, charge, cfg, delai):
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
             envoyes.append(json.loads(json.dumps(charge)))
             return reponses.pop(0)
         m._requete_bd = bd
@@ -2961,7 +2970,7 @@ class DansMachiTool(unittest.TestCase):
         m.CFG["jarvis_langue"] = "fr"
         corps = {}
 
-        def refus(chemin, charge, cfg, delai):
+        def refus(chemin, charge, cfg, delai, sur_debut=None):
             raise urllib.error.HTTPError(chemin, 502, "Bad Gateway", {}, io.BytesIO(json.dumps(corps).encode()))
         m._requete_bd = refus
         corps.update(error="401 authentication_error: invalid x-api-key", raison="cle")
@@ -3047,7 +3056,7 @@ class DansMachiTool(unittest.TestCase):
         vu = {}
         vrai = m._requete_bd
         self.addCleanup(lambda: setattr(m, "_requete_bd", vrai))
-        m._requete_bd = lambda chemin, charge, cfg, delai: vu.update(chemin=chemin, charge=charge) or {"rendezVous": []}
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: vu.update(chemin=chemin, charge=charge) or {"rendezVous": []}
         m.lire_agenda(m.CFG)
         self.assertRegex(vu["chemin"], r"^/api/machitool/agenda\?depuis=\d{4}-\d{2}-\d{2}&jours=14$")
         self.assertIsNone(vu["charge"], "une lecture : GET, sans corps")
@@ -3459,7 +3468,7 @@ class DansMachiTool(unittest.TestCase):
         m = self.m
         pret, lache = threading.Event(), threading.Event()
 
-        def bd(chemin, charge, cfg, delai):
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
             pret.set()
             lache.wait(5)
             return {"texte": "Une reponse d'avant.", "mode": "jarvis"}
@@ -3631,6 +3640,198 @@ class DansMachiTool(unittest.TestCase):
         m.VOIX.fini(premier, True, "Still the first one.")
         m.traiter_evenement({"evt": "vide", "apres_coupure": True})
         self.assertEqual(voix[-1]["texte"], "Still the first one.")
+
+    # ---------------- « REND JARVIS PLUS FLUIDE » ----------------
+
+    def _voix_et_bd(self, bd):
+        """Sa voix neuronale, l'oreille vivante, et BrainDebugger remplace par `bd`."""
+        m = self.m
+        voix, oreille = [], []
+        vrais = (m._requete_bd, m.oreille_vivante)
+        self.addCleanup(lambda: (setattr(m, "_requete_bd", vrais[0]), setattr(m, "oreille_vivante", vrais[1])))
+        m.envoyer_voix = lambda o: voix.append(o) or True
+        m.envoyer_oreille = lambda o: oreille.append(o) or True
+        m.voix_prete = lambda cle=None: True
+        m.oreille_vivante = lambda: True
+        m.prechauffer_dictee = lambda: None
+        m.VOIX = m.Voix()
+        m.CFG.update(jarvis_voix=True, jarvis_langue="fr")
+        m._requete_bd = bd
+        dits = lambda: [v for v in voix if v.get("cmd") == "dire"]
+        ecoutes = lambda: [o for o in oreille if o.get("cmd") == "ecouter"]
+        return dits, ecoutes
+
+    def test_il_parle_des_sa_premiere_phrase(self):
+        # « Il met du temps a repondre » : la premiere phrase sonne pendant que
+        # le modele ecrit la suite ; la reponse entiere ne la redit pas.
+        m = self.m
+        pendant = []
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            self.assertTrue(charge.get("flux") is None and sur_debut is not None)
+            sur_debut("Il pleut à Paris.")
+            pendant.append(len(dits()))
+            return {"texte": "Il pleut à Paris. Prenez un parapluie, il y en a pour la journée.", "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, quel temps fait-il à Paris ?")
+        self.assertEqual(pendant, [1], "elle sonnait avant que la reponse entiere arrive")
+        premier, suite = dits()
+        self.assertIn("Il pleut", premier["texte"])
+        self.assertNotIn("Il pleut", suite["texte"], "pas redite")
+        self.assertIn("parapluie", suite["texte"])
+        self.assertEqual(m.JARVIS["historique"][-1]["texte"],
+                         "Il pleut à Paris. Prenez un parapluie, il y en a pour la journée.")
+        # l'ecoute d'apres attend la FIN de la reponse, pas la fin de la premiere phrase
+        m.VOIX.fini(premier["id"], False)
+        self.assertEqual(ecoutes(), [])
+        self.assertEqual(m.JARVIS["etat"], "parle")
+        m.VOIX.fini(suite["id"], False)
+        self.assertEqual(len(ecoutes()), 1, "puis il ecoute la suite, sans qu'on redise son nom")
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+
+    def test_la_premiere_phrase_dite_avant_que_la_suite_arrive(self):
+        m = self.m
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Je regarde cela.")
+            m.VOIX.fini(dits()[0]["id"], False)          # dite, et la suite n'est pas la
+            etats.append(m.JARVIS["etat"])
+            return {"texte": "Je regarde cela.Grand soleil demain.", "mode": "jarvis"}
+        etats = []
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, quel temps fera-t-il demain ?")
+        self.assertEqual(etats, ["pense"], "entre les deux, il reflechit (il ne parle plus)")
+        self.assertEqual(len(dits()), 2)
+        self.assertIn("Grand soleil", dits()[1]["texte"])
+        m.VOIX.fini(dits()[1]["id"], False)
+        self.assertEqual(len(ecoutes()), 1)
+
+    def test_rien_apres_la_premiere_phrase(self):
+        m = self.m
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("C'est entendu.")
+            return {"texte": "C'est entendu.", "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, souviens-toi de ça pour plus tard.")
+        self.assertEqual(len(dits()), 1, "rien a ajouter : une seule phrase")
+        self.assertEqual(ecoutes(), [], "il parle encore")
+        m.VOIX.fini(dits()[0]["id"], False)
+        self.assertEqual(len(ecoutes()), 1, "l'ecoute part quand elle est dite")
+
+    def test_un_vieux_braindebugger_sans_avance(self):
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            return {"texte": "Il pleut. Prenez un parapluie.", "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, quel temps fait-il ?")
+        self.assertEqual(len(dits()), 1)
+        self.assertIn("parapluie", dits()[0]["texte"])
+
+    def test_coupe_pendant_une_reponse_en_deux_temps(self):
+        # on lui coupe la parole pendant sa premiere phrase, pour rien : il
+        # reprend, et la suite de SA reponse avec
+        m = self.m
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Il pleut à Paris.")
+            return {"texte": "Il pleut à Paris. Prenez un parapluie.", "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, quel temps fait-il à Paris ?")
+        premier = dits()[0]["id"]
+        m.traiter_evenement({"evt": "coupure"})
+        self.assertIn("parapluie", m.VOIX.reprise["texte"])
+        m.VOIX.fini(premier, True, "Il pleut à Paris.")
+        m.traiter_evenement({"evt": "vide", "apres_coupure": True})
+        self.assertIn("Il pleut", dits()[-1]["texte"])
+        self.assertIn("parapluie", dits()[-1]["texte"])
+        m.VOIX.fini(dits()[-1]["id"], False)
+        self.assertEqual(m.JARVIS["etat"], "ecoute", "et il ecoute la suite, comme prevu")
+
+    def test_la_reponse_en_flux(self):
+        # BrainDebugger en flux : l'avance, puis la reponse entiere ; ou l'erreur
+        m = self.m
+
+        class Reponse:
+            def __init__(self, lignes, type_="application/x-ndjson; charset=utf-8"):
+                self.lignes, self.headers = lignes, {"Content-Type": type_}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return iter(self.lignes)
+
+            def read(self):
+                return b"".join(self.lignes)
+        vraie = urllib.request.urlopen
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", vraie))
+        envoyes, avance = [], []
+        rep = {}
+        urllib.request.urlopen = lambda req, **k: envoyes.append(json.loads(req.data)) or rep["r"]
+        rep["r"] = Reponse([b'{"debut": "Bonsoir."}\n', b"\n", b'{"fin": {"texte": "Bonsoir. Tout va bien."}}\n'])
+        r = m._requete_bd("/api/machitool/jarvis", {"texte": "salut"}, m.CFG, 5, sur_debut=avance.append)
+        self.assertEqual(r, {"texte": "Bonsoir. Tout va bien."})
+        self.assertEqual(avance, ["Bonsoir."])
+        self.assertIs(envoyes[-1]["flux"], True, "il demande le flux")
+        rep["r"] = Reponse([b'{"texte": "Bonsoir."}'], "application/json; charset=utf-8")
+        self.assertEqual(m._requete_bd("/x", {"texte": "salut"}, m.CFG, 5, sur_debut=avance.append),
+                         {"texte": "Bonsoir."}, "un BrainDebugger d'avant : du JSON tout court")
+        m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+        self.assertNotIn("flux", envoyes[-1], "sans avance demandee, pas de flux")
+        rep["r"] = Reponse([b'{"erreur": {"error": "cle refusee", "raison": "cle"}, "statut": 502}\n'])
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            m._requete_bd("/x", {"texte": "salut"}, m.CFG, 5, sur_debut=avance.append)
+        self.assertEqual(e.exception.code, 502)
+        self.assertEqual(m._corps_http(e.exception)["raison"], "cle")
+        rep["r"] = Reponse([b'{"debut": "Bonsoir."}\n'])
+        with self.assertRaises(ConnectionError):
+            m._requete_bd("/x", {"texte": "salut"}, m.CFG, 5, sur_debut=avance.append)
+
+    def test_une_phrase_en_suspens_attend_la_suite(self):
+        # « mets la musique de... » : il ne repond pas a la moitie
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Bien.", "mode": "jarvis"})
+        vus = self.espions()
+        self.phrase("Jarvis, raconte-moi l'histoire de")
+        self.assertEqual(vus["jarvis"], [], "rien n'est parti")
+        self.assertEqual(ecoutes()[-1]["attente"], J.SUSPENS_ECOUTE_S)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        self.assertTrue(m.JARVIS["entendu"].startswith("raconte-moi l'histoire de"), m.JARVIS["entendu"])
+        m.transcrire = lambda octets: "la tour Eiffel."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus["jarvis"], ["raconte-moi l'histoire de la tour Eiffel."])
+
+    def test_une_phrase_en_suspens_puis_rien(self):
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Bien.", "mode": "jarvis"})
+        vus = self.espions()
+        del m._JARVIS_TRAVAIL[:]
+        self.phrase("Jarvis, explique-moi la différence entre")
+        self.assertEqual(vus["jarvis"], [])
+        m.traiter_evenement({"evt": "vide"})
+        item = m._JARVIS_TRAVAIL.pop()
+        m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+        self.assertEqual(vus["jarvis"], ["explique-moi la différence entre"], "elle part telle quelle")
+        # deux reprises au plus
+        self.phrase("Jarvis, parle-moi de")
+        for bout in ("la ville de", "Paris et"):
+            m.transcrire = lambda octets, b=bout: b
+            m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus["jarvis"][-1], "parle-moi de la ville de Paris et")
+
+    def test_ce_qui_n_est_pas_en_suspens(self):
+        for t in ("Mets-la.", "Allume la lumière du salon.", "C'est qui ?", "J'en prends une.", "Il y en a.",
+                  "Tu peux me dire de quoi ?"):
+            self.assertFalse(J.phrase_suspendue(t), t)
+        for t in ("Mets la musique de", "je pense que...", "C'est l'", "euh"):
+            self.assertTrue(J.phrase_suspendue(t), t)
+        self.assertTrue(J.phrase_suspendue("Play some music by the", "en"))
+        self.assertFalse(J.phrase_suspendue("il a", "fr"))
+        self.assertEqual(J.reste_a_dire("Il pleut.  Prenez un   parapluie.", "Il pleut."), "Prenez un parapluie.")
+        self.assertEqual(J.reste_a_dire("Autre chose.", "Il pleut."), "Autre chose.", "jamais une phrase perdue")
 
     def test_coupe_par_un_bruit_sans_mots_il_reprend_aussi(self):
         """La phrase d'apres la coupure n'avait pas de mots (le micro a entendu
