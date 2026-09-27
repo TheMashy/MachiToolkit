@@ -157,6 +157,28 @@ class AL_Ecran(unittest.TestCase):
         finally:
             p.root.destroy()
 
+    def test_la_boule_s_affiche_sans_planter(self):
+        """Sa boule a l'ecran : une couleur mal passee la faisait planter a
+        chaque image, et elle n'est jamais apparue."""
+        p = self.p
+        vieux = {k: M.CFG.get(k) for k in ("jarvis_actif", "jarvis_boule", "jarvis_panneau")}
+        etat = M.JARVIS.get("etat")
+        try:
+            M.CFG.update(jarvis_actif=True, jarvis_boule=True, jarvis_panneau=False)
+            for e in ("ecoute", "parle"):
+                M.JARVIS["etat"] = e
+                self.assertEqual(p._boule_tic(), 40, e)
+                p.root.update()
+                self.assertEqual(p.boule.state(), "normal", e)
+                self.assertGreaterEqual(len(p.boule_toile.find_all()), 4)
+            M.JARVIS["etat"] = "attente"
+            for _ in range(12):
+                p._boule_tic()
+            self.assertEqual(p.boule.state(), "withdrawn", "elle s'efface quand il se tait")
+        finally:
+            M.CFG.update(vieux)
+            M.JARVIS["etat"] = etat
+
     def test_une_icone_par_page_et_l_etoile_de_la_page_ouverte(self):
         p = self.p
         self.assertEqual(set(p.onglets), {cle for cle, _, _, _ in M.MENU})

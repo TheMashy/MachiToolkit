@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.64.0"
+VERSION = "1.64.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11057,9 +11057,9 @@ class Panneau:
         souffle = 0.5 + 0.5 * math.sin(st["phase"])
         for k, frac in ((3, 1.0), (2, 0.82), (1, 0.64)):
             r = r0 * (frac - 0.08 * (1 - souffle) * k / 3)
-            c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(couleur, "#000000", 0.25 * k), outline="")
+            c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(hex_vers_rgb(couleur), (0, 0, 0), 0.25 * k), outline="")
         r = r0 * (0.34 + 0.06 * souffle)
-        c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(couleur, "#FFFFFF", 0.45), outline="")
+        c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(hex_vers_rgb(couleur), (255, 255, 255), 0.45), outline="")
         self.boule.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
         if self.boule.state() == "withdrawn":
             self.boule.deiconify()
