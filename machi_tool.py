@@ -14533,7 +14533,7 @@ class Panneau:
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
                 ("jarvis_boule", "Une petite boule qui joue avec sa voix (et va sur l'ecran qu'il regarde)"),
                 ("jarvis_legende", "Ce qu'il dit, en petit a cote de la boule"),
-                ("jarvis_panneau", "En plus, son grand panneau en haut de l'ecran")):
+                ("jarvis_panneau", "Le carre de Jarvis : en plus, son grand panneau en haut de l'ecran")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, CONFIG_DEFAUT.get(cle, True)) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
@@ -16666,6 +16666,16 @@ def lancer():
         except Exception:
             pass
 
+    def basculer_carre_jarvis(*_):
+        """« Tu peux mettre un toggle pour remettre le carre de Jarvis » : son
+        grand panneau, a un clic depuis l'icone (la case des options suit)."""
+        CFG["jarvis_panneau"] = not CFG.get("jarvis_panneau", False)
+        sauver_config(CFG)
+        try:
+            panneau.vars_jarvis["jarvis_panneau"].set(1 if CFG["jarvis_panneau"] else 0)
+        except Exception:
+            pass
+
     def travail_maj(quoi):
         if quoi == "installer":
             if MAJ["etat"] != "prete":
@@ -16838,6 +16848,8 @@ def lancer():
         # demander d'ouvrir une fenetre.
         pystray.MenuItem("Jarvis ecoute", basculer_jarvis,
                          checked=lambda i: bool(CFG.get("jarvis_actif", False))),
+        pystray.MenuItem("Le carre de Jarvis", basculer_carre_jarvis,
+                         checked=lambda i: bool(CFG.get("jarvis_panneau", False))),
         pystray.MenuItem("Faire taire Jarvis", lambda *_: threading.Thread(target=terminer_conversation,
                                                                          daemon=True).start(),
                          visible=lambda i: bool(CFG.get("jarvis_actif", False))),
