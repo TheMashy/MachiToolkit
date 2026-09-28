@@ -91,7 +91,7 @@ class Demarrage(unittest.TestCase):
 
     def test_config_absente(self):
         cfg = self.mt.charger_config()
-        self.assertEqual(cfg["config_version"], 5)
+        self.assertEqual(cfg["config_version"], 6)
 
     def test_config_illisible_ne_tue_pas(self):
         """Une ecriture interrompue laisse du JSON tronque. On repart des
@@ -113,11 +113,22 @@ class Demarrage(unittest.TestCase):
         self.ecrire_config({"config_version": 3, "collecte_titres_complets": False})
         cfg = self.mt.charger_config()
         self.assertTrue(cfg["collecte_titres_complets"])
-        self.assertEqual(cfg["config_version"], 5)
+        self.assertEqual(cfg["config_version"], 6)
         # Et une fois passee, elle ne repasse plus : quelqu'un qui decoche la
         # case ne doit pas la retrouver cochee au lancement suivant.
         self.ecrire_config(dict(cfg, collecte_titres_complets=False))
         self.assertFalse(self.mt.charger_config()["collecte_titres_complets"])
+
+    def test_la_migration_v6_eteint_le_grand_panneau_une_fois(self):
+        """« Jarvis ne devrait afficher que la petite bulle, plus la grande
+        fenetre » : le panneau etait coche par defaut, donc ecrit dans chaque
+        fichier. On l'eteint une fois ; recoche ensuite, il le reste."""
+        self.ecrire_config({"config_version": 5, "jarvis_panneau": True})
+        cfg = self.mt.charger_config()
+        self.assertFalse(cfg["jarvis_panneau"])
+        self.assertTrue(cfg["jarvis_legende"])
+        self.ecrire_config(dict(cfg, jarvis_panneau=True))
+        self.assertTrue(self.mt.charger_config()["jarvis_panneau"])
 
     def test_valeurs_de_travers_dans_la_migration(self):
         """`int(cfg.get(...))` levait sur null, sur "" et sur "trois" — en
@@ -127,7 +138,7 @@ class Demarrage(unittest.TestCase):
                                 "pont_intervalle": mauvaise,
                                 "maj_intervalle_heures": mauvaise})
             cfg = self.mt.charger_config()
-            self.assertEqual(cfg["config_version"], 5, repr(mauvaise))
+            self.assertEqual(cfg["config_version"], 6, repr(mauvaise))
 
     def test_entier(self):
         self.assertEqual(self.mt.entier("7", 3), 7)

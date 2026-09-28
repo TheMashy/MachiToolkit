@@ -5353,7 +5353,7 @@ def cible_boule(etat, mode, regard, zone, maintenant, fx=0.97, fy=0.90, taille=4
         y = int(e["top"] + max(8, e["height"] * 0.04))
         return True, x, y, couleur, 2.5
     x, y = place_boule(zone, fx, fy, taille)
-    return etat in BOULE_ETATS or etat == "erreur", x, y, couleur, rythme
+    return etat in BOULE_ETATS or etat in ("erreur", "fait"), x, y, couleur, rythme
 
 
 # --------------------------- L'ECOUTE QUI S'ADAPTE ----------------------
@@ -6844,6 +6844,46 @@ MOTS_PANNEAU = {"fr": {"ecoute": "A VOUS", "comprend": "RECU", "pense": "REFLEXI
                        "erreur": "ERREUR", "fait": "FAIT"},
                 "en": {"ecoute": "LISTENING", "comprend": "GOT IT", "pense": "THINKING", "parle": "SPEAKING",
                        "erreur": "ERROR", "fait": "DONE"}}
+
+
+# LA LEGENDE DE LA BOULE. « Jarvis ne devrait afficher que la petite bulle,
+# plus la grande fenetre, le texte peut s'afficher en minuscule a cote (ecran
+# 4K) » : ce que le panneau ecrivait en grandes lettres de LED, en petit, a
+# cote de la boule, en casse normale.
+MOTS_LEGENDE = {"fr": {"ecoute": "à vous", "comprend": "reçu", "pense": "je réfléchis…", "parle": "",
+                       "erreur": "erreur", "fait": "fait"},
+                "en": {"ecoute": "listening", "comprend": "got it", "pense": "thinking…", "parle": "",
+                       "erreur": "error", "fait": "done"}}
+LEGENDE_SIGNES = 140          # au plus : la fin de ce qu'il dit, pas un paragraphe
+
+
+def _fin_de(texte, n=LEGENDE_SIGNES):
+    """Les `n` derniers signes, coupes a un mot, precedes de « … »."""
+    texte = " ".join(str(texte or "").split())
+    if len(texte) <= n:
+        return texte
+    reste = texte[-n:]
+    espace = reste.find(" ")
+    if 0 <= espace < n // 3:
+        reste = reste[espace + 1:]
+    return "\u2026" + reste
+
+
+def legende_boule(etat, langue="fr", dit="", entendu="", erreur=""):
+    """Le petit texte a cote de la boule : ce qu'il dit pendant qu'il parle
+    (la fin, au fil de sa voix), ce qu'il a compris pendant qu'il reflechit,
+    la raison d'une erreur -- sinon un mot sur ou il en est. "" : rien."""
+    mots = MOTS_LEGENDE["en" if langue == "en" else "fr"]
+    if etat == "parle":
+        return _fin_de(dit)
+    entendu = " ".join(str(entendu or "").split())
+    if etat in ("pense", "fait") and entendu:
+        return _fin_de("\u00ab " + entendu.rstrip("\u2026") + " \u00bb")      # ce qu'il a compris
+    if etat in ("ecoute", "comprend") and entendu:
+        return _fin_de(entendu)                                             # ce qu'il entend deja
+    if etat == "erreur" and str(erreur or "").strip():
+        return _fin_de(erreur)
+    return mots.get(etat, "")
 
 
 def _barres_parle(m, t, niveau, cy, haut, c):

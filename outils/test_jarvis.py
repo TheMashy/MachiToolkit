@@ -532,6 +532,29 @@ class SesMains(unittest.TestCase):
         self.assertEqual(J.cible_boule("pense", "jarvis", regard, zone, 106)[1:3], J.place_boule(zone),
                          "regard fini : elle revient a sa place")
 
+    def test_la_legende_de_la_boule(self):
+        # « Jarvis ne devrait afficher que la petite bulle, plus la grande fenetre,
+        # le texte peut s'afficher en minuscule a cote (ecran 4K) »
+        L = J.legende_boule
+        self.assertEqual(L("parle", "fr", dit="Il fait 21 degrés."), "Il fait 21 degrés.")
+        long_ = " ".join("mot%d" % i for i in range(80))
+        fin = L("parle", "fr", dit=long_)
+        self.assertLessEqual(len(fin), J.LEGENDE_SIGNES + 1)
+        self.assertTrue(fin.startswith("\u2026") and fin.endswith("mot79"), "la fin de ce qu'il dit")
+        self.assertNotIn("\u2026ot", fin, "coupe a un mot")
+        self.assertEqual(L("pense", "fr", entendu="mets de la musique"), "\u00ab mets de la musique \u00bb")
+        self.assertEqual(L("pense", "fr"), "je réfléchis\u2026")
+        self.assertEqual(L("ecoute", "en"), "listening")
+        self.assertEqual(L("ecoute", "fr", entendu="mets de\u2026"), "mets de\u2026", "ce qu'il entend deja")
+        self.assertEqual(L("erreur", "fr", erreur="BrainDebugger ne répond pas."), "BrainDebugger ne répond pas.")
+        self.assertEqual(L("erreur", "en"), "error")
+        self.assertEqual(L("parle", "fr"), "", "rien encore de dit : pas d'etiquette vide")
+        self.assertEqual(L("attente", "fr"), "")
+        for mots in J.MOTS_LEGENDE.values():
+            self.assertTrue(all(m == m.lower() for m in mots.values()), "en petit, pas en capitales")
+        # une commande faite se lit un instant, la boule seule le montre
+        self.assertTrue(J.cible_boule("fait", "jarvis", None, (0, 0, 1920, 1040), 100)[0])
+
     def test_le_son_appli_par_appli(self):
         # « baisser le son de Spotify, baisser le son de Discord, baisser le son du jeu »
         attendu = {
@@ -3818,7 +3841,9 @@ class DansMachiTool(unittest.TestCase):
         m = self.m
         m.dire("Il fait 21 degrés à Lyon.")
         self.assertEqual(m.JARVIS["reponse_affichee"], "Il fait 21 degrés à Lyon.")
-        self.assertTrue(m.CONFIG_DEFAUT["jarvis_panneau"])
+        # « que la petite bulle, plus la grande fenetre » : la boule seule, et sa legende
+        self.assertFalse(m.CONFIG_DEFAUT["jarvis_panneau"])
+        self.assertTrue(m.CONFIG_DEFAUT["jarvis_legende"])
 
     def test_oust_degage_casse_toi_il_part(self):
         # « Quand je dis oust, degage, casse-toi... il dit "oui" ou "je m'efface", mais reste. »

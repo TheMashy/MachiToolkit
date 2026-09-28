@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.66.0"
+VERSION = "1.67.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -386,10 +386,13 @@ CONFIG_DEFAUT = {
     # Elle joue avec sa voix quand il parle (« un petit peu de jazz »).
     "jarvis_boule": True,
     # LE PANNEAU DE JARVIS : le contenu « Jarvis » du panneau LED 64 x 64, en
-    # haut au milieu de l'ecran quand il est actif. Avec lui, la boule ne sort
-    # plus que quand il parle, qu'il t'ecoute, ou pour aller sur l'ecran qu'il
-    # regarde.
-    "jarvis_panneau": True,
+    # haut au milieu de l'ecran quand il est actif. « Jarvis ne devrait
+    # afficher que la petite bulle, plus la grande fenetre » : eteint par
+    # defaut (migration v6), la boule seule, et sa legende a cote.
+    "jarvis_panneau": False,
+    # LA LEGENDE DE LA BOULE : ce qu'il dit, ce qu'il a compris, en petit a
+    # cote d'elle (voir _jv.legende_boule)
+    "jarvis_legende": True,
     "jarvis_boule_x": 0.97,
     "jarvis_boule_y": 0.90,
     "spotify_refresh": "",
@@ -425,7 +428,7 @@ CONFIG_DEFAUT = {
     "routines_lumiere": [],
 
     # Mises a jour depuis les publications GitHub du depot.
-    "config_version": 5,              # sert aux migrations, voir charger_config
+    "config_version": 6,              # sert aux migrations, voir charger_config
     "derniere_version": "",           # la version du dernier demarrage : dit au
                                       # retour qu'une mise a jour est passee, et
                                       # qu'il ne s'agissait pas d'un plantage
@@ -673,7 +676,12 @@ def charger_config():
                 cfg["jarvis_lenteur"] = 0.95
         except (TypeError, ValueError):
             cfg["jarvis_lenteur"] = 0.95
-    cfg["config_version"] = 5
+    # Version 6 : « Jarvis ne devrait afficher que la petite bulle, plus la
+    # grande fenetre, le texte peut s'afficher en minuscule a cote » -- le
+    # panneau etait coche par defaut, donc ecrit dans chaque fichier. Une fois.
+    if enregistre and entier(enregistre.get("config_version", 1), 1) < 6:
+        cfg["jarvis_panneau"] = False
+    cfg["config_version"] = 6
     """
     ET ON SE SOUVIENT DE LA VERSION QU'ON ETAIT LA FOIS D'AVANT.
 
@@ -12845,7 +12853,7 @@ class Panneau:
         def cache():
             if f is not None and f.winfo_exists() and f.state() != "withdrawn":
                 f.withdraw()
-        if not self.cfg.get("jarvis_panneau", True) or not self.cfg.get("jarvis_actif"):
+        if not self.cfg.get("jarvis_panneau", False) or not self.cfg.get("jarvis_actif"):
             cache()
             return 500
         maintenant = time.time()
@@ -13009,6 +13017,7 @@ class Panneau:
         def cache():
             if b is not None and b.winfo_exists() and b.state() != "withdrawn":
                 b.withdraw()
+            self._legende_cacher()
         if not self.cfg.get("jarvis_boule", True) or not self.cfg.get("jarvis_actif"):
             cache()
             return 500
@@ -13024,14 +13033,21 @@ class Panneau:
         # « Un petit peu de jazz » : avec son panneau, elle ne sortait plus que
         # pour regarder un ecran. Elle sort aussi quand il parle -- elle joue
         # avec sa voix -- et quand il t'ecoute.
-        if self.cfg.get("jarvis_panneau", True) and etat not in self.BOULE_AVEC_PANNEAU:
-            etat = "attente"
         maintenant = time.time()
+        if self.cfg.get("jarvis_panneau", False):
+            if etat not in self.BOULE_AVEC_PANNEAU:
+                etat = "attente"
+        else:
+            # LA BOULE SEULE : elle dit aussi, le temps de les lire, une
+            # commande faite et une erreur (le panneau les montrait)
+            etat = _jv.etat_panneau(etat, maintenant, JARVIS.get("fait_jusqua"),
+                                    JARVIS.get("erreur_jusqua")) or etat
         visible, x, y, couleur, rythme = _jv.cible_boule(
             etat, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), maintenant,
             self.cfg.get("jarvis_boule_x", 0.97), self.cfg.get("jarvis_boule_y", 0.90), taille)
         if not visible and (b is None or not b.winfo_exists() or b.state() == "withdrawn"):
             st["x"] = None
+            self._legende_cacher()
             return 300                                     # rien a l'ecran : rien a dessiner
         if b is None or not b.winfo_exists() or self.boule_objets.get("taille") != taille:
             if b is not None and b.winfo_exists():
@@ -13046,6 +13062,7 @@ class Panneau:
         st["alpha"] = min(1.0, st["alpha"] + 0.15) if visible else max(0.0, st["alpha"] - 0.12)
         if st["alpha"] <= 0.0:
             b.withdraw()
+            self._legende_cacher()
             st.update(x=None, t=None)
             return 300
         # sa respiration suit l'horloge, pas les images : la meme a toute cadence
@@ -13062,7 +13079,89 @@ class Panneau:
         if b.state() == "withdrawn":
             b.deiconify()
             b.attributes("-topmost", True)
+        self._legende_tic(etat if visible else "attente", maintenant, int(st["x"]), int(st["y"]), taille,
+                          st["alpha"])
         return 40
+
+    # ------------------------------------------------------------------
+    #  La legende de la boule : « le texte peut s'afficher en minuscule a
+    #  cote (ecran 4K) ». Une petite etiquette sombre, du cote de l'ecran ou
+    #  il y a la place ; un clic la congedie, un clic droit ouvre le menu du
+    #  panneau (la boule, elle, laisse passer les clics).
+
+    LEGENDE_FOND = "#0B0D12"
+    LEGENDE_LARGEUR = 360            # points, avant l'echelle : trois lignes au plus
+
+    def _legende_creer(self):
+        tk = self.tk
+        f = tk.Toplevel(self.root)
+        f.overrideredirect(True)
+        f.configure(bg=self.LEGENDE_FOND)
+        f.attributes("-topmost", True)
+        lab = tk.Label(f, text="", bg=self.LEGENDE_FOND, fg=CRAIE, font=(self.f_ui, 9), bd=0,
+                       padx=self.px(7), pady=self.px(3), justify="left", cursor="hand2",
+                       wraplength=self.px(self.LEGENDE_LARGEUR))
+        lab.pack()
+        lab.bind("<Button-1>", lambda _e: self.congedier_jarvis())
+        lab.bind("<Button-3>", self.menu_panneau)
+        f.geometry("+-10000+-10000")
+        f.update_idletasks()
+        if os.name == "nt":
+            # pas de bouton dans la barre des taches, jamais le focus
+            import ctypes
+            u = ctypes.WinDLL("user32")
+            h = int(f.wm_frame(), 16)
+            u.SetWindowLongW(h, -20, u.GetWindowLongW(h, -20) | 0x00080000 | 0x00000080 | 0x08000000)
+        f.withdraw()
+        self.legende, self.legende_texte = f, lab
+        self.legende_vu = None
+
+    def _legende_cacher(self):
+        f = getattr(self, "legende", None)
+        if f is not None and f.winfo_exists() and f.state() != "withdrawn":
+            f.withdraw()
+
+    def _legende_tic(self, etat, maintenant, x, y, taille, alpha):
+        """Place et remplit la legende a cote de la boule (x, y, taille)."""
+        if not self.cfg.get("jarvis_legende", True):
+            return self._legende_cacher()
+        erreur = (JARVIS.get("derniere_erreur") or ("", "", 0.0))[0] if etat == "erreur" else ""
+        texte = _jv.legende_boule(etat, langue_jarvis(self.cfg),
+                                  dit=sous_titre_courant(maintenant) if etat == "parle" else "",
+                                  entendu=JARVIS.get("entendu") or "", erreur=erreur)
+        if not texte:
+            return self._legende_cacher()
+        f = getattr(self, "legende", None)
+        if f is None or not f.winfo_exists():
+            self._legende_creer()
+            f = self.legende
+        lab = self.legende_texte
+        # sa parole en clair ; le reste (ou il en est, ce qu'il a compris) plus discret
+        vu = (texte, etat == "parle")
+        if vu != self.legende_vu:
+            self.legende_vu = vu
+            lab.configure(text=texte, fg=CRAIE if etat == "parle" else BRUME)
+        l, h = lab.winfo_reqwidth(), lab.winfo_reqheight()
+        zx, zy, zl, zh = self._boule_zone()
+        ecart = max(6, taille // 5)
+        # du cote ou il y a la place : a gauche d'une boule rangee a droite
+        if x + taille / 2.0 > zx + zl / 2.0:
+            lx = x - ecart - l
+            lab.configure(justify="right")
+        else:
+            lx = x + taille + ecart
+            lab.configure(justify="left")
+        ly = int(y + taille / 2.0 - h / 2.0)
+        lx = max(zx, min(int(lx), zx + zl - l))
+        ly = max(zy, min(ly, zy + zh - h))
+        f.geometry("%dx%d+%d+%d" % (l, h, lx, ly))
+        try:
+            f.attributes("-alpha", 0.9 * alpha)
+        except Exception:
+            pass
+        if f.state() == "withdrawn":
+            f.deiconify()
+            f.attributes("-topmost", True)
 
     def _boule_jeu(self, etat, maintenant):
         """(niveau 0 a 1, touches) : ce que joue la boule a l'instant."""
@@ -14332,9 +14431,10 @@ class Panneau:
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
-                ("jarvis_panneau", "Son panneau en haut de l'ecran quand il est actif"),
-                ("jarvis_boule", "Une petite boule qui joue avec sa voix (et va sur l'ecran qu'il regarde)")):
-            v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
+                ("jarvis_boule", "Une petite boule qui joue avec sa voix (et va sur l'ecran qu'il regarde)"),
+                ("jarvis_legende", "Ce qu'il dit, en petit a cote de la boule"),
+                ("jarvis_panneau", "En plus, son grand panneau en haut de l'ecran")):
+            v = tk.IntVar(value=1 if self.cfg.get(cle, CONFIG_DEFAUT.get(cle, True)) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
