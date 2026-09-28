@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.64.1"
+VERSION = "1.65.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -353,6 +353,11 @@ CONFIG_DEFAUT = {
     # d'acces dit a voix haute. Du code, on ne garde qu'une empreinte.
     "jarvis_pc": False,
     "jarvis_ecran": False,
+    # « Ranger les fichiers » (deplacer, renommer, corbeille, modifier un texte
+    # -- annulable) et « Reglages de Windows » (Wi-Fi, Bluetooth, mode sombre,
+    # sortie audio, fermer une appli bloquee, installer) : ses nouveaux pouvoirs.
+    "jarvis_fichiers": False,
+    "jarvis_windows": False,
     # « Faire en sorte qu'il n'y ait plus de code d'acces a demander » : il agit
     # directement. Le code reste possible, si on coche la case qui le demande.
     "jarvis_code_actif": False,
@@ -378,10 +383,12 @@ CONFIG_DEFAUT = {
     "onglets_cle": "",
     # LA BOULE DE JARVIS a l'ecran quand il est reveille ; sa place en
     # fractions de l'ecran principal (la meme a toutes les resolutions).
+    # Elle joue avec sa voix quand il parle (« un petit peu de jazz »).
     "jarvis_boule": True,
     # LE PANNEAU DE JARVIS : le contenu « Jarvis » du panneau LED 64 x 64, en
     # haut au milieu de l'ecran quand il est actif. Avec lui, la boule ne sort
-    # plus que pour aller sur l'ecran qu'il regarde.
+    # plus que quand il parle, qu'il t'ecoute, ou pour aller sur l'ecran qu'il
+    # regarde.
     "jarvis_panneau": True,
     "jarvis_boule_x": 0.97,
     "jarvis_boule_y": 0.90,
@@ -397,6 +404,9 @@ CONFIG_DEFAUT = {
     "jarvis_suite": True,             # apres sa reponse, il ecoute la suite sans mot d'eveil
     "jarvis_suite_questions": False,  # ... seulement quand il a pose une question
     "jarvis_repliques_spontanees": False,   # ses routines parlent aussi au reveil, a l'au revoir, pour une appli
+    # « Prendre des initiatives » : surchauffe, volume trop fort tard le soir,
+    # longue session sans pause -- toujours annoncees (voir veiller_initiatives)
+    "jarvis_initiatives": False,
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -4186,11 +4196,27 @@ DICTEE_ENFANT_ARG = "--moteur-dictee"
 DICTEE_MEMOIRE_MIN_MO = 1500        # en dessous, charger 1 Go gelerait le PC
 DICTEE_DEMARRAGE_S = 90             # l'exe se decompresse avant de repondre
 DICTEE_REPONSE_S = 300              # premier chargement + transcription
-_MOTEUR = {"proc": None, "sock": None, "vu": 0.0}
+# UN MOTEUR DEJA CHARGE rend une phrase en une fraction de seconde (0,3 s pour
+# 3 s de son, 1,1 s pour 10 s). Les 300 s du premier chargement ne valent
+# plus : un moteur qui cale (la memoire qui pagine, un jeu qui prend tout)
+# tenait Jarvis « Je transcris... » cinq minutes, les phrases suivantes
+# empilees derriere. Large quand meme : 30 s, plus une seconde par seconde de son.
+DICTEE_REPONSE_CHAUD_S = 30.0
+DICTEE_REPONSE_PAR_S = 1.0
+# la porteuse (voir jarvis.reconnaitre) ne part qu'avec un son court : une
+# fenetre de suite (quelques secondes d'attente, puis un mot), pas un monologue
+DICTEE_ANCRE_MAX_S = 15.0
+_MOTEUR ={"proc": None, "sock": None, "vu": 0.0, "charge": False}
 
 
 class DicteeImpossible(RuntimeError):
-    """Une raison qu'on peut dire telle quelle a la personne."""
+    """Une raison qu'on peut dire telle quelle a la personne -- sur la page de
+    la dictee. Jarvis, lui, dit `cle` (une phrase courte, dans sa langue :
+    voir _PHRASES) ; la raison technique va au journal."""
+
+    def __init__(self, message, cle="transcription_ratee"):
+        super().__init__(message)
+        self.cle = cle
 
 
 def memoire_libre_mo():
@@ -4226,9 +4252,11 @@ def _commande_moteur(port, secret):
     return [sys.executable, os.path.abspath(__file__), DICTEE_ENFANT_ARG, str(port), secret]
 
 
-def _arreter_moteur():
+def _arreter_moteur(attente=3):
+    """Arrete le moteur : il finit proprement s'il le peut en `attente`
+    secondes, sinon on le tue (0 : un moteur qui cale, tue tout de suite)."""
     sock, proc = _MOTEUR["sock"], _MOTEUR["proc"]
-    _MOTEUR.update(sock=None, proc=None)
+    _MOTEUR.update(sock=None, proc=None, charge=False)
     if sock is not None:
         try:
             _envoyer_trame(sock, b"")                 # « c'est fini »
@@ -4240,7 +4268,9 @@ def _arreter_moteur():
             pass
     if proc is not None and proc.poll() is None:
         try:
-            proc.wait(timeout=3)
+            if attente <= 0:
+                raise TimeoutError()
+            proc.wait(timeout=attente)
         except Exception:
             try:
                 proc.kill()
@@ -4262,7 +4292,7 @@ def _moteur_vivant():
         raise DicteeImpossible(
             "pas assez de memoire libre pour la dictee (%d Mo, il en faut %d) — "
             "ferme des applications ; Handy garde peut-etre le meme modele ouvert"
-            % (libre, DICTEE_MEMOIRE_MIN_MO))
+            % (libre, DICTEE_MEMOIRE_MIN_MO), cle="memoire_pleine")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         srv.bind(("127.0.0.1", 0))
@@ -4293,8 +4323,45 @@ def _moteur_vivant():
             raise DicteeImpossible("le moteur de dictee n'a pas repondu comme prevu")
     finally:
         srv.close()
-    _MOTEUR.update(proc=proc, sock=sock, vu=time.time())
+    _MOTEUR.update(proc=proc, sock=sock, vu=time.time(), charge=False)
     return sock
+
+
+def moteur_chaud():
+    """Le moteur tourne-t-il, son modele deja charge (il a deja repondu) ?"""
+    proc = _MOTEUR["proc"]
+    return bool(proc is not None and proc.poll() is None and _MOTEUR["sock"] is not None
+                and _MOTEUR.get("charge"))
+
+
+def _delai_reponse(duree_s):
+    """Combien attendre la reponse du moteur : le premier chargement a droit a
+    DICTEE_REPONSE_S ; un moteur charge, a bien moins (voir DICTEE_REPONSE_CHAUD_S)."""
+    if not _MOTEUR.get("charge"):
+        return DICTEE_REPONSE_S
+    return DICTEE_REPONSE_CHAUD_S + DICTEE_REPONSE_PAR_S * max(0.0, float(duree_s))
+
+
+def _moteur_charge(psutil_=None, windows=None):
+    """Le moteur vient de repondre pour la premiere fois : son modele est
+    charge. La priorite basse le protegeait pendant ce chargement (1 Go lu
+    d'un coup) ; ensuite, pendant un jeu, elle l'affamait -- une phrase de
+    0,3 s s'etirait. Il repasse en priorite normale : il n'a de toute facon que
+    la moitie des coeurs (_options_onnx)."""
+    if _MOTEUR.get("charge"):
+        return False
+    _MOTEUR["charge"] = True
+    proc = _MOTEUR["proc"]
+    if proc is None or not (os.name == "nt" if windows is None else windows):
+        return False
+    try:
+        if psutil_ is None:
+            import psutil as psutil_
+        psutil_.Process(proc.pid).nice(psutil_.NORMAL_PRIORITY_CLASS)
+        return True
+    except Exception as e:
+        print("Dictee : priorite inchangee (%s)" % type(e).__name__)
+        return False
 
 
 def entete_wav(octets):
@@ -4303,8 +4370,17 @@ def entete_wav(octets):
         return w.getnchannels(), w.getframerate(), w.getnframes(), w.getsampwidth()
 
 
-def transcrire(octets):
-    """Le texte dit dans ce WAV. Le son ne touche jamais le disque."""
+def transcrire(octets, porteuse=None):
+    """Le texte dit dans ce WAV. Le son ne touche jamais le disque.
+
+    `porteuse` (un WAV a la meme frequence, en memoire) : de quoi ancrer la
+    langue d'une reponse d'un mot (voir jarvis.reconnaitre) -- le moteur ne
+    s'en sert que si la parole est courte.
+
+    UN MOTEUR QUI MEURT EN PLEINE PHRASE (un plantage natif) : la phrase est
+    encore la, en memoire ; on relance un moteur et on la lui redonne, une
+    fois. Jamais apres un simple depassement du delai : sous une memoire qui
+    pagine, recharger 1 Go aggraverait tout."""
     if etat_dictee()["etat"] != "pret":
         raise RuntimeError("le modele de dictee n'est pas pret")
     try:
@@ -4317,22 +4393,48 @@ def transcrire(octets):
         raise ValueError("frequence non prise en charge : %s" % frequence)
     if n < frequence * 0.2:
         return ""                                   # un clic, pas une phrase
-    with _DICTEE_VERROU:
-        sock = _moteur_vivant()
+    trame = octets
+    if porteuse and n <= frequence * DICTEE_ANCRE_MAX_S:
         try:
-            _envoyer_trame(sock, octets)
-            reponse = json.loads(_recevoir_trame(sock).decode("utf-8"))
-        except (OSError, ConnectionError, ValueError):
-            proc = _MOTEUR["proc"]
-            code = proc.poll() if proc is not None else None
-            _arreter_moteur()
-            libre = memoire_libre_mo()
-            conseil = (" — il ne restait que %d Mo de memoire libre" % libre
-                       if libre is not None and libre < 3 * DICTEE_MEMOIRE_MIN_MO else "")
-            print("Dictee : le moteur s'est arrete (code %s)" % code)
-            raise DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription%s. "
-                                   "Machi Tool, lui, tourne toujours." % conseil)
+            ok = entete_wav(porteuse)[1] == frequence
+        except Exception:
+            ok = False
+        if ok:
+            trame = json.dumps({"wav": base64.b64encode(octets).decode("ascii"),
+                                "porteuse": base64.b64encode(porteuse).decode("ascii")}).encode("ascii")
+    with _DICTEE_VERROU:
+        for essai in (0, 1):
+            sock = _moteur_vivant()
+            try:
+                sock.settimeout(_delai_reponse(n / float(frequence)))
+                _envoyer_trame(sock, trame)
+                reponse = json.loads(_recevoir_trame(sock).decode("utf-8"))
+                break
+            except (OSError, ConnectionError, ValueError) as e:
+                proc = _MOTEUR["proc"]
+                code = proc.poll() if proc is not None else None
+                if code is None and proc is not None and not isinstance(e, socket.timeout):
+                    # la connexion tombe un instant avant que le processus ait fini de mourir
+                    try:
+                        code = proc.wait(timeout=2)
+                    except Exception:
+                        code = None
+                _arreter_moteur(0 if isinstance(e, socket.timeout) else 3)
+                libre = memoire_libre_mo()
+                memoire_ok = libre is None or libre >= DICTEE_MEMOIRE_MIN_MO
+                if essai == 0 and code is not None and memoire_ok:
+                    print("Dictee : le moteur est tombe en pleine phrase (code %s), je le relance" % code)
+                    continue
+                conseil = (" — il ne restait que %d Mo de memoire libre" % libre
+                           if libre is not None and libre < 3 * DICTEE_MEMOIRE_MIN_MO else "")
+                print("Dictee : le moteur s'est arrete (code %s, %s)" % (code, type(e).__name__))
+                raise DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription%s. "
+                                       "Machi Tool, lui, tourne toujours." % conseil,
+                                       cle="transcription_ratee" if memoire_ok else "memoire_pleine")
         _MOTEUR["vu"] = time.time()
+        if "erreur" not in reponse:
+            _moteur_charge()
+    trame = None
     _programmer_dechargement()
     if "erreur" in reponse:
         raise DicteeImpossible("le moteur de dictee a echoue : %s" % reponse["erreur"])
@@ -4364,8 +4466,17 @@ def moteur_dictee_enfant(port, secret, charger=None):
             try:
                 if modele is None:
                     modele = (charger or _charger_modele_dictee)()
+                porteuse = None
+                if not wav.startswith(b"RIFF"):
+                    # une reponse courte de Jarvis : le son, et sa porteuse
+                    d = json.loads(wav.decode("ascii"))
+                    wav = base64.b64decode(d["wav"])
+                    if d.get("porteuse"):
+                        porteuse, f_p = son_depuis_wav(base64.b64decode(d["porteuse"]))
                 son, frequence = son_depuis_wav(wav)
-                reponse = {"texte": str(modele.recognize(son, sample_rate=frequence) or "").strip()}
+                if porteuse is not None and f_p != frequence:
+                    porteuse = None
+                reponse = {"texte": _jv.reconnaitre(modele, son, frequence, porteuse)}
             except Exception as e:
                 reponse = {"erreur": "%s : %s" % (type(e).__name__, str(e)[:200])}
             wav = None
@@ -4382,13 +4493,113 @@ _DICTEE_MINUTEUR = [None]
 
 def delai_dechargement(cfg=None, libre=None):
     """Combien de temps le moteur reste charge sans servir : dix minutes ; une
-    heure si Jarvis ecoute et que la memoire le permet."""
+    heure si Jarvis ecoute et que la memoire le permet ; une demi-heure si
+    Jarvis ecoute et qu'il reste encore de la marge (voir entretenir_dictee)."""
     cfg = CFG if cfg is None else cfg
     if cfg.get("jarvis_actif"):
         libre = memoire_libre_mo() if libre is None else libre
         if libre is None or libre >= DICTEE_GARDER_MEMOIRE_MO:
             return DICTEE_GARDER_JARVIS_S
+        if libre >= DICTEE_GARDER_MARGE_MO:
+            return DICTEE_GARDER_SERRE_S
     return DICTEE_DECHARGER_S
+
+
+# ---------------------------------------------------------------------
+#  LE MOTEUR TENU CHAUD PENDANT QUE JARVIS ECOUTE.
+#
+#  « Jarvis, allume la lumiere » apres le demarrage, ou apres le dejeuner :
+#  plusieurs secondes de « Je transcris... » -- l'exe se decompresse, puis
+#  1 Go de modele se charge. Rien ne le chargeait avant qu'on ait deja parle.
+#
+#  LE COMPROMIS MEMOIRE / ATTENTE, tant que « Ecouter Jarvis » est coche :
+#    - au demarrage de l'oreille, le moteur se charge ~45 s plus tard (pas
+#      pendant que le PC finit de demarrer), si la memoire le permet ENCORE
+#      une fois le modele charge (DICTEE_GARDER_MEMOIRE_MO libres, + le modele) ;
+#    - s'il reste assez de memoire, il reste charge : une transcription de
+#      silence toutes les 20 minutes garde ses pages en memoire (Windows les
+#      aurait rendues au disque) et repousse son dechargement ;
+#    - si la memoire se resserre (un jeu), plus d'entretien : il part 30 min
+#      apres sa derniere phrase s'il reste DICTEE_GARDER_MARGE_MO libres, 10
+#      min sinon -- et en dessous de DICTEE_MEMOIRE_MIN_MO, il ne se charge pas.
+#  Decoche, rien de tout ca : la dictee du site garde ses dix minutes.
+# ---------------------------------------------------------------------
+
+DICTEE_MODELE_MO = 1000                  # le moteur charge : ~1 Go
+DICTEE_GARDER_SERRE_S = 30 * 60
+DICTEE_GARDER_MARGE_MO = DICTEE_MEMOIRE_MIN_MO + 500
+DICTEE_ENTRETIEN_S = 20 * 60
+DICTEE_PRECHAUFFE_DELAI_S = 45
+_ENTRETIEN = {"prechauffe_a": 0.0, "en_cours": False}
+
+
+def memoire_pour_garder(charge=True, libre=None):
+    """Assez de memoire pour garder le moteur (`charge`), ou pour le charger
+    et qu'il en reste autant ensuite ? (Inconnue : oui.)"""
+    libre = memoire_libre_mo() if libre is None else libre
+    return libre is None or libre >= DICTEE_GARDER_MEMOIRE_MO + (0 if charge else DICTEE_MODELE_MO)
+
+
+def moteur_vivant():
+    proc = _MOTEUR["proc"]
+    return proc is not None and proc.poll() is None and _MOTEUR["sock"] is not None
+
+
+def programmer_prechauffage(maintenant=None):
+    """L'oreille demarre : le moteur se chargera dans DICTEE_PRECHAUFFE_DELAI_S."""
+    t = time.time() if maintenant is None else maintenant
+    if not _ENTRETIEN["prechauffe_a"]:
+        _ENTRETIEN["prechauffe_a"] = t + DICTEE_PRECHAUFFE_DELAI_S
+
+
+def entretenir_dictee(cfg, maintenant=None, lancer=None):
+    """A chaque tour de veille : precharge le moteur quand c'est l'heure, ou
+    l'entretient. Rend ce qui a ete lance (« prechauffe », « entretien ») ou None."""
+    lancer = lancer or (lambda f: threading.Thread(target=f, daemon=True).start())
+    if not cfg.get("jarvis_actif") or not dictee_possible() or etat_dictee()["etat"] != "pret":
+        return None
+    t = time.time() if maintenant is None else maintenant
+    if not moteur_vivant():
+        a = _ENTRETIEN["prechauffe_a"]
+        if a and t >= a:
+            _ENTRETIEN["prechauffe_a"] = 0.0
+            if memoire_pour_garder(charge=False):
+                lancer(prechauffer_dictee)
+                return "prechauffe"
+        return None
+    if (t - _MOTEUR["vu"] >= DICTEE_ENTRETIEN_S and not _ENTRETIEN["en_cours"]
+            and memoire_pour_garder(charge=True)):
+        _ENTRETIEN["en_cours"] = True
+        lancer(garder_au_chaud)
+        return "entretien"
+    return None
+
+
+def garder_au_chaud():
+    """Une transcription de silence (0,4 s) : le modele est relu, ses pages
+    restent en memoire, et il repousse son depart. Si une vraie phrase est en
+    cours, rien : elle fait deja ce travail."""
+    try:
+        if not _DICTEE_VERROU.acquire(blocking=False):
+            return False
+        try:
+            if not moteur_vivant():
+                return False
+            sock = _MOTEUR["sock"]
+            sock.settimeout(_delai_reponse(0.4))
+            _envoyer_trame(sock, _jv.wav_de(__import__("numpy").zeros(int(_jv.FREQ * 0.4), dtype="int16")))
+            _recevoir_trame(sock)
+            _MOTEUR["vu"] = time.time()
+        except Exception as e:
+            print("Dictee : entretien impossible (%s)" % type(e).__name__)
+            _arreter_moteur()
+            return False
+        finally:
+            _DICTEE_VERROU.release()
+        _programmer_dechargement()
+        return True
+    finally:
+        _ENTRETIEN["en_cours"] = False
 
 
 def _programmer_dechargement():
@@ -4453,6 +4664,8 @@ JARVIS = {
     "modeles": "absent", "progres": 0.0,
     "apprentissage": None,    # {"n", "total", "message", "fini"}
     "minuteurs": [],          # [{"fin", "quoi", "minuteur"}]
+    "avance": None,           # la reponse en cours : sa premiere phrase, dite en avance
+    "agenda_change": 0.0,     # Jarvis vient de poser quelque chose dans l'agenda : la fenetre se relit
     # Deux modes : « jarvis » (orange, le majordome du PC) et « psy » (bleu, le
     # compagnon de BrainDebugger). Le mode psy se referme sur « non rien »,
     # « oublie », « degage »... ou apres PSY_DUREE_S sans un mot.
@@ -4475,6 +4688,10 @@ JARVIS = {
     "souci": None,            # (message, t) : un souci de fond (le micro) -- sur sa page, pas a l'ecran
     "calme_jusqua": 0.0,      # on vient de le congedier : pas de replique spontanee d'ici la
     "reveil_verifie": False,  # le dernier reveil : son nom deja lu dans la transcription
+    # (ce qui a ete dit, le detail technique, t) : le dernier echec, pour sa page
+    # -- le panneau ne le montre qu'un instant
+    "derniere_erreur": None,
+    "attente_oui": None,      # « Je ferme de force Discord ? » : les outils qui attendent un oui
 }
 _OREILLE = {"proc": None, "sock": None, "echecs": 0, "prochain": 0.0}
 _OREILLE_VERROU = threading.Lock()
@@ -5172,6 +5389,21 @@ atexit.register(arreter_voix)
 SOUS_TITRES = {}
 
 
+def nom_dans_sa_voix(ident=None, texte=None):
+    """Son propre nom est-il dans ce qu'il dit ? Pendant qu'il parle,
+    l'oreille cherche « Jarvis » -- sauf si sa propre voix le prononce. Dans
+    le doute (texte inconnu), oui : elle ne cherche pas."""
+    if texte is None:
+        st = SOUS_TITRES.get(ident)
+        texte = " ".join(st.get("phrases") or []) if st else ""
+    if not texte:
+        return True
+    try:
+        return bool(_jv.contient_nom(texte, noms_appris()))
+    except Exception:
+        return True
+
+
 def sous_titre_courant(maintenant=None):
     """Ce que Jarvis a deja prononce, a l'instant."""
     st = JARVIS.get("sous_titre")
@@ -5187,6 +5419,24 @@ def sous_titre_courant(maintenant=None):
     return _jv.texte_dit(st["phrases"], st["k"], (t - st["t0"]) / max(0.1, st.get("duree") or 0.1))
 
 
+def niveau_de_sa_voix(maintenant=None):
+    """Le niveau de SA voix (0 a 1) a l'instant, lu dans l'enveloppe que la
+    voix envoie avec chaque phrase (« dit ») : sa boule et son panneau jouent
+    avec. 0 tant que le son n'a pas commence ; None quand la voix ne dit rien
+    de son son (la voix de Windows) -- on swingue alors sans elle."""
+    st = JARVIS.get("sous_titre")
+    if not st:
+        return 0.0
+    if st.get("estime"):
+        return None
+    env = st.get("enveloppe")                     # (t0, pas, niveaux), d'un seul tenant
+    if env is None:
+        return 0.0 if st.get("k", -1) < 0 else None
+    t = time.time() if maintenant is None else maintenant
+    t0, pas, niveaux = env
+    return _jv.niveau_enveloppe(niveaux, pas, t - t0 - _jv.VOIX_LATENCE_S)
+
+
 def _lire_voix(sock):
     while True:
         try:
@@ -5199,11 +5449,17 @@ def _lire_voix(sock):
         if quoi == "dit":
             st = SOUS_TITRES.get(ev.get("id"))
             if st is not None:
-                st.update(k=int(ev.get("phrase") or 0), t0=time.time(), duree=float(ev.get("duree") or 0.0))
+                t0 = time.time()
+                maj = {"k": int(ev.get("phrase") or 0), "t0": t0, "duree": float(ev.get("duree") or 0.0)}
+                if isinstance(ev.get("env"), list):
+                    # son enveloppe, avec son instant : lue d'un bloc par la boule
+                    maj["enveloppe"] = (t0, float(ev.get("pas") or _jv.VOIX_ENVELOPPE_PAS), ev["env"])
+                st.update(maj)
                 JARVIS["sous_titre"] = st
         elif quoi == "debut":
             # IL PARLE : l'oreille guette qu'on lui coupe la parole
-            envoyer_oreille({"cmd": "parole", "actif": True})
+            noter_temps("voix")
+            envoyer_oreille({"cmd": "parole", "actif": True, "nom": nom_dans_sa_voix(ev.get("id"))})
             if ev.get("id") in SOUS_TITRES:
                 JARVIS["sous_titre"] = SOUS_TITRES[ev.get("id")]
         elif quoi == "pret":
@@ -5212,8 +5468,14 @@ def _lire_voix(sock):
             if ev.get("cle") == "en" or (ev.get("cle") == "fr" and kokoro_fr_pret(CFG)):
                 KOKORO.update(etat="pret", message="")
         elif quoi == "fini":
-            envoyer_oreille({"cmd": "parole", "actif": False})
-            VOIX.fini(ev.get("id"), bool(ev.get("coupe")), ev.get("reste"))
+            # la suite de la meme reponse attend deja derriere : l'oreille ne
+            # croit pas qu'il s'est tu entre les deux (elle guette toujours
+            # qu'on lui coupe la parole)
+            if not any(i != ev.get("id") for i in VOIX.attentes):
+                envoyer_oreille({"cmd": "parole", "actif": False})
+            VOIX.fini(ev.get("id"), bool(ev.get("coupe")), ev.get("reste"), rate=bool(ev.get("rate")))
+        elif quoi == "rendu":
+            recevoir_porteuse(ev)            # la porteuse de la transcription
         elif quoi == "erreur":
             print("Jarvis : voix : %s" % str(ev.get("message"))[:200])
             # La voix anglaise n'a pas pu se charger : on le DIT, au lieu de
@@ -5227,7 +5489,7 @@ def _lire_voix(sock):
         n = _VOIX_ENFANT["echecs"]
         _VOIX_ENFANT.update(sock=None, pret=False, charge=None, echecs=n + 1,
                             prochain=time.time() + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)])
-        VOIX.enfant_perdu()
+        VOIX.enfant_perdu(redire=True)
 
 
 class Voix:
@@ -5254,6 +5516,8 @@ class Voix:
         self.n = 0
         self.verrou = threading.Lock()
         self.enchaine = {}          # ident -> celui dont il est la suite (sa reponse, apres la phrase d'avance)
+        self.coupes = set()         # les textes qu'on lui a coupes (voir `rejoindre`)
+        self.repris = {}            # ident coupe -> celui qui l'a repris (coupe pour rien)
 
     def peut_parler(self):
         return voix_prete() or self.disponible
@@ -5293,6 +5557,9 @@ class Voix:
             if fin:
                 fin()
             return
+        self._par_windows(texte, fin, langue)
+
+    def _par_windows(self, texte, fin, langue):
         JARVIS["sous_titre"] = {"phrases": [texte], "k": -1, "estime": True, "t0": time.time()}
         self.file.append((texte, fin, langue))
         self.signal.set()
@@ -5313,8 +5580,13 @@ class Voix:
                 self.en_cours[ident] = (texte, fin, langue)
             return True
 
-    def fini(self, ident, coupe, reste=None):
-        self.en_cours.pop(ident, None)
+    def fini(self, ident, coupe, reste=None, rate=False):
+        """`rate` : la voix n'a pas pu le dire (un casque debranche en pleine
+        phrase, une synthese en echec). « Silence, puis le carillon d'ecoute
+        comme s'il avait repondu » : ce qui n'a pas ete dit passe par la voix
+        de Windows, et la suite (l'ecoute d'apres) attend qu'elle l'ait dit ;
+        sans elle, une notification le montre et le souci s'affiche."""
+        dit = self.en_cours.pop(ident, None)
         if coupe and reste and self.reprise and self.reprise["id"] == ident:
             # a partir de la phrase coupee
             self.reprise["texte"] = (reste + " " + self.reprise.get("apres", "")).strip()
@@ -5322,32 +5594,77 @@ class Voix:
             fin = self.attentes.pop(ident, None)
         if not self.attentes:
             self.parle = False
+        if rate and not coupe:
+            a_dire = str(reste or (dit[0] if dit else "") or "").strip()
+            langue = dit[2] if dit else "fr"
+            print("Jarvis : la voix neuronale n'a pas pu parler%s" % (", la voix de Windows reprend"
+                                                                      if a_dire and self.disponible else ""))
+            if a_dire and self.disponible:
+                self._par_windows(a_dire, fin, langue)
+                return
+            if a_dire:
+                n = JARVIS_CROCHETS.get("notifier")
+                if n:
+                    n("Jarvis", _jv.pour_la_voix(a_dire, 240))
+                souci("La voix n'a pas pu parler : sa reponse est dans la notification.")
         if fin and not coupe:
             try:
                 fin()
             except Exception:
                 pass
 
-    def enfant_perdu(self):
+    def enfant_perdu(self, redire=False):
         """La voix est tombee en pleine phrase : on ne laisse pas la suite
-        (la guirlande, l'ecoute d'apres) attendre une fin qui ne viendra pas."""
+        (la guirlande, l'ecoute d'apres) attendre une fin qui ne viendra pas.
+        `redire` : tombee toute seule (pas arretee expres) -- ce qu'elle avait
+        a dire passe par la voix de Windows, et la suite attend qu'il soit dit."""
         attentes, self.attentes = self.attentes, {}
+        en_cours = self.en_cours
         self.en_cours, self.reprise = {}, None
         self.parle = False
         # l'oreille ne doit pas croire qu'il parle encore (elle ne cherchait plus son nom)
         envoyer_oreille({"cmd": "parole", "actif": False})
-        for fin in attentes.values():
+        for ident in sorted(attentes):
+            fin = attentes[ident]
+            if redire and self.disponible and ident in en_cours:
+                texte, _, langue = en_cours[ident]
+                self._par_windows(texte, fin, langue)
+                continue
             if fin:
                 try:
                     fin()
                 except Exception:
                     pass
 
+    def rejoindre(self, ident, reste, fin):
+        """LA SUITE D'UNE REPONSE dont la premiere phrase est partie en avance
+        (`ident`). « Je lui coupe la parole pendant sa premiere phrase, il se
+        tait, puis la suite arrive quand meme » : si cette phrase a ete coupee,
+        la suite ne se dit pas -- elle rejoint ce qu'il reprendra si personne
+        ne parlait (avec la vraie fin : l'ecoute d'apres), et disparait si on
+        lui a vraiment parle. Deja reprise (coupe pour rien) : la suite se dit
+        derriere la reprise. Rend l'ident derriere lequel dire la suite, ou
+        None s'il n'y a rien a dire maintenant."""
+        while ident in self.coupes and ident in self.repris:
+            ident = self.repris[ident]
+        if ident not in self.coupes:
+            return ident
+        r = self.reprise
+        if r and r["id"] == ident:
+            r["texte"] = (r["texte"] + " " + reste).strip()
+            r["apres"] = (r.get("apres", "") + " " + reste).strip()
+            r["fin"] = fin
+        return None
+
     def taire(self, garder=False):
         """Il se tait. `garder` : on vient de lui couper la parole -- on garde
         ce qu'il disait, pour le reprendre si personne ne parlait en fait."""
         self.reprise = None
         if garder and self.en_cours:
+            self.coupes.update(self.en_cours)
+            for vieux in [i for i in self.coupes if i < self.n - 20]:
+                self.coupes.discard(vieux)
+                self.repris.pop(vieux, None)
             # la voix dit ses textes dans l'ordre : celui qui sonne est le plus
             # ancien ; ceux qui attendaient, « taire » les jette (sans « fini »)
             # -- sauf la suite de la MEME reponse (sa premiere phrase dite en
@@ -5376,7 +5693,9 @@ class Voix:
         r, self.reprise = self.reprise, None
         if not r or not r.get("texte") or time.time() - r["t"] > 30.0:
             return False
-        self.dire(r["texte"], r["fin"], r["langue"])
+        ident = self.dire(r["texte"], r["fin"], r["langue"])
+        if ident is not None:
+            self.repris[r["id"]] = ident          # la suite de sa reponse viendra derriere
         return True
 
     def oublier_reprise(self):
@@ -5428,7 +5747,8 @@ class Voix:
                 self.couper.clear()
                 self.parle = True
                 dit = True
-                envoyer_oreille({"cmd": "parole", "actif": True})
+                noter_temps("voix")
+                envoyer_oreille({"cmd": "parole", "actif": True, "nom": nom_dans_sa_voix(texte=texte)})
                 try:
                     dit = self._sapi(texte, langue)
                 except Exception as e:
@@ -5638,13 +5958,18 @@ def traiter_evenement(ev):
     if quoi == "pret":
         _OREILLE["echecs"] = 0
         JARVIS["niveau_t"] = time.time()             # le chien de garde repart d'ici
-        JARVIS["souci"] = None
+        # (un micro muet le reste quand il se rouvre : seul un vrai son l'efface)
+        if not micro_muet_signale():
+            JARVIS["souci"] = None
         JARVIS["vad"] = bool(ev.get("vad"))
         # le micro qui se rouvre en pleine conversation ne la coupe pas
         if JARVIS.get("etat") in _ETATS_HORS_CONVERSATION:
             JARVIS.update(etat="attente", message=message_attente())
         if not ev.get("vad") and vad_present():
             envoyer_oreille({"cmd": "vad"})
+        # l'oreille demarre : le moteur de transcription se chargera sous peu,
+        # avant le premier « Jarvis » (voir entretenir_dictee)
+        programmer_prechauffage()
         if "micro" in ev:
             # Le micro qu'il ecoute vraiment -- et s'il n'est pas celui choisi
             # (debranche), on le dit plutot que d'ecouter ailleurs en silence.
@@ -5652,6 +5977,15 @@ def traiter_evenement(ev):
             JARVIS["micro_absent"] = not ev.get("trouve", True)
             if JARVIS["micro_absent"]:
                 print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
+    elif quoi == "essai" and ev.get("maj"):
+        # ce qu'est devenu l'appel pas net en attente de lecture : « lent » (le
+        # moteur de transcription demarre), ou tranche au score sans lecture
+        for e in reversed(JARVIS.get("essais") or []):
+            if e.get("issue") in ("verifier", "lent"):
+                e["issue"] = str(ev.get("issue") or "")
+                break
+        if ev.get("issue") == "lent":
+            print("Jarvis : la verification tarde (moteur de transcription froid ?)")
     elif quoi == "essai":
         # L'INDICATEUR DE DETECTION : chaque mot proche de « Jarvis », sa
         # distance, les deux seuils, et ce qui en est sorti
@@ -5662,6 +5996,10 @@ def traiter_evenement(ev):
         # « Jarvis » passe pres du seuil sans le franchir : on le garde pour
         # l'afficher, avec de quoi y remedier.
         JARVIS["presque"] = (float(ev.get("distance") or 0), float(ev.get("seuil") or 0), time.time())
+        # quelqu'un vient peut-etre de l'appeler : le moteur se reveille (rien s'il l'est)
+        if (CFG.get("jarvis_actif") and dictee_possible() and not moteur_vivant()
+                and memoire_pour_garder(charge=False)):
+            threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "voix_niveau":
         t = time.time()
         JARVIS["voix_niveau"] = (float(ev.get("v") or 0.0), t)
@@ -5672,6 +6010,7 @@ def traiter_evenement(ev):
         JARVIS["niveau_t"] = time.time()
         JARVIS["db"] = ev.get("db")
         JARVIS["coupure"] = ev.get("coupure")
+        suivre_micro_muet(ev.get("db"), JARVIS["niveau_t"])
     elif quoi == "vad":
         JARVIS["vad"] = bool(ev.get("ok"))
     elif quoi == "coupure":
@@ -5679,14 +6018,23 @@ def traiter_evenement(ev):
         # suite -- elle fera une phrase comme une autre.
         print("Jarvis : on lui coupe la parole")
         VOIX.taire(garder=True)
+        # ce qu'il disait a cet instant : sa voix est au debut de la phrase
+        # captee, la transcription l'ecrit (voir `_jv.sans_sa_voix`)
+        JARVIS["coupe_contexte"] = contexte_de_coupure()
         poser_led("ecoute")
         JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=0.0, parole_vue=time.time())
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "reveil":
-        print("Jarvis : eveil (%s%s)" % (ev.get("par"), ", verifie" if ev.get("verifie") else ""))
+        print("Jarvis : eveil (%s%s)" % (ev.get("par"), ", verifie" if ev.get("verifie") else
+                                         ", sans lecture : le score a tranche" if ev.get("repli") else ""))
         # UN NOUVEAU TOUR : ce qu'il preparait pour le tour d'avant ne se dira pas
         JARVIS["tour"] = int(JARVIS.get("tour") or 0) + 1
         VOIX.taire()
+        if etat_dictee()["etat"] != "pret":
+            # RIEN NE POURRA ETRE TRANSCRIT (le modele se telecharge, ou a rate) :
+            # il ne t'invite pas a parler dans le vide -- il dit ou il en est
+            envoyer_oreille({"cmd": "annuler"})
+            return dire_transcription_indisponible(langue_du_mode())
         mode_courant()
         # « Quand Jarvis s'allume, il doit toujours etre en mode Jarvis (meme
         # s'il etait en psychologue avant). » La seance continue tant qu'on se
@@ -5695,7 +6043,6 @@ def traiter_evenement(ev):
         JARVIS["reveil_verifie"] = bool(ev.get("verifie"))
         poser_mode("jarvis")
         JARVIS.update(suite_active=False, attente_code=None, entendu="", fait_jusqua=0.0)
-        declencher_routines("evenement", "reveil", CFG)
         if ev.get("deja_fini"):
             # « Jarvis, allume la lumiere » dit d'une traite pendant qu'il
             # verifiait l'appel : il n'ecoute plus, il lit
@@ -5706,6 +6053,9 @@ def traiter_evenement(ev):
             poser_led("ecoute")
             JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=time.time() + attente,
                           ecoute_duree=attente, parole_vue=0.0)
+        # la lumiere de la routine du reveil -- APRES l'ecoute ouverte : sa
+        # replique ne se dit pas par-dessus la demande qui commence
+        declencher_routines("evenement", "reveil", CFG)
         # Le moteur de transcription se reveille PENDANT qu'on parle : sa
         # premiere phrase apres un long silence ne paie pas son chargement.
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
@@ -5714,6 +6064,12 @@ def traiter_evenement(ev):
         # reprend sa phrase -- l'oreille, elle, a deja appris que c'etait de l'echo.
         if ev.get("apres_coupure") and reprendre_apres_coupure():
             return
+        if (JARVIS.get("suspens") or {}).get("coupe") and JARVIS["etat"] == "ecoute":
+            # « Attends... » dit par-dessus lui, et rien n'a suivi : il reprend
+            JARVIS["suspens"] = None
+            if reprendre_apres_coupure():
+                return
+            return fin_de_l_ecoute()
         if JARVIS.get("suspens") and JARVIS["etat"] == "ecoute":
             # sa phrase en suspens, et rien n'a suivi : elle part telle quelle
             JARVIS["ecoute_fin"] = 0.0
@@ -5726,13 +6082,25 @@ def traiter_evenement(ev):
             fin_de_l_ecoute()
     elif quoi == "phrase":
         # IL N'ECOUTE PLUS : ca se voit tout de suite (l'oreille a joue son petit son)
+        noter_temps("phrase", ev.get("pause"), ev.get("fin_t"))
+        # (la fin prevue de la fenetre de suite est gardee : si ce n'etait que
+        # la queue de sa voix, il ecoute encore le temps qui restait)
+        JARVIS["ecoute_avant"] = (float(JARVIS.get("ecoute_fin") or 0.0)
+                                  if JARVIS.get("etat") == "ecoute" and JARVIS.get("suite_active") else 0.0)
         JARVIS["ecoute_fin"] = 0.0
+        a = JARVIS.get("avance")
+        if (ev.get("apres_coupure") and not ev.get("breve") and a and not a.get("fini")
+                and a.get("id") in VOIX.coupes and a.get("tour") == JARVIS.get("tour")):
+            # ON LUI A VRAIMENT PARLE par-dessus sa premiere phrase (des mots,
+            # pas un bruit bref) : la reponse qu'il attendait encore n'est plus
+            # la question -- il n'attend plus BrainDebugger pour t'ecouter
+            a["interrompue"] = True
         if JARVIS.get("etat") in ("ecoute", "attente"):
             poser_led("comprend")
             JARVIS.update(etat="comprend", message="Je transcris...")
         _JARVIS_TRAVAIL.append({"wav": ev.get("wav") or "", "apres_coupure": bool(ev.get("apres_coupure")),
                                 "deja_dit": bool(ev.get("deja_dit")), "breve": bool(ev.get("breve")),
-                                "tour": JARVIS.get("tour")})
+                                "avec_debut": bool(ev.get("avec_debut")), "tour": JARVIS.get("tour")})
         _JARVIS_TRAVAIL_SIGNAL.set()
     elif quoi == "gabarit":
         _GABARIT_RECU["evt"] = ev
@@ -5767,30 +6135,114 @@ def fin_de_l_ecoute():
     JARVIS.update(etat="attente", message=message_attente())
 
 
+def consigne_ecouter(attente, mode=None, **plus):
+    """L'ordre « ecouter » pour l'oreille, selon le mode : le psychologue
+    laisse des phrases plus longues ET plus de silence avant de conclure."""
+    psy = (mode or JARVIS.get("mode")) == "psy"
+    c = {"cmd": "ecouter", "attente": attente, "duree_max": _jv.PHRASE_PSY_MAX_S if psy else _jv.PHRASE_MAX_S}
+    if psy:
+        c["pause"] = _jv.PHRASE_PSY_PAUSE_S
+    c.update(plus)
+    return c
+
+
+def reecouter_la_suite():
+    """« JE VOUS ECOUTE ENCORE UN INSTANT » -- et il se rendormait 1,5 s plus
+    tard : la fin de sa voix (une enceinte en retard, l'echo), pas un mot de
+    toi, avait ferme l'ecoute. Tant qu'il reste du temps a la fenetre de
+    suite, il ecoute encore ce temps-la, sans carillon."""
+    jusqua = float(JARVIS.get("ecoute_avant") or 0.0)
+    reste = jusqua - time.time()
+    if reste < 1.0 or not oreille_vivante():
+        return False
+    JARVIS["ecoute_avant"] = 0.0
+    print("Jarvis : rien de toi dans ce qu'il a entendu, il ecoute encore %.1f s" % reste)
+    poser_led("ecoute")
+    JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.", suite_active=True,
+                  ecoute_fin=jusqua, ecoute_duree=reste, parole_vue=0.0)
+    envoyer_oreille(consigne_ecouter(round(reste, 2), ignorer=0.0))
+    return True
+
+
+def contexte_de_coupure():
+    """La phrase qu'il disait quand on l'a coupe, et celle d'avant."""
+    r = VOIX.reprise
+    if not r:
+        return ""
+    st = SOUS_TITRES.get(r.get("id"))
+    if not st:
+        return str(r.get("texte") or "")[:400]
+    phrases, k = list(st.get("phrases") or []), int(st.get("k", -1))
+    return " ".join(phrases[max(0, k - 1):k + 1] if k >= 0 else phrases[:2])
+
+
+# « IL NE M'ENTEND PLUS » : la confidentialite de Windows qui refuse le micro
+# aux applications, une touche « micro coupe » -- le micro ne rend que des
+# zeros. La page montrait « -90 dB » sans rien dire. Un indice, pas une erreur :
+# certains pilotes antibruit rendent aussi des zeros dans une piece calme.
+MICRO_MUET_DB = -90.0
+MICRO_MUET_S = 30.0
+MICRO_MUET_MESSAGE = ("Le micro ne rend que du silence : coupe, ou acces refuse "
+                      "(Parametres > Confidentialite > Microphone).")
+
+
+def micro_muet_signale():
+    return (JARVIS.get("souci") or ("",))[0] == MICRO_MUET_MESSAGE
+
+
+def suivre_micro_muet(db, maintenant):
+    """Chaque niveau du micro : trente secondes de zeros exacts, on le dit ;
+    le premier vrai son l'efface."""
+    try:
+        db = float(db)
+    except (TypeError, ValueError):
+        return
+    if db <= MICRO_MUET_DB:
+        debut = JARVIS.get("muet_depuis") or maintenant
+        JARVIS["muet_depuis"] = debut
+        if maintenant - debut >= MICRO_MUET_S and not micro_muet_signale():
+            souci(MICRO_MUET_MESSAGE)
+    else:
+        JARVIS["muet_depuis"] = None
+        if micro_muet_signale():
+            JARVIS["souci"] = None
+
+
 def verifier_appel(wav64, n=None):
     """Tranche un appel pas net : « Jarvis » (meme ecorche) dans la
-    transcription -> il se reveille ; sinon, il se rendort sans un bruit."""
-    ok, lu = False, None
+    transcription -> il se reveille ; sinon, il se rendort sans un bruit.
+
+    Trois reponses : oui, non, et « illisible » (None : transcription pas
+    prete, memoire, moteur qui plante) -- alors l'oreille laisse le score
+    trancher. Un « non » sans avoir rien lu rejetait tout appel pas net, sans
+    un mot. Rend True seulement si on y a lu son nom."""
+    ok, lu = None, None
     try:
         if etat_dictee()["etat"] == "pret":
             texte = transcrire(base64.b64decode(wav64))
-            lu = _jv.nom_trouve(texte, noms_appris())
-            # parler DE lui (« j'ai l'impression que Jarvis ecoute ») n'est pas l'appeler
-            ok = lu is not None and not _jv.est_une_mention(texte, noms_appris())
+            # « J'AI GALERE A CE QU'IL S'ALLUME » : un « Jarvis » dit seul,
+            # Parakeet l'ecrit « Javi », « Chavis », « É Javi » -- la forme
+            # ecorchee confirme un appel que l'empreinte a deja trouve proche
+            lu = _jv.nom_verifie(texte, noms_appris())
+            # parler DE lui (« j'ai l'impression que Jarvis ecoute ») n'est pas
+            # l'appeler ; le bout de son finit juste apres le nom (« Jarvis il »)
+            ok = lu is not None and not _jv.est_une_mention(texte, noms_appris(), tronque=True)
     except Exception as e:
         print("Jarvis : verification impossible (%s)" % type(e).__name__)
     # le mot qui l'a confirme, pour comprendre un reveil intempestif (pas la phrase)
-    print("Jarvis : appel pas net %s" % ("confirme (« %s »)" % lu if ok else
+    print("Jarvis : appel pas net %s" % ("illisible : le score tranche" if ok is None else
+                                         "confirme (« %s »)" % lu if ok else
                                          "ecarte" + (" (on parlait de lui)" if lu else "")))
-    for e in reversed(JARVIS.get("essais") or []):
-        if e.get("issue") == "verifier":
-            e["issue"] = "confirme" if ok else "ecarte"
-            break
+    if ok is not None:
+        for e in reversed(JARVIS.get("essais") or []):
+            if e.get("issue") in ("verifier", "lent"):
+                e["issue"] = "confirme" if ok else "ecarte"
+                break
     verdict = {"cmd": "verifie", "ok": ok}
     if n is not None:
         verdict["n"] = n
     envoyer_oreille(verdict)
-    return ok
+    return bool(ok)
 
 
 def garder_facons(transcription):
@@ -5837,9 +6289,18 @@ def reprendre_apres_coupure():
     if not VOIX.reprise:
         return False
     print("Jarvis : coupe pour rien, il reprend")
-    if VOIX.reprise.get("fin") is None:
-        # un minuteur, une annonce : rien ne le remettait « a l'ecoute » apres
-        VOIX.reprise["fin"] = lambda: (poser_led(None), JARVIS.update(etat="attente", message=message_attente()))
+    fin, tour = VOIX.reprise.get("fin"), JARVIS.get("tour")
+
+    def puis():
+        # un minuteur, une annonce -- ou sa premiere phrase, dite en avance, dont
+        # la suite ne viendra plus : rien ne le remettait « a l'ecoute » apres,
+        # et il restait « parle » pour toujours
+        if fin:
+            fin()
+        if JARVIS.get("etat") == "parle" and JARVIS.get("tour") == tour:
+            poser_led(None)
+            JARVIS.update(etat="attente", message=message_attente())
+    VOIX.reprise["fin"] = puis
     poser_led("parle")
     JARVIS.update(etat="parle", message="Je reprends.")
     if VOIX.reprendre():
@@ -5856,6 +6317,54 @@ def message_attente():
         return ("A l'ecoute : dis « Hey Jarvis » (a l'anglaise). Pour « Jarvis » tout "
                 "seul, apprends-lui ta voix.")
     return "Apprends-lui ta voix pour qu'il reconnaisse « Jarvis »."
+
+
+# LE GARDE-FOU DES ETATS. « Il reste bloque sur "il reflechit" jusqu'a ce que
+# je redise Jarvis » : un etat ecrit trop tard (la reponse d'un tour d'avant,
+# un « fini » que la voix n'enverra jamais) restait affiche pour toujours --
+# et bloquait les annonces. Un etat qui n'a plus de raison d'etre depuis
+# quelques secondes revient a l'attente.
+GARDE_ETATS_S = {"parle": 4.0, "pense": 10.0, "comprend": 10.0}
+_GARDE = {"cle": None, "depuis": 0.0, "sans_raison": None}
+
+
+def raison_d_etre(etat):
+    """Quelque chose justifie-t-il encore cet etat ?"""
+    if voix_occupee():
+        return True                       # il parle, ou il a encore a dire
+    if etat == "parle":
+        return False
+    # pense / comprend : une phrase en file, en travail, ou une requete en cours
+    # (une requete abandonnee qui traine encore ne compte pas)
+    return bool(_JARVIS_TRAVAIL or _TRAVAIL_COURANT.get("tour") is not None
+                or any(not v.get("annule") for v in list(_EN_VOL.values())))
+
+
+def surveiller_etats(maintenant=None):
+    """Appele chaque seconde par la veille. Rend True s'il a remis l'attente."""
+    maintenant = time.monotonic() if maintenant is None else maintenant
+    etat = JARVIS.get("etat")
+    cle = (etat, JARVIS.get("message"), JARVIS.get("tour"))
+    if cle != _GARDE["cle"]:
+        # un etat qui vient d'etre ecrit a toujours sa chance
+        _GARDE.update(cle=cle, depuis=maintenant, sans_raison=None)
+        return False
+    delai = GARDE_ETATS_S.get(etat)
+    if delai is None:
+        return False
+    if raison_d_etre(etat):
+        _GARDE["sans_raison"] = None
+        return False
+    if _GARDE["sans_raison"] is None:
+        _GARDE["sans_raison"] = maintenant
+    if maintenant - _GARDE["sans_raison"] < delai:
+        return False
+    print("Jarvis : garde-fou -- « %s » sans raison depuis %d s, retour a l'attente" % (etat, delai))
+    clore_temps("coince")
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+    _GARDE.update(cle=None, sans_raison=None)
+    return True
 
 
 def veiller_sur_jarvis(cfg):
@@ -5920,14 +6429,19 @@ def veiller_sur_jarvis(cfg):
                 if not vad_present() and time.time() - _VAD["essaye"] > 6 * 3600:
                     _VAD["essaye"] = time.time()
                     threading.Thread(target=preparer_vad, daemon=True).start()
+                veiller_sur_la_transcription(cfg)
             if not voulu and JARVIS["etat"] != "eteint" and _OREILLE["proc"] is None:
                 JARVIS.update(etat="eteint", message="")
+            if voulu:
+                surveiller_etats()
             # une tache de fond prete : il l'annonce des qu'il est libre (sans
             # attendre la guirlande, qui peut ne pas etre branchee)
             try:
+                dire_les_annonces()
                 annoncer_taches(cfg)
             except Exception as e:
                 print("Jarvis : annonce impossible (%s)" % e)
+            veiller_initiatives(cfg)         # ses petites initiatives (et le « oui ? » qui expire)
             # LA VOIX : un processus a part, ses voix chargees tant qu'il ecoute.
             # Relancee si elle tombe, rechargee si on en change.
             veut_voix = voulu and cfg.get("jarvis_voix", True)
@@ -5962,14 +6476,32 @@ def fil_jarvis_travail(cfg):
         _JARVIS_TRAVAIL_SIGNAL.clear()
         while _JARVIS_TRAVAIL:
             item = _JARVIS_TRAVAIL.pop(0)
+            _TRAVAIL_COURANT.update(tour=item.get("tour"), t=time.monotonic())
+            if item.get("wav"):
+                lancer_onglets(cfg)          # pendant la transcription (voir `onglets_attendus`)
             try:
                 traiter_phrase(item["wav"], cfg, item.get("apres_coupure", False), deja_dit=item.get("deja_dit", False),
-                               breve=item.get("breve", False), tour=item.get("tour"))
+                               breve=item.get("breve", False), tour=item.get("tour"),
+                               avec_debut=item.get("avec_debut", False))
+                if not voix_occupee():
+                    clore_temps("sans voix")   # un son, une commande muette, une phrase en suspens
             except Annule:
-                pass                         # congedie ou rappele pendant qu'il y pensait
+                clore_temps("annule")        # congedie ou rappele pendant qu'il y pensait
             except Exception as e:
                 print("Jarvis : phrase non traitee (%s)" % type(e).__name__)
-                signaler_erreur(phrase("rate", langue_du_mode(cfg)))
+                signaler_erreur(phrase("rate", langue_du_mode(cfg)), detail="phrase non traitee : %s" % type(e).__name__)
+            finally:
+                _TRAVAIL_COURANT.update(tour=None, t=time.monotonic())
+
+
+# ce que traite le fil de travail (tour, depuis quand) : le garde-fou des etats
+# sait ainsi qu'un « pense » a encore une raison d'etre
+_TRAVAIL_COURANT = {"tour": None, "t": 0.0}
+
+
+def voix_occupee():
+    """Dit-il quelque chose, ou a-t-il quelque chose a dire ?"""
+    return bool(VOIX.parle or VOIX.attentes or getattr(VOIX, "file", None))
 
 
 def demarrer_jarvis(cfg):
@@ -5990,14 +6522,137 @@ def prechauffer_dictee():
         try:
             sock = _moteur_vivant()
             silence = _jv.wav_de(__import__("numpy").zeros(int(_jv.FREQ * 0.4), dtype="int16"))
+            sock.settimeout(_delai_reponse(0.4))
             _envoyer_trame(sock, silence)
             _recevoir_trame(sock)
             _MOTEUR["vu"] = time.time()
+            _moteur_charge()
         except Exception as e:
             print("Jarvis : prechauffage impossible (%s)" % type(e).__name__)
             _arreter_moteur()
             return
     _programmer_dechargement()
+
+
+# ---------- la porteuse : la langue des reponses d'un mot ----------
+#
+# « Non » transcrit « Não », « Ouais » transcrit « Wait » (voir
+# jarvis.reconnaitre) : une phrase dite par SA voix francaise, rendue une fois
+# en memoire par le processus de la voix, ancre la langue. Jamais sur le disque.
+
+PORTEUSE_TEXTE = {"fr": "Je vous écoute."}
+PORTEUSE_REDEMANDE_S = 60
+_PORTEUSE = {"fr": None, "demande": 0.0}
+
+
+def porteuse_pour(langue):
+    """Le WAV de la porteuse de cette langue, rendu par la voix chargee en ce
+    moment -- ou None (pas de voix neuronale, ou pas encore rendue)."""
+    p = _PORTEUSE.get(langue) if langue in PORTEUSE_TEXTE else None
+    if p and p.get("sig") and p["sig"] == _VOIX_ENFANT.get("charge"):
+        return p["wav"]
+    return None
+
+
+def demander_porteuse(maintenant=None):
+    """La voix francaise est chargee et la porteuse manque (ou vient d'une
+    voix d'avant) : on la demande -- quand Jarvis ne fait rien, pour ne pas
+    retarder une reponse. La voix peut la perdre (« taire » vide sa file) :
+    on redemande, au plus une fois par minute."""
+    t = time.time() if maintenant is None else maintenant
+    if porteuse_pour("fr") is not None or not voix_prete("fr"):
+        return False
+    if JARVIS.get("etat") != "attente" or t - _PORTEUSE["demande"] < PORTEUSE_REDEMANDE_S:
+        return False
+    _PORTEUSE["demande"] = t
+    return envoyer_voix({"cmd": "rendre", "id": "porteuse", "cle": "fr", "texte": PORTEUSE_TEXTE["fr"]})
+
+
+def recevoir_porteuse(ev):
+    """Le processus de la voix rend la porteuse (evenement « rendu »)."""
+    cle = str(ev.get("cle") or "")
+    if cle not in PORTEUSE_TEXTE or not ev.get("wav"):
+        return False
+    try:
+        wav = base64.b64decode(ev["wav"])
+        if entete_wav(wav)[1] != _jv.FREQ:
+            return False
+    except Exception:
+        return False
+    _PORTEUSE[cle] = {"wav": wav, "sig": _VOIX_ENFANT.get("charge")}
+    return True
+
+
+def transcrire_phrase(octets, langue):
+    """transcrire, avec la porteuse de la langue quand on l'a."""
+    p = porteuse_pour(langue)
+    return transcrire(octets, porteuse=p) if p else transcrire(octets)
+
+
+# ---------- quand la transcription n'est pas la ----------
+#
+# « Un telechargement rate, et Jarvis est sourd pour de bon. » Le modele de
+# la dictee (456 Mo) peut rater sa venue (un reseau qui flanche) : rien ne
+# reessayait tant que Machi Tool tournait, et Jarvis ne le disait qu'une
+# fois -- ensuite chaque appel sonnait, on parlait dans le vide, et rien.
+
+DICTEE_RELANCES_S = (60, 5 * 60, 30 * 60)
+DICTEE_DIRE_S = 120                  # l'etat de la transcription, dit au plus toutes les 2 min
+_DICTEE_RELANCE = {"prochain": 0.0, "n": 0}
+
+
+def relancer_dictee_si_ratee(maintenant=None, lancer=None):
+    """La preparation du modele a echoue : on la retente apres 1 min, puis 5,
+    puis toutes les 30. Rend True si un essai part."""
+    t = time.time() if maintenant is None else maintenant
+    if not dictee_possible() or DICTEE.get("etat") != "erreur":
+        if DICTEE.get("etat") == "pret":
+            _DICTEE_RELANCE.update(prochain=0.0, n=0)
+        return False
+    if not _DICTEE_RELANCE["prochain"]:
+        _DICTEE_RELANCE["prochain"] = t + DICTEE_RELANCES_S[0]
+        return False
+    if t < _DICTEE_RELANCE["prochain"]:
+        return False
+    n = _DICTEE_RELANCE["n"] = _DICTEE_RELANCE["n"] + 1
+    _DICTEE_RELANCE["prochain"] = t + DICTEE_RELANCES_S[min(n, len(DICTEE_RELANCES_S) - 1)]
+    print("Dictee : nouvel essai de preparation (%d)" % n)
+    (lancer or (lambda f: threading.Thread(target=f, daemon=True).start()))(preparer_dictee)
+    return True
+
+
+def etat_de_la_transcription(langue):
+    """Ce qu'il dit quand on l'appelle et qu'il ne peut pas transcrire."""
+    d = etat_dictee()
+    if d.get("etat") == "preparation":
+        return phrase("transcription_telecharge", langue, int(round(float(d.get("progres") or 0) * 100)))
+    if d.get("etat") == "erreur":
+        return phrase("transcription_reessaie", langue)
+    return phrase("transcription_absente", langue)
+
+
+def veiller_sur_la_transcription(cfg):
+    """A chaque tour de veille, l'oreille ouverte : un modele rate se retente,
+    le moteur se precharge ou s'entretient, la porteuse se demande."""
+    for f in (relancer_dictee_si_ratee, lambda: entretenir_dictee(cfg), demander_porteuse):
+        try:
+            f()
+        except Exception as e:
+            print("Jarvis : transcription, veille (%s)" % type(e).__name__)
+
+
+def dire_transcription_indisponible(langue, tour=None, maintenant=None):
+    """Il ne peut pas transcrire : il le dit (au plus toutes les deux minutes ;
+    entre-temps, le son d'erreur et le panneau)."""
+    t = time.time() if maintenant is None else maintenant
+    texte = etat_de_la_transcription(langue)
+    if t - float(JARVIS.get("dictee_dite") or 0.0) >= DICTEE_DIRE_S:
+        JARVIS["dictee_dite"] = t
+        return signaler_erreur(texte, tour)
+    poser_led("erreur", 1.6)
+    jouer_son("erreur")
+    JARVIS["erreur_jusqua"] = t + ERREUR_MONTREE_S
+    JARVIS.update(etat="attente", message=texte)
 
 
 PSY_DUREE_S = 180            # le mode psy se referme apres trois minutes sans un mot
@@ -6021,29 +6676,35 @@ _PHRASES = {
     "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
     "code_refuse": ("Accès refusé.", "Access denied."),
     "verrouille": ("Accès verrouillé.", "Access locked."),
-    "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
-                      "My hands on the PC are closed: Settings, Jarvis."),
+    "mains_fermees": ("Mes mains sur le PC sont fermées : ouvrez-les dans les réglages de l'assistant.",
+                      "My hands on the PC are closed: open them in the assistant settings."),
     "youtube_video": ("C'est lancé.", "Here you go."),
     "youtube_resultats": ("Les résultats de YouTube sont à l'écran.", "I've opened the YouTube results."),
     "youtube_rate": ("YouTube ne répond pas.", "YouTube isn't answering."),
     "son_rate": ("Je ne parviens pas à régler le son.", "I can't set the volume."),
     "oui": ("Oui ?", "Yes?"),
-    # sans dire son nom : sa propre voix le reveillerait
+    # AUCUNE ne dit son nom : sa propre voix le reveillerait (test : LeNomDansSesPhrases)
     "mode_psy": ("Mode psychologue. Je vous écoute. Appelez-moi par mon nom pour revenir.", None),
     "mode_jarvis": ("À votre service.", "At your service."),
     "retour": ("Content de vous revoir.", "Welcome back."),
     "lecture": ("Je n'ai pas pu lire ce que le micro m'a donné.", "I couldn't read what the microphone gave me."),
-    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.",
-                              "Transcription isn't ready yet. Have a look at the Jarvis page in Machi Tool."),
+    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page de l'assistant, dans Machi Tool.",
+                              "Transcription isn't ready yet. Have a look at the assistant page in Machi Tool."),
     "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
+    "transcription_telecharge": ("Ma transcription se télécharge encore : %d pour cent.",
+                                 "My transcription is still downloading: %d percent."),
+    "transcription_reessaie": ("Ma transcription n'a pas pu se préparer. Je réessaie.",
+                               "My transcription couldn't get ready. I'm trying again."),
+    "memoire_pleine": ("Il me manque de la mémoire pour vous comprendre. Fermez une application, je vous prie.",
+                       "I'm short of memory to understand you. Please close an application."),
     "commande_ratee": ("Je crains de ne pas avoir pu le faire.", "I'm afraid I couldn't do that."),
     "rate": ("Un incident de mon côté, je le crains.", "Something went wrong on my side, I'm afraid."),
     "cle_absente": ("Pour vous répondre, il me faut la clé de BrainDebugger : page Passerelle de Machi Tool.",
                     "To answer you, I need the BrainDebugger key. It's on the Passerelle page of Machi Tool."),
     "cle_refusee": ("BrainDebugger refuse ma clé.", "BrainDebugger is refusing my key."),
     "bd_ancien_psy": ("Votre version de BrainDebugger ne sait pas encore m'écouter.", None),
-    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode Jarvis.",
-                         "Your BrainDebugger doesn't know Jarvis mode yet."),
+    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode majordome.",
+                         "Your BrainDebugger doesn't know butler mode yet."),
     "bd_sans_cle": ("BrainDebugger n'a pas de clé Claude pour me faire parler.",
                     "BrainDebugger has no Claude key to let me speak."),
     "bd_erreur": ("BrainDebugger a répondu par une erreur %s.", "BrainDebugger answered with error %s."),
@@ -6056,6 +6717,10 @@ _PHRASES = {
     "api_limite": ("Trop de demandes à Claude d'un coup. Réessayez dans une minute.",
                    "Too many requests to Claude at once. Try again in a minute."),
     "bd_injoignable": ("Je n'arrive pas à joindre BrainDebugger.", "I can't reach BrainDebugger."),
+    "bd_muet": ("BrainDebugger ne répond pas.", "BrainDebugger isn't answering."),
+    "bd_lent": ("Un instant.", "One moment."),
+    "transcription_moteur": ("Ma transcription a échoué. Le détail est sur la page de l'assistant.",
+                             "My transcription failed. The details are on the assistant page."),
     "compagnon_muet": ("Le compagnon n'a rien répondu.", None),
     "sans_reponse": ("Je n'ai rien à répondre à cela, curieusement.", "Curiously, I have nothing to say to that."),
     "dormir": ("Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool.",
@@ -6312,14 +6977,31 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
     def fin():
         if JARVIS.get("tour") != t0:
             return                                 # congedie pendant qu'il parlait
+        clore_temps("dit", t0)
+        # « IL M'ECOUTE ALORS QU'IL PARLE ENCORE » : un minuteur, une annonce
+        # attendent derriere sa reponse -- la suite (l'ecoute d'apres) attend
+        # qu'ils soient dits, sinon le micro l'enregistre, et il se repond.
+        plus_tard = [i for i in list(getattr(VOIX, "attentes", None) or {}) if i is not None]
+        if plus_tard:
+            dernier = max(plus_tard)
+            avant = VOIX.attentes.get(dernier)
+
+            def puis():
+                if avant:
+                    try:
+                        avant()
+                    except Exception:
+                        pass
+                fin()
+            if VOIX.rattacher(dernier, puis):
+                return
         if ecouter and oreille_vivante():
             jouer_son("eveil")
             attente = _jv.attente_suite(texte, echanges_en_cours(), mode)
             poser_led("ecoute")
             JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.", suite_active=True,
                           ecoute_fin=time.time() + attente, ecoute_duree=attente, parole_vue=0.0)
-            envoyer_oreille({"cmd": "ecouter", "attente": attente,
-                             "duree_max": _jv.PHRASE_PSY_MAX_S if mode == "psy" else _jv.PHRASE_MAX_S})
+            envoyer_oreille(consigne_ecouter(attente, mode))
         else:
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
@@ -6329,6 +7011,12 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
             except Exception:
                 pass
     if ident_deja is not None:
+        # on lui a coupe la parole pendant cette premiere phrase : la suite
+        # attend la reprise (ou disparait), et l'etat reste celui de l'ecoute
+        ident_deja = VOIX.rejoindre(ident_deja, reste, fin)
+        if ident_deja is None:
+            print("Jarvis : on lui avait coupe la parole, la suite ne se dit pas maintenant")
+            return
         # la premiere phrase sonne (ou a sonne) : la suite derriere elle
         poser_led("parle")
         JARVIS.update(etat="parle", message="Je reponds.")
@@ -6383,15 +7071,145 @@ def dire_et_attendre(texte, langue=None, delai=30.0):
     return fini.is_set()
 
 
+# ---------- le chronometre d'un echange ----------
+#
+# « IL MET UNE PLOMBE A REPONDRE » -- mais ou ? La pause de fin de phrase, la
+# transcription, BrainDebugger (et Claude), la voix ? Chaque echange garde ses
+# temps -- des nombres, jamais ce qui a ete dit : une ligne au journal, et la
+# page Jarvis montre le dernier, pour qu'on sache enfin ce qui est lent.
+
+CHRONO = {"courant": None}          # l'echange en cours : {"tour", "mur", "pause", "t": {etape: monotonic}}
+CHRONOS = deque(maxlen=10)          # les derniers echanges, le plus recent a la fin
+_CHRONO_DERNIERES = ("bd_fin",)     # les tours d'outils : la derniere reponse compte
+
+
+def noter_temps(etape, pause=None, fin_t=None):
+    """Un point du chronometre. « phrase » ouvre un echange (l'oreille rend ta
+    phrase : `pause`, le silence qu'elle a attendu ; `fin_t`, l'heure ou tu
+    t'es tu). Les autres etapes -- transcrit, bd_envoi, bd_debut, bd_fin,
+    voix -- ne comptent que pour l'echange en cours, et la premiere fois."""
+    try:
+        m = time.monotonic()
+        if etape == "phrase":
+            if CHRONO["courant"] is not None:
+                clore_temps("interrompu")
+            debut = m
+            if fin_t is not None:
+                debut = m - max(0.0, min(60.0, time.time() - float(fin_t)))
+            elif pause is not None:
+                debut = m - max(0.0, float(pause))
+            CHRONO["courant"] = {"tour": JARVIS.get("tour"), "mur": time.time(), "pause": pause,
+                                 "t": {"fin_parole": debut, "phrase": m}}
+            return
+        c = CHRONO["courant"]
+        if c is None or c["tour"] != JARVIS.get("tour"):
+            return
+        t = c["t"]
+        # « Un instant. » (il patiente) n'est pas le premier son de la reponse
+        if etape == "voix" and "bd_envoi" in t and "bd_debut" not in t and "bd_fin" not in t:
+            return
+        if etape in _CHRONO_DERNIERES or etape not in t:
+            t[etape] = m
+    except Exception:
+        pass
+
+
+def clore_temps(issue, tour=None):
+    """Ferme l'echange en cours (dit, erreur, annule...) : ses temps vont dans
+    CHRONOS et au journal, en une ligne."""
+    c = CHRONO["courant"]
+    if c is None or (tour is not None and c["tour"] != tour):
+        return None
+    CHRONO["courant"] = None
+    try:
+        c["t"].setdefault("fin", time.monotonic())
+        r = resume_temps(c, issue)
+        CHRONOS.append(r)
+        print(ligne_temps(r))
+        return r
+    except Exception as e:
+        print("Jarvis : chronometre (%s)" % type(e).__name__)
+        return None
+
+
+def resume_temps(c, issue):
+    """Les durees d'un echange, en secondes : chaque segment, puis le premier
+    son et la fin comptes depuis le moment ou tu t'es tu."""
+    t = c["t"]
+    d = lambda a, b: round(max(0.0, t[b] - t[a]), 2) if a in t and b in t else None
+    reponse = "bd_debut" if "bd_debut" in t else "bd_fin" if "bd_fin" in t else "transcrit"
+    return {"heure": time.strftime("%H:%M:%S", time.localtime(c["mur"])), "issue": issue,
+            "chemin": "bd" if "bd_envoi" in t else "ici", "pause": c.get("pause"),
+            "fin_de_phrase": d("fin_parole", "phrase"), "transcription": d("phrase", "transcrit"),
+            "contexte": d("transcrit", "bd_envoi"), "bd": d("bd_envoi", "bd_debut" if "bd_debut" in t else "bd_fin"),
+            "bd_fin": d("bd_envoi", "bd_fin"), "voix": d(reponse, "voix"),
+            "premier_son": d("fin_parole", "voix"), "total": d("fin_parole", "fin")}
+
+
+def ligne_temps(r):
+    """La ligne du journal (datee : un journal copie dit enfin ou ca traine)."""
+    noms = (("fin_de_phrase", "fin de phrase"), ("transcription", "transcription"), ("contexte", "contexte"),
+            ("bd", "BD 1re phrase"), ("bd_fin", "BD fin"), ("voix", "voix"))
+    bouts = ["%s %.2f" % (nom, r[k]) for k, nom in noms if r.get(k) is not None]
+    fin = [("1er son a %.2f s" % r["premier_son"]) if r.get("premier_son") is not None else "sans voix"]
+    if r.get("total") is not None:
+        fin.append("fin a %.2f s" % r["total"])
+    return "Jarvis : echange de %s (%s, %s) -- %s | %s" % (r["heure"], r["chemin"], r["issue"],
+                                                        " | ".join(bouts) or "-", " | ".join(fin))
+
+
+def _secondes(x):
+    return ("%.1f s" % x).replace(".", ",")
+
+
+def texte_dernier_echange():
+    """Pour la page Jarvis : « Dernier echange (14:03) : fin de phrase 0,8 s ·
+    transcription 0,4 s · BrainDebugger 1,6 s · voix 0,2 s -- premier son a
+    3,0 s. » Et le premier son des echanges d'avant."""
+    if not CHRONOS:
+        return ""
+    r = CHRONOS[-1]
+    noms = (("fin_de_phrase", "fin de phrase"), ("transcription", "transcription"),
+            ("contexte", "contexte"), ("bd", "BrainDebugger"), ("voix", "voix"))
+    bouts = ["%s %s" % (nom, _secondes(r[k])) for k, nom in noms if r.get(k) is not None
+             and (k != "contexte" or r[k] >= 0.05)]
+    txt = "Dernier echange (%s) : %s" % (r["heure"][:5], " · ".join(bouts) or "-")
+    if r.get("premier_son") is not None:
+        txt += " -- premier son a %s" % _secondes(r["premier_son"])
+    if r.get("issue") not in ("dit",):
+        txt += " (%s)" % r["issue"]
+    avant = [_secondes(x["premier_son"]) for x in list(CHRONOS)[-6:-1] if x.get("premier_son") is not None]
+    if avant:
+        txt += ".  Avant : " + " · ".join(reversed(avant))
+    return txt + "."
+
+
+def texte_derniere_erreur(maintenant=None):
+    """Le dernier echec, lisible sur la page Jarvis pendant une demi-heure (le
+    panneau ne le montre que le temps de le dire)."""
+    e = JARVIS.get("derniere_erreur")
+    maintenant = time.time() if maintenant is None else maintenant
+    if not e or maintenant - e[2] > 1800:
+        return ""
+    return "Dernier echec (%s) : %s" % (time.strftime("%H:%M", time.localtime(e[2])), (e[1] or e[0])[:240])
+
+
 ERREUR_MONTREE_S = 2.5
 
 
-def signaler_erreur(texte, tour=None):
+def signaler_erreur(texte, tour=None, detail=None):
     """Ce qui a rate, APRES une demande : il le dit (et le panneau l'ecrit),
     ou le panneau montre ERREUR un instant. Jamais pour un souci de fond (voir
-    `souci`), et jamais pour un tour d'avant."""
+    `souci`), et jamais pour un tour d'avant.
+
+    « JE NE SAIS PAS POURQUOI CA N'A PAS MARCHE » : il dit une phrase courte ;
+    le detail technique (`detail`) va au journal et reste sur sa page."""
+    # une ligne au journal pour chaque echec (la phrase ou le detail, jamais ce qu'on a dit)
+    print("Jarvis : echec -- %s" % str(detail or texte)[:240])
     if tour is not None and JARVIS.get("tour") != tour:
         return
+    JARVIS["derniere_erreur"] = (str(texte or ""), str(detail or ""), time.time())
+    clore_temps("erreur")
     poser_led("erreur", 1.6)
     jouer_son("erreur")
     JARVIS["erreur_jusqua"] = time.time() + ERREUR_MONTREE_S
@@ -6410,31 +7228,159 @@ class Annule(BaseException):
     l'attrapent pas -- il n'y a rien a dire.)"""
 
 
-def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None):
+class Interrompu(Annule):
+    """On lui a coupe la parole pendant sa premiere phrase, et c'etaient des
+    mots : la suite de cette reponse ne se dira pas."""
+
+
+class BDMuet(TimeoutError):
+    """BrainDebugger n'a rien rendu -- ni premiere phrase, ni reponse -- en
+    ATTENTE_BD_MAX_S : « il ne repond pas », pas « injoignable »."""
+
+
+# « JE LUI PARLE ET PLUS RIEN » : BrainDebugger tarde (Railway qui redemarre,
+# Claude surcharge, une recherche sur le web). Sans premiere phrase, un tout
+# petit son dit qu'il y pense encore, puis « Un instant. » une fois ; au-dela
+# d'ATTENTE_BD_MAX_S, il laisse tomber et le dit.
+PATIENCE_S = 4.0
+PATIENCE_REDIRE_S = 8.0
+PATIENCE_DIRE_S = 12.0
+ATTENTE_BD_MAX_S = 90.0             # une recherche sur le web met 20 a 40 s avant sa premiere phrase
+
+# Les requetes a BrainDebugger en cours, par fil : {"r": la reponse ouverte,
+# "annule": True}. Une requete abandonnee (congedie, rappele, trop longue) est
+# fermee : le fil ne reste pas pendu a une reponse que personne n'entendra.
+_EN_VOL = {}
+
+
+def _fermer_reponse(r):
+    """Ferme une reponse ouverte depuis un autre fil. La socket d'abord (la
+    lecture en cours se debloque), puis la reponse."""
+    try:
+        sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        r.close()
+    except Exception:
+        pass
+
+
+def abandonner_requete(ident):
+    vol = _EN_VOL.get(ident)
+    if vol is None:
+        return False
+    vol["annule"] = True
+    if vol.get("r") is not None:
+        # dans son fil : fermer peut attendre que la lecture rende la main
+        threading.Thread(target=_fermer_reponse, args=(vol["r"],), daemon=True).start()
+    return True
+
+
+def requete_en_vol(ident=None):
+    """La requete de ce fil (ou de `ident`) a-t-elle ete abandonnee ? Rend son
+    entree (ou None)."""
+    return _EN_VOL.get(threading.get_ident() if ident is None else ident)
+
+
+def patienter(attente, deja_dit):
+    """Un signe pendant qu'il attend BrainDebugger : le petit son, et une fois
+    « Un instant. ». Rend True si « Un instant. » est parti."""
+    if JARVIS.get("etat") in ("pense", "comprend"):
+        JARVIS["message"] = "Jarvis reflechit... (BrainDebugger met du temps : %d s)" % attente
+    if VOIX.parle:
+        return False
+    L = langue_du_mode()
+    if (not deja_dit and attente >= PATIENCE_DIRE_S and CFG.get("jarvis_voix", True)
+            and VOIX.peut_parler()):
+        VOIX.dire(phrase("bd_lent", L), None, L)
+        return True
+    jouer_son("patience")
+    return False
+
+
+def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None, avance=None):
     """_requete_bd, mais on n'attend plus des que la conversation a change (un
     nouveau reveil, « tais-toi », un clic sur le panneau) : Annule, et la
-    reponse, si elle arrive, part a la poubelle. Il repondait encore apres
-    qu'on l'avait congedie -- et la phrase suivante attendait derriere."""
+    requete est fermee. Il repondait encore apres qu'on l'avait congedie -- et
+    la phrase suivante attendait derriere.
+
+    Tant qu'aucune phrase n'est venue : un signe de loin en loin (voir
+    `patienter`), et BDMuet au bout d'ATTENTE_BD_MAX_S. `avance` : sa premiere
+    phrase, dite en avance ; interrompue pour de bon (voir traiter_evenement,
+    « phrase »), c'est Interrompu."""
+    noter_temps("bd_envoi")
+    vu = {"debut": None}
+
+    def debut(texte):
+        if vu["debut"] is None:
+            vu["debut"] = time.monotonic()
+            noter_temps("bd_debut")
+        sur_debut(texte)
+    en_flux = debut if sur_debut is not None else None
     if tour is None:
-        return _requete_bd(chemin, charge, cfg, delai, sur_debut)
+        r = _requete_bd(chemin, charge, cfg, delai, en_flux)
+        noter_temps("bd_fin")
+        return r
     boite, fini = {}, threading.Event()
 
     def faire():
+        _EN_VOL[threading.get_ident()] = {"r": None, "annule": False}
         try:
-            boite["r"] = _requete_bd(chemin, charge, cfg, delai, sur_debut)
+            boite["r"] = _requete_bd(chemin, charge, cfg, delai, en_flux)
         except BaseException as e:
             boite["e"] = e
         finally:
+            _EN_VOL.pop(threading.get_ident(), None)
             fini.set()
-    threading.Thread(target=faire, daemon=True).start()
-    while not fini.wait(0.1):
-        if JARVIS.get("tour") != tour:
-            raise Annule()
+    fil = threading.Thread(target=faire, daemon=True)
+    fil.start()
+    t0, signe, dit = time.monotonic(), PATIENCE_S, False
+    try:
+        while not fini.wait(0.1):
+            if JARVIS.get("tour") != tour:
+                raise Annule()
+            if avance is not None and avance.get("interrompue"):
+                raise Interrompu()
+            attente = time.monotonic() - t0
+            if vu["debut"] is not None:
+                continue
+            if attente >= ATTENTE_BD_MAX_S:
+                raise BDMuet("rien en %d s" % ATTENTE_BD_MAX_S)
+            if attente >= signe:
+                signe = attente + PATIENCE_REDIRE_S
+                dit = patienter(attente, dit) or dit
+    except BaseException:
+        abandonner_requete(fil.ident)
+        raise
     if JARVIS.get("tour") != tour:
         raise Annule()
     if "e" in boite:
         raise boite["e"]
+    noter_temps("bd_fin")
     return boite.get("r")
+
+
+def echec_bd(e, L, tour, pour="jarvis", t0=None):
+    """Ce qu'il dit quand BrainDebugger n'a pas repondu : une erreur (voir
+    `erreur_bd`), un silence trop long (« ne repond pas ») ou pas de
+    connexion (« injoignable »). La cause exacte au journal et sur sa page
+    -- « injoignable » pouvait etre un nom introuvable, un pare-feu, une
+    reponse coupee, et personne ne savait laquelle."""
+    duree = "" if t0 is None else ", apres %.1f s" % (time.monotonic() - t0)
+    if isinstance(e, urllib.error.HTTPError):
+        corps = _corps_http(e)
+        detail = "BrainDebugger %s : %s%s" % (e.code, str(corps.get("error") or corps.get("raison")
+                                                           or e.reason or "")[:160], duree)
+        return signaler_erreur(erreur_bd(e, L, pour=pour), tour, detail=detail)
+    cause = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else e
+    muet = isinstance(cause, (TimeoutError, socket.timeout))
+    cause = cause if isinstance(cause, BaseException) else e
+    detail = "BrainDebugger %s -- %s: %s%s" % ("ne repond pas" if muet else "injoignable", type(cause).__name__,
+                                               str(cause)[:120], duree)
+    return signaler_erreur(phrase("bd_muet" if muet else "bd_injoignable", L), tour, detail=detail)
 
 
 def veut_partir(texte, brut=""):
@@ -6462,7 +7408,9 @@ def retirer_nom_ecorche(texte, noms=()):
     return str(texte or "").strip()
 
 
-def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False, tour=None):
+def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False, tour=None, avec_debut=False):
+    """`avec_debut` : l'oreille a mis la phrase en suspens DEVANT sa suite --
+    la transcription lit la phrase entiere, on ne recolle pas deux textes."""
     tour = JARVIS.get("tour") if tour is None else tour
     if JARVIS.get("tour") != tour:
         return                                     # congedie avant qu'on la lise
@@ -6476,6 +7424,9 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
         # la phrase en suspens, et personne n'a rien ajoute : elle part telle quelle
         if not suspens:
             return fin_de_l_ecoute()
+        if suspens.get("coupe"):
+            # « Attends... » par-dessus lui, et rien apres : il reprend sa phrase
+            return reprendre_apres_coupure() or fin_de_l_ecoute()
         return _traiter_texte(suspens["brut"], cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
                               sans_suspens=True)
     try:
@@ -6483,16 +7434,20 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
     except Exception:
         return signaler_erreur(phrase("lecture", L), tour)
     if etat_dictee()["etat"] != "pret":
-        # dit UNE fois : ensuite, sa page le dit -- pas a chaque appel
-        if not JARVIS.get("transcription_absente_dite"):
-            JARVIS["transcription_absente_dite"] = True
-            return signaler_erreur(phrase("transcription_absente", L), tour)
-        poser_led(None)
-        return JARVIS.update(etat="attente", message=phrase("transcription_absente", "fr"))
+        # ce qu'il en est (un telechargement a 42 %, un nouvel essai) -- dit au
+        # plus toutes les deux minutes, pas une seule fois pour toujours
+        return dire_transcription_indisponible(L, tour)
+    if dictee_possible() and not moteur_chaud():
+        # le moteur se charge (l'exe, puis 1 Go) : l'attente a une raison visible
+        JARVIS.update(message="Je prepare la transcription...")
     try:
-        texte = transcrire(octets)
+        texte = transcrire_phrase(octets, L)
+        noter_temps("transcrit")
     except DicteeImpossible as e:
-        return signaler_erreur(str(e)[:160], tour)
+        # la raison technique au journal et sur la page ; a voix haute, une phrase courte, dans sa langue
+        print("Jarvis : transcription impossible (%s)" % str(e)[:200])
+        return signaler_erreur(phrase(getattr(e, "cle", None) or "transcription_moteur", L), tour,
+                               detail=str(e)[:240])
     except Exception as e:
         print("Jarvis : transcription impossible (%s)" % type(e).__name__)
         return signaler_erreur(phrase("transcription_ratee", L), tour)
@@ -6501,20 +7456,30 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
     if JARVIS.get("tour") != tour:
         return
     texte = str(texte or "")
+    if suspens and suspens.get("coupe"):
+        if not texte.strip():
+            return reprendre_apres_coupure() or fin_de_l_ecoute()
+        VOIX.oublier_reprise()                   # on lui a vraiment parle
     if suspens:
-        texte = (suspens["brut"] + " " + texte).strip()
+        if avec_debut and texte.strip() and not suspens.get("coupe"):
+            print("Jarvis : la phrase en suspens relue en entier, avec sa suite")
+        else:
+            texte = _jv.joindre_suspens(suspens["brut"], texte)
     return _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L)
 
 
-def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L):
+def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=False):
     """« Mets la musique de... » -- la phrase n'est pas finie : il ne repond
-    pas a la moitie, il ecoute la suite (sans carillon : on parlait deja)."""
+    pas a la moitie, il ecoute la suite (sans carillon : on parlait deja).
+    L'oreille reprend depuis la FIN de la phrase (`reprise`) : ce qui a ete dit
+    pendant qu'on transcrivait n'est plus perdu. `coupe` : « attends... » dit
+    par-dessus lui -- sa reponse est gardee, il la reprend si rien ne suit."""
     n = int((suspens or {}).get("n") or 0)
     if n >= _jv.SUSPENS_MAX or not oreille_vivante():
         return False
     print("Jarvis : phrase en suspens, il attend la suite")
     JARVIS["suspens"] = {"brut": brut, "tour": tour, "n": n + 1, "deja_dit": deja_dit,
-                         "suite": (suspens or {}).get("suite", suite)}
+                         "suite": True if coupe else (suspens or {}).get("suite", suite), "coupe": bool(coupe)}
     attente = _jv.SUSPENS_ECOUTE_S
     poser_led("ecoute")
     try:
@@ -6523,19 +7488,27 @@ def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L):
         vu = brut
     JARVIS.update(etat="ecoute", message="Je vous ecoute.", entendu=vu.strip() + "\u2026", suite_active=True,
                   ecoute_fin=time.time() + attente, ecoute_duree=attente, parole_vue=0.0)
-    envoyer_oreille({"cmd": "ecouter", "attente": attente,
-                     "duree_max": _jv.PHRASE_PSY_MAX_S if JARVIS.get("mode") == "psy" else _jv.PHRASE_MAX_S})
+    # pas de carillon, donc rien a ignorer ; et apres une coupure, pas la
+    # phrase d'avant devant (sa voix y est)
+    envoyer_oreille(consigne_ecouter(attente, ignorer=0.0, reprise=True, debut=not coupe))
     return True
 
 
 def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L, sans_suspens=False):
     brut = texte = str(texte or "")
     noms = noms_appris()
+    if (apres_coupure or breve) and not suspens:
+        # LE DEBUT DE LA PHRASE D'APRES UNE COUPURE, C'EST SA VOIX : « operational.
+        # Stop. » -> « Stop. » ; « systems are operational » -> rien (une toux)
+        net = _jv.sans_sa_voix(brut, JARVIS.get("coupe_contexte") or "")
+        if net != brut.strip():
+            print("Jarvis : sa propre voix retiree de ce qu'on lui a dit")
+        brut = texte = net
     # une reponse, sans le nom (la phrase en suspens garde ce qu'elle etait)
     suite = bool(suspens["suite"]) if suspens else bool(JARVIS.get("suite_active"))
     JARVIS["suite_active"] = False
     deja_dit = bool(deja_dit or (suspens or {}).get("deja_dit"))
-    code = JARVIS.get("attente_code")
+    code = JARVIS.get("attente_code") or oui_en_attente()
     if (not code and not apres_coupure and not breve and not sans_suspens and brut.strip()
             and (suspens is None or suspens.get("n", 0) < _jv.SUSPENS_MAX)
             and _jv.phrase_suspendue(brut, L)
@@ -6550,6 +7523,14 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
         JARVIS["auto_en_attente"] = []
         poser_led(None)
         JARVIS.update(etat="attente", message=message_attente())
+
+    # LA FIN DE SA PROPRE PHRASE, revenue des haut-parleurs dans la fenetre de
+    # suite (« sir. ») : ce n'est pas ta reponse -- il ecoute encore
+    if (suite and not code and not suspens and not apres_coupure and not breve
+            and _jv.queue_de_sa_voix(brut, JARVIS.get("reponse_affichee"))):
+        if reecouter_la_suite():
+            return
+        return se_rendormir("la fin de sa propre voix")
 
     # « SURTOUT QU'IL N'APPARAISSE PAS POUR RIEN » : juste apres un reveil que
     # personne n'a lu, il faut son nom dans ce qui a ete dit (meme ecorche) ;
@@ -6568,6 +7549,8 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
     if premiere and not coupe and texte == brut.strip() and not _jv.contient_nom(brut, noms):
         texte = retirer_nom_ecorche(texte, noms)
     JARVIS["entendu"] = texte
+    if code and not JARVIS.get("attente_code"):
+        return repondre_au_oui(texte, brut, cfg)      # « Je ferme de force Discord ? » -- « oui »
     if code:
         # LA REPONSE A « CODE D'ACCES ? » -- comparee ici, jamais journalisee
         # ni envoyee. « Annule », « degage » : on laisse tomber.
@@ -6591,7 +7574,17 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
             if reprendre_apres_coupure():
                 return
             return se_rendormir("coupe pour rien")
-        # on lui a vraiment parle -- son nom compris (« Jarvis ? » pour le couper)
+        # « MM-HMM », « OUI » par-dessus lui : continue (c'etait bien toi, pas
+        # l'echo -- rien a apprendre). « ATTENDS... » : il se tait, et ecoute la
+        # suite sans repondre ; si rien ne suit, il reprend.
+        nature = _jv.nature_coupure(brut) if VOIX.reprise else None
+        if nature == "relance" and reprendre_apres_coupure():
+            return
+        if nature == "attente" and _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=True):
+            return
+        # on lui a vraiment parle -- son nom compris (« Jarvis ? » pour le couper) :
+        # rien de ce qu'il disait ne repart derriere (ni la suite de sa reponse)
+        VOIX.taire()
         VOIX.oublier_reprise()
     # CHEZ LE PSYCHOLOGUE, la phrase brute d'abord : son nom, « reviens »,
     # « arrete », « je veux plus du psy » -- avant que le nom soit retire.
@@ -6635,8 +7628,10 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
         changement, texte = None, ""
     if not texte:
         if not premiere:
-            # la suite d'une conversation, mais pas un mot (une toux, un clavier) :
-            # il n'insiste pas
+            # la suite d'une conversation, mais pas un mot (une toux, un clavier,
+            # la fin de sa voix) : il ecoute le temps qui restait, sans insister
+            if not apres_coupure and not breve and reecouter_la_suite():
+                return
             return se_rendormir("rien de dit")
         # « Jarvis. » tout court : il attend la suite -- et, UNE fois, s'il
         # a ete reveille par « Hey Jarvis » sans connaitre la voix, il dit
@@ -6749,16 +7744,66 @@ def _requete_bd(chemin, charge, cfg, delai, sur_debut=None):
                "X-Fuseau": "UTC" if not decalage else "Etc/GMT%+d" % -decalage}
     corps = None if charge is None else json.dumps(charge, ensure_ascii=False).encode("utf-8")
     requete = urllib.request.Request(base + chemin, data=corps, headers=entetes)
-    with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
-        if sur_debut is None or "ndjson" not in str(r.headers.get("Content-Type") or ""):
-            return json.loads(r.read().decode("utf-8"))
-        return _lire_flux_bd(r, base + chemin, sur_debut)
+    vol = requete_en_vol()
+    for essai in (1, 2):
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
+                if vol is not None:
+                    vol["r"] = r                 # abandonnee (voir `abandonner_requete`) : on la ferme
+                    if vol.get("annule"):
+                        raise Annule()
+                if sur_debut is None or "ndjson" not in str(r.headers.get("Content-Type") or ""):
+                    return json.loads(r.read().decode("utf-8"))
+                return _lire_flux_bd(r, base + chemin, sur_debut)
+        except urllib.error.URLError as e:
+            if isinstance(getattr(e, "reason", None), _ssl_erreurs()):
+                _oublier_contexte_ssl()          # un magasin de certificats perime : relu la prochaine fois
+            if essai == 2 or (vol is not None and vol.get("annule")) or not reessai_sur(e, time.monotonic() - t0):
+                raise
+            print("Jarvis : BrainDebugger -- %s, je reessaie une fois" % _cause_courte(e))
+            time.sleep(REESSAI_BD_S)
+
+
+REESSAI_BD_S = 0.8
+
+
+def _ssl_erreurs():
+    try:
+        import ssl
+        return (ssl.SSLError, ssl.CertificateError)
+    except Exception:
+        return ()
+
+
+def _cause_courte(e):
+    c = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+    c = c if isinstance(c, BaseException) else e
+    return "%s: %s" % (type(c).__name__, str(c)[:120])
+
+
+def reessai_sur(e, duree):
+    """Reessayer une requete a BrainDebugger n'est sur que si elle n'a PAS pu
+    le mettre au travail : il execute des outils (l'agenda, le carnet) pendant
+    la requete, et une seconde fois les poserait deux fois. Donc : le nom
+    introuvable, la connexion refusee ou pas etablie, la poignee de main TLS
+    (urllib ne les leve en URLError qu'avant la reponse) ; ou une page 502/503/504
+    du bord de Railway -- pas du JSON de BrainDebugger -- rendue tout de suite
+    (l'appli redemarre). Jamais une connexion coupee apres l'envoi."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (502, 503, 504) and duree < 2.0 and not _corps_http(e)
+    cause = getattr(e, "reason", None)
+    return isinstance(cause, (socket.gaierror, ConnectionRefusedError, socket.timeout, TimeoutError)
+                      + _ssl_erreurs())
 
 
 def _lire_flux_bd(r, url, sur_debut):
     """Les lignes d'une reponse en flux : l'avance, puis la fin (ou l'erreur,
     rendue comme BrainDebugger la rendait avant : une HTTPError)."""
+    vol = requete_en_vol()
     for ligne in r:
+        if vol is not None and vol.get("annule"):
+            raise Annule()                         # plus personne ne l'attend
         ligne = ligne.strip()
         if not ligne:
             continue
@@ -6804,7 +7849,7 @@ def _corps_http(e):
 def erreur_bd(e, L, pour="jarvis"):
     """Ce qu'il dit quand BrainDebugger repond une erreur -- la CAUSE, quand on
     la connait (« BrainDebugger a repondu par une erreur 502 » ne disait pas
-    quoi faire). Le detail va aussi au panneau et au journal."""
+    quoi faire). Le detail va au journal et sur sa page."""
     corps = _corps_http(e)
     detail, raison = str(corps.get("error") or ""), str(corps.get("raison") or "")
     if detail:
@@ -6817,7 +7862,9 @@ def erreur_bd(e, L, pour="jarvis"):
         return phrase("api_" + raison, L)
     if "clé API" in detail:
         return phrase("bd_sans_cle", L)
-    return phrase("bd_erreur", L, e.code) + ((" " + detail[:160]) if detail and L == "fr" else "")
+    # le detail (souvent l'anglais du SDK) ne se lit plus a voix haute : il est
+    # au journal et sur sa page (voir `echec_bd`)
+    return phrase("bd_erreur", L, e.code)
 
 
 def parler_au_compagnon(texte, cfg, tour=None):
@@ -6827,12 +7874,11 @@ def parler_au_compagnon(texte, cfg, tour=None):
     poser_led("pense")
     JARVIS.update(etat="pense", message="Le compagnon reflechit...")
     print("Jarvis : message au compagnon (%d signes)" % len(texte))
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/parler", {"texte": texte}, cfg, 180, tour)
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, "fr", pour="psy"), tour)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", "fr"), tour)
+    except Exception as e:
+        return echec_bd(e, "fr", tour, pour="psy", t0=t0)
     reponse = str((donnees or {}).get("texte") or "").strip()
     if not reponse:
         return signaler_erreur(phrase("compagnon_muet", "fr"), tour)
@@ -6858,7 +7904,9 @@ def parler_au_compagnon(texte, cfg, tour=None):
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
                     "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets", "temperatures",
                     "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda",
-                    "lancer_tache", "taches", "noter_projet"}
+                    "lancer_tache", "taches", "noter_projet",
+                    # Machi Tool lui-meme est a lui : jamais sous code
+                    "lumiere", "routine_lumiere", "reglages_machi"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -7473,6 +8521,50 @@ def onglets_du_moment():
     return liste_onglets([o for o in onglets if isinstance(o, dict)], par_famille=6, titre_max=60)
 
 
+# « IL MET DU TEMPS A DEMARRER » : la liste des onglets demandait jusqu'a 1,5 s
+# a l'extension (morte depuis peu, elle passait encore pour branchee), APRES la
+# transcription. Elle part maintenant PENDANT la transcription (voir
+# `fil_jarvis_travail`), et la question ne l'attend guere plus.
+ONGLETS_BUDGET_S = 0.3
+_ONGLETS_AVANCE = {"fil": None, "boite": None, "t": 0.0}
+
+
+def lancer_onglets(cfg):
+    """Demande la liste des onglets en avance, dans son fil."""
+    if not cfg.get("jarvis_pc") or not extension_branchee():
+        return None
+    boite = {}
+
+    def faire():
+        try:
+            boite["r"] = onglets_du_moment()
+        except Exception:
+            boite["r"] = ""
+    fil = threading.Thread(target=faire, daemon=True)
+    _ONGLETS_AVANCE.update(fil=fil, boite=boite, t=time.monotonic())
+    fil.start()
+    return fil
+
+
+def onglets_attendus(cfg, budget=None):
+    """La liste des onglets pour la question : celle demandee en avance (ou
+    demandee maintenant), attendue au plus `budget` secondes -- sinon rien :
+    Jarvis n'attend pas l'extension."""
+    if not cfg.get("jarvis_pc"):
+        return ""
+    budget = ONGLETS_BUDGET_S if budget is None else budget
+    a = _ONGLETS_AVANCE
+    if a["fil"] is None or time.monotonic() - a["t"] > 10.0:
+        if lancer_onglets(cfg) is None:
+            return ""
+    fil, boite = a["fil"], a["boite"]
+    a.update(fil=None, boite=None)                 # une liste sert une fois
+    fil.join(budget)
+    if "r" not in boite:
+        print("Jarvis : les onglets tardent, la question part sans eux")
+    return boite.get("r") or ""
+
+
 EXTENSION_MANIFESTE = {
     "manifest_version": 3,
     "name": "Machi Tool - les onglets pour Jarvis",
@@ -7908,6 +9000,8 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": "Note dans les projets : %s -- %s" % (e.get("projet"), e.get("note"))}
         if not cfg.get("jarvis_pc"):
             return {"id": ident, "erreur": "Les mains de Jarvis sur le PC sont fermees (Machi Tool > Reglages > Jarvis)."}
+        if _jv.groupe_outil(nom):              # ranger les fichiers, reglages de Windows
+            return {"id": ident, "texte": outil_pouvoir(nom, e, cfg)}
         if nom == "rechercher_google":
             ou = ouvrir_dans_chrome(_jv.adresse_google(e.get("recherche")))
             return {"id": ident, "texte": "Recherche Google ouverte dans %s." % ou}
@@ -8067,25 +9161,32 @@ def executer_outil(outil, cfg):
 def outils_de_jarvis(etat, cfg):
     """Les outils d'un tour : ceux qui touchent aux fichiers ou a l'ecran
     attendent le code (ou une session ouverte) ; ceux-la mis a part, on
-    execute, on renvoie, et Jarvis continue -- cinq tours au plus."""
+    execute, on renvoie, et Jarvis continue -- cinq tours au plus.
+
+    « Selon la gravite » (voir _jv.palier_outil) : le code d'abord (s'il en
+    faut un), puis le « oui ? » pour ce qui ne s'annule pas (fermer de force,
+    installer), puis tout s'execute. `etat["refus"]` : {rang: erreur} deja
+    decides (code verrouille, « non » a la question)."""
     L = langue_jarvis(cfg)
     outils = etat["outils"]
+    refus = dict(etat.get("refus") or {})
     # mains fermees : ces outils seront refuses, inutile de demander le code
-    besoin = [o for o in outils if o.get("nom") not in OUTILS_SANS_CODE] if cfg.get("jarvis_pc") else []
+    besoin = [i for i, o in enumerate(outils) if i not in refus and _palier(o, cfg) == _jv.PALIER_CODE]
     if besoin and cfg.get("jarvis_code_actif") and not acces_ouvert():
         if time.time() < float(JARVIS.get("verrou_jusqua") or 0):
-            refus = "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
-            return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
-                                           else {"id": o.get("id"), "erreur": refus} for o in outils], cfg)
-        if not code_regle(cfg):
-            refus = ("Aucun code d'acces n'est regle dans Machi Tool (Reglages > Jarvis) : les dossiers, "
-                     "les fichiers et l'ecran restent fermes.")
-            return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
-                                           else {"id": o.get("id"), "erreur": refus} for o in outils], cfg)
-        JARVIS["attente_code"] = dict(etat, expire=time.time() + 30, essais=0)
-        print("Jarvis : code d'acces demande")
-        return dire(phrase("code_demande", L), suite="toujours", langue=L, tour=etat.get("conv"))
-    return continuer_jarvis(etat, [executer_outil(o, cfg) for o in outils], cfg)
+            refus.update({i: "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
+                          for i in besoin})
+        elif not code_regle(cfg):
+            refus.update({i: "Aucun code d'acces n'est regle dans Machi Tool (Reglages > Jarvis) : les dossiers, "
+                             "les fichiers et l'ecran restent fermes." for i in besoin})
+        else:
+            JARVIS["attente_code"] = dict(etat, refus=refus, expire=time.time() + 30, essais=0)
+            print("Jarvis : code d'acces demande")
+            return dire(phrase("code_demande", L), suite="toujours", langue=L, tour=etat.get("conv"))
+    if not etat.get("oui_donne") and demander_oui(etat, refus, cfg):
+        return None
+    return continuer_jarvis(etat, [{"id": o.get("id"), "erreur": refus[i]} if i in refus else executer_outil(o, cfg)
+                                   for i, o in enumerate(outils)], cfg)
 
 
 def repondre_au_code(texte, cfg):
@@ -8189,6 +9290,741 @@ def outil_application(nom, e, cfg):
             return "%s = %s." % (cle, v)
         raise ValueError("action inconnue : %s" % a)
     raise ValueError("outil inconnu : %s" % nom)
+
+
+# ---------- ses nouveaux pouvoirs ----------
+# « Ranger les fichiers », « Reglages de Windows », « Prendre des
+# initiatives » -- et « selon la gravite » : le code d'acces pour les
+# fichiers et Windows, un simple « oui ? » avant ce qui ne s'annule pas
+# (fermer de force une appli, installer), le reste directement. Les decisions
+# sont dans jarvis.py (palier_outil, refus_chemin, choisir_initiative...) ;
+# ici, les gestes, le journal d'annulation et les sauvegardes. Aucune saisie
+# clavier simulee, aucun presse-papiers.
+
+OUI_DUREE_S = 20
+REFUS_OUI = "Refuse par la personne : rien n'a ete fait."
+ANNULATIONS = {"liste": None}          # le journal d'annulation (lu du disque une fois)
+_WINGET = {"recherches": {}}
+WINGET_RECHERCHE_S = 300
+INITIATIVES = {"recentes": [], "deja": {}, "actif_depuis": None, "grave_jusqua": 0.0,
+               "mesures": {}, "mesure_t": 0.0, "mesure_en_cours": False}
+INITIATIVE_MESURE_S = 60               # temperatures et volume, lus hors de la veille
+
+
+def _texte_erreur(ex):
+    if isinstance(ex, (ValueError, LookupError, RuntimeError)):
+        return str(ex)[:300]
+    return "%s : %s" % (type(ex).__name__, str(ex)[:300])
+
+
+def _palier(o, cfg):
+    """Le palier d'un outil ici, ou None s'il sera refuse de toute facon
+    (mains fermees, groupe pas permis) : inutile alors de rien demander."""
+    nom = o.get("nom")
+    if nom in OUTILS_SANS_CODE:
+        return _jv.PALIER_DIRECT
+    if not cfg.get("jarvis_pc"):
+        return None
+    groupe = _jv.groupe_outil(nom)
+    if groupe and not cfg.get("jarvis_" + groupe):
+        return None
+    return _jv.palier_outil(nom, o.get("entree"), OUTILS_SANS_CODE)
+
+
+def geste_oui(o):
+    """Ce que dira la question (« Je ferme de force Discord ? ») ; leve si
+    l'outil sera refuse de toute facon -- alors on ne demande rien."""
+    e = o.get("entree") or {}
+    if o.get("nom") == "forcer_fermeture":
+        return "forcer", _joli(appli_a_fermer(e.get("cible")))
+    action = e.get("action")
+    return action, paquet_voulu(e.get("nom"))["nom"]
+
+
+def demander_oui(etat, refus, cfg):
+    """Pose la question « oui ? » si un outil du tour ne s'annule pas. Rend
+    True si elle est posee (on attend la reponse)."""
+    gestes, indices = [], []
+    for i, o in enumerate(etat["outils"]):
+        if i in refus or _palier(o, cfg) != _jv.PALIER_OUI:
+            continue
+        try:
+            gestes.append(geste_oui(o))
+            indices.append(i)
+        except Exception as ex:
+            refus[i] = _texte_erreur(ex)
+    if not gestes:
+        return False
+    L = langue_jarvis(cfg)
+    JARVIS["attente_oui"] = dict(etat, refus=refus, oui=indices, expire=time.time() + OUI_DUREE_S,
+                                 tour_oui=JARVIS.get("tour"))
+    print("Jarvis : il demande « oui ? » (%s)" % ", ".join(g for g, _ in gestes))
+    dire(_jv.question_oui(gestes, L), suite="toujours", langue=L, tour=etat.get("conv"))
+    return True
+
+
+def oui_en_attente():
+    """La question « oui ? » attend-elle sa reponse ? Pas apres 20 s, ni
+    apres un nouvel appel : le silence, c'est non (rien n'est fait)."""
+    att = JARVIS.get("attente_oui")
+    if not att:
+        return False
+    if att.get("tour_oui") != JARVIS.get("tour") or time.time() > float(att.get("expire") or 0):
+        JARVIS["attente_oui"] = None
+        print("Jarvis : « oui ? » reste sans reponse -- rien n'est fait")
+        return False
+    return True
+
+
+def repondre_au_oui(texte, brut, cfg):
+    """La phrase qui suit « Je ferme de force Discord ? ». Un oui franc fait ;
+    tout le reste annule (« refuse par la personne »), et Jarvis le sait."""
+    att = JARVIS.get("attente_oui") or {}
+    JARVIS["attente_oui"] = None
+    if _jv.renvoi(texte) or _jv.renvoi(brut) or _jv.adieu(texte):
+        return terminer_conversation()
+    att["conv"] = JARVIS.get("tour")
+    if _jv.normaliser(texte).replace("-", " ").strip(" '") in _OUI:
+        print("Jarvis : oui")
+        return outils_de_jarvis(dict(att, oui_donne=True), cfg)
+    print("Jarvis : pas de oui -- rien n'est fait")
+    refus = dict(att.get("refus") or {})
+    refus.update({i: REFUS_OUI for i in att.get("oui") or []})
+    return outils_de_jarvis(dict(att, refus=refus, oui_donne=True), cfg)
+
+
+def outil_pouvoir(nom, e, cfg):
+    """Les outils des groupes « fichiers » et « windows ». Rend le texte du
+    resultat ; leve ce qui ne va pas (executer_outil le dit a Jarvis)."""
+    groupe = _jv.groupe_outil(nom)
+    if groupe == "fichiers" and not cfg.get("jarvis_fichiers"):
+        raise RuntimeError("Ranger les fichiers n'est pas permis dans Machi Tool (Reglages > Jarvis).")
+    if groupe == "windows" and not cfg.get("jarvis_windows"):
+        raise RuntimeError("Les reglages de Windows ne sont pas permis dans Machi Tool (Reglages > Jarvis).")
+    if nom == "reglage_windows":
+        return reglage_windows(e.get("reglage"), e.get("action") or "lire", e.get("appareil") or "")
+    if nom == "forcer_fermeture":
+        return forcer_fermeture(e.get("cible"))
+    if nom == "installer_appli":
+        return installer_appli(e.get("action"), e.get("nom"), cfg)
+    if nom == "annuler_fichier":
+        return annuler_fichier()
+    bases = bases_dossiers()
+
+    def chemin(cle):
+        # jamais « rien » compris comme le dossier personnel
+        if not str(e.get(cle) or "").strip():
+            raise ValueError("%s vide" % cle)
+        return _jv.resoudre_chemin(e.get(cle), bases)
+    if nom == "lire_fichier":
+        return lire_fichier_texte(chemin("chemin"))
+    if nom == "deplacer":
+        return deplacer_fichier(chemin("source"), chemin("destination"), bases)
+    if nom == "renommer":
+        return renommer_fichier(chemin("chemin"), e.get("nouveau_nom"), bases)
+    if nom == "corbeille":
+        return jeter_fichier(chemin("chemin"), bases)
+    if nom == "modifier_fichier":
+        return modifier_fichier_texte(chemin("chemin"), e.get("remplacements"), e.get("ajouter_a_la_fin") or "")
+    raise ValueError("outil inconnu : %s" % nom)
+
+
+# --- RANGER LES FICHIERS -----------------------------------------------
+
+def dossiers_machi():
+    """Le dossier de Machi Tool (sa config, ses cles) et celui de son programme."""
+    prog = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    return [DOSSIER, prog]
+
+
+def _gardes(bases=None):
+    """(dossiers du systeme, dossiers de base, dossiers de Machi Tool)."""
+    return (_jv.dossiers_systeme(os.environ), list((bases or bases_dossiers()).values()), dossiers_machi())
+
+
+def _fichier_annulations():
+    return os.path.join(dossier_jarvis(), "annulations.json")
+
+
+def dossier_sauvegardes():
+    return os.path.join(dossier_jarvis(), "sauvegardes")
+
+
+def journal_annulations():
+    if ANNULATIONS["liste"] is None:
+        try:
+            with open(_fichier_annulations(), encoding="utf-8") as f:
+                ANNULATIONS["liste"] = [o for o in (json.load(f) or []) if isinstance(o, dict)]
+        except Exception:
+            ANNULATIONS["liste"] = []
+    return ANNULATIONS["liste"]
+
+
+def _ecrire_annulations():
+    os.makedirs(dossier_jarvis(), exist_ok=True)
+    ch = _fichier_annulations()
+    with open(ch + ".part", "w", encoding="utf-8") as f:
+        json.dump(ANNULATIONS["liste"] or [], f, ensure_ascii=False)
+    os.replace(ch + ".part", ch)
+
+
+def noter_annulation(operation):
+    ANNULATIONS["liste"] = _jv.journal_ajoute(journal_annulations(), dict(operation, t=time.time()))
+    _ecrire_annulations()
+
+
+def purger_sauvegardes(maintenant=None):
+    """Les copies d'avant une modification : trente jours, pas plus."""
+    d = dossier_sauvegardes()
+    try:
+        fichiers = [(n, os.path.getmtime(os.path.join(d, n))) for n in os.listdir(d)]
+    except OSError:
+        return []
+    perimees = _jv.sauvegardes_perimees(fichiers, time.time() if maintenant is None else maintenant)
+    for n in perimees:
+        try:
+            os.remove(os.path.join(d, n))
+        except OSError:
+            pass
+    return perimees
+
+
+def _fichier_texte(ch):
+    """Un fichier TEXTE qui existe, hors du systeme et de Machi Tool."""
+    systeme, _, machi = _gardes()
+    if not os.path.isfile(ch):
+        raise FileNotFoundError("pas de fichier ici : %s" % ch)
+    r = _jv.refus_chemin(ch, systeme, (), machi)
+    if r:
+        raise PermissionError(r)
+    ext = os.path.splitext(ch)[1].lower()
+    if ext not in _jv.EXTENSIONS_TEXTE:
+        raise PermissionError("seulement un fichier texte (%s), pas « %s »"
+                              % (" ".join(sorted(_jv.EXTENSIONS_TEXTE)), ext or "sans extension"))
+    return ch
+
+
+def lire_fichier_texte(ch):
+    ch = _fichier_texte(ch)
+    with open(ch, "rb") as f:
+        octets = f.read(_jv.FICHIER_MODIFIABLE_MAX)
+    texte, _ = _jv.decoder_texte(octets)
+    return _jv.texte_lu(ch, texte)
+
+
+def deplacer_fichier(source, destination, bases=None):
+    systeme, b, machi = _gardes(bases)
+    src, cible = _jv.preparer_deplacement(source, destination, systeme, b, machi)
+    shutil.move(src, cible)
+    noter_annulation({"op": "deplacer", "de": src, "vers": cible})
+    return "Deplace : %s -> %s (annulable)." % (src, cible)
+
+
+def renommer_fichier(chemin, nouveau_nom, bases=None):
+    systeme, b, machi = _gardes(bases)
+    src, cible = _jv.preparer_renommage(chemin, nouveau_nom, systeme, b, machi)
+    os.rename(src, cible)
+    noter_annulation({"op": "renommer", "de": src, "vers": cible})
+    return "Renomme : %s -> %s (annulable)." % (os.path.basename(src), os.path.basename(cible))
+
+
+def jeter_fichier(chemin, bases=None):
+    """A la corbeille de Windows -- jamais une suppression definitive."""
+    systeme, b, machi = _gardes(bases)
+    src = os.path.normpath(os.path.abspath(chemin))
+    if not os.path.exists(src):
+        raise FileNotFoundError("rien a cet endroit : %s" % src)
+    r = _jv.refus_chemin(src, systeme, b, machi, source=True)
+    if r:
+        raise PermissionError(r)
+    envoyer_a_la_corbeille(src)
+    if os.path.exists(src):
+        raise RuntimeError("Windows ne l'a pas mis a la corbeille : %s" % src)
+    noter_annulation({"op": "corbeille", "chemin": src})
+    return "A la corbeille : %s (annulable)." % src
+
+
+def envoyer_a_la_corbeille(chemin):
+    """SHFileOperation avec « annulable » (FOF_ALLOWUNDO) : la Corbeille. Un
+    lecteur sans corbeille (cle USB, reseau) est refuse -- Windows y
+    supprimerait pour de bon."""
+    if os.name != "nt":
+        raise OSError("la corbeille ne se pilote que sous Windows")
+    import ctypes
+    from ctypes import wintypes
+    racine = os.path.splitdrive(chemin)[0] + "\\"
+    if ctypes.WinDLL("kernel32").GetDriveTypeW(racine) != 3:            # DRIVE_FIXED
+        raise PermissionError("pas de corbeille sur ce lecteur (amovible ou reseau) : je ne supprime jamais "
+                              "pour de bon")
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+    # FO_DELETE ; FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING (Windows
+    # previent s'il allait supprimer au lieu de jeter)
+    op = SHFILEOPSTRUCTW(None, 3, chemin + "\0", None, 0x40 | 0x10 | 0x4 | 0x4000, False, None, None)
+    r = ctypes.WinDLL("shell32").SHFileOperationW(ctypes.byref(op))
+    if r or op.fAnyOperationsAborted:
+        raise OSError("la corbeille a refuse (code %s)" % r)
+
+
+def restaurer_de_la_corbeille(chemin):
+    """Le remet a sa place depuis la Corbeille (le verbe « undelete » du
+    shell). Rend True si c'est fait."""
+    if os.name != "nt":
+        raise OSError("la corbeille ne se pilote que sous Windows")
+    import pythoncom
+    import win32com.client
+    pythoncom.CoInitialize()
+    bac = win32com.client.Dispatch("Shell.Application").NameSpace(10)
+    dossier, nom = os.path.split(chemin)
+    trouve = None
+    for item in bac.Items():
+        try:
+            origine = str(item.ExtendedProperty("System.Recycle.DeletedFrom") or "")
+        except Exception:
+            origine = ""
+        origine = origine or str(bac.GetDetailsOf(item, 1) or "")
+        if os.path.normcase(origine.rstrip("\\")) == os.path.normcase(dossier.rstrip("\\")) and \
+                str(item.Name) in (nom, os.path.splitext(nom)[0]):
+            trouve = item
+    if trouve is None:
+        return False
+    trouve.InvokeVerb("undelete")
+    for _ in range(30):
+        if os.path.exists(chemin):
+            return True
+        time.sleep(0.1)
+    return os.path.exists(chemin)
+
+
+def modifier_fichier_texte(ch, remplacements, ajout=""):
+    """Un fichier TEXTE modifie : chaque « avant » doit y etre (sinon rien
+    n'est ecrit) ; une copie d'avant est gardee (annulable, trente jours)."""
+    ch = _fichier_texte(ch)
+    if os.path.getsize(ch) > _jv.FICHIER_MODIFIABLE_MAX:
+        raise ValueError("fichier trop gros pour que je le reecrive (%d octets)" % os.path.getsize(ch))
+    with open(ch, "rb") as f:
+        texte, encodage = _jv.decoder_texte(f.read())
+    nouveau, n = _jv.appliquer_modification(texte, remplacements, ajout)
+    try:
+        octets = nouveau.encode(encodage)
+    except UnicodeEncodeError:
+        raise ValueError("ces caracteres ne tiennent pas dans l'encodage du fichier (%s)" % encodage)
+    purger_sauvegardes()
+    os.makedirs(dossier_sauvegardes(), exist_ok=True)
+    sauve = _jv.chemin_libre(os.path.join(dossier_sauvegardes(), time.strftime("%Y%m%d-%H%M%S-")
+                                          + os.path.basename(ch)))
+    shutil.copy2(ch, sauve)
+    with open(ch, "wb") as f:
+        f.write(octets)
+    noter_annulation({"op": "modifier", "chemin": ch, "sauvegarde": sauve})
+    return "Modifie : %s (%d remplacement%s%s). La version d'avant est gardee : annulable." % (
+        ch, n, "s" if n > 1 else "", ", ajout a la fin" if ajout else "")
+
+
+def annuler_fichier():
+    """« Annule » : defait la derniere operation de fichier de Jarvis."""
+    journal = journal_annulations()
+    if not journal:
+        return "Aucune operation de fichier a annuler."
+    op = journal[-1]
+    ANNULATIONS["liste"] = journal[:-1]
+    _ecrire_annulations()
+    systeme, _, machi = _gardes()
+    if op.get("op") in ("deplacer", "renommer"):
+        de, vers = op.get("de") or "", op.get("vers") or ""
+        if not os.path.exists(vers):
+            raise LookupError("Introuvable, je ne peux pas le remettre : %s (deplace ou supprime depuis ?)" % vers)
+        r = _jv.refus_chemin(de, systeme, (), machi)
+        if r:
+            raise PermissionError(r)
+        retour = de
+        if os.path.exists(de) and os.path.normcase(de) != os.path.normcase(vers):
+            retour = _jv.chemin_libre(de)
+        shutil.move(vers, retour)
+        return "Annule : %s est revenu a %s." % (os.path.basename(vers), retour)
+    if op.get("op") == "modifier":
+        ch, sauve = op.get("chemin") or "", op.get("sauvegarde") or ""
+        if not os.path.isfile(sauve):
+            raise LookupError("La copie d'avant n'existe plus (plus de %d jours ?) : %s" % (_jv.SAUVEGARDE_JOURS, ch))
+        shutil.copyfile(sauve, ch)
+        return "Annule : %s a retrouve son contenu d'avant." % ch
+    if op.get("op") == "corbeille":
+        ch = op.get("chemin") or ""
+        if os.path.exists(ch):
+            return "Il est deja revenu : %s." % ch
+        try:
+            ok = restaurer_de_la_corbeille(ch)
+        except Exception as ex:
+            print("Jarvis : corbeille -- %s" % ex)
+            ok = False
+        if ok:
+            return "Sorti de la corbeille : %s." % ch
+        return ("Je n'arrive pas a le sortir de la corbeille moi-meme : « %s » y est (il venait de %s). "
+                "Dans la Corbeille : clic droit, Restaurer." % (os.path.basename(ch), os.path.dirname(ch)))
+    raise ValueError("operation inconnue dans le journal : %s" % op.get("op"))
+
+
+# --- QUELQUES REGLAGES DE WINDOWS -----------------------------------------
+
+def _commande(args, delai):
+    """Une commande Windows standard, sans fenetre, avec un delai. Rend
+    (code, sortie)."""
+    if os.name != "nt":
+        raise OSError("%s : seulement sous Windows" % os.path.basename(args[0]))
+    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=delai,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def _powershell(script, delai=25):
+    exe = shutil.which("powershell") or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                                                     "WindowsPowerShell", "v1.0", "powershell.exe")
+    return _commande([exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], delai)
+
+
+def ouvrir_parametres(reglage):
+    page = _jv.PAGES_PARAMETRES[reglage]
+    startfile_sur(page)
+    return page
+
+
+def reglage_windows(reglage, action="lire", appareil=""):
+    """Wi-Fi, Bluetooth, mode sombre, sortie audio, ne pas deranger : une
+    liste fermee. Ce qui ne se fait pas sans administrateur ou sans API
+    publique ouvre la bonne page des Parametres, et le dit."""
+    r, a = _jv.reglage_windows_valide(reglage, action)
+    if os.name != "nt":
+        raise OSError("les reglages de Windows ne se pilotent que sous Windows")
+    if r == "ne_pas_deranger":
+        page = ouvrir_parametres(r)
+        return ("Windows ne laisse pas une appli lire ni changer « Ne pas deranger » : la page des Parametres "
+                "est ouverte (%s), c'est un clic." % page)
+    try:
+        if r in ("wifi", "bluetooth"):
+            return _radio(r, a)
+        if r == "mode_sombre":
+            return _mode_sombre(a)
+        return _sortie_audio(a, appareil)
+    except (ValueError, LookupError):
+        raise
+    except Exception as ex:
+        print("Jarvis : reglage %s impossible (%s)" % (r, ex))
+        page = ouvrir_parametres(r)
+        return "Je n'y arrive pas directement (%s) : la page des Parametres est ouverte (%s)." % (
+            _texte_erreur(ex)[:120], page)
+
+
+def _radio(genre, action):
+    nom = {"wifi": "Wi-Fi", "bluetooth": "Bluetooth"}[genre]
+    code, sortie = _powershell(_jv.script_radio(genre, None if action == "lire" else action == "activer"))
+    etat = ([l.strip() for l in sortie.splitlines() if l.strip()] or [""])[-1]
+    if etat == "ABSENT":
+        return "Pas de %s sur ce PC." % nom
+    if etat not in ("On", "Off"):
+        raise RuntimeError("l'API Radios ne repond pas (%s)" % " ".join(sortie.split())[-120:])
+    if action != "lire" and etat != ("On" if action == "activer" else "Off"):
+        raise RuntimeError("Windows a refuse")
+    return "%s %s." % (nom, "active" if etat == "On" else "desactive")
+
+
+def _mode_sombre(action):
+    import winreg
+    cle = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+    if action == "lire":
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cle) as k:
+            clair = winreg.QueryValueEx(k, "AppsUseLightTheme")[0]
+        return "Mode sombre %s." % ("desactive" if clair else "active")
+    clair = 0 if action == "activer" else 1
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cle, 0, winreg.KEY_SET_VALUE) as k:
+        for n in ("AppsUseLightTheme", "SystemUsesLightTheme"):
+            winreg.SetValueEx(k, n, 0, winreg.REG_DWORD, clair)
+    import ctypes
+    res = ctypes.c_size_t(0)
+    # WM_SETTINGCHANGE « ImmersiveColorSet » : les fenetres ouvertes suivent
+    ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "ImmersiveColorSet", 0x2, 3000, ctypes.byref(res))
+    return "Mode sombre %s." % ("active" if action == "activer" else "desactive")
+
+
+def sorties_audio():
+    """([(id, nom)], id de celle par defaut) : les sorties audio actives."""
+    import comtypes
+    from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator
+    try:
+        from pycaw.constants import CLSID_MMDeviceEnumerator
+    except ImportError:
+        from pycaw.pycaw import CLSID_MMDeviceEnumerator
+    comtypes.CoInitialize()
+    en = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER)
+    coll = en.EnumAudioEndpoints(0, 1)                   # eRender, DEVICE_STATE_ACTIVE
+    out = []
+    for i in range(coll.GetCount()):
+        dev = coll.Item(i)
+        ident = dev.GetId()
+        try:
+            nom = AudioUtilities.CreateDevice(dev).FriendlyName or ident
+        except Exception:
+            nom = ident
+        out.append((ident, nom))
+    return out, en.GetDefaultAudioEndpoint(0, 1).GetId()
+
+
+def poser_sortie_audio(ident):
+    """La sortie par defaut, pour les trois roles de Windows (IPolicyConfig,
+    l'interface du panneau Son ; en echec, la page des Parametres s'ouvre)."""
+    import comtypes
+    from comtypes import GUID, COMMETHOD, HRESULT, IUnknown
+    from ctypes import c_void_p, c_wchar_p, c_int
+    vide = lambda n: COMMETHOD([], HRESULT, n, (["in"], c_void_p, "a"))
+
+    class IPolicyConfig(IUnknown):
+        _iid_ = GUID("{f8679f50-850a-41cf-9c72-430f290290c8}")
+        _methods_ = [vide(n) for n in ("GetMixFormat", "GetDeviceFormat", "ResetDeviceFormat", "SetDeviceFormat",
+                                        "GetProcessingPeriod", "SetProcessingPeriod", "GetShareMode", "SetShareMode",
+                                        "GetPropertyValue", "SetPropertyValue")] + [
+            COMMETHOD([], HRESULT, "SetDefaultEndpoint", (["in"], c_wchar_p, "ident"), (["in"], c_int, "role")),
+            vide("SetEndpointVisibility")]
+    comtypes.CoInitialize()
+    pc = comtypes.CoCreateInstance(GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}"), IPolicyConfig,
+                                   comtypes.CLSCTX_ALL)
+    for role in (0, 1, 2):
+        pc.SetDefaultEndpoint(ident, role)
+
+
+def _sortie_audio(action, appareil):
+    sorties, defaut = sorties_audio()
+    if action == "lire":
+        return "Sortie audio : %s." % next((n for i, n in sorties if i == defaut), "inconnue")
+    if action == "lister":
+        return "Sorties audio : %s." % " ; ".join(n + (" (celle en service)" if i == defaut else "")
+                                                   for i, n in sorties)
+    trouves = _jv.choisir(appareil, [(n, i) for i, n in sorties], seuil=40)
+    if not trouves:
+        raise LookupError("Aucune sortie audio ne s'appelle « %s » (il y a : %s)."
+                          % (appareil, ", ".join(n for _, n in sorties) or "aucune"))
+    if len(trouves) > 1:
+        raise LookupError("Plusieurs sorties correspondent : %s. Laquelle ?" % ", ".join(n for n, _ in trouves))
+    nom, ident = trouves[0]
+    poser_sortie_audio(ident)
+    return "Le son sort maintenant par %s." % nom
+
+
+# --- FERMER UNE APPLI BLOQUEE -----------------------------------------------
+
+def processus_ouverts():
+    """[(pid, nom de l'exe)]."""
+    if os.name != "nt":
+        raise OSError("fermer une appli de force ne se fait que sous Windows")
+    import psutil
+    return [(p.info["pid"], p.info["name"] or "") for p in psutil.process_iter(["pid", "name"])]
+
+
+def terminer_processus(pids):
+    if os.name != "nt":
+        raise OSError("fermer une appli de force ne se fait que sous Windows")
+    import psutil
+    tues = []
+    for pid in pids:
+        try:
+            p = psutil.Process(pid)
+            p.kill()
+            tues.append(p)
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(tues, timeout=5)
+    return len(tues)
+
+
+def appli_a_fermer(cible):
+    """L'exe designe par le nom d'une fenetre ou d'une appli (jamais un PID)."""
+    processus = [n for _, n in processus_ouverts()]          # hors Windows : l'erreur claire, d'abord
+    return _jv.appli_a_fermer(cible, [(t, p) for _, t, p in fenetres_ouvertes()], processus)
+
+
+def forcer_fermeture(cible):
+    exe = appli_a_fermer(cible)
+    moi = {os.getpid(), os.getppid()}
+    pids = [pid for pid, n in processus_ouverts() if n.lower() == exe.lower() and pid not in moi]
+    if not pids:
+        raise LookupError("« %s » ne tourne plus." % _joli(exe))
+    n = terminer_processus(pids)
+    return "Ferme de force : %s (%d processus)." % (_joli(exe), n)
+
+
+# --- INSTALLER UNE APPLI (winget) ---------------------------------------------
+
+def _winget(args, delai):
+    exe = shutil.which("winget") if os.name == "nt" else None
+    if os.name == "nt" and not exe:
+        raise RuntimeError("winget est absent (le « Programme d'installation d'application » du Microsoft Store).")
+    return _commande([exe or "winget"] + list(args) + ["--accept-source-agreements", "--disable-interactivity"],
+                     delai)
+
+
+def chercher_paquets(nom):
+    n = _jv.nom_de_paquet(nom)
+    vu = _WINGET["recherches"].get(n.lower())
+    if vu and time.time() - vu[0] < WINGET_RECHERCHE_S:
+        return vu[1]
+    _, sortie = _winget(["search", n], 60)
+    res = _jv.lire_winget(sortie)
+    _WINGET["recherches"][n.lower()] = (time.time(), res)
+    return res
+
+
+def paquet_voulu(nom):
+    """Le paquet (un seul) ; jamais un paquet qui gere l'alimentation du PC."""
+    n = _jv.nom_de_paquet(nom)
+    if _jv.paquet_touche_a_l_alimentation(n):
+        raise PermissionError(_jv.REFUS_ALIMENTATION)
+    p = _jv.choisir_paquet(n, chercher_paquets(n))
+    if _jv.paquet_touche_a_l_alimentation(p["nom"], p["id"]):
+        raise PermissionError(_jv.REFUS_ALIMENTATION)
+    return p
+
+
+def installer_appli(action, nom, cfg):
+    """chercher : ce que winget connait ; installer / mettre_a_jour : UN
+    paquet, sans interaction ni redemarrage -- jamais « upgrade --all ».
+    L'installation tourne en fond ; il dit quand c'est fini."""
+    if action == "chercher":
+        n = _jv.nom_de_paquet(nom)
+        res = chercher_paquets(n)
+        if not res:
+            return "winget ne trouve rien pour « %s »." % n
+        return "Trouve par winget : %s." % " ; ".join("%s (%s%s)" % (r["nom"], r["id"],
+                                                                        ", " + r["version"] if r["version"] else "")
+                                                         for r in res[:8])
+    if action not in ("installer", "mettre_a_jour"):
+        raise ValueError("action : chercher | installer | mettre_a_jour")
+    p = paquet_voulu(nom)
+    args = ["install" if action == "installer" else "upgrade", "--id", p["id"], "--exact", "--silent",
+            "--accept-package-agreements"]
+    _en_fond(lambda: finir_installation(action, p, args, cfg))
+    return "%s de %s (%s) lancee par winget, en fond : Machi Tool dira quand c'est fini." % (
+        "Installation" if action == "installer" else "Mise a jour", p["nom"], p["id"])
+
+
+def finir_installation(action, p, args, cfg):
+    try:
+        code, sortie = _winget(args, 1800)
+    except Exception as ex:
+        code, sortie = -1, str(ex)
+    L = langue_jarvis(cfg)
+    ok = code == 0
+    print("Jarvis : winget %s %s -> %s%s" % (args[0], p["id"], code,
+                                             "" if ok else " (%s)" % " ".join(str(sortie).split())[-200:]))
+    if L == "en":
+        texte = ("%s is %s." % (p["nom"], "installed" if action == "installer" else "up to date") if ok
+                 else "The %s of %s failed." % ("installation" if action == "installer" else "update", p["nom"]))
+    else:
+        texte = ("C'est fait : %s est %s." % (p["nom"], "installé" if action == "installer" else "à jour") if ok
+                 else "L'%s de %s a échoué." % ("installation" if action == "installer" else "mise à jour", p["nom"]))
+    annoncer_resultat(texte, cfg)
+    return texte
+
+
+def annoncer_resultat(texte, cfg):
+    """Un resultat qui arrive plus tard : dit s'il est libre, sinon en notification."""
+    if (JARVIS.get("etat") in ("attente", None) and JARVIS.get("mode") != "psy"
+            and not (JARVIS.get("attente_code") or JARVIS.get("attente_oui"))):
+        return dire(texte, suite=False, langue=langue_jarvis(cfg), tour=JARVIS.get("tour"))
+    n = JARVIS_CROCHETS.get("notifier")
+    if n:
+        n("Jarvis", texte)
+
+
+# --- SES PETITES INITIATIVES, toujours annoncees -----------------------------
+
+def _mesurer_pour_initiatives():
+    """Temperatures et volume, dans un fil a part : nvidia-smi peut prendre six
+    secondes, et la veille ne doit jamais attendre."""
+    m = {"t": time.time()}
+    try:
+        cpu = _jv.lire_coretemp(memoire_coretemp())
+        if cpu:
+            m.update(cpu=max(cpu["temperatures"]), tjmax=cpu.get("tjmax"))
+    except Exception:
+        pass
+    try:
+        temps = [g["temperature"] for g in _jv.lire_nvidia_smi(sortie_nvidia_smi()) if g.get("temperature") is not None]
+        if temps:
+            m["gpu"] = max(temps)
+    except Exception:
+        pass
+    try:
+        import comtypes
+        comtypes.CoInitialize()
+        v = _volume_general()
+        if not v.GetMute():
+            m["volume"] = round(v.GetMasterVolumeLevelScalar() * 100)
+    except Exception:
+        pass
+    INITIATIVES.update(mesures=m, mesure_en_cours=False)
+
+
+def _lancer_mesures(t):
+    if os.name == "nt" and not INITIATIVES["mesure_en_cours"] and t - INITIATIVES["mesure_t"] >= INITIATIVE_MESURE_S:
+        INITIATIVES.update(mesure_t=t, mesure_en_cours=True)
+        _en_fond(_mesurer_pour_initiatives)
+
+
+def signaux_initiatives(cfg, t):
+    m = INITIATIVES["mesures"] if t - float(INITIATIVES["mesures"].get("t") or 0) < 5 * 60 else {}
+    return {"actif": bool(cfg.get("jarvis_actif")), "etat": JARVIS.get("etat"), "mode": JARVIS.get("mode"),
+            "en_attente": bool(JARVIS.get("attente_code") or JARVIS.get("attente_oui") or JARVIS.get("suite_active")),
+            "voix_occupee": bool(getattr(VOIX, "parle", False) or getattr(VOIX, "file", None)
+                                 or getattr(VOIX, "attentes", None)),
+            "plein_ecran": plein_ecran_occupe(t), "calme_jusqua": JARVIS.get("calme_jusqua"),
+            "heure": time.localtime(t).tm_hour, "inactivite_s": secondes_inactivite(),
+            "temp_cpu": m.get("cpu"), "tjmax": m.get("tjmax"), "temp_gpu": m.get("gpu"), "volume": m.get("volume")}
+
+
+def suivre_activite(inactivite_s, t):
+    """Depuis quand tu es sur le PC sans pause (cinq minutes loin = une pause).
+    Apres une pause, la proposition d'en faire une peut revenir."""
+    if inactivite_s >= _jv.INITIATIVE_PRESENCE_S:
+        INITIATIVES["actif_depuis"] = None
+        INITIATIVES["deja"].pop("pause", None)
+        return 0.0
+    if INITIATIVES["actif_depuis"] is None:
+        INITIATIVES["actif_depuis"] = t
+    return t - INITIATIVES["actif_depuis"]
+
+
+def veiller_initiatives(cfg, maintenant=None, signaux=None):
+    """Depuis sa veille (chaque seconde) : une petite initiative, TOUJOURS
+    annoncee (a voix haute, ou en notification si la voix est coupee) -- si
+    on les a permises, et si la porte commune le laisse parler. Rend ce
+    qu'il a dit, ou None. `signaux` : pour les tests, ce que le PC dirait."""
+    try:
+        t = time.time() if maintenant is None else maintenant
+        oui_en_attente()                          # un « oui ? » reste sans reponse : il expire
+        if not cfg.get("jarvis_initiatives"):
+            return None
+        if JARVIS.get("psy_grave"):
+            INITIATIVES["grave_jusqua"] = t + _jv.INITIATIVE_APRES_GRAVE_S
+        if signaux is None:
+            _lancer_mesures(t)
+            signaux = signaux_initiatives(cfg, t)
+        s = dict(signaux, maintenant=t, langue=langue_jarvis(cfg), recentes=INITIATIVES["recentes"],
+                 grave_jusqua=max(float(signaux.get("grave_jusqua") or 0), INITIATIVES["grave_jusqua"]))
+        s["activite_continue_s"] = suivre_activite(float(s.get("inactivite_s") or 0), t)
+        choix = _jv.choisir_initiative(s, INITIATIVES["deja"])
+        if not choix or _jv.parole_spontanee_refusee(s, choix["nuit_permise"]):
+            return None
+        if choix.get("volume") is not None:
+            regler_son("regler", "", choix["volume"])
+        INITIATIVES["recentes"] = [x for x in INITIATIVES["recentes"] if t - x < 3600] + [t]
+        INITIATIVES["deja"][choix["cle"]] = t
+        print("Jarvis : initiative (%s)" % choix["cle"])
+        dire(choix["texte"], suite=False, langue=langue_jarvis(cfg), tour=JARVIS.get("tour"))
+        return choix["texte"]
+    except Exception as e:
+        print("Jarvis : initiative impossible (%s)" % e)
+        return None
 
 
 # ---------- ses taches de fond ----------
@@ -8375,6 +10211,9 @@ def capacites_jarvis(cfg):
             "spotify": pc and spotify_connecte(cfg),
             "onglets": pc and extension_branchee(),
             "fenetre_agenda": pc,
+            # ses nouveaux pouvoirs : ranger les fichiers, reglages de Windows, initiatives
+            "fichiers": pc and bool(cfg.get("jarvis_fichiers")), "windows": pc and bool(cfg.get("jarvis_windows")),
+            "initiatives": bool(cfg.get("jarvis_initiatives")),
             # Machi Tool lui-meme : la guirlande, ses routines, les reglages
             "application": True, "routines": _jv.resume_routines(cfg.get("routines_lumiere") or []),
             "souvenirs": souvenirs_a_envoyer(cfg),
@@ -8388,19 +10227,24 @@ def continuer_jarvis(etat, resultats, cfg):
     """Renvoie a BrainDebugger ce que les outils ont fait ; Jarvis continue."""
     L = langue_jarvis(cfg)
     conv = etat.get("conv")
+    if conv is not None and JARVIS.get("tour") != conv:
+        # congedie ou rappele pendant les outils : il ne repasse pas a « pense »
+        # par-dessus la nouvelle ecoute (la boule y restait coincee)
+        raise Annule()
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis agit...")
-    avance = {}
+    avance = JARVIS["avance"] = {}
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"suite": etat["suite"], "resultats": resultats, "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
-                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance))
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, L), conv)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", L), conv)
+                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
+    except Interrompu:
+        return reponse_interrompue(etat["texte"], avance)
+    except Exception as e:
+        return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1, conv, avance)
 
 
@@ -8428,6 +10272,8 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         raise Annule()
     if avance is not None:
         avance["fini"] = True                  # la reponse est la : la premiere phrase n'attend plus
+    if donnees.get("agenda_modifie"):
+        JARVIS["agenda_change"] = time.time()  # la fenetre Agenda, si elle est ouverte, se relit
     if donnees.get("detail"):
         # CE QUE CLAUDE A REPONDU EN ENTIER, quand Jarvis l'a consulte : il en
         # dit l'essentiel, le texte complet va dans le presse-papiers.
@@ -8495,19 +10341,31 @@ def parler_a_jarvis(texte, cfg, conv=None):
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis reflechit...")
     print("Jarvis : question au majordome (%d signes)" % len(texte))
-    avance = {}
+    avance = JARVIS["avance"] = {}
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                                              "onglets_ouverts": onglets_du_moment() if cfg.get("jarvis_pc") else ""},
+                                              "onglets_ouverts": onglets_attendus(cfg)},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
-                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance))
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, L), conv)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", L), conv)
+                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
+    except Interrompu:
+        return reponse_interrompue(texte, avance)
+    except Exception as e:
+        return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(texte, donnees, cfg, 1, conv, avance)
+
+
+def reponse_interrompue(texte, avance):
+    """On lui a coupe la parole pendant sa premiere phrase : il n'attend plus
+    la suite pour t'ecouter. L'historique garde ce que tu avais demande et ce
+    qu'il a eu le temps de dire -- BrainDebugger sait ou vous en etiez."""
+    avance["fini"] = True
+    print("Jarvis : interrompu pendant sa premiere phrase, il t'ecoute")
+    JARVIS["historique"] = (JARVIS["historique"] + [
+        {"role": "user", "texte": texte},
+        {"role": "assistant", "texte": (str(avance.get("texte") or "") + " [interrompu]").strip()}])[-12:]
 
 
 _JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -8636,6 +10494,60 @@ def executer_commande(a, cfg, maintenant=None):
     return None
 
 
+# CE QU'IL DIT SANS QU'ON LUI AIT PARLE (un minuteur, un rappel) : jamais par-
+# dessus une conversation. Le son et la notification tout de suite ; la
+# phrase, des qu'il est libre (voir `dire_les_annonces`, depuis sa veille).
+ANNONCES = []
+ANNONCE_GARDEE_S = 600
+
+
+def annoncer(texte, langue="fr"):
+    """« Le minuteur sonne pendant qu'il m'ecoute : il l'enregistre et se
+    repond. » Libre, il le dit ; une fenetre d'ecoute d'apres ou personne n'a
+    encore parle, il la referme et le dit ; en pleine conversation (il
+    t'ecoute, transcrit, reflechit, parle), ca attend qu'il ait fini.
+    Rend True s'il le dit maintenant."""
+    if not (CFG.get("jarvis_voix", True) and VOIX.peut_parler()):
+        return False
+    etat = JARVIS.get("etat")
+    if (etat == "ecoute" and JARVIS.get("suite_active") and not JARVIS.get("parole_vue")
+            and not JARVIS.get("suspens") and not JARVIS.get("attente_code")):
+        envoyer_oreille({"cmd": "annuler"})
+        poser_led(None)
+        JARVIS.update(etat="attente", suite_active=False, ecoute_fin=0.0, message=message_attente())
+        etat = "attente"
+    if etat in ("attente", "eteint", None):
+        VOIX.dire(texte, None, langue)
+        return True
+    ANNONCES.append((texte, langue, time.time()))
+    return False
+
+
+def dire_les_annonces():
+    """Depuis sa veille : ce qui attendait qu'il soit libre."""
+    while ANNONCES and JARVIS.get("etat") in ("attente", "eteint", None):
+        texte, langue, t = ANNONCES.pop(0)
+        if time.time() - t > ANNONCE_GARDEE_S:
+            continue                          # trop vieux : la notification a suffi
+        if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
+            VOIX.dire(texte, None, langue)
+
+
+def rappel_dans_l_agenda(quoi, fin, cfg):
+    """Le rappel « rappelle-moi dans 2 h d'appeler maman », pose aussi dans
+    l'agenda : son jour et son heure. Rend True s'il y est."""
+    t = time.localtime(fin)
+    titre = str(quoi or "").strip()
+    titre = titre[:1].upper() + titre[1:]
+    try:
+        poser_agenda(cfg, titre[:120], time.strftime("%Y-%m-%d", t), heure=time.strftime("%H:%M", t))
+    except Exception as e:
+        print("Jarvis : rappel pas pose dans l'agenda (%s)" % type(e).__name__)
+        return False
+    JARVIS["agenda_change"] = time.time()
+    return True
+
+
 def poser_minuteur(secondes, quoi="", langue="fr"):
     secondes = max(1.0, min(24 * 3600.0, float(secondes)))
     entree = {"fin": time.time() + secondes, "quoi": quoi, "duree": secondes}
@@ -8650,13 +10562,17 @@ def poser_minuteur(secondes, quoi="", langue="fr"):
         notifier = JARVIS_CROCHETS.get("notifier")
         if notifier:
             notifier("Jarvis", texte)
-        if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
-            VOIX.dire(texte, None, langue)
+        annoncer(texte, langue)
 
     entree["minuteur"] = threading.Timer(secondes, sonner)
     entree["minuteur"].daemon = True
     entree["minuteur"].start()
     JARVIS["minuteurs"].append(entree)
+    if quoi and _cle_presente(CFG):
+        # « Assure-toi que rajouter un rappel rajoute un element a l'agenda
+        # aussi » : il sonne ici, ET il est dans l'agenda de BrainDebugger
+        # (la fenetre Agenda, la frise) -- meme apres un redemarrage.
+        _en_fond(lambda: rappel_dans_l_agenda(quoi, entree["fin"], CFG))
     if quoi:
         return phrase("rappel_pose", langue, _jv.dire_duree(secondes, langue))
     return phrase("minuteur", langue, _jv.dire_duree(secondes, langue))
@@ -10157,8 +12073,11 @@ class Panneau:
         self.animer()
         self.rafraichir()
         self.boule = None
-        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0}
-        self.root.after(500, self.boule_tic)
+        self.boule_objets = {}
+        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0, "t": None}
+        # une seule boucle par interface : refaire_interface en relance une
+        g = self.generation
+        self.root.after(500, lambda: g == self.generation and self.boule_tic())
 
     def refaire_interface(self, echelle):
         """Refait l'interface a l'echelle du nouvel ecran.
@@ -10842,6 +12761,10 @@ class Panneau:
 
     BOULE_TAILLE = 44
     BOULE_CLE = "#010203"            # la couleur rendue transparente
+    BOULE_TOUCHES = 7                # une octave de touches blanches, au coeur de la boule
+    BOULE_IVOIRE = (255, 244, 228)   # une touche enfoncee
+    # avec son panneau, elle ne sort que pour ca (et pour aller sur l'ecran qu'il regarde)
+    BOULE_AVEC_PANNEAU = ("parle", "ecoute")
 
     # ------------------------------------------------------------------
     #  Le panneau de Jarvis : « le meme qu'ici » -- le contenu Jarvis du
@@ -10920,7 +12843,9 @@ class Panneau:
         from PIL import Image, ImageTk
         # ce qu'il dit s'ecrit au fil de sa voix, DANS le panneau
         texte = sous_titre_courant(maintenant) if etat == "parle" else ""
-        niveau = niveau_de_la_voix(maintenant) if etat == "ecoute" else None
+        # ta voix quand il ecoute, la sienne quand il parle (None : le sinus)
+        niveau = (niveau_de_la_voix(maintenant) if etat == "ecoute" else
+                  niveau_de_sa_voix(maintenant) if etat == "parle" else None)
         reste = None
         if etat == "ecoute" and JARVIS.get("ecoute_fin") and not JARVIS.get("parole_vue"):
             reste = (float(JARVIS["ecoute_fin"]) - maintenant) / max(0.5, float(JARVIS.get("ecoute_duree") or 5.0))
@@ -10961,6 +12886,7 @@ class Panneau:
             m.grab_release()
 
     def boule_tic(self):
+        g = self.generation
         delai = 400
         try:
             delai = min(delai, self._panneau_tic())
@@ -10968,6 +12894,14 @@ class Panneau:
             if not getattr(self, "_panneau_erreur", False):
                 print("Jarvis : panneau impossible (%s)" % e)
                 self._panneau_erreur = True
+        change = JARVIS.get("agenda_change") or 0
+        if change > getattr(self, "_agenda_relu", 0):
+            # Jarvis vient d'y poser quelque chose : la fenetre ouverte le montre
+            self._agenda_relu = change
+            try:
+                self.remplir_agenda()
+            except Exception as e:
+                print("Agenda : relecture impossible (%s)" % e)
         demande = JARVIS.get("montrer_agenda") or 0
         if demande > getattr(self, "_agenda_montre", 0):
             self._agenda_montre = demande
@@ -10981,7 +12915,9 @@ class Panneau:
             if not getattr(self, "_boule_erreur", False):
                 print("Jarvis : boule impossible (%s)" % e)
                 self._boule_erreur = True
-        self.root.after(max(20, delai), self.boule_tic)
+        # la generation : apres refaire_interface, l'ancienne boucle s'arrete
+        # (sinon deux boucles, puis trois... et deux fois plus de dessin)
+        self.root.after(max(20, delai), lambda: g == self.generation and self.boule_tic())
 
     def _boule_creer(self, taille):
         tk = self.tk
@@ -11007,7 +12943,16 @@ class Panneau:
             u.SetWindowLongW(h, GWL_EXSTYLE, u.GetWindowLongW(h, GWL_EXSTYLE)
                              | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
         b.withdraw()
+        # ses objets, crees une fois et deplaces a chaque image (pas de
+        # delete("all") vingt-cinq fois par seconde) : trois anneaux, et au
+        # coeur une octave de touches, des traits aux bouts arrondis
+        largeur = max(2, int(round(taille * 0.05)))
+        anneaux = [toile.create_oval(0, 0, 0, 0, fill=self.BOULE_CLE, outline="") for _ in range(3)]
+        touches = [toile.create_line(0, 0, 0, 0, width=largeur, capstyle="round", fill=self.BOULE_CLE)
+                   for _ in range(self.BOULE_TOUCHES)]
         self.boule, self.boule_toile = b, toile
+        self.boule_objets = {"anneaux": anneaux, "touches": touches, "taille": taille,
+                             "largeur": largeur, "couleur": None}
 
     def _boule_zone(self):
         """La zone de travail de l'ecran principal (sans la barre des taches)."""
@@ -11021,21 +12966,41 @@ class Panneau:
         return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     def _boule_tic(self):
+        b = self.boule
+        st = self.boule_etat
+
+        def cache():
+            if b is not None and b.winfo_exists() and b.state() != "withdrawn":
+                b.withdraw()
         if not self.cfg.get("jarvis_boule", True) or not self.cfg.get("jarvis_actif"):
-            if self.boule is not None and self.boule.winfo_exists() and self.boule.state() != "withdrawn":
-                self.boule.withdraw()
+            cache()
+            return 500
+        # UN JEU, UNE VIDEO EN PLEIN ECRAN : rien ne se dessine par-dessus (voir
+        # animer : Tk qui dessine pendant qu'un jeu change la resolution, c'est
+        # Tcl_Panic ; la guirlande et le son disent ou il en est)
+        if plein_ecran_occupe():
+            cache()
+            st.update(alpha=0.0, x=None, t=None)
             return 500
         taille = max(24, int(self.BOULE_TAILLE * getattr(self, "echelle", 1.0)))
-        etat_boule = "attente" if self.cfg.get("jarvis_panneau", True) else JARVIS.get("etat")
+        etat = JARVIS.get("etat")
+        # « Un petit peu de jazz » : avec son panneau, elle ne sortait plus que
+        # pour regarder un ecran. Elle sort aussi quand il parle -- elle joue
+        # avec sa voix -- et quand il t'ecoute.
+        if self.cfg.get("jarvis_panneau", True) and etat not in self.BOULE_AVEC_PANNEAU:
+            etat = "attente"
+        maintenant = time.time()
         visible, x, y, couleur, rythme = _jv.cible_boule(
-            etat_boule, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), time.time(),
+            etat, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), maintenant,
             self.cfg.get("jarvis_boule_x", 0.97), self.cfg.get("jarvis_boule_y", 0.90), taille)
-        st = self.boule_etat
-        if not visible and (self.boule is None or not self.boule.winfo_exists() or self.boule.state() == "withdrawn"):
+        if not visible and (b is None or not b.winfo_exists() or b.state() == "withdrawn"):
             st["x"] = None
             return 300                                     # rien a l'ecran : rien a dessiner
-        if self.boule is None or not self.boule.winfo_exists():
+        if b is None or not b.winfo_exists() or self.boule_objets.get("taille") != taille:
+            if b is not None and b.winfo_exists():
+                b.destroy()
             self._boule_creer(taille)
+            b = self.boule
         # elle glisse vers sa cible ; elle apparait et s'efface en douceur
         if st["x"] is None:
             st["x"], st["y"] = float(x), float(y)
@@ -11043,28 +13008,63 @@ class Panneau:
         st["y"] += (y - st["y"]) * 0.25
         st["alpha"] = min(1.0, st["alpha"] + 0.15) if visible else max(0.0, st["alpha"] - 0.12)
         if st["alpha"] <= 0.0:
-            self.boule.withdraw()
-            st["x"] = None
+            b.withdraw()
+            st.update(x=None, t=None)
             return 300
-        st["phase"] += 0.08 * rythme
+        # sa respiration suit l'horloge, pas les images : la meme a toute cadence
+        dt = 0.04 if st.get("t") is None else max(0.0, min(0.25, maintenant - st["t"]))
+        st["t"] = maintenant
+        st["phase"] += 2.0 * rythme * dt
         try:
-            self.boule.attributes("-alpha", 0.92 * st["alpha"])
+            b.attributes("-alpha", 0.92 * st["alpha"])
         except Exception:
             pass
-        c = self.boule_toile
-        c.delete("all")
-        r0 = taille / 2.0
-        souffle = 0.5 + 0.5 * math.sin(st["phase"])
-        for k, frac in ((3, 1.0), (2, 0.82), (1, 0.64)):
-            r = r0 * (frac - 0.08 * (1 - souffle) * k / 3)
-            c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(hex_vers_rgb(couleur), (0, 0, 0), 0.25 * k), outline="")
-        r = r0 * (0.34 + 0.06 * souffle)
-        c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(hex_vers_rgb(couleur), (255, 255, 255), 0.45), outline="")
-        self.boule.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
-        if self.boule.state() == "withdrawn":
-            self.boule.deiconify()
-            self.boule.attributes("-topmost", True)
+        niveau, touches = self._boule_jeu(etat, maintenant)
+        self._boule_dessiner(taille, couleur, 0.5 + 0.5 * math.sin(st["phase"]), niveau, touches)
+        b.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
+        if b.state() == "withdrawn":
+            b.deiconify()
+            b.attributes("-topmost", True)
         return 40
+
+    def _boule_jeu(self, etat, maintenant):
+        """(niveau 0 a 1, touches) : ce que joue la boule a l'instant."""
+        repos = [0.0] * self.BOULE_TOUCHES
+        if etat == "parle":
+            n = niveau_de_sa_voix(maintenant)
+            if n is None:
+                # la voix de Windows ne dit rien de son son : un leger swing
+                n = 0.75 * _jv.niveau_swing(maintenant)
+            return n, _jv.touches_piano(n, maintenant, self.BOULE_TOUCHES)
+        if etat == "ecoute":
+            # ta voix fait enfler son halo, discretement ; les touches se reposent
+            return 0.5 * niveau_de_la_voix(maintenant, "voix_lisse_boule"), repos
+        return 0.0, repos
+
+    def _boule_dessiner(self, taille, couleur, souffle, niveau, touches):
+        """Deplace les objets de la boule : le halo enfle avec sa voix (dans
+        les blancs, il respire a peine), les touches de l'accord s'enfoncent
+        et s'eclairent d'ivoire."""
+        c, o = self.boule_toile, self.boule_objets
+        rvb = hex_vers_rgb(couleur)
+        if o["couleur"] != couleur:
+            o["couleur"] = couleur
+            for k, a in zip((3, 2, 1), o["anneaux"]):
+                c.itemconfigure(a, fill=melange(rvb, (0, 0, 0), 0.25 * k))
+        r0 = taille / 2.0
+        gonfle = max(0.3 * souffle, min(1.0, niveau))
+        rin = r0
+        for (k, frac), a in zip(((3, 1.0), (2, 0.82), (1, 0.64)), o["anneaux"]):
+            rin = r0 * (frac - 0.1 * (1 - gonfle) * k / 3)
+            c.coords(a, r0 - rin, r0 - rin, r0 + rin, r0 + rin)
+        pas_x, n = taille * 0.08, len(o["touches"])
+        for i, (objet, v) in enumerate(zip(o["touches"], touches)):
+            dx = (i - (n - 1) / 2.0) * pas_x
+            # jamais hors du disque sombre du milieu
+            corde = math.sqrt(max(0.0, rin * rin - dx * dx)) - o["largeur"]
+            h = max(0.5, min(corde, rin * 0.7) * max(v, 0.08 + 0.06 * souffle))
+            c.coords(objet, r0 + dx, r0 - h, r0 + dx, r0 + h)
+            c.itemconfigure(objet, fill=melange(self.BOULE_IVOIRE, rvb, 0.15 + 0.7 * max(0.0, min(1.0, v))))
 
     def animer(self):
         g = self.generation
@@ -12038,6 +14038,11 @@ class Panneau:
     #  Page Jarvis
     # ------------------------------------------------------------------
 
+    def reessayer_dictee(self):
+        """Le modele de la transcription, tout de suite (pas au prochain essai)."""
+        _DICTEE_RELANCE.update(prochain=0.0, n=0)
+        threading.Thread(target=preparer_dictee, daemon=True).start()
+
     def page_jarvis(self):
         # « UNE PASSE DE SIMPLICITE » : en haut ce qui sert tous les jours -- l'ecouter,
         # ta voix, ses mains ; le reste est replie, une section a la fois.
@@ -12051,6 +14056,14 @@ class Panneau:
         self.txt_jarvis.pack(fill="x", pady=(6, 0))
         self.txt_jarvis_detail = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_jarvis_detail.pack(fill="x", pady=(2, 0))
+        # « IL MET DU TEMPS » : ou passe le temps du dernier echange, et le dernier echec
+        self.txt_jarvis_chrono = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_jarvis_chrono.pack(fill="x", pady=(2, 0))
+        # la transcription a rate sa venue : un bouton pour ne pas attendre le prochain essai
+        ligne_dictee = tk.Frame(f, bg=NUIT)
+        ligne_dictee.pack(fill="x", pady=(2, 0))
+        self.bt_dictee = self.bouton(ligne_dictee, "Reessayer la transcription", self.reessayer_dictee,
+                                     compact=True)
         self.texte(f, "Dis « Jarvis », puis ta demande -- ou a la fin : « baisse le son, Jarvis ». Avant son nom, "
                       "rien ne sort du micro : un petit modele compare chaque instant a ton « Jarvis », sans "
                       "transcrire. Apres, la phrase est transcrite sur ce PC (le moteur de la dictee, telecharge "
@@ -12088,7 +14101,9 @@ class Panneau:
         self.separateur(f, 12, 8)
         self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
         self.texte(f, "Musique, Spotify, applis et jeux, fenetres, son, luminosite, onglets, notes, dossiers et "
-                      "fichiers. Il ne supprime, ne deplace ni ne modifie jamais un fichier existant, et ne peut "
+                      "fichiers. Il ne deplace, ne renomme, ne jette (a la corbeille) ni ne modifie un fichier que "
+                      "si tu coches « Ranger les fichiers » -- et tout s'annule (« annule ») ; il ne supprime jamais "
+                      "pour de bon, ne touche ni a Windows ni a Machi Tool, et ne peut "
                       "ni eteindre, ni redemarrer, ni mettre en veille le PC, ni fermer ta session. Il agit sans "
                       "code : quiconque l'appelle dans la piece peut lui demander tes dossiers (le code d'acces, "
                       "plus bas, l'evite). Noms de dossiers et captures partent le temps de la reponse, sans "
@@ -12103,6 +14118,18 @@ class Panneau:
         self.case(f, "Il peut chercher dans l'historique du navigateur (lu sur le PC, seules les pages trouvees partent)",
                   self.var_jarvis_historique,
                   lambda: self.regler_mains("jarvis_historique", self.var_jarvis_historique)).pack(fill="x")
+        self.var_jarvis_fichiers = tk.IntVar(value=1 if self.cfg.get("jarvis_fichiers") else 0)
+        self.case(f, "Ranger les fichiers (deplacer, renommer, corbeille, modifier un fichier texte -- annulable)",
+                  self.var_jarvis_fichiers,
+                  lambda: self.regler_mains("jarvis_fichiers", self.var_jarvis_fichiers)).pack(fill="x")
+        self.var_jarvis_windows = tk.IntVar(value=1 if self.cfg.get("jarvis_windows") else 0)
+        self.case(f, "Reglages de Windows (Wi-Fi, Bluetooth, mode sombre, sortie audio, ne pas deranger, fermer "
+                     "une appli bloquee, installer une appli)",
+                  self.var_jarvis_windows,
+                  lambda: self.regler_mains("jarvis_windows", self.var_jarvis_windows)).pack(fill="x")
+        self.texte(f, "Avec le code d'acces, il le demande avant les fichiers et Windows ; avant de fermer de force "
+                      "une appli ou d'installer quoi que ce soit, il demande toujours « oui ? ».",
+                   BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(8, 0))
         self.bouton(ligne, "Ouvrir l'agenda", self.ouvrir_agenda, compact=True).pack(side="left")
@@ -12260,12 +14287,14 @@ class Panneau:
                 ("jarvis_suite_questions", "... seulement quand il vient de poser une question"),
                 ("jarvis_repliques_spontanees", "Ses routines parlent aussi sans qu'on l'appelle (reveil, "
                                                 "au revoir, une appli) -- sinon, seulement la lumiere"),
+                ("jarvis_initiatives", "Prendre de petites initiatives (toujours annoncees) : surchauffe, volume "
+                                       "trop fort tard le soir, une pause apres deux heures"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
                 ("jarvis_panneau", "Son panneau en haut de l'ecran quand il est actif"),
-                ("jarvis_boule", "Une petite boule sur l'ecran qu'il regarde")):
+                ("jarvis_boule", "Une petite boule qui joue avec sa voix (et va sur l'ecran qu'il regarde)")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
@@ -12406,7 +14435,8 @@ class Panneau:
         c.create_text(g, haut - self.px(3), text="REVEIL", fill=VIF, font=police, anchor="sw")
         c.create_text(x(verifie), haut - self.px(3), text="VERIFIE", fill=ETOILE, font=police, anchor="se")
         c.create_text(dr, haut - self.px(3), text="RATE", fill=BRUME, font=police, anchor="se")
-        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME}
+        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME,
+                  "lent": ETOILE, "sans_lecture": VIF, "trop_loin": BRUME}
         for k, e in enumerate(essais):
             if e.get("d") is None:
                 continue
@@ -12419,7 +14449,10 @@ class Panneau:
             e = essais[-1]
             quoi = {"reveil": "reveil direct", "confirme": "verifie : c'etait bien toi",
                     "verifier": "verification en cours...", "ecarte": "verifie : ce n'etait pas « Jarvis »",
-                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)"}
+                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)",
+                    "lent": "verification : la transcription demarre, un instant...",
+                    "sans_lecture": "pas lu a temps, mais tout pres de ta voix : reveille",
+                    "trop_loin": "pas lu a temps, et trop loin de ta voix pour deviner"}
             texte = "Dernier : %.3f -- %s." % (e["d"], quoi.get(e.get("issue"), e.get("issue")))
         else:
             texte = "Dis « Jarvis » : chaque essai apparait ici, a sa distance de ta voix apprise."
@@ -12727,6 +14760,19 @@ class Panneau:
         d = etat_dictee()
         details.append("transcription : " + {"pret": "prete", "preparation": "preparation %d %%" % (d["progres"] * 100),
                                              "absent": "pas encore installee", "erreur": "erreur"}.get(d["etat"], d["etat"]))
+        if d["etat"] == "erreur":
+            # POURQUOI, et quand il reessaie -- plus « erreur » tout court, sans suite
+            details[-1] += " (%s)" % (d.get("message") or "raison inconnue")
+            if _DICTEE_RELANCE["prochain"] > time.time():
+                details[-1] += ", nouvel essai dans %d min" % max(1, round((_DICTEE_RELANCE["prochain"]
+                                                                           - time.time()) / 60))
+        if hasattr(self, "bt_dictee"):
+            voir = d["etat"] == "erreur"
+            if voir != bool(self.bt_dictee.winfo_manager()):
+                if voir:
+                    self.bt_dictee.pack(side="left")
+                else:
+                    self.bt_dictee.pack_forget()
         n_voix, n_auto = len(gabarits_jarvis()), len(gabarits_auto())
         details.append(("voix apprise (%d facons%s)" % (n_voix, ", + %d gardees seul" % n_auto if n_auto else ""))
                        if n_voix else "voix pas encore apprise")
@@ -12736,6 +14782,10 @@ class Panneau:
         if n:
             details.append("%d minuteur(s)" % n)
         self.txt_jarvis_detail.configure(text=" · ".join(details))
+        if hasattr(self, "txt_jarvis_chrono"):
+            chrono = "\n".join(x for x in (texte_dernier_echange(), texte_derniere_erreur()) if x)
+            if self.txt_jarvis_chrono.cget("text") != chrono:
+                self.txt_jarvis_chrono.configure(text=chrono)
         a = JARVIS.get("apprentissage")
         self.txt_jarvis_appris.configure(text=(a or {}).get("message", ""))
         if voix_fr_choisie(self.cfg) != "piper":
@@ -13685,7 +15735,23 @@ def plus_recente(candidate, reference):
     return version_en_tuple(candidate) > version_en_tuple(reference)
 
 
+_SSL = {"contexte": None}
+
+
+def _oublier_contexte_ssl():
+    _SSL["contexte"] = None
+
+
 def _contexte_ssl():
+    """Le contexte SSL, construit une fois : relire le magasin de certificats
+    de Windows a chaque question a Jarvis coutait des dizaines de ms (il est
+    relu apres une erreur SSL, voir `_oublier_contexte_ssl`)."""
+    if _SSL["contexte"] is None:
+        _SSL["contexte"] = _nouveau_contexte_ssl()
+    return _SSL["contexte"]
+
+
+def _nouveau_contexte_ssl():
     """Le magasin de Windows passe en premier : c'est lui qui contient les
     autorites ajoutees par un antivirus ou un proxy d'entreprise, sans
     lesquelles la connexion echouerait. certifi ne sert que si ce magasin

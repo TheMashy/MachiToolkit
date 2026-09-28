@@ -40,6 +40,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -78,6 +79,20 @@ class Commandes(unittest.TestCase):
     def action(self, texte):
         a = J.comprendre(texte)
         return a and a["action"]
+
+    def test_mets_ecrit_mais(self):
+        """« Mets un minuteur de dix minutes » transcrit « Mais un minuteur... » :
+        la commande partait chez BrainDebugger au lieu de se faire ici."""
+        a = J.comprendre("Mais un minuteur de 10 minutes.")
+        self.assertEqual((a["action"], a["secondes"]), ("minuteur", 600))
+        self.assertEqual(self.action("Mais la lumière en bleu."), "lumiere_couleur")
+        self.assertEqual(self.action("Met la lumière en rouge"), "lumiere_couleur")
+        self.assertEqual(self.action("Mes la lumière en vert"), "lumiere_couleur")
+        # un vrai « mais » reste une phrase pour le compagnon
+        self.assertIsNone(J.comprendre("Mais la lumière est déjà allumée ?"))
+        self.assertIsNone(J.comprendre("Mais non"))
+        self.assertIsNone(J.comprendre("Mais moi je veux dormir"))
+        self.assertIsNone(J.comprendre("Mes enfants sont là"))
 
     def test_la_lumiere(self):
         self.assertEqual(self.action("Allume la lumière."), "lumiere_on")
@@ -1169,6 +1184,41 @@ class MotEveil(unittest.TestCase):
                   "Jarvis, il fait froid", "baisse le son Jarvis", "Jarvis ?"):
             self.assertFalse(J.est_une_mention(t), t)
 
+    def test_une_question_n_est_pas_une_mention(self):
+        # « Jarvis il est quelle heure ? » sans virgule : il se rendormait
+        for t in ("Jarvis il est quelle heure ?", "Jarvis il est quelle", "Jarvis elle est où ma clé",
+                  "euh Jarvis il fait combien dehors"):
+            self.assertFalse(J.est_une_mention(t), t)
+        for t in ("Jarvis il apparaît pour rien", "Jarvis il marche pas.", "Jarvis il",
+                  "j'ai l'impression que Jarvis écoute tout le temps"):
+            self.assertTrue(J.est_une_mention(t), t)
+        # le bout de son d'une verification : on ne voit pas encore la suite
+        self.assertFalse(J.est_une_mention("Jarvis il", tronque=True))
+        self.assertTrue(J.est_une_mention("Jarvis il apparaît", tronque=True))
+
+    def test_une_mention_avec_le_nom_ecorche(self):
+        # « Javi » confirme un appel pas net : il doit aussi reconnaitre une mention
+        self.assertTrue(J.est_une_mention("le Javi que j'ai codé"))
+        self.assertFalse(J.est_une_mention("Javi, allume la lumière"))
+
+    def test_le_nom_au_milieu_de_la_demande(self):
+        # « Rappelle-moi Jarvis dans dix minutes... » : le debut etait jete
+        t = J.retirer_mot_eveil("Rappelle-moi Jarvis dans dix minutes de sortir le linge", garder_avant=True)
+        self.assertEqual(t, "Rappelle-moi dans dix minutes de sortir le linge")
+        self.assertEqual(J.comprendre(t)["action"], "minuteur")
+        self.assertEqual(J.retirer_mot_eveil("Mets la musique, Jarvis, de Daft Punk"), "Mets la musique de Daft Punk")
+        self.assertEqual(J.retirer_mot_eveil("Allume, Jarvis, la lumière."), "Allume la lumière.")
+        # ... pas quand la suite est deja une commande, ni sans parole avant le nom
+        self.assertEqual(J.retirer_mot_eveil("Il fait beau aujourd hui Jarvis allume la lumière"),
+                         "allume la lumière")
+        self.assertEqual(J.retirer_mot_eveil("Salut Jarvis, allume la lumière"), "allume la lumière")
+        self.assertEqual(J.retirer_mot_eveil("Salut Jarvis, dis-moi une blague"), "dis-moi une blague")
+        self.assertEqual(J.retirer_mot_eveil("Rappelle-moi Jarvis dans dix minutes", garder_avant=False),
+                         "dans dix minutes")
+        # « merci beaucoup » n'est pas la demande : il terminait la conversation
+        self.assertEqual(J.retirer_mot_eveil("Baisse le son Jarvis, merci beaucoup."), "Baisse le son")
+        self.assertEqual(J.retirer_mot_eveil("Jarvis, allume la lumière."), "allume la lumière.")
+
 
 class Nombres(unittest.TestCase):
     def test_nombres(self):
@@ -1321,6 +1371,19 @@ class FinDePhrase(unittest.TestCase):
         self.assertAlmostEqual(t, J.PHRASE_MAX_S, delta=0.09)
         fin, t = self.jouer("p" * 900, duree_max=J.PHRASE_PSY_MAX_S)      # le psychologue en laisse plus
         self.assertAlmostEqual(t, J.PHRASE_PSY_MAX_S, delta=0.09)
+
+    def test_un_effleurement_ne_ferme_pas_l_ecoute(self):
+        """« Je vous ecoute encore un instant » -- et il se rendormait 1,5 s
+        plus tard : la queue de sa voix (une enceinte Bluetooth en retard), la
+        reverberation. Un bout de moins de deux trames ne ferme plus la fenetre."""
+        for seq in ("...ppp", "....pp"):
+            fin, t = self.jouer(seq + "." * 110, attente=8.0, ignorer=0.35)
+            self.assertEqual((fin, t), ("vide", 8.0), seq)
+        # une vraie reponse, meme courte, apres l'effleurement
+        fin, t = self.jouer("....pp" + "." * 20 + "pppp" + "." * 30, attente=8.0, ignorer=0.35)
+        self.assertEqual(fin, "fini")
+        # et un nom dit a la fin de la demande reste fini
+        self.assertEqual(self.jouer(".pp" + "." * 30, deja_dit=True, ignorer=0.0)[0], "fini")
 
     def test_le_wav_contient_le_debut(self):
         avant = np.full(J.TRAME * 3, 7, np.int16)
@@ -1475,6 +1538,346 @@ class OreilleSansMicro(unittest.TestCase):
         for _ in range(60):
             self.o.trame(trame())
         self.assertEqual(self.sorties[0].get("erreur"), "rien entendu")
+
+
+# ======================================================================
+#  COMMENT IL ECOUTE UNE PHRASE (la fin, la suite, le fond, par-dessus lui)
+# ======================================================================
+
+def trame_vad(rms, p, marque=None):
+    """Une trame de niveau `rms`, dont le VAD scripte lira la probabilite `p`."""
+    x = (np.sin(np.arange(J.TRAME) * 0.3) * rms * np.sqrt(2)).astype(np.int16)
+    x[1] = int(round(p * 1000))
+    if marque is not None:
+        x[5] = marque
+    return x
+
+
+class VadScripte:
+    """Le VAD lit la probabilite que le test a mise dans la trame."""
+    def trame(self, x):
+        return int(x[1]) / 1000.0
+
+
+class SansMot:
+    """Aucun mot d'eveil (pas de « hey », pas de gabarit)."""
+    hey_m = None
+
+    def trame(self, x):
+        return 0.0, np.zeros(96, np.float32)
+
+
+def parle_marque(marque):
+    x = trame(parole=True)
+    x[5] = marque
+    return x
+
+
+def compte(wav64, marque):
+    with wave.open(io.BytesIO(base64.b64decode(wav64))) as w:
+        s = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+    return int(np.sum(s == marque))
+
+
+def duree(wav64):
+    with wave.open(io.BytesIO(base64.b64decode(wav64))) as w:
+        return w.getnframes() / 16000.0
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LEcoute(unittest.TestCase):
+    def setUp(self):
+        self.sorties, self.sons = [], []
+        self.o = J.Oreille(FaussesEmpreintes(), self.sorties.append, self.sons.append)
+        self.o.niveau_vu = float("inf")
+        for _ in range(20):                      # le calme de la piece : le plancher s'y cale
+            self.o.trame(trame())
+
+    def evts(self):
+        return [e["evt"] for e in self.sorties if e["evt"] not in ("voix_niveau", "essai")]
+
+    def phrases(self):
+        return [e for e in self.sorties if e["evt"] == "phrase"]
+
+    def _premiere_partie(self):
+        """« Mets la musique de... » : une phrase qui se ferme sur la pause."""
+        self.o.commande({"cmd": "ecouter", "attente": 5.0})
+        for _ in range(12):
+            self.o.trame(trame(parole=True))
+        for _ in range(40):
+            if "phrase" in self.evts():
+                break
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["phrase"])
+
+    def test_la_suite_d_une_phrase_en_suspens_n_est_plus_perdue(self):
+        """« ... Daft Punk », dit pendant qu'il transcrivait la premiere moitie :
+        il n'ecoutait plus, ces mots tombaient dans le vide. Maintenant la
+        suite repart de la fin de la phrase -- et la phrase entiere est devant."""
+        self._premiere_partie()
+        for _ in range(3):
+            self.o.trame(trame())
+        for _ in range(3):                       # la personne reprend PENDANT la transcription
+            self.o.trame(parle_marque(7003))
+        self.o.commande({"cmd": "ecouter", "attente": 3.0, "reprise": True, "ignorer": 0.0})
+        for _ in range(10):
+            self.o.trame(parle_marque(7003))
+        for _ in range(30):
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["phrase", "phrase"])
+        suite = self.phrases()[-1]
+        self.assertEqual(compte(suite["wav"], 7003), 13, "le trou n'est plus perdu")
+        self.assertTrue(suite.get("avec_debut"), "la premiere moitie est devant")
+        self.assertGreater(duree(suite["wav"]), duree(self.phrases()[0]["wav"]) + 13 * J.TRAME_S)
+
+    def test_une_suite_deja_finie_quand_il_rouvre(self):
+        # toute la suite dite dans le trou : elle n'attend pas trois secondes pour finir « vide »
+        self._premiere_partie()
+        for _ in range(2):
+            self.o.trame(trame())
+        for _ in range(6):
+            self.o.trame(parle_marque(7004))
+        for _ in range(8):
+            self.o.trame(trame())
+        self.o.commande({"cmd": "ecouter", "attente": 3.0, "reprise": True, "ignorer": 0.0})
+        n = 0
+        while len(self.evts()) < 2 and n < 60:
+            self.o.trame(trame())
+            n += 1
+        self.assertEqual(self.evts(), ["phrase", "phrase"])
+        self.assertLessEqual(n, 8, "la pause etait deja en cours")
+        self.assertEqual(compte(self.phrases()[-1]["wav"], 7004), 6)
+
+    def test_apres_une_coupure_la_suite_sans_le_debut(self):
+        # « attends... » par-dessus lui : sa voix est dans la phrase d'avant, on ne la remet pas
+        self._premiere_partie()
+        self.o.commande({"cmd": "ecouter", "attente": 3.0, "reprise": True, "debut": False})
+        for _ in range(6):
+            self.o.trame(parle_marque(7005))
+        for _ in range(20):
+            self.o.trame(trame())
+        suite = self.phrases()[-1]
+        self.assertFalse(suite.get("avec_debut"))
+        self.assertLess(duree(suite["wav"]), 3.0)
+
+    def test_le_psychologue_laisse_des_silences(self):
+        """« Je me sens... [1,2 s] ...completement vide » : une seule phrase."""
+        seq = [True] * 30 + [False] * 15 + [True] * 20 + [False] * 30
+        self.o.commande({"cmd": "ecouter", "attente": 10.0, "pause": J.PHRASE_PSY_PAUSE_S})
+        for p in seq:
+            self.o.trame(trame(parole=p))
+        self.assertEqual(self.evts(), ["phrase"])
+        self.assertGreater(duree(self.phrases()[0]["wav"]), 5.0, "la pensee entiere")
+        # chez le majordome, rien ne change : la pause de 0,75 s ferme
+        self.sorties.clear()
+        self.o.commande({"cmd": "ecouter", "attente": 10.0})
+        for p in seq:
+            self.o.trame(trame(parole=p))
+        self.assertLess(duree(self.phrases()[0]["wav"]), 3.5)
+
+    def test_ecouter_n_ecrase_pas_la_coupure(self):
+        """« Voulez-vous que je le lance ? » -- « Oui ! » : la coupure et la fin
+        de sa voix se croisent ; l'« ecouter » qui arrive ne jette plus le debut."""
+        o = self.o
+        o.phrase = o._nouvelle_phrase(avant=np.zeros(int(0.6 * J.FREQ), np.int16), attente=1.5, ignorer=0.0)
+        o.etat, o.apres_coupure = "phrase", True
+        o.trame(trame(parole=True))
+        o.commande({"cmd": "ecouter", "attente": 5.0})
+        for _ in range(10):
+            o.trame(trame(parole=True))
+        for _ in range(20):
+            o.trame(trame())
+        self.assertEqual(self.evts(), ["phrase"])
+        self.assertTrue(self.phrases()[0].get("apres_coupure"), "toujours la reponse a sa coupure")
+        self.assertGreater(duree(self.phrases()[0]["wav"]), 0.6 + 11 * J.TRAME_S)
+
+    # ---------------- la tele, la musique ----------------
+
+    def _oreille_tele(self):
+        sorties = []
+        o = J.Oreille(SansMot(), sorties.append, lambda g: None)
+        o.niveau_vu = float("inf")
+        o.det.vad = VadScripte()
+        o.commande({"cmd": "config", "niveau_voix": 2500.0})
+        rng = np.random.default_rng(5)
+
+        def tele():
+            if rng.random() < 0.85:
+                return trame_vad(rng.uniform(250, 600), rng.uniform(0.5, 0.95))
+            return trame_vad(80, 0.1)
+        return o, sorties, tele
+
+    @staticmethod
+    def _quand(sorties, trames, oreille, evt=("phrase", "vide")):
+        for i, x in enumerate(trames):
+            oreille.trame(x)
+            fins = [e["evt"] for e in sorties if e["evt"] in evt]
+            if fins:
+                return fins[0], i + 1
+        return None, None
+
+    def test_la_tele_ne_tient_plus_la_phrase_ouverte(self):
+        """« Jarvis, baisse le son » avec la tele allumee : la phrase ne se
+        fermait qu'a 30 s (la tele parlait encore), et la tele entrait dans
+        ta demande."""
+        o, sorties, tele = self._oreille_tele()
+        for _ in range(150):
+            o.trame(tele())                       # il dort, la tele parle
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        toi = [trame_vad(2500, 0.95) for _ in range(20)]
+        fin, i = self._quand(sorties, toi + [tele() for _ in range(400)], o)
+        self.assertEqual(fin, "phrase")
+        self.assertLessEqual((i - 20) * J.TRAME_S, 1.2, "fermee %.2f s apres toi" % ((i - 20) * J.TRAME_S))
+
+    def test_la_tele_seule_n_est_pas_une_reponse(self):
+        o, sorties, tele = self._oreille_tele()
+        for _ in range(150):
+            o.trame(tele())
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        fin, i = self._quand(sorties, [tele() for _ in range(400)], o)
+        self.assertEqual(fin, "vide", "personne ne lui a repondu")
+        self.assertAlmostEqual(i * J.TRAME_S, 4.0, delta=0.2)
+
+    def test_ta_voix_plus_basse_ne_ferme_pas_la_phrase(self):
+        # 10 dB sous ton « Jarvis », pendant une seconde, la tele derriere
+        o, sorties, tele = self._oreille_tele()
+        for _ in range(150):
+            o.trame(tele())
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        toi = [trame_vad(2500, 0.95) for _ in range(10)] + [trame_vad(800, 0.9) for _ in range(12)]
+        fin, i = self._quand(sorties, toi + [tele() for _ in range(400)], o)
+        self.assertEqual(fin, "phrase")
+        self.assertGreater(i, 22, "pas fermee pendant que tu parlais plus bas")
+        self.assertLessEqual((i - 22) * J.TRAME_S, 1.2)
+
+    def test_dans_le_calme_rien_ne_change(self):
+        o, sorties, _ = self._oreille_tele()
+        for _ in range(150):
+            o.trame(trame_vad(20, 0.02))
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        fin, i = self._quand(sorties, [trame_vad(2500, 0.95)] * 20 + [trame_vad(20, 0.02)] * 60, o)
+        self.assertEqual(fin, "phrase")
+        self.assertEqual(i, 20 + 13, "la pause de 1 s, comme avant")
+        self.assertEqual(o.phrase, None)
+
+    # ---------------- pendant qu'il parle ----------------
+
+    class CoupureStub:
+        def __init__(s, coupe=False):
+            s.coupe, s.appels = coupe, []
+
+        def armer(s, t):
+            pass
+
+        def desarmer(s, garder=True):
+            s.appels.append("desarmer")
+
+        def reference(s, x, t):
+            pass
+
+        def micro(s, x, t):
+            return s.coupe
+
+        def pret(s):
+            return True
+
+    def _pendant_qu_il_parle(self, nom, coupe=False, erreur=None):
+        sorties, horloge = [], {"t": 100.0}
+        lb = FauxLoopback()
+        lb.erreur = erreur
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, lb, horloge=lambda: horloge["t"])
+        o.niveau_vu = float("inf")
+        o.coupure = self.CoupureStub(coupe)
+        for _ in range(20):
+            o.trame(trame())
+        o.commande({"cmd": "parole", "actif": True, "nom": nom})
+
+        def jouer(x):
+            horloge["t"] += J.TRAME_S
+            lb.blocs.append((horloge["t"], np.zeros(J.TRAME, np.float32)))
+            o.trame(x)
+        return o, sorties, jouer, horloge, lb
+
+    def test_jarvis_par_dessus_sa_voix_le_coupe(self):
+        """Sur un portable, personne ne parle plus fort que son echo : la
+        coupure ne l'entendait pas, et le mot d'eveil ne cherchait plus."""
+        o, sorties, jouer, _, _ = self._pendant_qu_il_parle(nom=False)
+        for _ in range(10):
+            jouer(trame())
+        jouer(trame(parole=True, marque=True))
+        self.assertIn("reveil", [e["evt"] for e in sorties])
+        self.assertFalse(o.parole, "il se tait")
+
+    def test_son_propre_nom_ne_le_reveille_pas(self):
+        o, sorties, jouer, _, _ = self._pendant_qu_il_parle(nom=True)
+        for _ in range(10):
+            jouer(trame())
+        jouer(trame(parole=True, marque=True))
+        self.assertEqual([e["evt"] for e in sorties], [])
+        self.assertTrue(o.parole)
+
+    def test_un_appel_pas_net_pendant_qu_il_parle_n_est_pas_verifie(self):
+        sorties = []
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, None)
+        o.niveau_vu = float("inf")
+        for _ in range(20):
+            o.trame(trame())
+        o.det.seuil_hey = 1.5                    # 0,95 : pas net
+        o.commande({"cmd": "parole", "actif": True, "nom": False})
+        for _ in range(5):
+            o.trame(trame(parole=True))
+        o.trame(trame(parole=True, marque=True))
+        for _ in range(10):
+            o.trame(trame())
+        self.assertNotIn("verifier", [e["evt"] for e in sorties], "sa propre voix : rien a verifier")
+        o.commande({"cmd": "parole", "actif": False})
+        o.det.repos_jusqua = 0
+        for _ in range(5):
+            o.trame(trame(parole=True))
+        o.trame(trame(parole=True, marque=True))
+        for _ in range(10):
+            o.trame(trame())
+        self.assertIn("verifier", [e["evt"] for e in sorties], "il s'est tu : on verifie comme avant")
+
+    def test_sans_reference_vivante_il_ne_se_coupe_pas(self):
+        """Une sortie son changee, un loopback tombe : l'echo predit valait
+        zero et il se coupait sur sa propre voix, au bout d'une seconde et demie."""
+        o, sorties, jouer, horloge, lb = self._pendant_qu_il_parle(nom=True, coupe=True, erreur="OSError : x")
+        for _ in range(5):
+            jouer(trame(parole=True))
+        self.assertNotIn("coupure", [e["evt"] for e in sorties])
+        lb.erreur = None                          # rouvert : la coupure revient
+        jouer(trame(parole=True))
+        self.assertIn("coupure", [e["evt"] for e in sorties])
+        # une reference qui n'envoie plus rien depuis plus de 0,3 s
+        o, sorties, _, horloge, lb = self._pendant_qu_il_parle(nom=True, coupe=True)
+        horloge["t"] += 0.6
+        for _ in range(5):
+            horloge["t"] += J.TRAME_S
+            o.trame(trame(parole=True))
+        self.assertNotIn("coupure", [e["evt"] for e in sorties])
+
+    def test_le_loopback_rouvert_oublie_son_erreur(self):
+        class Rec:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                return False
+
+            def record(s, numframes):
+                time.sleep(0.002)
+                return np.zeros((numframes, 1), np.float32)
+        lb = J.Loopback(ouvrir=Rec)
+        lb.erreur = "OSError : ancienne"
+        lb.demarrer()
+        for _ in range(200):
+            if lb.blocs:
+                break
+            time.sleep(0.01)
+        lb.arreter()
+        lb.fil.join(2)
+        self.assertIsNone(lb.erreur)
 
 
 class EmpreintesEcrites:
@@ -1893,6 +2296,264 @@ class Protocole(unittest.TestCase):
 
 
 # ======================================================================
+#  SES NOUVEAUX POUVOIRS : les decisions (jarvis.py, sans disque ni Windows)
+# ======================================================================
+
+class SesNouveauxPouvoirs(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.d, ignore_errors=True))
+        d = self.d
+        self.home = os.path.join(d, "Users", "moi")
+        self.docs = os.path.join(self.home, "Documents")
+        self.machi = os.path.join(self.home, "AppData", "Local", "MachiTool")
+        self.windows = os.path.join(d, "Windows")
+        self.prog = os.path.join(d, "Program Files")
+        self.startup = os.path.join(self.home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu",
+                                    "Programs", "Startup")
+        for p in (self.docs, self.machi, self.windows, self.prog, self.startup,
+                  os.path.join(self.home, "Desktop", "Démarrage"), os.path.join(self.docs, "Rangement")):
+            os.makedirs(p, exist_ok=True)
+        self.systeme = J.dossiers_systeme({"SystemRoot": self.windows, "ProgramFiles": self.prog,
+                                           "APPDATA": os.path.join(self.home, "AppData", "Roaming")})
+        self.bases = [self.home, self.docs]
+        self.gardes = (self.systeme, self.bases, [self.machi])
+
+    def fichier(self, *chemin, contenu="x"):
+        p = os.path.join(*chemin)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(contenu)
+        return p
+
+    def test_le_palier_de_chaque_outil(self):
+        # « selon la gravite » : le code pour les fichiers et Windows, un oui
+        # avant ce qui ne s'annule pas, le reste directement
+        sans = {"musique", "lumiere"}
+        P = J.palier_outil
+        self.assertEqual(P("musique", {}, sans), "direct")
+        self.assertEqual(P("lumiere", {}, sans), "direct")
+        for nom in J.OUTILS_FICHIERS:
+            self.assertEqual(P(nom, {}, sans), "code", nom)
+        for a in ("lire", "lister"):
+            self.assertEqual(P("reglage_windows", {"action": a}, sans), "direct", a)
+        for a in ("activer", "desactiver", "choisir"):
+            self.assertEqual(P("reglage_windows", {"action": a}, sans), "code", a)
+        self.assertEqual(P("forcer_fermeture", {"cible": "Discord"}, sans), "oui")
+        self.assertEqual(P("installer_appli", {"action": "chercher"}, sans), "direct")
+        for a in ("installer", "mettre_a_jour"):
+            self.assertEqual(P("installer_appli", {"action": a}, sans), "oui", a)
+        self.assertEqual(J.groupe_outil("corbeille"), "fichiers")
+        self.assertEqual(J.groupe_outil("installer_appli"), "windows")
+        self.assertIsNone(J.groupe_outil("ouvrir"))
+        self.assertEqual(J.question_oui([("forcer", "Discord")]), "Je ferme de force Discord ?")
+        self.assertEqual(J.question_oui([("installer", "VLC")]), "J'installe VLC ?")
+        self.assertEqual(J.question_oui([("forcer", "Discord"), ("mettre_a_jour", "VLC")]),
+                         "Je ferme de force Discord, puis je mets à jour VLC ?")
+        self.assertEqual(J.question_oui([("installer", "VLC")], "en"), "Shall I install VLC?")
+
+    def test_jamais_le_systeme_ni_les_dossiers_de_base(self):
+        R = lambda ch, source=True: J.refus_chemin(ch, *self.gardes, source=source)
+        self.assertIsNone(R(self.fichier(self.docs, "a.txt")))
+        self.assertIn("racine", R(os.path.abspath(os.sep)))
+        self.assertIn("systeme", R(self.fichier(self.windows, "win.ini")))
+        self.assertIn("systeme", R(os.path.join(self.prog, "Appli")))
+        self.assertIn("je n'y touche pas", R(self.fichier(self.startup, "lance.lnk")))
+        self.assertIn("Demarrage", R(self.fichier(self.home, "Desktop", "Démarrage", "x.txt")))
+        self.assertIn("Machi Tool", R(self.fichier(self.machi, "config.json")))
+        for base in (self.home, self.docs):
+            self.assertIn("dossier de base", R(base), base)
+        self.assertIn("dossier de base", R(os.path.dirname(self.home)), "ce qui contient un dossier de base")
+        self.assertIn("dossier de base", R(os.path.join(self.home, "AppData")), "ce qui contient Machi Tool")
+        self.assertIsNone(R(self.docs, source=False), "on peut y ranger")
+        self.assertIn("systeme", R(self.windows, source=False), "mais jamais vers le systeme")
+
+    def test_deplacer_et_renommer_sans_ecraser_ni_creer_un_programme(self):
+        a = self.fichier(self.docs, "notes.txt")
+        rang = os.path.join(self.docs, "Rangement")
+        self.assertEqual(J.preparer_deplacement(a, rang, *self.gardes), (a, os.path.join(rang, "notes.txt")))
+        self.fichier(rang, "notes.txt")
+        self.assertEqual(J.preparer_deplacement(a, rang, *self.gardes)[1], os.path.join(rang, "notes (2).txt"),
+                         "jamais par-dessus : un nom libre")
+        self.assertEqual(J.preparer_deplacement(a, os.path.join(rang, "idees.md"), *self.gardes)[1],
+                         os.path.join(rang, "idees.md"), "un chemin complet : le nouveau nom")
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, self.windows, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, self.startup, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, self.machi, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(self.docs, rang, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, os.path.join(rang, "notes.bat"), *self.gardes)
+        with self.assertRaises(ValueError):
+            J.preparer_deplacement(rang, os.path.join(rang, "dedans"), *self.gardes)
+        with self.assertRaises(FileNotFoundError):
+            J.preparer_deplacement(os.path.join(self.docs, "absent.txt"), rang, *self.gardes)
+        with self.assertRaises(FileNotFoundError):
+            J.preparer_deplacement(a, os.path.join(self.docs, "Nulle part", "x.txt"), *self.gardes)
+        script = self.fichier(self.docs, "outil.bat")
+        self.assertTrue(J.preparer_deplacement(script, rang, *self.gardes), "un script deja script se range")
+        # renommer
+        self.assertEqual(J.preparer_renommage(a, "Idees.txt", *self.gardes)[1], os.path.join(self.docs, "Idees.txt"))
+        self.fichier(self.docs, "pris.txt")
+        self.assertEqual(J.preparer_renommage(a, "pris.txt", *self.gardes)[1], os.path.join(self.docs, "pris (2).txt"))
+        for mauvais in ("..\\ailleurs.txt", "a/b.txt", "", "CON.txt", "..", "x?.txt"):
+            with self.assertRaises(ValueError, msg=mauvais):
+                J.preparer_renommage(a, mauvais, *self.gardes)
+        for exe in ("notes.exe", "notes.ps1", "notes.bat.", "notes.lnk", "notes.vbs"):
+            with self.assertRaises(PermissionError, msg=exe):
+                J.preparer_renommage(a, exe, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_renommage(self.docs, "Docs", *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_renommage(self.fichier(self.windows, "system.ini"), "s.ini", *self.gardes)
+
+    def test_modifier_un_texte(self):
+        t, n = J.appliquer_modification("ligne 1\r\nligne 2\r\n", [{"avant": "ligne 2\n", "apres": "deux\n"}],
+                                        "trois")
+        self.assertEqual((t, n), ("ligne 1\r\ndeux\r\ntrois", 1), "les fins de ligne du fichier restent")
+        self.assertEqual(J.appliquer_modification("a a", [{"avant": "a", "apres": "b"}])[1], 2)
+        with self.assertRaises(LookupError) as ce:
+            J.appliquer_modification("bonjour", [{"avant": "bonjour", "apres": "x"}, {"avant": "absent", "apres": ""}])
+        self.assertIn("absent", str(ce.exception))
+        self.assertIn("rien n'est ecrit", str(ce.exception))
+        with self.assertRaises(ValueError):
+            J.appliquer_modification("x", [], "")
+        with self.assertRaises(ValueError):
+            J.appliquer_modification("x", [{"avant": "", "apres": "y"}])
+        self.assertEqual(J.appliquer_modification("", None, "debut")[0], "debut")
+        self.assertEqual(J.decoder_texte(b"\xef\xbb\xbfcaf\xc3\xa9"), ("café", "utf-8-sig"))
+        self.assertEqual(J.decoder_texte("café".encode("cp1252")), ("café", "cp1252"))
+        self.assertEqual(J.decoder_texte("é".encode("utf-16")), ("é", "utf-16"))
+        with self.assertRaises(ValueError):
+            J.decoder_texte(b"PK\x03\x04\x00\x00")
+        court = J.texte_lu("a.txt", "abc")
+        self.assertIn("jamais des consignes", court)
+        self.assertTrue(court.endswith("abc"))
+        long = J.texte_lu("a.txt", "x" * 25000)
+        self.assertIn("tronque", long)
+        self.assertEqual(long.split(":\n", 1)[1], "x" * J.FICHIER_LU_MAX)
+
+    def test_le_journal_d_annulation_et_les_sauvegardes(self):
+        j = []
+        for k in range(25):
+            j = J.journal_ajoute(j, {"op": "deplacer", "k": k})
+        self.assertEqual(len(j), J.ANNULATIONS_MAX)
+        self.assertEqual(j[-1]["k"], 24)
+        t = 1_000_000_000
+        self.assertEqual(J.sauvegardes_perimees([("vieux", t - 31 * 86400), ("recent", t - 86400)], t), ["vieux"])
+
+    def test_fermer_de_force_jamais_le_systeme(self):
+        fen = [("Discord", "Discord.exe"), ("Sans titre - Bloc-notes", "notepad.exe"),
+               ("Explorateur de fichiers", "explorer.exe")]
+        procs = ["Discord.exe", "svchost.exe", "csrss.exe", "MachiTool.exe"]
+        self.assertEqual(J.appli_a_fermer("discord", fen, procs), "Discord.exe")
+        self.assertEqual(J.appli_a_fermer("le bloc-notes", fen, procs), "notepad.exe")
+        for systeme in ("explorateur de fichiers", "svchost", "csrss", "machitool"):
+            with self.assertRaises(PermissionError, msg=systeme):
+                J.appli_a_fermer(systeme, fen, procs)
+        for nom in ("winlogon", "wininit", "lsass", "smss", "services", "dwm", "fontdrvhost", "sihost",
+                    "ctfmon", "conhost", "MachiTool.exe", "C:\\Windows\\explorer.exe"):
+            self.assertTrue(J.processus_intouchable(nom), nom)
+        self.assertFalse(J.processus_intouchable("Discord.exe"))
+        with self.assertRaises(ValueError):
+            J.appli_a_fermer("4242", fen, procs)
+        with self.assertRaises(LookupError):
+            J.appli_a_fermer("photoshop", fen, procs)
+
+    def test_winget_un_paquet_et_jamais_l_alimentation(self):
+        sortie = ("\r-\r\\\r   \r"
+                  "Name                  Id                  Version  Match      Source\n"
+                  "---------------------------------------------------------------------\n"
+                  "VLC media player      VideoLAN.VLC        3.0.21   Moniker: vlc winget\n"
+                  "VLC UWP               9NBLGGH4VVNH        Unknown             msstore\n"
+                  "\n2 packages\n")
+        res = J.lire_winget(sortie)
+        self.assertEqual([(r["nom"], r["id"], r["version"]) for r in res],
+                         [("VLC media player", "VideoLAN.VLC", "3.0.21"), ("VLC UWP", "9NBLGGH4VVNH", "Unknown")])
+        fr = ("Nom       ID               Version Source\n---------------------------------------\n"
+              "Discord   Discord.Discord  1.0.9   winget\n")
+        self.assertEqual(J.lire_winget(fr)[0]["id"], "Discord.Discord")
+        self.assertEqual(J.lire_winget("Aucun package ne correspond"), [])
+        self.assertEqual(J.choisir_paquet("VideoLAN.VLC", res)["id"], "VideoLAN.VLC")
+        self.assertEqual(J.choisir_paquet("vlc media player", res)["id"], "VideoLAN.VLC")
+        with self.assertRaises(LookupError):
+            J.choisir_paquet("vlc", res)                       # deux candidats : lequel ?
+        with self.assertRaises(LookupError):
+            J.choisir_paquet("rien", [])
+        for p in ("Shutdown Timer Classic", "Wise Auto Shutdown", "Microsoft.PowerToys", "Sleep Timer",
+                  "Minuteur d'arrêt", "Hibernate Trigger"):
+            self.assertTrue(J.paquet_touche_a_l_alimentation(p), p)
+        for p in ("VideoLAN.VLC", "Discord", "7zip.7zip"):
+            self.assertFalse(J.paquet_touche_a_l_alimentation(p), p)
+        for plusieurs in ("vlc, discord", "vlc et discord", "--all", "all", "tout"):
+            with self.assertRaises(ValueError, msg=plusieurs):
+                J.nom_de_paquet(plusieurs)
+        self.assertEqual(J.nom_de_paquet("--id VideoLAN.VLC"), "id VideoLAN.VLC", "pas d'option cachee")
+
+    def test_les_reglages_de_windows_une_liste_fermee(self):
+        self.assertEqual(J.reglage_windows_valide("Wi-Fi", "activer"), ("wifi", "activer"))
+        self.assertEqual(J.reglage_windows_valide("sortie audio", "lister"), ("sortie_audio", "lister"))
+        with self.assertRaises(ValueError):
+            J.reglage_windows_valide("pare-feu", "desactiver")
+        with self.assertRaises(ValueError):
+            J.reglage_windows_valide("wifi", "lister")
+        s = J.script_radio("bluetooth", True)
+        self.assertIn("'Bluetooth'", s)
+        self.assertIn("SetStateAsync('On')", s)
+        self.assertNotIn("SetStateAsync", J.script_radio("wifi"))
+        self.assertFalse(J._ALIMENTATION_TEXTE.search(s))
+        for r in J.REGLAGES_WINDOWS:
+            self.assertTrue(J.PAGES_PARAMETRES[r].startswith("ms-settings:"))
+            self.assertFalse(J.touche_a_l_alimentation(J.PAGES_PARAMETRES[r]))
+
+    def test_la_porte_de_la_parole_spontanee(self):
+        t = 1_000_000.0
+        s = {"maintenant": t, "actif": True, "etat": "attente", "mode": "jarvis", "heure": 15, "inactivite_s": 5}
+        R = J.parole_spontanee_refusee
+        self.assertIsNone(R(s))
+        for cle, val, raison in (("actif", False, "eteint"), ("etat", "ecoute", "occupe"), ("mode", "psy", "psy"),
+                                 ("en_attente", True, "attend une reponse"), ("voix_occupee", True, "parle deja"),
+                                 ("plein_ecran", True, "plein ecran"), ("calme_jusqua", t + 60, "calme"),
+                                 ("grave_jusqua", t + 60, "apres une seance grave"), ("heure", 23, "nuit"),
+                                 ("heure", 7, "nuit"), ("inactivite_s", 301, "absent"),
+                                 ("recentes", [t - 100, t - 200, t - 300], "plafond")):
+            self.assertEqual(R(dict(s, **{cle: val})), raison, cle)
+        self.assertIsNone(R(dict(s, heure=2), nuit_permise=True))
+        self.assertIsNone(R(dict(s, recentes=[t - 4000] * 5)), "le plafond est par heure")
+
+    def test_chaque_initiative(self):
+        t = 1_000_000.0
+        s = {"maintenant": t, "heure": 15}
+        C = J.choisir_initiative
+        self.assertIsNone(C(s, {}))
+        c = C(dict(s, temp_cpu=96, tjmax=100), {})
+        self.assertEqual((c["cle"], c["nuit_permise"]), ("surchauffe", True))
+        self.assertIn("processeur est à 96 °C", c["texte"])
+        self.assertIsNone(C(dict(s, temp_cpu=85, tjmax=100), {}))
+        self.assertEqual(C(dict(s, temp_cpu=82, tjmax=85), {})["cle"], "surchauffe", "pres de sa limite")
+        self.assertIn("carte graphique", C(dict(s, temp_gpu=90), {})["texte"])
+        self.assertIsNone(C(dict(s, temp_gpu=90), {"surchauffe": t - 60}), "pas deux fois en une demi-heure")
+        self.assertIsNone(C(dict(s, volume=80), {}), "l'apres-midi, le volume est a toi")
+        c = C(dict(s, heure=23, volume=80), {})
+        self.assertEqual((c["cle"], c["volume"]), ("volume_soir", 40))
+        self.assertEqual(c["texte"], "Il est tard : j'ai baissé le volume à 40 %.")
+        self.assertIsNone(C(dict(s, heure=23, volume=55), {}))
+        self.assertIsNone(C(dict(s, heure=0, volume=80), {"volume_soir": t - 3600}))
+        c = C(dict(s, activite_continue_s=2 * 3600 + 1), {})
+        self.assertEqual(c["cle"], "pause")
+        self.assertIsNone(C(dict(s, activite_continue_s=3 * 3600), {"pause": t - 3600}), "une fois")
+        self.assertIn("break", C(dict(s, activite_continue_s=3 * 3600, langue="en"), {})["texte"])
+
+    def test_ses_droits_ne_se_donnent_pas(self):
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
+                    "jarvis_annoncer_taches"):
+            self.assertIn(cle, J.REGLAGES_INTERDITS, cle)
+
+
+# ======================================================================
 #  CE QUE CE CODE NE FAIT PAS
 # ======================================================================
 
@@ -1966,7 +2627,16 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False, suspens=None)
+                        transcription_absente_dite=False, suspens=None, agenda_change=0.0,
+                        voix_lisse_boule=0.0, derniere_erreur=None, coupe_contexte="", ecoute_avant=0.0,
+                        muet_depuis=None, avance=None, dictee_dite=0.0,
+                        attente_oui=None)
+        del m.ANNONCES[:]
+        # ses nouveaux pouvoirs : ni journal d'annulation ni initiatives d'un test a l'autre
+        m.ANNULATIONS["liste"] = None
+        m.INITIATIVES.update(recentes=[], deja={}, actif_depuis=None, grave_jusqua=0.0, mesures={},
+                             mesure_t=0.0, mesure_en_cours=False)
+        m._WINGET["recherches"].clear()
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -2049,6 +2719,67 @@ class DansMachiTool(unittest.TestCase):
         self.assertFalse(m.verifier_appel(""), "sans transcription, on ne se reveille pas au hasard")
         self.assertTrue(m.config_oreille(m.CFG)["tolerant"])
 
+    def test_un_jarvis_dit_seul_et_ecorche_confirme_l_appel(self):
+        # « J'ai galere a ce qu'il s'allume » : Parakeet ecrit un « Jarvis » dit
+        # seul « Javi », « Chavis », « É Javi » -- c'est bien lui
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        for t in ("Javi ?", "Chavis.", "É Javi.", "Ok, Javi.", "Jarbis"):
+            m.transcrire = lambda o, t=t: t
+            self.assertTrue(m.verifier_appel(base64.b64encode(b"RIFF").decode(), n=7), t)
+            self.assertEqual(envoye[-1], {"cmd": "verifie", "ok": True, "n": 7})
+        for t in ("j'avais dit", "java", "j'arrive", "le Javi que j'ai codé"):
+            m.transcrire = lambda o, t=t: t
+            self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()), t)
+            self.assertIs(envoye[-1]["ok"], False, t)
+
+    def test_le_bout_de_son_coupe_apres_le_nom_n_est_pas_une_mention(self):
+        # « Jarvis il est quelle heure ? » d'une traite : le bout de son a
+        # verifier finit sur « Jarvis il » -- ce n'est pas « Jarvis il plante »
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        for t in ("Jarvis il", "Jarvis elle est", "Jarvis il est quelle"):
+            m.transcrire = lambda o, t=t: t
+            self.assertTrue(m.verifier_appel(base64.b64encode(b"RIFF").decode()), t)
+        m.transcrire = lambda o: "Jarvis il apparaît pour rien"
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+
+    def test_sans_transcription_l_appel_est_illisible_pas_ecarte(self):
+        # « illisible » : l'oreille laisse le score trancher (tout pres du seuil,
+        # c'etait lui) -- un « non » rejetait TOUT appel pas net, sans un mot
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        m.etat_dictee = lambda: {"etat": "absent", "progres": 0.0}
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode(), n=3))
+        self.assertEqual(envoye[-1], {"cmd": "verifie", "ok": None, "n": 3})
+        m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
+
+        def plus_de_memoire(o):
+            raise m.DicteeImpossible("memoire")
+        m.transcrire = plus_de_memoire
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+        self.assertIsNone(envoye[-1]["ok"])
+
+    def test_la_verification_lente_se_voit(self):
+        m = self.m
+        m.JARVIS["essais"] = [{"d": 0.2, "issue": "verifier"}]
+        m.traiter_evenement({"evt": "essai", "maj": True, "issue": "lent"})
+        self.assertEqual(m.JARVIS["essais"], [{"d": 0.2, "issue": "lent"}], "une mise a jour, pas un essai de plus")
+        m.traiter_evenement({"evt": "essai", "maj": True, "issue": "sans_lecture"})
+        self.assertEqual(m.JARVIS["essais"][-1]["issue"], "sans_lecture")
+
+    def test_ses_phrases_ne_disent_jamais_son_nom(self):
+        # « Mes mains sont fermees : Reglages, Jarvis. » -- sans double
+        # transmission, sa propre voix le reveillait
+        for cle, textes in self.m._PHRASES.items():
+            for t in textes:
+                if t:
+                    self.assertIsNone(self.m._jv.nom_verifie(t), (cle, t))
+                    self.assertFalse(self.m._jv.contient_nom(t), (cle, t))
+
     def test_le_sous_titre_suit_la_voix(self):
         m = self.m
         m.SOUS_TITRES.clear()
@@ -2065,6 +2796,38 @@ class DansMachiTool(unittest.TestCase):
         m.JARVIS["sous_titre"] = {"phrases": ["un deux trois quatre cinq six"], "k": -1, "estime": True, "t0": t}
         self.assertEqual(m.sous_titre_courant(t + 0.7), "un deux trois")
         self.assertEqual(m.sous_titre_courant(t + 60), "un deux trois quatre cinq six")
+
+    def test_sa_boule_lit_l_enveloppe_de_sa_voix(self):
+        # « un petit peu de jazz » : le niveau de SA voix, relu au fil du temps
+        m = self.m
+        m.SOUS_TITRES.clear()
+        m.SOUS_TITRES[8] = {"phrases": ["Tres bien monsieur."], "k": -1}
+        m.JARVIS["sous_titre"] = None
+        self.assertEqual(m.niveau_de_sa_voix(), 0.0, "rien encore : elle respire")
+        m.JARVIS["sous_titre"] = m.SOUS_TITRES[8]
+        self.assertEqual(m.niveau_de_sa_voix(), 0.0, "la voix n'a pas encore commence")
+        a, b = socket.socketpair()
+        try:
+            J.envoyer(a, {"evt": "dit", "id": 8, "phrase": 0, "duree": 0.3,
+                          "env": [0, 99, 99, 0, 0, 0], "pas": 0.05}, threading.Lock())
+            a.close()
+            avant = time.time()
+            m._lire_voix(b)
+        finally:
+            b.close()
+        st = m.SOUS_TITRES[8]
+        self.assertEqual(st["k"], 0, "le sous-titre, comme avant")
+        t0, pas, env = st["enveloppe"]
+        self.assertGreaterEqual(t0, avant)
+        self.assertEqual((pas, env), (0.05, [0, 99, 99, 0, 0, 0]))
+        lat = J.VOIX_LATENCE_S
+        self.assertAlmostEqual(m.niveau_de_sa_voix(t0 + lat + 0.09), 1.0, places=6, msg="la tranche forte")
+        self.assertEqual(m.niveau_de_sa_voix(t0 + lat + 0.01), 0.0, "le blanc du debut")
+        self.assertEqual(m.niveau_de_sa_voix(t0 + lat + 3.0), 0.0, "la phrase finie")
+        self.assertGreater(m.niveau_de_sa_voix(t0 + lat + 0.2), 0.3, "il retombe en douceur")
+        # la voix de Windows ne dit rien de son son : None, et la boule swingue sans elle
+        m.JARVIS["sous_titre"] = {"phrases": ["Oui."], "k": -1, "estime": True, "t0": time.time()}
+        self.assertIsNone(m.niveau_de_sa_voix())
 
     def test_l_aide_courte(self):
         m = self.m
@@ -2982,7 +3745,9 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.JARVIS["message"], "Le crédit de la clé API Claude est épuisé.")
         corps.update(error="quelque chose d'inattendu", raison="autre")
         self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
-        self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502. quelque chose d'inattendu")
+        # le detail brut du serveur ne se lit plus a voix haute : il est sur sa page
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502.")
+        self.assertIn("quelque chose d'inattendu", m.texte_derniere_erreur())
         corps.clear()
         self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
         self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502.", "un 502 de Railway, sans JSON")
@@ -3495,6 +4260,201 @@ class DansMachiTool(unittest.TestCase):
         self.assertIsNone(m.VOIX.reprise)
         self.assertEqual(voix[-1]["texte"], "Yes?")
 
+    # ---------------- CE QU'ON DIT PAR-DESSUS SA VOIX ----------------
+
+    def test_sa_propre_voix_au_debut_de_la_phrase_coupee(self):
+        """La phrase d'apres une coupure commence avant la decision : sa voix
+        y est, et la transcription l'ecrit."""
+        ctx = "All systems are operational. Your calendar is clear."
+        self.assertEqual(J.sans_sa_voix("operational. Stop.", ctx), "Stop.")
+        self.assertEqual(J.sans_sa_voix("systems are operational", ctx), "")
+        self.assertEqual(J.sans_sa_voix("What time is it?", ctx), "What time is it?")
+        self.assertEqual(J.sans_sa_voix("Clear the calendar", ctx), "Clear the calendar", "tes mots a toi restent")
+        self.assertEqual(J.sans_sa_voix("clear. Jarvis, stop.", ctx), "Jarvis, stop.")
+
+    def test_une_toux_pendant_qu_il_parle_il_reprend(self):
+        # la transcription n'est pas vide (sa voix y est), mais personne n'a parle
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        vus = self.espions()
+        m.transcrire = lambda octets: "systems are operational"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, breve=True, apres_coupure=True)
+        self.assertEqual(vus["jarvis"], [], "il ne repond pas a sa propre phrase")
+        self.assertIn({"cmd": "fausse_coupure"}, oreille)
+        self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.")
+
+    def test_stop_par_dessus_sa_voix(self):
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        vus = self.espions()
+        m.transcrire = lambda octets: "operational. Stop."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, breve=True, apres_coupure=True)
+        self.assertEqual(vus["jarvis"], [], "« stop », pas une question")
+        self.assertIn({"cmd": "annuler"}, oreille)
+        self.assertEqual(m.JARVIS["etat"], "attente")
+
+    def test_un_mm_hmm_par_dessus_lui_il_continue(self):
+        """« Mm-hmm », « d'accord » dits par-dessus lui : continue -- pas une
+        nouvelle question, pas la fin de la conversation."""
+        m = self.m
+        for dit in ("Mm-hmm.", "D'accord.", "Oui."):
+            voix, oreille = self._jarvis_parle()
+            vus = self.espions()
+            m.transcrire = lambda octets, d=dit: d
+            m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+            self.assertEqual(vus["jarvis"], [], dit)
+            self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.", dit)
+            self.assertNotIn({"cmd": "fausse_coupure"}, oreille, "c'etait toi, pas de l'echo")
+            self.assertNotIn({"cmd": "annuler"}, oreille, dit)
+        self.assertIsNone(J.nature_coupure("oui oui oui"), "repete, ca veut dire « ca suffit »")
+        self.assertIsNone(J.nature_coupure("Attends, mets plutôt Lyon"))
+
+    def test_attends_par_dessus_lui(self):
+        """« Attends... » : il se tait et ecoute la suite sans repondre ; si
+        rien ne suit, il reprend sa phrase."""
+        m = self.m
+        vrai = m.oreille_vivante
+        self.addCleanup(lambda: setattr(m, "oreille_vivante", vrai))
+        m.oreille_vivante = lambda: True
+        voix, oreille = self._jarvis_parle()
+        vus = self.espions()
+        m.transcrire = lambda octets: "Attends..."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        self.assertEqual(vus["jarvis"], [])
+        self.assertEqual(oreille[-1]["cmd"], "ecouter")
+        self.assertEqual(oreille[-1]["attente"], J.SUSPENS_ECOUTE_S)
+        self.assertEqual((oreille[-1]["reprise"], oreille[-1]["debut"]), (True, False))
+        self.assertIsNotNone(m.VOIX.reprise, "sa reponse est gardee")
+        m.traiter_evenement({"evt": "vide"})
+        self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.")
+        # ... ou la suite vient : elle part, avec le debut, et il ne reprend pas
+        voix, oreille = self._jarvis_parle()
+        m.transcrire = lambda octets: "Wait,"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        m.transcrire = lambda octets: "what's the weather tomorrow?"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus["jarvis"], ["Wait, what's the weather tomorrow?"])
+        self.assertIsNone(m.VOIX.reprise)
+
+    # ---------------- LA PHRASE EN SUSPENS ----------------
+
+    def test_la_suite_en_suspens_repart_de_la_fin_de_la_phrase(self):
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Bien.", "mode": "jarvis"})
+        vus = self.espions()
+        self.phrase("Jarvis, raconte-moi l'histoire de")
+        e = ecoutes()[-1]
+        self.assertTrue(e["reprise"], "l'oreille reprend depuis la fin de la phrase")
+        self.assertEqual(e["ignorer"], 0.0, "pas de carillon : rien a ignorer")
+        # l'oreille a mis la phrase entiere devant : on la lit telle quelle
+        m.transcrire = lambda octets: "Jarvis, raconte-moi l'histoire de la tour Eiffel."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, avec_debut=True)
+        self.assertEqual(vus["jarvis"], ["raconte-moi l'histoire de la tour Eiffel."])
+        # sans elle, deux textes recolles -- et redire tout, guide par le « toc », ne double rien
+        self.phrase("Jarvis, mets la musique de")
+        m.transcrire = lambda octets: "Mets la musique de Daft Punk."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(J.joindre_suspens("mets la musique de", "Mets la musique de Daft Punk."),
+                         "Mets la musique de Daft Punk.")
+
+    def test_le_petit_mot_mal_ecrit(self):
+        # la transcription ecrit « de » ou « a » suivi d'un silence en un autre mot
+        for t in ("Baisse le sonde.", "Allume la lumière dent.", "Ouvre le dossier d'e.",
+                  "Ouvre le dossier d'eux.", "Envoie un message A.", "Mets la musique dent"):
+            self.assertTrue(J.phrase_suspendue(t), t)
+        for t in ("Il y en a.", "il a", "Je me brosse les dents.", "Rappelle-moi donc.", "Cherche des vidéos sûres.",
+                  "Baisse le son de Discord.", "Allume la lumière.", "Il y en a plus d'un.", "Va voir la sonde."):
+            self.assertFalse(J.phrase_suspendue(t), t)
+
+    def test_chez_le_psychologue_il_laisse_des_silences(self):
+        m = self.m
+        ordres = []
+        vrai = m.oreille_vivante
+        self.addCleanup(lambda: setattr(m, "oreille_vivante", vrai))
+        m.oreille_vivante = lambda: True
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        m.dire("Je vous entends.", suite=True)
+        self.assertNotIn("pause", ordres[-1], "chez le majordome, la pause d'avant")
+        m.JARVIS["mode"] = "psy"
+        m.dire("Je vous entends.", suite=True)
+        self.assertEqual(ordres[-1]["pause"], J.PHRASE_PSY_PAUSE_S)
+        self.assertEqual(ordres[-1]["duree_max"], J.PHRASE_PSY_MAX_S)
+        m._suspendre("je me sens un peu comme", m.CFG, m.JARVIS.get("tour"), None, True, False, "fr")
+        self.assertEqual(ordres[-1]["pause"], J.PHRASE_PSY_PAUSE_S)
+
+    # ---------------- LA FENETRE DE SUITE ----------------
+
+    def _fenetre(self, reponse):
+        m = self.m
+        ordres = []
+        vrai = m.oreille_vivante
+        self.addCleanup(lambda: setattr(m, "oreille_vivante", vrai))
+        m.oreille_vivante = lambda: True
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        m.dire(reponse, suite=True)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        del m._JARVIS_TRAVAIL[:]
+        m.traiter_evenement({"evt": "phrase", "wav": base64.b64encode(b"RIFF....").decode()})
+        return ordres, m._JARVIS_TRAVAIL.pop()
+
+    def test_la_fin_de_sa_voix_n_est_pas_ta_reponse(self):
+        """« Je vous ecoute encore un instant » -- la fenetre entendait la fin de
+        SA phrase (« sir. »), l'envoyait comme ta reponse, ou se refermait."""
+        m = self.m
+        vus = self.espions()
+        ordres, item = self._fenetre("Very good, sir.")
+        m.transcrire = lambda octets: "sir."
+        m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+        self.assertEqual(vus["jarvis"], [])
+        self.assertEqual(m.JARVIS["etat"], "ecoute", "il ecoute encore")
+        self.assertEqual(ordres[-1]["cmd"], "ecouter")
+        self.assertEqual(ordres[-1]["ignorer"], 0.0)
+        self.assertLessEqual(ordres[-1]["attente"], ordres[0]["attente"])
+        # un bruit sans mots dans la fenetre : pareil, tant qu'il reste du temps
+        ordres, item = self._fenetre("Voila qui est fait.")
+        m.transcrire = lambda octets: ""
+        m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        self.assertEqual(ordres[-1]["cmd"], "ecouter")
+        # apres une question, « du cafe » est bien ta reponse
+        self.assertFalse(J.queue_de_sa_voix("du café", "Du thé ou du café ?"))
+
+    # ---------------- LE MICRO MUET ----------------
+
+    def test_le_micro_qui_ne_rend_que_du_silence_est_signale(self):
+        """Micro refuse par Windows, touche « micro coupe » : il n'entendait
+        plus rien, et rien ne disait pourquoi."""
+        m = self.m
+        horloge = {"t": 1000.0}
+
+        class Horloge:
+            def __getattr__(s, n):
+                return getattr(time, n)
+
+            def time(s):
+                return horloge["t"]
+        vrai = m.time
+        self.addCleanup(lambda: setattr(m, "time", vrai))
+        m.time = Horloge()
+        m.envoyer_oreille = lambda o: True
+        for _ in range(int(m.MICRO_MUET_S) + 2):
+            horloge["t"] += 1.0
+            m.traiter_evenement({"evt": "niveau", "db": -90.3})
+        self.assertEqual(m.JARVIS["souci"][0], m.MICRO_MUET_MESSAGE)
+        m.traiter_evenement({"evt": "pret", "vad": True})     # l'oreille rouvre le micro
+        self.assertEqual(m.JARVIS["souci"][0], m.MICRO_MUET_MESSAGE, "rouvrir ne l'efface pas")
+        m.traiter_evenement({"evt": "niveau", "db": -60.0})
+        self.assertIsNone(m.JARVIS["souci"], "un vrai son l'efface")
+
+    def test_son_nom_dans_ce_qu_il_dit(self):
+        m = self.m
+        m.SOUS_TITRES[991] = {"phrases": ["Ouvrez les Réglages, Jarvis."], "k": -1}
+        m.SOUS_TITRES[992] = {"phrases": ["Il pleut."], "k": -1}
+        self.addCleanup(lambda: (m.SOUS_TITRES.pop(991, None), m.SOUS_TITRES.pop(992, None)))
+        self.assertTrue(m.nom_dans_sa_voix(991))
+        self.assertFalse(m.nom_dans_sa_voix(992))
+        self.assertTrue(m.nom_dans_sa_voix(12345), "inconnu : l'oreille ne cherche pas")
+
     def test_le_micro_qui_se_rouvre_ne_coupe_pas_la_conversation(self):
         m = self.m
         m.JARVIS["etat"] = "ecoute"
@@ -3661,6 +4621,35 @@ class DansMachiTool(unittest.TestCase):
         ecoutes = lambda: [o for o in oreille if o.get("cmd") == "ecouter"]
         return dits, ecoutes
 
+    def test_un_rappel_va_aussi_dans_l_agenda(self):
+        # « Assure-toi que rajouter un rappel rajoute un element a l'agenda aussi. »
+        m = self.m
+        vrais = (m._en_fond, m._requete_bd)
+        self.addCleanup(lambda: (setattr(m, "_en_fond", vrais[0]), setattr(m, "_requete_bd", vrais[1])))
+        m._en_fond = lambda f: f()
+        poses = []
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: poses.append((chemin, charge)) or {"texte": "Ajouté."}
+        self.addCleanup(lambda: [e["minuteur"].cancel() for e in m.JARVIS["minuteurs"]])
+        avant = time.time()
+        m.executer_commande(J.comprendre("rappelle-moi dans 2 heures d'appeler maman"), m.CFG)
+        self.assertEqual(len(poses), 1, "le rappel est pose dans l'agenda")
+        chemin, charge = poses[0]
+        self.assertEqual(chemin, "/api/machitool/agenda")
+        fin = time.localtime(avant + 7200)
+        self.assertEqual(charge["date"], time.strftime("%Y-%m-%d", fin))
+        self.assertIn(charge["heure"], (time.strftime("%H:%M", fin), time.strftime("%H:%M", time.localtime(avant + 7260))))
+        self.assertEqual(charge["titre"], "Appeler maman")
+        self.assertGreater(m.JARVIS["agenda_change"], 0, "la fenetre Agenda se relit")
+        # un simple minuteur n'encombre pas l'agenda
+        m.executer_commande(J.comprendre("minuteur de 10 minutes"), m.CFG)
+        self.assertEqual(len(poses), 1)
+        # Jarvis qui l'a pose lui-meme (chez BrainDebugger) : la fenetre se relit aussi
+        m.JARVIS["agenda_change"] = 0.0
+        m.JARVIS["tour"] = 7
+        m.recevoir_jarvis("mets kine mercredi", {"texte": "C'est note pour mercredi.", "agenda_modifie": True},
+                          m.CFG, 1, 7)
+        self.assertGreater(m.JARVIS["agenda_change"], 0)
+
     def test_il_parle_des_sa_premiere_phrase(self):
         # « Il met du temps a repondre » : la premiere phrase sonne pendant que
         # le modele ecrit la suite ; la reponse entiere ne la redit pas.
@@ -3746,6 +4735,229 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("parapluie", dits()[-1]["texte"])
         m.VOIX.fini(dits()[-1]["id"], False)
         self.assertEqual(m.JARVIS["etat"], "ecoute", "et il ecoute la suite, comme prevu")
+
+    # ---- « je lui coupe la parole pendant sa premiere phrase » (v1.64) ----
+
+    def _coupe_pendant_l_avance(self, reponse="Il pleut à Paris. Prenez un parapluie."):
+        """BrainDebugger ecrit encore quand on coupe la premiere phrase : la
+        reponse entiere arrive APRES la coupure."""
+        m = self.m
+        del m._JARVIS_TRAVAIL[:]
+        self.addCleanup(lambda: m._JARVIS_TRAVAIL.clear())
+        etats = []
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Il pleut à Paris.")
+            premier = dits()[0]["id"]
+            m.traiter_evenement({"evt": "coupure"})
+            m.VOIX.fini(premier, True, "Il pleut à Paris.")
+            etats.append(m.JARVIS["etat"])
+            return {"texte": reponse, "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, quel temps fait-il à Paris ?")
+        self.assertEqual(etats, ["ecoute"])
+        return dits, ecoutes
+
+    def test_coupe_pendant_l_avance_la_suite_ne_se_dit_pas(self):
+        m = self.m
+        dits, ecoutes = self._coupe_pendant_l_avance()
+        self.assertEqual(len(dits()), 1, "la suite n'est pas dite par-dessus celui qui lui parle")
+        self.assertEqual(m.JARVIS["etat"], "ecoute", "il t'ecoute toujours (pas « parle »)")
+        self.assertEqual(ecoutes(), [])
+        self.assertIn("parapluie", m.VOIX.reprise["texte"], "elle attend la reprise")
+        # c'etait pour rien (un bruit bref, sans mots : le vrai chemin de l'oreille)
+        m.transcrire = lambda octets: ""
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True, breve=True)
+        self.assertEqual(len(dits()), 2)
+        self.assertEqual(dits()[-1]["texte"], "Il pleut à Paris. Prenez un parapluie.", "dans l'ordre, une fois")
+        m.VOIX.fini(dits()[-1]["id"], False)
+        self.assertEqual(len(ecoutes()), 1, "puis l'ecoute d'apres, une fois")
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+
+    def test_coupe_pendant_l_avance_pour_de_vrai(self):
+        m = self.m
+        dits, ecoutes = self._coupe_pendant_l_avance()
+        m.transcrire = lambda octets: "Non attends, je voulais dire Lyon."
+        m.JARVIS["reveil_verifie"] = True
+        vus = self.espions()
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        self.assertFalse(any("parapluie" in d["texte"] for d in dits()), "la suite de l'ancienne reponse : jamais")
+        self.assertEqual(vus["jarvis"], ["Non attends, je voulais dire Lyon."])
+        self.assertIsNone(m.VOIX.reprise)
+
+    def test_coupe_pendant_l_avance_sans_suite(self):
+        # la reponse, c'etait la premiere phrase : la coupure ne fait pas partir l'ecoute
+        m = self.m
+        dits, ecoutes = self._coupe_pendant_l_avance("Il pleut à Paris.")
+        self.assertEqual(ecoutes(), [], "pas de carillon d'ecoute par-dessus la coupure")
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        m.transcrire = lambda octets: ""
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True, breve=True)
+        m.VOIX.fini(dits()[-1]["id"], False)
+        self.assertEqual(len(ecoutes()), 1)
+
+    def test_coupe_pendant_l_avance_la_reprise_avant_la_suite(self):
+        # l'autre ordre : personne ne parlait, il reprend sa premiere phrase
+        # AVANT que la suite arrive -- elle se dit derriere, puis il ecoute
+        m = self.m
+        del m._JARVIS_TRAVAIL[:]
+        self.addCleanup(lambda: m._JARVIS_TRAVAIL.clear())
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Il pleut à Paris.")
+            m.traiter_evenement({"evt": "coupure"})
+            m.VOIX.fini(dits()[0]["id"], True, "Il pleut à Paris.")
+            m.traiter_evenement({"evt": "vide", "apres_coupure": True})
+            return {"texte": "Il pleut à Paris. Prenez un parapluie.", "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        self.phrase("Jarvis, quel temps fait-il à Paris ?")
+        self.assertEqual([d["texte"] for d in dits()], ["Il pleut à Paris.", "Il pleut à Paris.",
+                                                        "Prenez un parapluie."])
+        m.VOIX.fini(dits()[1]["id"], False)
+        self.assertEqual(ecoutes(), [])
+        m.VOIX.fini(dits()[2]["id"], False)
+        self.assertEqual(len(ecoutes()), 1)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+
+    def test_interrompu_pour_de_vrai_il_n_attend_plus_braindebugger(self):
+        # des mots par-dessus sa premiere phrase : la requete en vol ne retient
+        # plus la phrase qui l'a interrompu
+        m = self.m
+        del m._JARVIS_TRAVAIL[:]
+        self.addCleanup(lambda: m._JARVIS_TRAVAIL.clear())
+        rendu = threading.Event()
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Il pleut à Paris.")
+            m.traiter_evenement({"evt": "coupure"})
+            m.VOIX.fini(dits()[0]["id"], True, "Il pleut à Paris.")
+            m.traiter_evenement({"evt": "phrase", "wav": "UklGRg==", "apres_coupure": True})
+            time.sleep(1.5)
+            rendu.set()
+            return {"texte": "Il pleut à Paris. Prenez un parapluie.", "mode": "jarvis"}
+        dits, ecoutes = self._voix_et_bd(bd)
+        t0 = time.time()
+        self.phrase("Jarvis, quel temps fait-il à Paris ?")
+        self.assertLess(time.time() - t0, 1.2, "il n'a pas attendu la fin de BrainDebugger")
+        self.assertFalse(rendu.is_set())
+        self.assertEqual(len(m._JARVIS_TRAVAIL), 1, "la phrase qui l'a interrompu est la suivante")
+        self.assertEqual(m.JARVIS["historique"][-2:], [
+            {"role": "user", "texte": "quel temps fait-il à Paris ?"},
+            {"role": "assistant", "texte": "Il pleut à Paris. [interrompu]"}])
+        rendu.wait(3)
+        self.assertEqual(len(dits()), 1, "la suite n'arrive jamais")
+        # et si ce n'etaient pas des mots, il reprend sa phrase et ne reste pas « parle »
+        m.transcrire = lambda octets: ""
+        item = m._JARVIS_TRAVAIL.pop(0)
+        m.traiter_phrase(item["wav"], m.CFG, True, tour=item["tour"])
+        self.assertEqual(dits()[-1]["texte"], "Il pleut à Paris.")
+        m.VOIX.fini(dits()[-1]["id"], False)
+        self.assertEqual(m.JARVIS["etat"], "attente")
+
+    def test_l_ecoute_attend_que_la_voix_ait_tout_dit(self):
+        # « il m'ecoute alors qu'il parle encore » : un minuteur dit derriere sa
+        # reponse passe AVANT l'ecoute d'apres
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Bien, monsieur.", "mode": "jarvis"})
+        self.phrase("Jarvis, ça va ?")
+        reponse = dits()[-1]["id"]
+        m.VOIX.dire("Votre minuteur est terminé.", None, "fr")
+        minuteur = dits()[-1]["id"]
+        m.VOIX.fini(reponse, False)
+        self.assertEqual(ecoutes(), [], "le minuteur se dit encore")
+        self.assertEqual(m.JARVIS["etat"], "parle")
+        m.VOIX.fini(minuteur, False)
+        self.assertEqual(len(ecoutes()), 1)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+
+    def test_un_minuteur_ne_parle_pas_par_dessus_la_conversation(self):
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Bien.", "mode": "jarvis"})
+        oreille = []
+        m.envoyer_oreille = lambda o: oreille.append(o) or True
+        m.JARVIS.update(etat="pense")
+        self.assertFalse(m.annoncer("Votre minuteur est terminé.", "fr"))
+        self.assertEqual(dits(), [], "il reflechit a ta question : pas maintenant")
+        m.dire_les_annonces()
+        self.assertEqual(dits(), [])
+        m.JARVIS.update(etat="attente")
+        m.dire_les_annonces()
+        self.assertEqual([d["texte"] for d in dits()], ["Votre minuteur est terminé."])
+        # une fenetre d'ecoute d'apres, ou personne ne parle : il la ferme, et le dit
+        m.JARVIS.update(etat="ecoute", suite_active=True, parole_vue=0.0)
+        self.assertTrue(m.annoncer("Votre rappel.", "fr"))
+        self.assertEqual(m.JARVIS["etat"], "attente")
+        self.assertIn({"cmd": "annuler"}, oreille)
+        self.assertEqual(dits()[-1]["texte"], "Votre rappel.")
+        # tu parlais : ca attend
+        m.JARVIS.update(etat="ecoute", suite_active=True, parole_vue=time.time())
+        self.assertFalse(m.annoncer("Encore un.", "fr"))
+        self.assertEqual(len(m.ANNONCES), 1)
+        # le minuteur lui-meme : le son et la notification tout de suite, la phrase plus tard
+        m.JARVIS.update(etat="comprend")
+        m.poser_minuteur(600, "", "fr")
+        e = m.JARVIS["minuteurs"][-1]
+        e["minuteur"].cancel()
+        n, self.dit[:] = len(dits()), []
+        e["minuteur"].function()
+        self.assertEqual(len(dits()), n, "pas par-dessus ta phrase")
+        self.assertEqual(len(self.dit), 1, "la notification, elle, tout de suite")
+        self.assertEqual(len(m.ANNONCES), 2)
+
+    def test_entre_sa_premiere_phrase_et_la_suite_il_parle_toujours(self):
+        # l'oreille ne croit pas qu'il s'est tu entre deux textes qui se suivent
+        # (elle guette toujours qu'on lui coupe la parole) ; et « rate » arrive
+        m = self.m
+        oreille, voix = [], []
+        m.envoyer_oreille = lambda o: oreille.append(o) or True
+        m.envoyer_voix = lambda o: voix.append(o) or True
+        m.voix_prete = lambda cle=None: True
+        m.VOIX = m.Voix()
+        m.VOIX.disponible = False
+        a, b = m.VOIX.dire("Il pleut.", None), m.VOIX.dire("Prenez un parapluie.", None)
+        s1, s2 = socket.socketpair()
+        J.envoyer(s2, {"evt": "fini", "id": a, "coupe": False})
+        J.envoyer(s2, {"evt": "fini", "id": b, "coupe": False, "rate": True, "reste": "Prenez un parapluie."})
+        J.envoyer(s2, None)
+        m._lire_voix(s1)
+        s1.close()
+        s2.close()
+        self.assertEqual([o for o in oreille if o.get("cmd") == "parole"], [{"cmd": "parole", "actif": False}])
+        self.assertEqual(self.dit, ["Prenez un parapluie."], "la voix a rate : la notification le montre")
+
+    def test_la_voix_en_echec_n_est_pas_une_reponse(self):
+        # le casque debranche en pleine phrase : pas de silence suivi du
+        # carillon d'ecoute -- la voix de Windows dit ce qui manquait, puis il ecoute
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Il pleut. Prenez un parapluie.",
+                                                          "mode": "jarvis"})
+        par_windows = []
+        m.VOIX._par_windows = lambda texte, fin, langue: par_windows.append((texte, fin, langue))
+        m.VOIX.disponible = True
+        self.phrase("Jarvis, quel temps fait-il ?")
+        ident = dits()[-1]["id"]
+        m.VOIX.fini(ident, False, "Prenez un parapluie.", rate=True)
+        self.assertEqual(ecoutes(), [], "il n'a pas repondu : il n'ecoute pas encore")
+        self.assertEqual([(t, l) for t, f, l in par_windows], [("Prenez un parapluie.", "fr")])
+        par_windows[0][1]()
+        self.assertEqual(len(ecoutes()), 1, "dit par la voix de Windows : la suite reprend")
+        # sans voix de Windows : la notification montre la reponse, et le souci le dit
+        m.VOIX.disponible = False
+        self.dit.clear()
+        self.phrase("Jarvis, quel temps fait-il ?")
+        m.VOIX.fini(dits()[-1]["id"], False, None, rate=True)
+        self.assertEqual(self.dit, ["Il pleut. Prenez un parapluie."])
+        self.assertIn("voix", m.JARVIS["souci"][0])
+        # la voix tombee toute seule : ce qu'elle avait a dire passe a Windows
+        m.VOIX.disponible = True
+        par_windows.clear()
+        self.phrase("Jarvis, quel temps fait-il ?")
+        n = len(ecoutes())
+        m.VOIX.enfant_perdu(redire=True)
+        self.assertEqual([t for t, f, l in par_windows], ["Il pleut. Prenez un parapluie."])
+        self.assertEqual(len(ecoutes()), n)
+        m.VOIX.enfant_perdu()
+        self.assertEqual(len(par_windows), 1, "arretee expres : rien a redire")
 
     def test_la_reponse_en_flux(self):
         # BrainDebugger en flux : l'avance, puis la reponse entiere ; ou l'erreur
@@ -4118,6 +5330,668 @@ class DansMachiTool(unittest.TestCase):
                        "speaker_id_map": {"jessica": 0, "pierre": 1}}, fj)
         self.assertEqual(m.piper_pret(m.CFG)["locuteur"], 1)
 
+    # ---- la transcription telle que Jarvis s'en sert ----
+
+    def remplacer(self, **kw):
+        for nom, valeur in kw.items():
+            self.addCleanup(setattr, self.m, nom, getattr(self.m, nom))
+            setattr(self.m, nom, valeur)
+
+    def moteur_factice(self, vu):
+        """Un moteur « vivant » sans processus : de quoi juger l'entretien."""
+        m = self.m
+
+        class Proc:
+            pid = 1
+
+            def poll(self):
+                return None
+        self.addCleanup(m._MOTEUR.update, proc=None, sock=None, vu=0.0, charge=False)
+        m._MOTEUR.update(proc=Proc(), sock=object(), vu=vu, charge=True)
+
+    def test_le_moteur_se_precharge_apres_le_demarrage_de_l_oreille(self):
+        """« Le premier Jarvis paie le deballage et 652 Mo de modele » : rien ne
+        chargeait le moteur avant qu'on ait parle. L'oreille prete, il se
+        charge ~45 s plus tard -- si la memoire le permet encore, lui charge."""
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True, envoyer_oreille=lambda o: True)
+        self.addCleanup(m._ENTRETIEN.update, prechauffe_a=0.0, en_cours=False)
+        m._ENTRETIEN.update(prechauffe_a=0.0, en_cours=False)
+        m.CFG["jarvis_actif"] = True
+        t0 = time.time()
+        m.traiter_evenement({"evt": "pret", "micro": "x", "trouve": True})
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 1, lances.append), "pas pendant que le PC demarre")
+        self.remplacer(memoire_libre_mo=lambda: 3700)
+        self.assertEqual(m.entretenir_dictee(m.CFG, t0 + 60, lances.append), "prechauffe")
+        self.assertEqual(lances, [m.prechauffer_dictee])
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 120, lances.append), "une seule fois par oreille")
+        # peu de memoire : 1 Go de plus gelerait le PC -- il attendra qu'on l'appelle
+        m.traiter_evenement({"evt": "pret", "micro": "x", "trouve": True})
+        self.remplacer(memoire_libre_mo=lambda: 3000)
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 200, lances.append))
+        self.assertEqual(len(lances), 1)
+        # Jarvis decoche : rien
+        m.CFG["jarvis_actif"] = False
+        m.traiter_evenement({"evt": "pret", "micro": "x", "trouve": True})
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 900, lances.append))
+
+    def test_le_moteur_est_entretenu_tant_que_la_memoire_le_permet(self):
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True, memoire_libre_mo=lambda: 2600)
+        self.addCleanup(m._ENTRETIEN.update, prechauffe_a=0.0, en_cours=False)
+        m.CFG["jarvis_actif"] = True
+        t = time.time()
+        self.moteur_factice(vu=t - 5 * 60)
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t, lances.append), "servi il y a 5 min : rien a faire")
+        m._MOTEUR["vu"] = t - 21 * 60
+        self.assertEqual(m.entretenir_dictee(m.CFG, t, lances.append), "entretien")
+        self.assertEqual(lances, [m.garder_au_chaud])
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t, lances.append), "un entretien a la fois")
+        m._ENTRETIEN["en_cours"] = False
+        # la memoire se resserre (un jeu) : plus d'entretien, il partira de lui-meme
+        self.remplacer(memoire_libre_mo=lambda: 2100)
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t, lances.append))
+        self.assertEqual(len(lances), 1)
+
+    def test_le_delai_de_dechargement_reste_fini(self):
+        m = self.m
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": True}, libre=4000), m.DICTEE_GARDER_JARVIS_S)
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": True}, libre=2100), 30 * 60,
+                         "Jarvis ecoute, encore de la marge : une demi-heure, pas dix minutes")
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": True}, libre=1600), m.DICTEE_DECHARGER_S)
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": False}, libre=9000), m.DICTEE_DECHARGER_S)
+
+    def test_presque_reconnu_reveille_le_moteur(self):
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True, memoire_libre_mo=lambda: 8000,
+                       prechauffer_dictee=lambda: lances.append(1))
+        m.CFG["jarvis_actif"] = True
+        m.traiter_evenement({"evt": "presque", "distance": 0.2, "seuil": 0.18})
+        fin = time.time() + 2
+        while not lances and time.time() < fin:
+            time.sleep(0.01)
+        self.assertEqual(lances, [1])
+
+    def test_un_modele_rate_se_retente_de_plus_en_plus_lentement(self):
+        """« Un telechargement rate rend Jarvis sourd pour de bon. »"""
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True)
+        self.addCleanup(m._DICTEE_RELANCE.update, prochain=0.0, n=0)
+        self.addCleanup(m.DICTEE.update, etat="absent")
+        m._DICTEE_RELANCE.update(prochain=0.0, n=0)
+        m.DICTEE.update(etat="erreur", message="delai depasse")
+        t = 1000.0
+        self.assertFalse(m.relancer_dictee_si_ratee(t, lances.append))
+        self.assertFalse(m.relancer_dictee_si_ratee(t + 30, lances.append))
+        self.assertTrue(m.relancer_dictee_si_ratee(t + 61, lances.append), "une minute apres")
+        self.assertEqual(lances, [m.preparer_dictee])
+        self.assertFalse(m.relancer_dictee_si_ratee(t + 200, lances.append))
+        self.assertTrue(m.relancer_dictee_si_ratee(t + 61 + 301, lances.append), "puis cinq")
+        self.assertFalse(m.relancer_dictee_si_ratee(t + 61 + 301 + 600, lances.append))
+        self.assertTrue(m.relancer_dictee_si_ratee(t + 61 + 301 + 1801, lances.append), "puis trente")
+        self.assertEqual(len(lances), 3)
+
+    def test_un_appel_sans_transcription_ne_fait_pas_parler_dans_le_vide(self):
+        m = self.m
+        envoye = []
+        self.remplacer(prechauffer_dictee=lambda: None)
+        m.envoyer_oreille = envoye.append
+        m.etat_dictee = lambda: {"etat": "preparation", "progres": 0.42}
+        m.traiter_evenement({"evt": "reveil", "par": "voix", "score": 0.1})
+        self.assertNotEqual(m.JARVIS["etat"], "ecoute")
+        self.assertIn({"cmd": "annuler"}, envoye)
+        self.assertIn("42", m.JARVIS["message"])
+
+    def test_la_transcription_absente_se_dit_encore_apres_la_premiere_fois(self):
+        m = self.m
+        self.addCleanup(m.DICTEE.update, etat="absent")
+        sons = []
+        m.jouer_son = sons.append
+        m.etat_dictee = lambda: {"etat": "erreur", "progres": 0.0}
+        vus = self.espions()
+        for _ in range(3):
+            m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+            self.assertEqual(m.JARVIS["message"], m.phrase("transcription_reessaie", m.langue_du_mode()),
+                             "il se taisait des la deuxieme fois")
+        self.assertEqual(sons.count("erreur"), 3)
+        self.assertEqual(vus, {"jarvis": [], "psy": []})
+        # deux minutes plus tard, il le redit a voix haute
+        dit = m.JARVIS["dictee_dite"]
+        m.JARVIS["dictee_dite"] = dit - 121
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertGreater(m.JARVIS["dictee_dite"], dit - 121)
+
+    def test_une_panne_de_moteur_se_dit_court_et_dans_sa_langue(self):
+        """La phrase technique (150 caracteres, en francais meme en anglais)
+        n'est plus lue : elle va au journal."""
+        m = self.m
+        m.CFG["jarvis_langue"] = "en"
+
+        def panne(octets):
+            raise m.DicteeImpossible("pas assez de memoire libre pour la dictee (900 Mo, il en faut 1500)",
+                                     cle="memoire_pleine")
+        m.transcrire = panne
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(m.JARVIS["message"], m.phrase("memoire_pleine", "en"))
+        self.assertNotIn("Mo", m.JARVIS["message"])
+
+    def test_le_moteur_froid_se_voit_au_panneau(self):
+        m = self.m
+        vus = []
+        self.remplacer(dictee_possible=lambda: True)
+        m.transcrire = lambda octets: vus.append(m.JARVIS["message"]) or "Jarvis, quelle heure est-il ?"
+        self.espions()
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus, ["Je prepare la transcription..."])
+        vus.clear()
+        self.moteur_factice(vu=time.time())
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus, ["Je transcris..."])
+
+    def test_la_porteuse_part_avec_une_phrase_francaise(self):
+        m = self.m
+        self.addCleanup(m._PORTEUSE.update, fr=None, demande=0.0)
+        self.addCleanup(m._VOIX_ENFANT.update, charge=None)
+        m._PORTEUSE.update(fr=None, demande=0.0)
+        m._VOIX_ENFANT["charge"] = "fr:kokoro:fr_jarvis"
+        vus, envoye = [], []
+        m.transcrire = lambda octets, porteuse=None: vus.append(porteuse) or "Non."
+        # pas encore rendue : on la demande a la voix, au plus une fois par minute
+        m.voix_prete = lambda cle=None: True
+        m.envoyer_voix = lambda o: envoye.append(o) or True
+        self.assertTrue(m.demander_porteuse(1000.0))
+        self.assertEqual(envoye, [{"cmd": "rendre", "id": "porteuse", "cle": "fr", "texte": "Je vous écoute."}])
+        self.assertFalse(m.demander_porteuse(1030.0))
+        self.assertEqual(m.transcrire_phrase(b"RIFF", "fr"), "Non.")
+        self.assertEqual(vus, [None])
+        porteuse = J.wav_de(np.zeros(8000, np.int16)) if NUMPY else b""
+        if not NUMPY:
+            return
+        self.assertTrue(m.recevoir_porteuse({"evt": "rendu", "cle": "fr",
+                                             "wav": base64.b64encode(porteuse).decode()}))
+        m.transcrire_phrase(b"RIFF", "fr")
+        m.transcrire_phrase(b"RIFF", "en")
+        self.assertEqual(vus[1:], [porteuse, None], "en francais seulement")
+        self.assertFalse(m.demander_porteuse(2000.0), "deja la")
+        # une autre voix chargee : cette porteuse ne vaut plus
+        m._VOIX_ENFANT["charge"] = "fr:piper:gilles"
+        self.assertIsNone(m.porteuse_pour("fr"))
+
+    # ---------- ses nouveaux pouvoirs, dans Machi Tool ----------
+
+    def pouvoirs(self, fichiers=True, windows=True):
+        """Les mains ouvertes, un faux PC : un dossier personnel temporaire,
+        une fausse corbeille. Rend (ex, maison, corbeille)."""
+        m = self.m
+        maison = tempfile.mkdtemp(dir=self.tmp)
+        for d in ("Documents", "Desktop", "Downloads"):
+            os.makedirs(os.path.join(maison, d))
+        bac = tempfile.mkdtemp(dir=self.tmp)
+        vrais = {k: getattr(m, k) for k in ("bases_dossiers", "envoyer_a_la_corbeille", "restaurer_de_la_corbeille")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        self.vrais_pouvoirs = vrais
+        m.bases_dossiers = lambda: {"home": maison, "documents": os.path.join(maison, "Documents"),
+                                    "desktop": os.path.join(maison, "Desktop"),
+                                    "downloads": os.path.join(maison, "Downloads")}
+
+        def jeter(ch):
+            shutil.move(ch, os.path.join(bac, os.path.basename(ch)))
+
+        def restaurer(ch):
+            shutil.move(os.path.join(bac, os.path.basename(ch)), ch)
+            return True
+        m.envoyer_a_la_corbeille, m.restaurer_de_la_corbeille = jeter, restaurer
+        m.CFG.update(jarvis_pc=True, jarvis_fichiers=fichiers, jarvis_windows=windows)
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        return ex, maison, bac
+
+    def ecrire(self, chemin, contenu="bonjour\n"):
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(contenu)
+        return chemin
+
+    def test_ses_nouveaux_pouvoirs_sont_fermes_par_defaut(self):
+        m = self.m
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives"):
+            self.assertIs(m.CONFIG_DEFAUT[cle], False, cle)
+        c = m.capacites_jarvis(m.CFG)
+        self.assertEqual((c["fichiers"], c["windows"], c["initiatives"]), (False, False, False))
+        m.CFG.update(jarvis_pc=True, jarvis_fichiers=True, jarvis_windows=True, jarvis_initiatives=True)
+        c = m.capacites_jarvis(m.CFG)
+        self.assertEqual((c["fichiers"], c["windows"], c["initiatives"]), (True, True, True))
+        m.CFG["jarvis_pc"] = False
+        c = m.capacites_jarvis(m.CFG)
+        self.assertEqual((c["fichiers"], c["windows"]), (False, False), "sans ses mains, rien")
+        # ...et il ne peut pas se les donner
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
+                    "jarvis_annoncer_taches"):
+            self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": cle, "valeur": "oui"}), cle)
+        m.CFG["jarvis_pc"] = True
+        m.CFG["jarvis_fichiers"] = m.CFG["jarvis_windows"] = False
+        self.assertIn("pas permis", ex("corbeille", {"chemin": "Documents\\a.txt"})["erreur"])
+        self.assertIn("pas permis", ex("reglage_windows", {"reglage": "wifi", "action": "lire"})["erreur"])
+
+    @unittest.skipIf(os.name == "nt", "hors Windows seulement")
+    def test_hors_windows_une_erreur_claire(self):
+        ex, _, _ = self.pouvoirs()
+        for nom, e in (("reglage_windows", {"reglage": "wifi", "action": "activer"}),
+                       ("reglage_windows", {"reglage": "sortie_audio", "action": "lister"}),
+                       ("forcer_fermeture", {"cible": "Discord"}),
+                       ("installer_appli", {"action": "chercher", "nom": "vlc"})):
+            self.assertIn("Windows", ex(nom, e)["erreur"], nom)
+
+    def test_ranger_les_fichiers_et_tout_annuler(self):
+        m = self.m
+        ex, maison, bac = self.pouvoirs()
+        docs = os.path.join(maison, "Documents")
+        a = self.ecrire(os.path.join(docs, "facture.txt"))
+        os.makedirs(os.path.join(docs, "Factures"))
+        # deplacer, puis annuler
+        r = ex("deplacer", {"source": "Documents\\facture.txt", "destination": "Documents\\Factures"})
+        self.assertIn("Deplace", r["texte"])
+        self.assertTrue(os.path.isfile(os.path.join(docs, "Factures", "facture.txt")))
+        self.assertIn("revenu", ex("annuler_fichier", {})["texte"])
+        self.assertTrue(os.path.isfile(a))
+        # renommer, puis annuler
+        self.assertIn("Renomme", ex("renommer", {"chemin": "Documents\\facture.txt", "nouveau_nom": "f.txt"})["texte"])
+        self.assertTrue(os.path.isfile(os.path.join(docs, "f.txt")))
+        ex("annuler_fichier", {})
+        self.assertTrue(os.path.isfile(a))
+        # modifier (une copie d'avant), puis annuler
+        r = ex("modifier_fichier", {"chemin": a, "remplacements": [{"avant": "bonjour", "apres": "bonsoir"}],
+                                    "ajouter_a_la_fin": "merci"})
+        self.assertIn("annulable", r["texte"])
+        with open(a, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "bonsoir\nmerci")
+        sauvegardes = os.listdir(m.dossier_sauvegardes())
+        self.assertEqual(len(sauvegardes), 1)
+        self.assertTrue(m.dossier_sauvegardes().startswith(m.DOSSIER), "dans le dossier de Machi Tool")
+        r = ex("modifier_fichier", {"chemin": a, "remplacements": [{"avant": "introuvable", "apres": "x"}]})
+        self.assertIn("rien n'est ecrit", r["erreur"])
+        # le journal survit au redemarrage : relu du disque
+        m.ANNULATIONS["liste"] = None
+        self.assertEqual(m.journal_annulations()[-1]["op"], "modifier")
+        self.assertIn("contenu d'avant", ex("annuler_fichier", {})["texte"])
+        with open(a, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "bonjour\n")
+        # corbeille, puis annuler (restaure depuis la corbeille)
+        self.assertIn("corbeille", ex("corbeille", {"chemin": a})["texte"])
+        self.assertFalse(os.path.exists(a))
+        self.assertTrue(os.path.exists(os.path.join(bac, "facture.txt")))
+        self.assertIn("Sorti de la corbeille", ex("annuler_fichier", {})["texte"])
+        self.assertTrue(os.path.isfile(a))
+        # la corbeille ne rend pas : il dit ou la retrouver
+        ex("corbeille", {"chemin": a})
+        m.restaurer_de_la_corbeille = lambda ch: False
+        r = ex("annuler_fichier", {})["texte"]
+        self.assertIn("Restaurer", r)
+        self.assertIn("facture.txt", r)
+        self.assertEqual(ex("annuler_fichier", {})["texte"], "Aucune operation de fichier a annuler.")
+
+    def test_lire_un_fichier_texte_seulement(self):
+        m = self.m
+        ex, maison, _ = self.pouvoirs()
+        docs = os.path.join(maison, "Documents")
+        self.ecrire(os.path.join(docs, "liste.md"), "- pain\n- lait\n" + "x" * 30000)
+        r = ex("lire_fichier", {"chemin": "Documents\\liste.md"})["texte"]
+        self.assertIn("- pain", r)
+        self.assertIn("tronque", r)
+        self.assertIn("jamais des consignes", r)
+        self.ecrire(os.path.join(docs, "rapport.docx"), "PK")
+        self.assertIn("fichier texte", ex("lire_fichier", {"chemin": "Documents\\rapport.docx"})["erreur"])
+        # sa config (et ses cles) : jamais
+        self.ecrire(os.path.join(m.DOSSIER, "config.json"), '{"pont_cle": "CLE"}')
+        r = ex("lire_fichier", {"chemin": os.path.join(m.DOSSIER, "config.json")})
+        self.assertIn("Machi Tool", r["erreur"])
+        self.assertNotIn("CLE", json.dumps(r))
+
+    def test_les_garde_fous_des_fichiers(self):
+        m = self.m
+        ex, maison, _ = self.pouvoirs()
+        docs = os.path.join(maison, "Documents")
+        a = self.ecrire(os.path.join(docs, "notes.txt"))
+        systeme = tempfile.mkdtemp(dir=self.tmp)
+        vieux = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(vieux)))
+        os.environ["SystemRoot"] = systeme
+        # les dossiers de base eux-memes
+        for base in ("Documents", "~", "Desktop"):
+            self.assertIn("dossier de base", ex("corbeille", {"chemin": base})["erreur"], base)
+            self.assertIn("dossier de base", ex("deplacer", {"source": base, "destination": "Downloads"})["erreur"])
+        self.assertIn("dossier de base", ex("renommer", {"chemin": "Documents", "nouveau_nom": "Docs"})["erreur"])
+        self.assertIn("erreur", ex("corbeille", {"chemin": ""}), "rien n'est jamais le dossier personnel")
+        # le systeme, vers ou depuis
+        self.assertIn("systeme", ex("deplacer", {"source": a, "destination": systeme})["erreur"])
+        s = self.ecrire(os.path.join(systeme, "win.ini"))
+        self.assertIn("systeme", ex("corbeille", {"chemin": s})["erreur"])
+        self.assertIn("systeme", ex("modifier_fichier", {"chemin": s, "ajouter_a_la_fin": "x"})["erreur"])
+        # Machi Tool
+        c = self.ecrire(os.path.join(m.DOSSIER, "config.json"), "{}")
+        self.assertIn("Machi Tool", ex("corbeille", {"chemin": c})["erreur"])
+        self.assertIn("Machi Tool", ex("deplacer", {"source": a, "destination": m.DOSSIER})["erreur"])
+        # une extension de programme
+        self.assertIn("programme", ex("renommer", {"chemin": a, "nouveau_nom": "notes.bat"})["erreur"])
+        self.assertIn("programme", ex("deplacer", {"source": a, "destination": os.path.join(docs, "n.ps1")})["erreur"])
+        # modifier : un fichier texte seulement
+        exe = self.ecrire(os.path.join(docs, "outil.exe"), "MZ")
+        self.assertIn("fichier texte", ex("modifier_fichier", {"chemin": exe, "ajouter_a_la_fin": "x"})["erreur"])
+        bat = self.ecrire(os.path.join(docs, "outil.bat"), "echo")
+        self.assertIn("fichier texte", ex("modifier_fichier", {"chemin": bat, "ajouter_a_la_fin": "shutdown"})["erreur"])
+        self.assertTrue(os.path.isfile(a), "rien n'a bouge")
+        self.assertEqual(m.journal_annulations(), [])
+
+    def test_la_corbeille_hors_windows_le_dit(self):
+        m = self.m
+        ex, maison, _ = self.pouvoirs()
+        a = self.ecrire(os.path.join(maison, "Documents", "a.txt"))
+        m.envoyer_a_la_corbeille = self.vrais_pouvoirs["envoyer_a_la_corbeille"]
+        r = ex("corbeille", {"chemin": a})
+        self.assertIn("Windows", r["erreur"])
+        self.assertTrue(os.path.isfile(a), "jamais de suppression")
+
+    def test_les_paliers_code_direct_oui(self):
+        m = self.m
+        envoyes, maison = self.mains([self.outil("deplacer", {"source": "Documents\\a.txt",
+                                                              "destination": "Documents\\Rangement"}),
+                                      {"texte": "Rangé.", "mode": "jarvis"},
+                                      self.outil("reglage_windows", {"reglage": "wifi", "action": "lire"}, "t2"),
+                                      {"texte": "Le Wi-Fi est actif.", "mode": "jarvis"},
+                                      self.outil("lumiere", {"action": "couleur", "couleur": "rouge"}, "t3"),
+                                      {"texte": "Rouge.", "mode": "jarvis"}])
+        m.CFG.update(jarvis_fichiers=True, jarvis_windows=True)
+        self.ecrire(os.path.join(maison, "Documents", "a.txt"))
+        os.makedirs(os.path.join(maison, "Documents", "Rangement"))
+        vrai = m.reglage_windows
+        self.addCleanup(lambda: setattr(m, "reglage_windows", vrai))
+        m.reglage_windows = lambda r, a="lire", appareil="": "Wi-Fi active."
+        # les fichiers : le code
+        self.phrase("Jarvis, range a.txt dans Rangement")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+        self.assertTrue(os.path.isfile(os.path.join(maison, "Documents", "a.txt")), "rien avant le code")
+        self.phrase("4 8 1 5")
+        self.assertTrue(os.path.isfile(os.path.join(maison, "Documents", "Rangement", "a.txt")))
+        # lire un reglage de Windows, la lumiere : directement, meme session fermee
+        m.JARVIS["acces_jusqua"] = 0.0
+        self.phrase("Jarvis, le wifi est allumé ?")
+        self.assertEqual(envoyes[3]["resultats"][0]["texte"], "Wi-Fi active.")
+        self.phrase("Jarvis, fais une ambiance de feu")
+        self.assertIn("Guirlande", envoyes[5]["resultats"][0]["texte"])
+        self.assertEqual(self.dit[-1], "Rouge.")
+        self.assertEqual(self.dit.count("Code d'accès ?"), 1)
+
+    def fermer_discord(self, reponses, **kw):
+        m = self.m
+        tues = []
+        vrais = {k: getattr(m, k) for k in ("fenetres_ouvertes", "processus_ouverts", "terminer_processus")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        m.fenetres_ouvertes = lambda: [(1, "Discord", "Discord.exe"), (2, "Explorateur", "explorer.exe")]
+        m.processus_ouverts = lambda: [(10, "Discord.exe"), (11, "Discord.exe"), (4, "explorer.exe")]
+        m.terminer_processus = lambda pids: tues.extend(pids) or len(pids)
+        envoyes, maison = self.mains(reponses, **kw)
+        m.CFG.update(jarvis_fichiers=True, jarvis_windows=True)
+        return envoyes, tues, maison
+
+    def test_le_oui_avant_de_fermer_de_force(self):
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "Discord"}),
+                                                {"texte": "Discord est fermé.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, Discord est planté, occupe-t'en")
+        self.assertEqual(self.dit[-1], "Je ferme de force Discord ?")
+        self.assertEqual(tues, [], "rien avant le oui")
+        self.assertTrue(m.JARVIS["attente_oui"])
+        self.phrase("Oui, vas-y.")
+        self.assertEqual(sorted(tues), [10, 11])
+        self.assertIn("Ferme de force", envoyes[1]["resultats"][0]["texte"])
+        self.assertEqual(self.dit[-1], "Discord est fermé.")
+        self.assertIsNone(m.JARVIS["attente_oui"])
+
+    def test_le_oui_refuse_ou_autre_chose(self):
+        m = self.m
+        for reponse in ("non", "euh attends, quelle heure est-il ?"):
+            self.dit.clear()
+            envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "Discord"}),
+                                                    {"texte": "Très bien, je n'y touche pas.", "mode": "jarvis"}],
+                                                   code_actif=False)
+            self.phrase("Jarvis, Discord est planté, occupe-t'en")
+            self.assertEqual(self.dit[-1], "Je ferme de force Discord ?")
+            self.phrase(reponse)
+            self.assertEqual(tues, [], reponse)
+            self.assertEqual(envoyes[1]["resultats"][0]["erreur"], m.REFUS_OUI, reponse)
+            self.assertEqual(self.dit[-1], "Très bien, je n'y touche pas.")
+
+    def test_le_oui_expire(self):
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "Discord"}),
+                                                {"texte": "Oui ?", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, Discord est planté, occupe-t'en")
+        m.JARVIS["attente_oui"]["expire"] = time.time() - 1
+        m.veiller_initiatives(m.CFG)                  # la veille le laisse tomber
+        self.assertIsNone(m.JARVIS["attente_oui"])
+        self.phrase("Jarvis, oui")
+        self.assertEqual(tues, [], "vingt secondes passees : rien")
+        # un nouvel appel aussi l'efface
+        m.JARVIS["attente_oui"] = {"tour_oui": m.JARVIS["tour"] - 1, "expire": time.time() + 20}
+        self.assertFalse(m.oui_en_attente())
+
+    def test_jamais_un_processus_du_systeme(self):
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "explorateur"}),
+                                                {"texte": "Je ne peux pas.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, l'explorateur est planté, occupe-t'en")
+        self.assertNotIn("Je ferme", " ".join(self.dit), "refuse d'avance : il ne demande rien")
+        self.assertIn("jamais de force", envoyes[1]["resultats"][0]["erreur"])
+        self.assertEqual(tues, [])
+
+    def test_le_code_d_abord_puis_le_oui(self):
+        m = self.m
+        envoyes, tues, maison = self.fermer_discord([
+            {"texte": "", "mode": "jarvis",
+             "outils": [{"id": "a", "nom": "corbeille", "entree": {"chemin": "Documents\\vieux.txt"}},
+                        {"id": "b", "nom": "forcer_fermeture", "entree": {"cible": "Discord"}}],
+             "suite": [{"role": "user", "content": "x"}]},
+            {"texte": "Voilà.", "mode": "jarvis"}])
+        bac = []
+        vrai = m.envoyer_a_la_corbeille
+        self.addCleanup(lambda: setattr(m, "envoyer_a_la_corbeille", vrai))
+        m.envoyer_a_la_corbeille = lambda ch: (bac.append(ch), os.remove(ch))
+        v = self.ecrire(os.path.join(maison, "Documents", "vieux.txt"))
+        self.phrase("Jarvis, fais le ménage comme convenu")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+        self.phrase("4815")
+        self.assertEqual(self.dit[-1], "Je ferme de force Discord ?")
+        self.assertEqual((bac, tues), ([], []), "tout attend le oui")
+        self.phrase("oui")
+        self.assertEqual((bac, sorted(tues)), ([v], [10, 11]))
+        self.assertEqual([r["id"] for r in envoyes[1]["resultats"]], ["a", "b"])
+        self.assertEqual(self.dit[-1], "Voilà.")
+
+    def test_installer_une_appli_avec_un_oui(self):
+        m = self.m
+        commandes, fonds = [], []
+        vrais = {k: getattr(m, k) for k in ("_winget", "_en_fond")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+
+        def winget(args, delai):
+            commandes.append(list(args))
+            if args[0] == "search":
+                if "shutdown" in args[1].lower():
+                    return 0, "Name Id Version\n------------------\nShutdown Timer  Timer.Arret  1.0\n"
+                return 0, ("Name              Id            Version\n------------------------------------\n"
+                           "VLC media player  VideoLAN.VLC  3.0.21\n")
+            return 0, "Installe"
+        m._winget = winget
+        m._en_fond = fonds.append
+        installation = lambda: [f for f in fonds if "installer_appli" in f.__qualname__]
+        envoyes, maison = self.mains([self.outil("installer_appli", {"action": "chercher", "nom": "vlc"}),
+                                      {"texte": "Je trouve VLC.", "mode": "jarvis"},
+                                      self.outil("installer_appli", {"action": "installer", "nom": "vlc"}, "t2"),
+                                      {"texte": "C'est lancé.", "mode": "jarvis"},
+                                      self.outil("installer_appli", {"action": "installer", "nom": "shutdown timer"}, "t3"),
+                                      {"texte": "Non.", "mode": "jarvis"}], code_actif=False)
+        m.CFG.update(jarvis_windows=True)
+        self.phrase("Jarvis, occupe-toi de VLC")
+        self.assertIn("VideoLAN.VLC", envoyes[1]["resultats"][0]["texte"], "chercher : directement")
+        self.phrase("Jarvis, occupe-toi de VLC pour de bon")
+        self.assertEqual(self.dit[-1], "J'installe VLC media player ?")
+        self.assertFalse(any(c[0] == "install" for c in commandes))
+        self.phrase("oui")
+        self.assertEqual(len(installation()), 1)
+        installation()[0]()                                # l'installation, en fond
+        (install,) = [c for c in commandes if c[0] == "install"]
+        self.assertEqual(install[:4], ["install", "--id", "VideoLAN.VLC", "--exact"])
+        self.assertIn("--silent", install)
+        self.assertFalse(any("--all" in c or "all" in c for c in commandes), "jamais tout d'un coup")
+        self.assertEqual(self.dit[-1], "C'est fait : VLC media player est installé.")
+        self.phrase("Jarvis, occupe-toi du minuteur")
+        self.assertIn("ni fermer la session", envoyes[5]["resultats"][0]["erreur"])
+        self.assertEqual(self.dit.count("J'installe VLC media player ?"), 1)
+        self.assertEqual(len([d for d in self.dit if d.startswith("J'installe")]), 1, "pas de question")
+
+    def initiative(self, t, **signaux):
+        self.m.CFG["jarvis_langue"] = "fr"
+        s = dict({"actif": True, "etat": "attente", "mode": "jarvis", "en_attente": False, "voix_occupee": False,
+                  "plein_ecran": False, "calme_jusqua": 0.0, "heure": 15, "inactivite_s": 5}, **signaux)
+        return self.m.veiller_initiatives(self.m.CFG, maintenant=t, signaux=s)
+
+    def test_la_porte_des_initiatives(self):
+        m = self.m
+        t = time.time()
+        chaud = {"temp_cpu": 96, "tjmax": 100}
+        self.assertIsNone(self.initiative(t, **chaud), "pas permises par defaut")
+        m.CFG["jarvis_initiatives"] = True
+        for raison, s in (("psy", {"mode": "psy"}), ("plein ecran", {"plein_ecran": True}),
+                          ("parle", {"voix_occupee": True}), ("calme", {"calme_jusqua": t + 60}),
+                          ("absent", {"inactivite_s": 600}), ("code", {"en_attente": True})):
+            self.assertIsNone(self.initiative(t, **dict(chaud, **s)), raison)
+        m.INITIATIVES["actif_depuis"] = t - 3 * 3600
+        self.assertIsNone(self.initiative(t, heure=2), "la nuit, pas de pause proposee")
+        self.assertIn("pause", self.initiative(t, heure=15))
+        m.INITIATIVES.update(recentes=[], deja={}, actif_depuis=None)
+        # une seance grave : une heure de silence
+        m.JARVIS["psy_grave"] = True
+        self.initiative(t)
+        m.JARVIS["psy_grave"] = False
+        self.assertIsNone(self.initiative(t + 60, **chaud), "juste apres une seance grave")
+        m.INITIATIVES["grave_jusqua"] = 0.0
+        # la surchauffe parle, meme la nuit ; trois par heure au plus
+        self.assertIn("processeur", self.initiative(t, heure=3, **chaud))
+        self.assertIn("processeur", self.dit[-1], "annoncee (notification : la voix est coupee)")
+        m.INITIATIVES["deja"].clear()
+        self.assertTrue(self.initiative(t + 1, temp_gpu=95))
+        m.INITIATIVES["deja"].clear()
+        self.assertTrue(self.initiative(t + 2, **chaud))
+        m.INITIATIVES["deja"].clear()
+        self.assertIsNone(self.initiative(t + 3, **chaud), "plafond : trois par heure")
+        m.INITIATIVES["deja"].clear()
+        self.assertTrue(self.initiative(t + 3601, **chaud))
+
+    def test_chaque_initiative_dans_machi_tool(self):
+        m = self.m
+        m.CFG["jarvis_initiatives"] = True
+        regle = []
+        vrai = m.regler_son
+        self.addCleanup(lambda: setattr(m, "regler_son", vrai))
+        m.regler_son = lambda action, appli="", niveau=None: regle.append((action, appli, niveau)) or "ok"
+        t = time.time()
+        # tard le soir, trop fort : il baisse a 40 % et le dit
+        self.assertIsNone(self.initiative(t, heure=23, volume=55))
+        self.assertEqual(self.initiative(t, heure=23, volume=80), "Il est tard : j'ai baissé le volume à 40 %.")
+        self.assertEqual(regle, [("regler", "", 40)])
+        self.assertEqual(self.dit[-1], "Il est tard : j'ai baissé le volume à 40 %.")
+        self.assertIsNone(self.initiative(t + 60, heure=23, volume=80), "une fois par soiree")
+        # deux heures sans pause : il la propose, une fois
+        t = t + 10000
+        m.INITIATIVES["actif_depuis"] = None
+        self.assertIsNone(self.initiative(t))
+        self.assertIn("pause", self.initiative(t + 2 * 3600 + 5))
+        self.assertIsNone(self.initiative(t + 2 * 3600 + 900), "une seule fois")
+        self.initiative(t + 3 * 3600, inactivite_s=900)                # une vraie pause
+        self.initiative(t + 3 * 3600 + 10)
+        self.assertIsNone(self.initiative(t + 4 * 3600))
+        self.assertIn("pause", self.initiative(t + 5 * 3600 + 20))
+        # sans signaux injectes (hors Windows) : rien ne casse
+        m.INITIATIVES["deja"]["pause"] = t
+        self.assertIsNone(m.veiller_initiatives(m.CFG))
+
+
+class TranscriptionAncree(unittest.TestCase):
+    """« Non » transcrit « Não », « Ouais » transcrit « Wait » : une porteuse
+    francaise devant la reponse ancre la langue ; on ne garde que ce qui suit."""
+
+    def test_le_texte_apres_la_porteuse(self):
+        jetons = ["▁Je", "▁vous", "▁é", "coute", ".", "▁Non", "."]
+        dates = [0.1, 0.3, 0.5, 0.6, 1.2, 1.9, 2.1]
+        self.assertEqual(J.texte_apres(jetons, dates, 1.6), "Non.")
+        # le point final de la porteuse deborde la coupure
+        self.assertEqual(J.texte_apres(jetons, dates, 1.1), "Non.")
+        # onnx-asr a deja change « ▁ » en espace
+        self.assertEqual(J.texte_apres([" Oui", ",", " mer", "ci", "."], [2.0, 2.2, 2.3, 2.4, 2.5], 1.6),
+                         "Oui, merci.")
+        self.assertEqual(J.texte_apres(jetons, dates, 5.0), "")
+        self.assertEqual(J.texte_apres(None, None, 0), "")
+
+    def test_seulement_pour_une_parole_courte(self):
+        self.assertTrue(J.parole_courte([]))
+        self.assertTrue(J.parole_courte([3.1, 3.3]))
+        self.assertFalse(J.parole_courte([0.5, 0.9, 1.3, 1.8]))
+        # mesure : le point de « Não. » est date 1,5 s apres le mot
+        self.assertTrue(J.parole_courte([1.0, 2.6], jetons=["▁Não", "."]))
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_reconnaitre_ancre_seulement_ce_qui_est_court(self):
+        class R:
+            def __init__(self, texte, jetons, dates):
+                self.text, self.tokens, self.timestamps = texte, jetons, dates
+
+        class Faux:
+            """Sans contexte, il derive ; avec la porteuse (un son plus long), il lit juste."""
+            def __init__(self, court=True):
+                self.court, self.sons = court, []
+
+            def with_timestamps(self):
+                return self
+
+            def recognize(self, son, sample_rate=16000):
+                self.sons.append(len(son))
+                if len(self.sons) == 1:
+                    if not self.court:
+                        return R("Non c'est bon.", [" Non", " c", "'", "est", " bon", "."], [1.0, 1.4, 1.5, 1.7, 2.2, 2.6])
+                    return R("Não.", [" Não", "."], [2.0, 2.2])
+                t0 = porteuse_s
+                return R("Je vous écoute. Non.", [" Je", " vous", " écoute", ".", " Non", "."],
+                         [0.1, 0.3, 0.5, t0 + 0.05, t0 + 0.4, t0 + 0.6])
+        porteuse_s = 1.0
+        son = np.zeros(16000 * 3, np.float32)
+        son[32000:36000] = 0.3
+        porteuse = np.full(16000, 0.5, np.float32)
+        f = Faux()
+        self.assertEqual(J.reconnaitre(f, son, 16000, porteuse), "Non.")
+        # la porteuse est pres du mot : le son d'avant (l'attente) est coupe
+        self.assertLess(f.sons[1], len(porteuse) + len(son))
+        f = Faux(court=False)
+        self.assertEqual(J.reconnaitre(f, son, 16000, porteuse), "Non c'est bon.")
+        self.assertEqual(len(f.sons), 1, "une phrase longue ne paie pas un second passage")
+        class Nu:
+            def recognize(self, son, sample_rate=16000):
+                return "Não."
+        self.assertEqual(J.reconnaitre(Nu(), son, 16000, None), "Não.", "sans porteuse, comme avant")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_porteuse_rendue_en_memoire(self):
+        class Syn:
+            frequence, langue = 24000, "fr"
+
+            def phrases(self, texte, lenteur=1.0):
+                yield np.full(12000, 1000, np.int16)
+                yield np.full(12000, -1000, np.int16)
+        w = J.rendre_en_memoire(Syn(), "Je vous écoute.")
+        with wave.open(io.BytesIO(w)) as ww:
+            self.assertEqual((ww.getframerate(), ww.getnframes()), (16000, 16000))
 
 class mock_urlopen:
     def __init__(self, m, reponse):
@@ -4135,6 +6009,358 @@ class mock_urlopen:
     def __exit__(self, *a):
         self.m.urllib.request.urlopen = self.avant
         return False
+
+
+# ======================================================================
+#  ROBUSTESSE ET DIAGNOSTIC : le chronometre, la patience, les echecs
+# ======================================================================
+
+class RobustesseEtDiagnostic(unittest.TestCase):
+    """« Il met une plombe a repondre », « je lui parle et plus rien » : ou
+    passe le temps d'un echange, ce qu'il fait quand BrainDebugger tarde, et
+    ce qu'on sait d'un echec."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.m = charger_module(cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        DansMachiTool.setUp(self)
+        m = self.m
+        m.CHRONO["courant"] = None
+        m.CHRONOS.clear()
+        m._EN_VOL.clear()
+        del m._JARVIS_TRAVAIL[:]
+        m.CFG["jarvis_langue"] = "fr"
+        m._TRAVAIL_COURANT.update(tour=None, t=0.0)
+        m._GARDE.update(cle=None, sans_raison=None)
+        m._ONGLETS_AVANCE.update(fil=None, boite=None, t=0.0)
+        m.VOIX = m.Voix()
+        m.VOIX.disponible = False
+        self.sons = []
+        m.jouer_son = self.sons.append
+        consts = ("PATIENCE_S", "PATIENCE_REDIRE_S", "PATIENCE_DIRE_S", "ATTENTE_BD_MAX_S", "REESSAI_BD_S",
+                  "_requete_bd", "extension_branchee", "commande_onglets")
+        vrais = {k: getattr(m, k) for k in consts}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        vraie = urllib.request.urlopen
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", vraie))
+        m.REESSAI_BD_S = 0.0
+
+    def tearDown(self):
+        DansMachiTool.tearDown(self)
+
+    def journal(self, faire):
+        import contextlib
+        sortie = io.StringIO()
+        with contextlib.redirect_stdout(sortie):
+            faire()
+        return sortie.getvalue()
+
+    # --- le chronometre ---
+
+    def test_chaque_echange_est_chronometre_sans_rien_de_dit(self):
+        import socket as socket_
+        m = self.m
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            time.sleep(0.05)
+            sur_debut("Volontiers.")
+            time.sleep(0.05)
+            return {"texte": "Volontiers. Un pingouin entre dans un bar.", "mode": "jarvis"}
+        dits, _ = DansMachiTool._voix_et_bd(self, bd)
+        m.transcrire = lambda octets: "Jarvis, raconte-moi une blague sur les pingouins"
+        m.JARVIS["reveil_verifie"] = True
+        m.traiter_evenement({"evt": "phrase", "wav": base64.b64encode(b"RIFF....").decode(),
+                             "pause": 0.75, "fin_t": time.time() - 0.75})
+        item = m._JARVIS_TRAVAIL.pop(0)
+
+        def echange():
+            m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+            # la voix : la premiere phrase, puis la suite -- et c'est fini
+            a, b = socket_.socketpair()
+            for ev in ({"evt": "debut", "id": 1}, {"evt": "fini", "id": 1},
+                       {"evt": "debut", "id": 2}, {"evt": "fini", "id": 2}):
+                J.envoyer(a, ev)
+            a.close()
+            m._lire_voix(b)
+            b.close()
+        journal = self.journal(echange)
+        self.assertEqual([d["id"] for d in dits()], [1, 2])
+        self.assertEqual(len(m.CHRONOS), 1, journal)
+        r = m.CHRONOS[-1]
+        self.assertEqual((r["chemin"], r["issue"]), ("bd", "dit"))
+        for k in ("fin_de_phrase", "transcription", "contexte", "bd", "bd_fin", "voix", "premier_son", "total"):
+            self.assertIsNotNone(r[k], k)
+            self.assertGreaterEqual(r[k], 0.0, k)
+        self.assertGreaterEqual(r["fin_de_phrase"], 0.7)
+        self.assertGreaterEqual(r["bd"], 0.04, "BrainDebugger : jusqu'a sa premiere phrase")
+        self.assertGreaterEqual(r["bd_fin"], r["bd"])
+        self.assertGreaterEqual(r["premier_son"], r["fin_de_phrase"] + r["bd"])
+        self.assertLessEqual(r["premier_son"], r["total"])
+        ligne = [x for x in journal.splitlines() if "echange de" in x]
+        self.assertEqual(len(ligne), 1, journal)
+        for mot in ("blague", "pingouin", "Volontiers", "bar"):
+            self.assertNotIn(mot, ligne[0], "le journal ne garde jamais ce qui a ete dit")
+        self.assertRegex(m.texte_dernier_echange(),
+                         r"^Dernier echange \(\d\d:\d\d\) : fin de phrase 0,[78] s · transcription \d+,\d s · "
+                         r"(contexte \d+,\d s · )?BrainDebugger 0,\d s · voix \d+,\d s -- premier son a \d+,\d s\.$")
+
+    def test_le_chronometre_ne_grossit_pas(self):
+        m = self.m
+        def echanges():
+            for i in range(25):
+                m.JARVIS["tour"] = i
+                m.noter_temps("phrase", 0.5)
+                m.noter_temps("transcrit")
+            m.clore_temps("dit")
+        self.journal(echanges)
+        self.assertEqual(len(m.CHRONOS), 10)
+        self.assertEqual([r["issue"] for r in m.CHRONOS][-2:], ["interrompu", "dit"])
+        m.noter_temps("voix")                     # plus d'echange en cours : rien
+        self.assertIsNone(m.CHRONO["courant"])
+
+    # --- quand BrainDebugger tarde ---
+
+    def test_il_patiente_d_un_petit_son_quand_bd_tarde(self):
+        m = self.m
+        m.PATIENCE_S, m.PATIENCE_REDIRE_S, m.PATIENCE_DIRE_S = 0.1, 10.0, 100.0
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: (
+            time.sleep(0.45), {"texte": "Voila.", "mode": "jarvis"})[1]
+        tour = m.JARVIS["tour"]
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, tour))
+        self.assertEqual(self.sons.count("patience"), 1, self.sons)
+        self.assertEqual(self.dit, ["Voila."])
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Alors.")
+            time.sleep(0.45)
+            return {"texte": "Alors. Voila.", "mode": "jarvis"}
+        self.sons.clear()
+        m._requete_bd = bd
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, tour))
+        self.assertNotIn("patience", self.sons, "sa premiere phrase est la : pas de signe")
+
+    def test_un_instant_une_fois_si_ca_dure(self):
+        m = self.m
+        dits, _ = DansMachiTool._voix_et_bd(self, lambda chemin, charge, cfg, delai, sur_debut=None: (
+            time.sleep(0.7), {"texte": "Voila.", "mode": "jarvis"})[1])
+        m.PATIENCE_S, m.PATIENCE_REDIRE_S, m.PATIENCE_DIRE_S = 0.1, 0.1, 0.2
+        tour = m.JARVIS["tour"]
+
+        def ecouter_la_voix():
+            # la voix dit vite : « fini » arrive avant le signe suivant
+            while not m.VOIX.attentes:
+                time.sleep(0.01)
+            m.VOIX.fini(min(m.VOIX.attentes), False)
+        threading.Thread(target=ecouter_la_voix, daemon=True).start()
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, tour))
+        textes = [d["texte"] for d in dits()]
+        self.assertEqual(textes.count("Un instant."), 1, textes)
+        self.assertEqual(textes[-1], "Voila.")
+
+    def test_bd_muet_il_laisse_tomber_et_le_dit(self):
+        m = self.m
+        m.ATTENTE_BD_MAX_S = 0.3
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: time.sleep(3) or {"texte": "trop tard"}
+        t0 = time.monotonic()
+        journal = self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger ne répond pas.")
+        self.assertIn("BDMuet", m.JARVIS["derniere_erreur"][1])
+        self.assertIn("BDMuet", journal)
+
+    def test_une_requete_abandonnee_est_fermee(self):
+        m = self.m
+        fermee, lu = threading.Event(), threading.Event()
+
+        class Bloquee:
+            headers = {"Content-Type": "application/x-ndjson"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield b'{"debut": "Alors."}\n'
+                lu.set()
+                fermee.wait(5)             # BrainDebugger ecrit encore la suite
+
+            def close(self):
+                fermee.set()
+        urllib.request.urlopen = lambda req, **k: Bloquee()
+        tour = m.JARVIS["tour"]
+        threading.Timer(0.3, lambda: m.JARVIS.update(tour=tour + 1)).start()
+        with self.assertRaises(m.Annule):
+            m._requete_bd_annulable("/api/machitool/jarvis", {"texte": "x"}, m.CFG, 5, tour, sur_debut=lambda t: None)
+        self.assertTrue(lu.is_set())
+        self.assertTrue(fermee.wait(1.0), "la requete orpheline est fermee")
+        for _ in range(50):
+            if not m._EN_VOL:
+                break
+            time.sleep(0.02)
+        self.assertEqual(m._EN_VOL, {}, "le fil n'y reste pas pendu")
+
+    def test_il_reessaie_seulement_quand_c_est_sur(self):
+        import http.client
+        m = self.m
+        appels = []
+
+        def ouvrir(erreurs):
+            def faux(req, timeout=None, context=None):
+                appels.append(req)
+                if erreurs:
+                    raise erreurs.pop(0)
+                return FausseReponse(json.dumps({"texte": "Voila."}).encode())
+            return faux
+
+        def essai(*erreurs):
+            appels.clear()
+            urllib.request.urlopen = ouvrir(list(erreurs))
+            res = {}
+
+            def faire():
+                try:
+                    res["r"] = m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+                except BaseException as e:
+                    res["r"] = type(e).__name__
+            self.journal(faire)
+            return res["r"], len(appels)
+        # la connexion n'a pas pu se faire : rien n'est parti, il reessaie
+        self.assertEqual(essai(urllib.error.URLError(ConnectionRefusedError())), ({"texte": "Voila."}, 2))
+        self.assertEqual(essai(urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))),
+                         ({"texte": "Voila."}, 2))
+        # une page 502 du bord de Railway (pas du JSON), tout de suite : il reessaie
+        page = urllib.error.HTTPError("/x", 502, "Bad Gateway", {}, io.BytesIO(b"<html>Application failed</html>"))
+        self.assertEqual(essai(page), ({"texte": "Voila."}, 2))
+        # une erreur de BrainDebugger lui-meme, une coupure apres l'envoi : jamais
+        bd = urllib.error.HTTPError("/x", 502, "Bad Gateway", {}, io.BytesIO(b'{"error": "claude"}'))
+        self.assertEqual(essai(bd), ("HTTPError", 1))
+        self.assertEqual(essai(http.client.RemoteDisconnected("fermee")), ("RemoteDisconnected", 1))
+        self.assertEqual(essai(urllib.error.URLError(ConnectionResetError())), ("URLError", 1))
+        # une seule fois
+        self.assertEqual(essai(urllib.error.URLError(ConnectionRefusedError()),
+                               urllib.error.URLError(ConnectionRefusedError())), ("URLError", 2))
+
+    # --- les echecs ---
+
+    def test_un_echec_dit_court_et_garde_la_cause(self):
+        m = self.m
+
+        def panne(e):
+            def bd(chemin, charge, cfg, delai, sur_debut=None):
+                raise e
+            return bd
+        m._requete_bd = panne(urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")))
+        journal = self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertEqual(m.JARVIS["message"], "Je n'arrive pas à joindre BrainDebugger.")
+        self.assertIn("gaierror", journal)
+        self.assertIn("getaddrinfo failed", m.texte_derniere_erreur())
+        m._requete_bd = panne(socket.timeout("timed out"))
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger ne répond pas.", "un silence n'est pas « injoignable »")
+        self.assertIn("timed out", m.texte_derniere_erreur())
+        self.assertEqual(m.texte_derniere_erreur(time.time() + 3600), "", "une demi-heure, pas plus")
+
+    def test_une_panne_de_transcription_se_dit_dans_la_langue(self):
+        # en anglais, la voix anglaise lisait 160 signes de francais technique
+        m = self.m
+        m.CFG["jarvis_langue"] = "en"
+
+        def casse(octets):
+            raise m.DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription")
+        m.transcrire = casse
+        self.journal(lambda: m.traiter_phrase(base64.b64encode(b"RIFF").decode(), m.CFG))
+        self.assertEqual(m.JARVIS["message"], "Sorry, I couldn't make that out.")
+        self.assertIn("moteur de dictee", m.JARVIS["derniere_erreur"][1])
+
+    # --- avant la question ---
+
+    def test_le_contexte_ssl_se_construit_une_fois(self):
+        import ssl
+        m = self.m
+        n = []
+        vraie = ssl.create_default_context
+        self.addCleanup(lambda: setattr(ssl, "create_default_context", vraie))
+        ssl.create_default_context = lambda *a, **k: n.append(1) or vraie(*a, **k)
+        m._oublier_contexte_ssl()
+        with mock_urlopen(m, {"texte": "Voila."}):
+            m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+            apres_un = len(n)
+            m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+        self.assertGreaterEqual(apres_un, 1)
+        self.assertEqual(len(n), apres_un, "le magasin de certificats n'est pas relu a chaque question")
+        self.assertIs(m._contexte_ssl(), m._contexte_ssl())
+
+    def test_les_onglets_ne_retardent_pas_la_question(self):
+        m = self.m
+        m.CFG["jarvis_pc"] = True
+        m.extension_branchee = lambda: True
+        lent = {"s": 1.5}
+        m.commande_onglets = lambda quoi, **k: time.sleep(lent["s"]) or {
+            "onglets": [{"titre": "Lo-fi beats", "url": "https://www.youtube.com/watch?v=1"}]}
+        vus = []
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: (
+            vus.append((time.monotonic(), charge["onglets_ouverts"])), {"texte": "Voila.", "mode": "jarvis"})[1]
+        t0 = time.monotonic()
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertLess(vus[-1][0] - t0, 0.8, "l'extension lente ne fait plus attendre la question")
+        self.assertEqual(vus[-1][1], "")
+        # demandee pendant la transcription, elle est la a temps
+        lent["s"] = 0.05
+        m.lancer_onglets(m.CFG)
+        time.sleep(0.2)
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertIn("Lo-fi beats", vus[-1][1])
+
+    # --- le garde-fou des etats ---
+
+    def test_un_etat_sans_raison_revient_a_l_attente(self):
+        m = self.m
+        m.JARVIS.update(etat="parle", message="Je reponds.")
+        self.assertFalse(m.surveiller_etats(100.0), "un etat tout neuf a sa chance")
+        self.assertFalse(m.surveiller_etats(101.0))
+        journal = self.journal(lambda: self.assertTrue(m.surveiller_etats(105.1)))
+        self.assertIn("garde-fou", journal)
+        self.assertEqual(m.JARVIS["etat"], "attente")
+
+    def test_un_etat_qui_a_une_raison_reste(self):
+        m = self.m
+        m.JARVIS.update(etat="pense", message="Jarvis reflechit...")
+        m._TRAVAIL_COURANT["tour"] = m.JARVIS["tour"]            # il y travaille
+        for t in range(0, 40, 1):
+            self.assertFalse(m.surveiller_etats(200.0 + t))
+        m._TRAVAIL_COURANT["tour"] = None
+        m.VOIX.attentes[7] = None                              # il a encore a dire
+        m.JARVIS.update(etat="parle", message="Je reponds.")
+        for t in range(0, 40, 1):
+            self.assertFalse(m.surveiller_etats(300.0 + t))
+        m.VOIX.attentes.clear()
+        self.assertFalse(m.surveiller_etats(341.0))
+        self.assertTrue(m.surveiller_etats(346.0))
+
+    def test_rappele_pendant_les_outils_il_ne_repasse_pas_a_pense(self):
+        # « Jarvis, qu'est-ce qui joue ? » -- un outil lent -- « Jarvis » : la
+        # boule restait sur « il reflechit » jusqu'au prochain appel
+        m = self.m
+        tour = m.JARVIS["tour"]
+        m.JARVIS.update(tour=tour + 1, etat="ecoute", message="Je vous ecoute.")
+        with self.assertRaises(m.Annule):
+            m.continuer_jarvis({"texte": "x", "suite": [], "conv": tour, "tour": 1}, [], m.CFG)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        # et si l'etat etait deja ecrit trop tard, le garde-fou le rattrape
+        m.JARVIS.update(etat="pense", message="Jarvis agit...")
+        m.surveiller_etats(0.0)
+        m.surveiller_etats(1.0)
+        self.journal(lambda: m.surveiller_etats(11.5))
+        self.assertEqual(m.JARVIS["etat"], "attente")
 
 
 # ======================================================================
@@ -4434,6 +6660,27 @@ class LeMicroChoisi(unittest.TestCase):
         etat["defaut"] = self.Micro("{B}", "Webcam")      # Windows a change de micro
         self.assertEqual(list(flux), [], "il s'arrete pour rouvrir le nouveau")
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_pret_seulement_une_fois_le_micro_ouvert(self):
+        """Un micro refuse (confidentialite de Windows) : « pret » partait avant
+        l'ouverture, et effacait l'erreur qui suivait, toutes les 3 s."""
+        import types
+
+        def refuse(self, **k):
+            raise OSError("acces refuse")
+        test = self
+        test.Micro.recorder = refuse
+        self.addCleanup(lambda: delattr(test.Micro, "recorder"))
+        m = self.Micro("{A}", "Casque")
+        faux = types.SimpleNamespace(all_microphones=lambda: [m], default_microphone=lambda: m)
+        vrai = sys.modules.get("soundcard")
+        sys.modules["soundcard"] = faux
+        self.addCleanup(lambda: sys.modules.__setitem__("soundcard", vrai) if vrai else sys.modules.pop("soundcard"))
+        annonces = []
+        with self.assertRaises(OSError):
+            next(J.micro_windows("", lambda n, ok: annonces.append(n)))
+        self.assertEqual(annonces, [])
+
     def test_par_identifiant_puis_par_nom_sinon_celui_de_windows(self):
         a, b, c = self.Micro("{A}", "Micro casque"), self.Micro("{B}", "Webcam"), self.Micro("{C}", "Webcam")
         tous = lambda: [a, b, c]
@@ -4540,6 +6787,10 @@ class ProcessusReel(unittest.TestCase):
             m.dossier_jarvis = lambda: MODELES
             m._commande_oreille = lambda port, secret: [sys.executable, script, str(port), secret,
                                                         MODELES, npy]
+            # la transcription prete (sans elle, un reveil ne fait plus parler
+            # dans le vide depuis la v1.65) -- sans lancer de vrai moteur
+            m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
+            m.prechauffer_dictee = lambda: None
             etats = []
             origine = m.traiter_evenement
 
@@ -4640,6 +6891,266 @@ class ReprendreOuIlEnEtait(unittest.TestCase):
         self.assertEqual(J.decouper_phrases(""), [])
 
 
+class HautParleurEnTempsReel(FauxHautParleur):
+    """Joue au rythme du son (un dixieme de seconde prend un dixieme de
+    seconde), note quand chaque morceau commence, et compte ses ouvertures.
+    `panne` : les numeros de morceaux (a partir de 1) ou play() leve."""
+
+    def __init__(self, panne=(), temps_reel=True):
+        FauxHautParleur.__init__(self)
+        self.debuts, self.ouvertures, self.panne, self.temps_reel, self.n = [], 0, set(panne), temps_reel, 0
+
+    def __enter__(self):
+        self.ouvertures += 1
+        return self
+
+    def play(self, data):
+        self.n += 1
+        if self.n in self.panne or "toujours" in self.panne:
+            raise RuntimeError("AUDCLNT_E_DEVICE_INVALIDATED")
+        self.debuts.append(time.time())
+        self.morceaux.append(len(data))
+        if self.temps_reel:
+            time.sleep(len(data) / float(self.frequence))
+
+
+class SyntheseLente(SyntheseFactice):
+    """Une seconde de son par phrase, calculee en `cout` secondes ; `rate` :
+    la phrase qui ne se calcule pas."""
+
+    def __init__(self, cout=0.6, rate=None):
+        SyntheseFactice.__init__(self)
+        self.cout, self.rate = cout, rate
+
+    def phrases(self, texte, lenteur=1.0, **kw):
+        self.lues.append(texte)
+        if self.rate and self.rate in texte:
+            raise RuntimeError("onnxruntime")
+        time.sleep(self.cout)
+        yield (np.sin(np.arange(16000) / 5.0) * 8000).astype(np.int16)
+
+
+def _voix_enfant_de_test(test, lecteur, syn=None):
+    """Le processus de la voix, dans un fil, sur une vraie socket ; sa synthese
+    chargee par un « charger » (Phonemiseur et Synthese remplaces)."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    fil = threading.Thread(target=J.voix_enfant, args=(srv.getsockname()[1], "S3CRET", lecteur), daemon=True)
+    fil.start()
+    c, _ = srv.accept()
+    srv.close()
+    c.recv(4 + len("S3CRET"))
+    test.addCleanup(lambda: (J.envoyer(c, None), c.close(), fil.join(5)))
+    return c, fil
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LaVoixEnchaine(unittest.TestCase):
+    """« Un blanc d'une seconde entre sa premiere phrase et la suite », « il
+    se tait puis le carillon, comme s'il avait repondu », « la voix francaise
+    jamais chargee »."""
+
+    def setUp(self):
+        vrais = (J.Phonemiseur, J.Synthese)
+        self.addCleanup(lambda: (setattr(J, "Phonemiseur", vrais[0]), setattr(J, "Synthese", vrais[1])))
+        self.syn = SyntheseLente()
+
+        class Ph:
+            def __init__(ph, *a, **k):
+                time.sleep(0.3)                      # une voix qui se charge
+        J.Phonemiseur = Ph
+        J.Synthese = lambda *a, **k: self.syn
+
+    def evenements(self, c, jusqu_a, delai=15):
+        evts = []
+        fin = time.time() + delai
+        c.settimeout(delai)
+        while time.time() < fin:
+            e = J.recevoir(c)
+            if e is None:
+                break
+            evts.append(e)
+            if jusqu_a(e):
+                break
+        return evts
+
+    def test_la_suite_se_calcule_pendant_que_la_premiere_phrase_sonne(self):
+        hp = HautParleurEnTempsReel()
+        c, fil = _voix_enfant_de_test(self, hp)
+        J.envoyer(c, {"cmd": "charger", "cle": "fr", "bibliotheque": "", "donnees": "", "modele": "x"})
+        self.assertEqual(J.recevoir(c)["evt"], "pret")
+        J.envoyer(c, {"cmd": "dire", "id": 1, "texte": "Très bien, monsieur."})
+        time.sleep(0.1)
+        J.envoyer(c, {"cmd": "dire", "id": 2, "texte": "Le minuteur est lancé."})
+        evts = self.evenements(c, lambda e: e.get("evt") == "fini" and e.get("id") == 2)
+        self.assertEqual([(e["evt"], e["id"]) for e in evts if e["evt"] != "dit"],
+                         [("debut", 1), ("fini", 1), ("debut", 2), ("fini", 2)])
+        # 10 dixiemes de son + 2 de silence par phrase ; le blanc entre les deux
+        # textes est celui d'entre deux phrases, pas le calcul de la suite
+        self.assertEqual(len(hp.debuts), 24)
+        blanc = hp.debuts[12] - (hp.debuts[11] + 0.1)
+        self.assertLess(blanc, 0.25, "%.2f s de blanc entre la premiere phrase et la suite" % blanc)
+        self.assertEqual(hp.ouvertures, 1, "le haut-parleur reste ouvert entre les deux")
+
+    def test_taire_ne_jette_pas_une_voix_qui_se_charge(self):
+        c, fil = _voix_enfant_de_test(self, HautParleurEnTempsReel(temps_reel=False))
+        J.envoyer(c, {"cmd": "charger", "cle": "en", "bibliotheque": "", "donnees": "", "modele": "x"})
+        J.envoyer(c, {"cmd": "charger", "cle": "fr", "bibliotheque": "", "donnees": "", "modele": "x"})
+        J.envoyer(c, {"cmd": "dire", "id": 1, "texte": "Jetee."})
+        J.envoyer(c, {"cmd": "taire"})           # « Jarvis » dit pendant qu'elles se chargent
+        evts = self.evenements(c, lambda e: e.get("cle") == "fr", delai=5)
+        self.assertEqual([(e["evt"], e.get("cle")) for e in evts], [("pret", "en"), ("pret", "fr")])
+        self.assertEqual(self.syn.lues, [], "le texte qui attendait, lui, est jete")
+
+    def test_une_phrase_qui_ne_se_calcule_pas(self):
+        syn, evts, hp = SyntheseLente(cout=0.0, rate="Deux"), [], HautParleurEnTempsReel(temps_reel=False)
+        J.Bouche(syn, evts.append, hp).dire(3, "Un. Deux. Trois.")
+        self.assertEqual(evts[-1], {"evt": "fini", "id": 3, "coupe": False, "rate": True, "reste": "Deux. Trois."})
+        self.assertIn("erreur", [e["evt"] for e in evts])
+
+    def test_le_haut_parleur_change_en_route(self):
+        # un casque debranche : on rouvre celui de Windows, et on continue
+        syn, evts = SyntheseLente(cout=0.0), []
+        hp = HautParleurEnTempsReel(panne={5}, temps_reel=False)
+        J.Bouche(syn, evts.append, hp).dire(4, "Un. Deux.")
+        self.assertEqual(evts[-1], {"evt": "fini", "id": 4, "coupe": False})
+        self.assertEqual(len(hp.morceaux), 24, "rien de perdu")
+        self.assertEqual(hp.ouvertures, 2)
+
+    def test_plus_de_haut_parleur_du_tout(self):
+        syn, evts = SyntheseLente(cout=0.0), []
+        avant = threading.active_count()
+        hp = HautParleurEnTempsReel(panne={"toujours"}, temps_reel=False)
+        J.Bouche(syn, evts.append, hp).dire(5, "Un. Deux. Trois. Quatre. Cinq. Six.")
+        self.assertEqual(evts[-1], {"evt": "fini", "id": 5, "coupe": False, "rate": True,
+                                    "reste": "Un. Deux. Trois. Quatre. Cinq. Six."})
+        fin = time.time() + 2
+        while threading.active_count() > avant and time.time() < fin:
+            time.sleep(0.05)
+        self.assertEqual(threading.active_count(), avant, "le calcul ne reste pas bloque pour toujours")
+
+    def test_taire_arrete_aussi_ce_qui_se_calculait(self):
+        b = J.Bouche(SyntheseLente(cout=0.2), lambda e: None, HautParleurEnTempsReel(temps_reel=False))
+        t1, t2 = b.preparer(1, "Un. Deux."), b.preparer(2, "Trois.")
+        b.taire()
+        self.assertTrue(t1["arret"].is_set() and t2["arret"].is_set())
+        # le texte suivant ne ranime pas ceux qu'on a coupes
+        b.dire(3, "Quatre.")
+        self.assertTrue(t1["arret"].is_set())
+
+
+class LesNombresSeDisent(unittest.TestCase):
+    """« 45.5 », « 6:30 », « 1,500 », « 3,5 », « 14h », « 45°C », « M. Dupont »."""
+
+    def test_une_ponctuation_collee_ne_coupe_pas(self):
+        ph = J.Phonemiseur.__new__(J.Phonemiseur)
+        ph._proposition = lambda t: t
+        for t in ("Your GPU is at 45.5 degrees.", "It's 6:30 in the evening.", "That's 1,500 euros.",
+                  "Il fait 3,5 degrés."):
+            self.assertEqual(len(ph.phrases(t)), 1, t)
+        self.assertEqual([unicodedata.normalize("NFC", "".join(p))
+                          for p in ph.phrases("Bonjour, monsieur. Ça va ? Oui : bien.")],
+                         ["Bonjour, monsieur.", "Ça va?", "Oui: bien."])
+        self.assertEqual(ph.phrases("..."), [])
+
+    @unittest.skipUnless(bibli_de_test(), "espeak-ng absent")
+    def test_espeak_lit_le_nombre_entier(self):
+        en = J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, "en")
+        self.assertIn("pɔɪnt", "".join(en.phrases("Your GPU is at 45.5 degrees.")[0]))
+        fr = J.Phonemiseur(bibli_de_test(), PIPER_DOSSIER, "fr")
+        self.assertIn("viʁɡyl", unicodedata.normalize("NFC", "".join(fr.phrases("Il fait 3,5 degrés.")[0])))
+
+    def test_le_texte_pour_la_voix(self):
+        self.assertEqual(J.texte_pour_piper("à 14h."), "à 14 heures.")
+        self.assertEqual(J.texte_pour_piper("à 1h du matin"), "à 1 heure du matin")
+        self.assertEqual(J.texte_pour_piper("Il est 14h05."), "Il est 14 heures 05.")
+        self.assertEqual(J.texte_pour_piper("2 hommes, 3 heures"), "2 hommes, 3 heures")
+        self.assertEqual(J.texte_pour_piper("Il fait 45°C."), "Il fait 45 degrés.")
+        self.assertEqual(J.texte_pour_piper("It's 45° outside.", "en"), "It's 45 degrees outside.")
+        self.assertEqual(J.decouper_phrases(J.texte_pour_piper("M. Dupont arrive. Bien.")),
+                         ["monsieur Dupont arrive.", "Bien."])
+        self.assertEqual(J.texte_pour_piper("Mr. Smith is here.", "en"), "Mister Smith is here.")
+        self.assertEqual(J.texte_pour_piper("Voici :\n1. Ouvre Spotify.\n2. Lance la musique."),
+                         "Voici : Ouvre Spotify. Lance la musique.")
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LeMajordomeJazzy(unittest.TestCase):
+    """« Un petit peu de jazz » : sa boule et son panneau jouent avec SA voix,
+    pas avec un sinus -- l'enveloppe part avec chaque phrase."""
+
+    def test_chaque_phrase_part_avec_son_enveloppe(self):
+        syn = SyntheseFactice()
+        hp, evts = FauxHautParleur(), []
+        J.Bouche(syn, evts.append, hp).dire(3, "Bonsoir monsieur. Un peu de musique ?")
+        dits = [e for e in evts if e["evt"] == "dit"]
+        self.assertEqual(len(dits), 2)
+        for d in dits:
+            self.assertEqual(d["pas"], J.VOIX_ENVELOPPE_PAS)
+            self.assertEqual(len(d["env"]), int(np.ceil(d["duree"] / d["pas"] - 1e-9)), "une valeur par 50 ms")
+            self.assertTrue(all(isinstance(v, int) and 0 <= v <= 99 for v in d["env"]))
+            self.assertGreater(min(d["env"]), 60, "un son soutenu : haut")
+        self.assertEqual(len(hp.morceaux), 2 * 12, "la lecture garde ses tranches de 100 ms et ses 0,2 s de blanc")
+        self.assertEqual([e["evt"] for e in evts if e["evt"] != "dit"], ["debut", "fini"])
+        json.dumps(evts)                                   # passe tel quel dans la prise
+
+    def test_l_enveloppe(self):
+        f = 24000
+        self.assertEqual(J.enveloppe_voix(np.zeros(f, np.int16), f), [0] * 20, "le silence : zero")
+        self.assertEqual(J.enveloppe_voix(np.zeros(0, np.int16), f), [])
+        fort = (np.sin(np.arange(f) / 3.0) * 26000).astype(np.int16)
+        son = np.concatenate([fort[:f // 2], np.zeros(f // 2 + 100, np.int16)])
+        env = J.enveloppe_voix(son, f)
+        self.assertEqual(len(env), 21, "la derniere tranche, entamee, compte")
+        self.assertTrue(all(v >= 95 for v in env[:10]), env)
+        self.assertEqual(env[10:], [0] * 11)
+        faible = J.enveloppe_voix((fort // 30).astype(np.int16), f)
+        self.assertTrue(20 < faible[5] < env[5], "plus doux, plus bas")
+
+    def test_le_niveau_a_l_instant(self):
+        env, pas = [0, 0, 99, 99, 0, 0, 0, 0], 0.05
+        niv = lambda t: J.niveau_enveloppe(env, pas, t)
+        self.assertEqual(niv(-0.01), 0.0, "avant sa voix : rien")
+        self.assertEqual(niv(0.05), 0.0)
+        self.assertAlmostEqual(niv(0.14), 1.0, places=6, msg="le pic sur les tranches fortes")
+        self.assertLess(niv(0.101), 0.2, "l'attaque, courte")
+        # la relache : il retombe, doucement, sans remonter
+        chute = [niv(0.2 + k * 0.03) for k in range(10)]
+        self.assertTrue(all(a > b for a, b in zip(chute, chute[1:])), chute)
+        self.assertGreater(chute[1], 0.5)
+        self.assertLess(chute[-1], 0.2)
+        self.assertEqual(niv(5.0), 0.0, "longtemps apres : rien")
+        self.assertEqual(J.niveau_enveloppe([], pas, 0.1), 0.0)
+        # sans memoire : le meme instant, le meme niveau, quelle que soit la cadence
+        self.assertEqual(niv(0.23), niv(0.23))
+
+    def test_le_swing_et_les_touches(self):
+        T = J.JAZZ_TEMPS_S
+        # la croche longue (sur le temps) puis la courte, aux 2/3 du temps : ternaire
+        self.assertAlmostEqual(J.niveau_swing(0.0), 1.0)
+        self.assertGreater(J.niveau_swing(2 * T / 3 + 0.001), J.niveau_swing(2 * T / 3 - 0.001))
+        self.assertLess(J.niveau_swing(2 * T / 3 + 0.001), J.niveau_swing(T + 0.001), "l'accent est sur le temps")
+        self.assertTrue(all(0.35 <= J.niveau_swing(k * 0.013) <= 1.0 for k in range(200)))
+        self.assertEqual(J.touches_piano(0.0, 1.0), [0.0] * 7, "au silence, tout repose")
+        t = J.touches_piano(1.0, 0.0)
+        self.assertEqual([i for i, v in enumerate(t) if v == 1.0], [0, 1, 3], "Dm7 : re, fa, do")
+        self.assertEqual(len(J.touches_piano(0.5, 0.0, 12)), 12)
+        self.assertNotEqual(J.touches_piano(1.0, 0.0), J.touches_piano(1.0, 2 * T), "l'accord change")
+
+    def test_les_barres_du_panneau_suivent_sa_voix(self):
+        allume = lambda im: int((im[:44].max(axis=2) > 0).sum())
+        muet, fort = J.image_jarvis("parle", 1.0, niveau=0.0), J.image_jarvis("parle", 1.0, niveau=1.0)
+        self.assertGreater(allume(fort), allume(muet) + 100, "sa voix leve les barres")
+        self.assertTrue(np.any(np.all(fort[:44] == np.array(J.LED_COULEURS["ambre"], np.uint8), axis=2)))
+        self.assertGreater(int((muet[50:57].max(axis=2) > 0).sum()), 40, "SPEAKING, toujours")
+        st0 = J.image_jarvis("parle", 1.0, sous_titre="Bien", niveau=0.0)
+        st1 = J.image_jarvis("parle", 1.0, sous_titre="Bien", niveau=1.0)
+        self.assertGreater(allume(st1[:14]), allume(st0[:14]), "au-dessus du sous-titre aussi")
+        self.assertTrue(np.array_equal(J.image_jarvis("parle", 1.0), J.image_jarvis("parle", 1.0, niveau=None)),
+                        "sans niveau : le sinus d'avant")
+
+
 @unittest.skipUnless(PIPER, "JARVIS_PIPER_DOSSIER / JARVIS_PIPER_VOIX absents")
 class VoixEnMemoire(unittest.TestCase):
     """La voix de Jarvis : Piper, le modele charge UNE fois, espeak-ng appele
@@ -4707,6 +7218,34 @@ class VoixEnMemoire(unittest.TestCase):
         while ev.get("evt") == "dit":          # ou il en est, phrase par phrase (les sous-titres)
             ev = J.recevoir(c)
         self.assertEqual(ev, {"evt": "fini", "id": 1, "coupe": False})
+        J.envoyer(c, None)
+        c.close()
+        fil.join(5)
+        self.assertFalse(fil.is_alive())
+
+    def test_la_porteuse_rendue_par_le_processus_de_la_voix(self):
+        """La porteuse de la transcription (« Non » lu « Não ») : dite en
+        memoire par la voix francaise, a 16 kHz -- jamais au haut-parleur."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        hp = FauxHautParleur()
+        fil = threading.Thread(target=J.voix_enfant, args=(srv.getsockname()[1], "S3CRET", hp), daemon=True)
+        fil.start()
+        c, _ = srv.accept()
+        srv.close()
+        taille = int.from_bytes(c.recv(4), "big")
+        self.assertEqual(c.recv(taille), b"S3CRET")
+        J.envoyer(c, {"cmd": "charger", "bibliotheque": bibli_de_test(), "donnees": PIPER_DOSSIER,
+                      "modele": PIPER_VOIX, "espeak": "fr"})
+        self.assertEqual(J.recevoir(c)["evt"], "pret")
+        J.envoyer(c, {"cmd": "rendre", "id": "porteuse", "cle": "fr", "texte": "Je vous écoute."})
+        ev = J.recevoir(c)
+        self.assertEqual((ev["evt"], ev["id"], ev["cle"]), ("rendu", "porteuse", "fr"))
+        with wave.open(io.BytesIO(base64.b64decode(ev["wav"]))) as w:
+            self.assertEqual(w.getframerate(), 16000)
+            self.assertGreater(w.getnframes(), 8000)
+        self.assertEqual(hp.morceaux, [], "la porteuse ne passe pas par le haut-parleur")
         J.envoyer(c, None)
         c.close()
         fil.join(5)
@@ -5117,6 +7656,20 @@ class DoubleTransmission(unittest.TestCase):
             o.trame(silence)
         self.assertEqual(sorties[-1], {"evt": "vide"}, "une ecoute ordinaire n'est pas une coupure")
 
+    def test_sans_reference_il_ne_se_coupe_pas_lui_meme(self):
+        """Le loopback tombe apres que la piece a ete apprise : l'echo predit
+        vaut zero, et sa voix passait pour quelqu'un au bout de 1,6 s."""
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            p.passage(c, self.jarvis[0])
+            p.passage(c, self.jarvis[1])
+            _, mic, _, _ = p.signaux(self.jarvis[2])
+            p.t += 30.0
+            c.armer(p.t)
+            for i in range(0, len(mic) - J.TRAME, J.TRAME):
+                self.assertFalse(c.micro(mic[i:i + J.TRAME].astype(np.float32), p.t + (i + J.TRAME) / 16000.0),
+                                 "piece %d : coupe a %.2f s sans reference" % (graine, i / 16000.0))
+
     def test_sans_reference_seul_le_mot_d_eveil_le_coupe(self):
         sorties = []
         o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, None)
@@ -5283,6 +7836,103 @@ class AppelPerduDerriereUnDoute(TresTolerant):
         self.o.commande({"cmd": "verifie", "ok": None})               # la transcription n'a pas pu tourner
         self.assertIn("reveil", self.evts())
         self.assertEqual(self.sons, ["eveil"])
+
+    test_confirme_il_se_reveille_et_la_phrase_suit = None
+    test_ecarte_il_se_rendort_sans_un_bruit = None
+    test_la_phrase_finie_avant_le_verdict_l_attend = None
+    test_net_il_se_reveille_tout_de_suite = None
+    test_sans_reponse_il_laisse_tomber = None
+
+
+class LeReveilQuiRatait(TresTolerant):
+    """« J'ai galere a ce qu'il s'allume » -- et « surtout qu'il n'apparaisse
+    pas pour rien ». Les appels pas nets qu'il perdait, sans en accepter plus."""
+
+    def verifier(self):
+        return [e for e in self.sorties if e["evt"] == "verifier"]
+
+    def test_redire_son_nom_juste_apres_un_appel_pas_net(self):
+        # « Jarvis ? ... JARVIS ! » : 2 s de surdite apres le premier
+        self.appel_pas_net()
+        self.silence(3)
+        self.dire(self.g)
+        self.assertIn("reveil", self.evts())
+        self.assertEqual(self.sons, ["eveil"])
+
+    def test_un_second_appel_pas_net_est_verifie_aussi(self):
+        self.appel_pas_net()
+        self.silence(12)
+        self.dire(self.autrement)                     # « Jarvis ? » encore, pas net
+        self.silence(J.TOLERANCE_ATTENTE + 1)
+        v = self.verifier()
+        self.assertEqual(len(v), 2, "le second appel part aussi a la verification")
+        self.o.commande({"cmd": "verifie", "ok": False, "n": v[0]["n"]})   # le premier, mal lu
+        self.assertNotIn("reveil", self.evts(), "l'autre attend encore sa lecture")
+        self.assertIsNotNone(self.o.doute)
+        self.o.commande({"cmd": "verifie", "ok": True, "n": v[1]["n"]})
+        self.assertIn("reveil", self.evts())
+
+    def test_deux_non_et_il_se_rendort(self):
+        self.appel_pas_net()
+        self.silence(12)
+        self.dire(self.autrement)
+        self.silence(J.TOLERANCE_ATTENTE + 1)
+        v = self.verifier()
+        self.o.commande({"cmd": "verifie", "ok": False, "n": v[1]["n"]})
+        self.o.commande({"cmd": "verifie", "ok": False, "n": v[0]["n"]})
+        self.assertIsNone(self.o.doute)
+        self.assertNotIn("reveil", self.evts())
+
+    def test_pas_de_carillon_au_milieu_de_la_phrase(self):
+        # « Jarvis, mets de la musique de Daft Punk » d'une traite : le verdict
+        # arrive pendant « musique »
+        self.appel_pas_net()
+        self.dire([np.random.default_rng(5).normal(size=96)] * 12)
+        self.o.commande({"cmd": "verifie", "ok": True})
+        self.assertEqual(self.sons, [], "pas de « a vous » par-dessus la personne")
+        self.assertEqual([e for e in self.evts() if e != "presque"][-1], "reveil")
+        self.silence(25)
+        self.assertIn("phrase", self.evts())
+        self.assertEqual(self.sons, ["capte"])
+
+    def test_lecture_lente_tout_pres_il_n_attend_pas(self):
+        # le moteur de transcription demarre a froid : un appel tout pres du
+        # seuil ne reste pas 20 s dans le silence
+        self.appel_pas_net()
+        n = self.verifier()[0]["n"]
+        self.o.doute["reveil"]["score"] = 1.2 * self.o.det.seuil
+        self.silence(J.VERIF_REPLI_TRAMES + 2)
+        self.assertIn("reveil", self.evts())
+        r = [e for e in self.sorties if e["evt"] == "reveil"][-1]
+        self.assertTrue(r["repli"])
+        self.assertFalse(r["verifie"], "rien n'a ete lu : la phrase devra contenir son nom")
+        self.assertEqual(self.sons, ["eveil"])
+        self.assertIn("sans_lecture", [e.get("issue") for e in self.sorties if e.get("maj")])
+        self.o.commande({"cmd": "verifie", "ok": False, "n": n})           # la lecture, en retard
+        self.assertEqual(self.o.etat, "phrase", "un verdict en retard ne coupe pas l'ecoute")
+
+    def test_lecture_lente_trop_loin_il_attend_encore(self):
+        self.appel_pas_net()                          # ~1,4 x le seuil direct
+        self.silence(J.VERIF_REPLI_TRAMES + 2)
+        self.assertNotIn("reveil", self.evts())
+        self.assertIsNotNone(self.o.doute, "il attend toujours la lecture")
+        self.assertIn("lent", [e.get("issue") for e in self.sorties if e.get("maj")], "et ca se voit")
+        self.o.commande({"cmd": "verifie", "ok": True})
+        self.assertIn("reveil", self.evts())
+
+    def test_sa_propre_voix_ne_le_reveille_pas(self):
+        # sans double transmission : « ... Reglages, Jarvis. » dans sa voix
+        self.silence(20)
+        self.o.commande({"cmd": "parole", "actif": True})
+        self.dire(self.autrement)
+        self.silence(2)
+        self.o.commande({"cmd": "parole", "actif": False})
+        self.silence(10)
+        self.assertEqual(self.verifier(), [])
+        # ... mais TON « Jarvis » appris, net, le reveille par-dessus lui
+        self.o.commande({"cmd": "parole", "actif": True})
+        self.dire(self.g)
+        self.assertIn("reveil", self.evts())
 
     test_confirme_il_se_reveille_et_la_phrase_suit = None
     test_ecarte_il_se_rendort_sans_un_bruit = None
