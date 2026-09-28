@@ -2619,7 +2619,9 @@ class DansMachiTool(unittest.TestCase):
         os.makedirs(m.DOSSIER)
         m.CFG.clear()
         m.CFG.update(json.loads(json.dumps(m.CONFIG_DEFAUT)))
-        m.CFG.update(pont_site="https://bd.exemple", pont_cle="CLE", jarvis_voix=False)
+        # rien ne part au journal de BrainDebugger d'un test a l'autre (voir
+        # test_les_discussions_vont_au_journal)
+        m.CFG.update(pont_site="https://bd.exemple", pont_cle="CLE", jarvis_voix=False, jarvis_journal=False)
         m.ETAT["forcage"] = None
         m.JARVIS.update(led=None, led_fin=0.0, minuteurs=[], etat="attente", mode="jarvis",
                         mode_vu=0.0, historique=[], vu=0.0, propose_psy=False,
@@ -3420,6 +3422,46 @@ class DansMachiTool(unittest.TestCase):
         m.dire("Je lance la playlist ?", suite=True)
         self.phrase("ok")
         self.assertEqual(vus["jarvis"], ["ok"])
+
+    def test_les_discussions_vont_au_journal(self):
+        # « Fait en sorte que les discussions de Jarvis aillent aussi dans le journal ! »
+        m = self.m
+        vrais = (m._en_fond, m._requete_bd)
+        self.addCleanup(lambda: (setattr(m, "_en_fond", vrais[0]), setattr(m, "_requete_bd", vrais[1])))
+        m._en_fond = lambda f: f()
+        envoyes, reponses = [], []
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            envoyes.append((chemin, json.loads(json.dumps(charge))))
+            if chemin == "/api/machitool/journal":
+                return {"ok": True}
+            return reponses.pop(0)
+        m._requete_bd = bd
+        m.CFG["jarvis_journal"] = True
+        reponses += [{"texte": "Gris et doux, Monsieur.", "mode": "jarvis"}]
+        self.phrase("Jarvis, quel temps fait-il à Nantes ?")
+        journal = [c for chemin, c in envoyes if chemin == "/api/machitool/journal"]
+        self.assertEqual(journal, [{"dit": "quel temps fait-il à Nantes ?", "repondu": "Gris et doux, Monsieur."}])
+        # le grave part au compagnon, qui le range lui-meme : rien de plus
+        reponses += [{"texte": "Je suis la.", "mode": "psy"}]
+        self.phrase("Jarvis, je n'en peux plus")
+        self.assertEqual(len([1 for chemin, _ in envoyes if chemin == "/api/machitool/journal"]), 1)
+        # decoche : plus rien
+        m.poser_mode("jarvis")
+        m.CFG["jarvis_journal"] = False
+        reponses += [{"texte": "Il est midi.", "mode": "jarvis"}]
+        self.phrase("Jarvis, quelle heure est-il ?")
+        self.assertEqual(len([1 for chemin, _ in envoyes if chemin == "/api/machitool/journal"]), 1)
+        self.assertFalse(m.verser_au_journal("x", "y", m.CFG))
+        # un BrainDebugger d'avant (404) : rien ne casse, rien a voix haute
+        m.CFG["jarvis_journal"] = True
+
+        def ancien(chemin, charge, cfg, delai, sur_debut=None):
+            raise m.urllib.error.HTTPError(chemin, 404, "Not Found", {}, None)
+        m._requete_bd = ancien
+        self.assertTrue(m.verser_au_journal("x", "y", m.CFG))
+        # il ne peut pas se le cocher ni se le decocher
+        self.assertIn("jarvis_journal", J.REGLAGES_INTERDITS)
 
     def test_il_se_souvient_de_vos_conversations(self):
         # « Il faut que Jarvis se souvienne des anciennes discussions, mais simplement. »
