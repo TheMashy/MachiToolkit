@@ -4667,7 +4667,8 @@ class VoixEnMemoire(unittest.TestCase):
         self.assertEqual(len(list(sons)), 2, "trois phrases, trois morceaux")
         self.assertGreater(len(premiere) / float(self.syn.frequence), 0.3)
         self.assertLess(delai, 1.0, "la premiere phrase doit etre prete tout de suite")
-        self.assertGreater(int(np.max(np.abs(premiere))), 30000, "crete normalisee, comme piper")
+        self.assertAlmostEqual(int(np.max(np.abs(premiere))), int(J.VOIX_CRETE * 32767), delta=2,
+                               msg="crete normalisee (80 % : pas d'ecretage au reechantillonnage)")
 
     def test_la_bouche_parle_par_morceaux_et_se_tait(self):
         hp = FauxHautParleur()
@@ -4702,7 +4703,10 @@ class VoixEnMemoire(unittest.TestCase):
         self.assertEqual(J.recevoir(c)["evt"], "pret")
         J.envoyer(c, {"cmd": "dire", "id": 1, "texte": "Mode psychologue. Je vous écoute."})
         self.assertEqual(J.recevoir(c), {"evt": "debut", "id": 1})
-        self.assertEqual(J.recevoir(c), {"evt": "fini", "id": 1, "coupe": False})
+        ev = J.recevoir(c)
+        while ev.get("evt") == "dit":          # ou il en est, phrase par phrase (les sous-titres)
+            ev = J.recevoir(c)
+        self.assertEqual(ev, {"evt": "fini", "id": 1, "coupe": False})
         J.envoyer(c, None)
         c.close()
         fil.join(5)
@@ -5203,7 +5207,8 @@ class VoixAnglaise(unittest.TestCase):
             d = len(s) / float(J.KOKORO_FREQ)
             self.assertTrue(0.4 < d < 6, d)
             self.assertGreater(float(np.sqrt(np.mean(s.astype(np.float64) ** 2))), 1500, "il parle, il ne souffle pas")
-        self.assertGreater(int(np.max(np.abs(sons[0]))), 30000, "crete normalisee, comme piper")
+        self.assertAlmostEqual(int(np.max(np.abs(sons[0]))), int(J.VOIX_CRETE * 32767), delta=2,
+                               msg="crete normalisee (80 % : pas d'ecretage au reechantillonnage)")
 
     def test_deux_langues_dans_un_processus(self):
         """espeak-ng n'a qu'une voix par processus : le francais du mode psy
