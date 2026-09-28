@@ -802,11 +802,16 @@ SONS = {
     # (a vous) et de la fin qui descend (je m'en vais)
     "capte":    [(520, 0.045)],
     "minuteur": [(880, 0.12), (0, 0.08), (1175, 0.12), (0, 0.25)] * 3,
+    # « JE NE SAIS PAS S'IL EST MORT » : BrainDebugger tarde, il y pense
+    # encore -- deux gouttes tres douces, pas un bavardage
+    "patience": [(660, 0.03), (0, 0.07), (660, 0.03)],
 }
+SONS_VOLUME = {"patience": 0.08}     # les autres : le volume de `carillon`
 
 
-def carillon(genre, volume=0.22, frequence=22050):
+def carillon(genre, volume=None, frequence=22050):
     """Un petit son, fabrique en memoire : aucun fichier."""
+    volume = SONS_VOLUME.get(genre, 0.22) if volume is None else volume
     notes = SONS.get(genre, SONS["bip"])
     amorti = int(0.008 * frequence)
     ech = []
@@ -3208,6 +3213,8 @@ class Oreille:
                     # sinon, c'etait de l'echo : il le dit a l'oreille, et reprend.
                     ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii"),
                           "breve": True}
+                if fin == "fini":   # le chronometre de l'echange : quand tu t'es tu (des nombres, rien de dit)
+                    ev.update(pause=round(self.phrase.silence, 2), fin_t=round(time.time() - self.phrase.silence, 3))
                 # on lui a vraiment parle : ces facons de l'appeler etaient bien des appels
                 a_garder, self.auto_attente = (self.auto_attente if fin == "fini" else []), []
                 if self.doute is not None and self.doute.get("phrase") is self.phrase:
