@@ -4564,7 +4564,7 @@ class RobustesseEtDiagnostic(unittest.TestCase):
             raise m.DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription")
         m.transcrire = casse
         self.journal(lambda: m.traiter_phrase(base64.b64encode(b"RIFF").decode(), m.CFG))
-        self.assertEqual(m.JARVIS["message"], "My transcription failed. The details are on the Jarvis page.")
+        self.assertEqual(m.JARVIS["message"], "My transcription failed. The details are on the assistant page.")
         self.assertIn("moteur de dictee", m.JARVIS["derniere_erreur"][1])
 
     # --- avant la question ---
