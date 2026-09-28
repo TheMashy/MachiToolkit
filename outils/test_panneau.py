@@ -179,6 +179,82 @@ class AL_Ecran(unittest.TestCase):
             M.CFG.update(vieux)
             M.JARVIS["etat"] = etat
 
+    def test_la_boule_joue_avec_sa_voix_meme_avec_le_panneau(self):
+        """« Un petit peu de jazz » : avec son panneau, elle ne sortait plus que
+        pour regarder un ecran. Elle sort quand il parle et quand il ecoute, et
+        ses touches suivent l'enveloppe de sa voix -- jamais sur un jeu."""
+        p = self.p
+        vieux = {k: M.CFG.get(k) for k in ("jarvis_actif", "jarvis_boule", "jarvis_panneau")}
+        garde = {k: M.JARVIS.get(k) for k in ("etat", "sous_titre", "regard")}
+        plein = M.plein_ecran_occupe
+        try:
+            M.CFG.update(jarvis_actif=True, jarvis_boule=True, jarvis_panneau=True)
+            M.JARVIS.update(regard=None)
+            for e in ("ecoute", "parle"):
+                M.JARVIS["etat"] = e
+                self.assertEqual(p._boule_tic(), 40, e)
+                p.root.update()
+                self.assertEqual(p.boule.state(), "normal", "avec le panneau aussi : " + e)
+            M.JARVIS["etat"] = "pense"
+            for _ in range(12):
+                p._boule_tic()
+            self.assertEqual(p.boule.state(), "withdrawn", "avec le panneau, pas quand il reflechit")
+            # ses touches suivent sa voix ; les objets sont deplaces, pas refaits
+            M.JARVIS["etat"] = "parle"
+
+            def touche_la_plus_haute(niveau):
+                t0 = time.time() - M._jv.VOIX_LATENCE_S - 0.5
+                M.JARVIS["sous_titre"] = {"phrases": ["Bien."], "k": 0, "t0": t0, "duree": 2.0,
+                                          "enveloppe": (t0, 0.05, [niveau] * 40)}
+                self.assertEqual(p._boule_tic(), 40)
+                return max(abs(p.boule_toile.coords(o)[3] - p.boule_toile.coords(o)[1])
+                           for o in p.boule_objets["touches"])
+            objets = p.boule_toile.find_all()
+            muet, fort = touche_la_plus_haute(0), touche_la_plus_haute(99)
+            self.assertGreater(fort, muet + 4, "sa voix enfonce les touches")
+            self.assertEqual(p.boule_toile.find_all(), objets, "pas de delete('all') a chaque image")
+            self.assertGreaterEqual(len(objets), 4)
+            # la voix de Windows ne dit rien de son son : elle swingue quand meme
+            M.JARVIS["sous_titre"] = {"phrases": ["Oui."], "k": -1, "estime": True, "t0": time.time()}
+            self.assertEqual(p._boule_tic(), 40)
+            # UN JEU EN PLEIN ECRAN : elle se cache
+            M.plein_ecran_occupe = lambda *a: True
+            self.assertEqual(p._boule_tic(), 500)
+            p.root.update()
+            self.assertEqual(p.boule.state(), "withdrawn", "jamais par-dessus un jeu")
+        finally:
+            M.plein_ecran_occupe = plein
+            M.CFG.update(vieux)
+            M.JARVIS.update(garde)
+
+    def test_une_seule_boucle_de_boule_apres_refaire_interface(self):
+        """Un changement d'ecran refait l'interface : l'ancienne boucle de la
+        boule doit s'arreter, sinon elles s'additionnent."""
+        p = M.Panneau(M.CFG, lambda: None)
+        try:
+            appels = []
+            p._panneau_tic = lambda: 100
+            p._boule_tic = lambda: appels.append(time.time()) or 100
+
+            def tourner(s):
+                fin = time.time() + s
+                while time.time() < fin:
+                    p.root.update()
+                    time.sleep(0.005)
+            tourner(0.8)                                   # la boucle tourne deja...
+            for _ in range(2):
+                p.refaire_interface(p.echelle)             # ... quand l'ecran change, deux fois
+                tourner(0.8)
+            del appels[:]
+            tourner(1.0)
+            # une boucle : ~10 tours par seconde ; trois : ~30
+            self.assertLessEqual(len(appels), 14, len(appels))
+            self.assertGreaterEqual(len(appels), 5, "elle tourne toujours")
+        finally:
+            for a in p.root.tk.splitlist(p.root.tk.call("after", "info")):
+                p.root.after_cancel(a)
+            p.root.destroy()
+
     def test_une_icone_par_page_et_l_etoile_de_la_page_ouverte(self):
         p = self.p
         self.assertEqual(set(p.onglets), {cle for cle, _, _, _ in M.MENU})

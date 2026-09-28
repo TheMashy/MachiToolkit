@@ -1966,7 +1966,8 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False, suspens=None, agenda_change=0.0)
+                        transcription_absente_dite=False, suspens=None, agenda_change=0.0,
+                        voix_lisse_boule=0.0)
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -2065,6 +2066,38 @@ class DansMachiTool(unittest.TestCase):
         m.JARVIS["sous_titre"] = {"phrases": ["un deux trois quatre cinq six"], "k": -1, "estime": True, "t0": t}
         self.assertEqual(m.sous_titre_courant(t + 0.7), "un deux trois")
         self.assertEqual(m.sous_titre_courant(t + 60), "un deux trois quatre cinq six")
+
+    def test_sa_boule_lit_l_enveloppe_de_sa_voix(self):
+        # « un petit peu de jazz » : le niveau de SA voix, relu au fil du temps
+        m = self.m
+        m.SOUS_TITRES.clear()
+        m.SOUS_TITRES[8] = {"phrases": ["Tres bien monsieur."], "k": -1}
+        m.JARVIS["sous_titre"] = None
+        self.assertEqual(m.niveau_de_sa_voix(), 0.0, "rien encore : elle respire")
+        m.JARVIS["sous_titre"] = m.SOUS_TITRES[8]
+        self.assertEqual(m.niveau_de_sa_voix(), 0.0, "la voix n'a pas encore commence")
+        a, b = socket.socketpair()
+        try:
+            J.envoyer(a, {"evt": "dit", "id": 8, "phrase": 0, "duree": 0.3,
+                          "env": [0, 99, 99, 0, 0, 0], "pas": 0.05}, threading.Lock())
+            a.close()
+            avant = time.time()
+            m._lire_voix(b)
+        finally:
+            b.close()
+        st = m.SOUS_TITRES[8]
+        self.assertEqual(st["k"], 0, "le sous-titre, comme avant")
+        t0, pas, env = st["enveloppe"]
+        self.assertGreaterEqual(t0, avant)
+        self.assertEqual((pas, env), (0.05, [0, 99, 99, 0, 0, 0]))
+        lat = J.VOIX_LATENCE_S
+        self.assertAlmostEqual(m.niveau_de_sa_voix(t0 + lat + 0.09), 1.0, places=6, msg="la tranche forte")
+        self.assertEqual(m.niveau_de_sa_voix(t0 + lat + 0.01), 0.0, "le blanc du debut")
+        self.assertEqual(m.niveau_de_sa_voix(t0 + lat + 3.0), 0.0, "la phrase finie")
+        self.assertGreater(m.niveau_de_sa_voix(t0 + lat + 0.2), 0.3, "il retombe en douceur")
+        # la voix de Windows ne dit rien de son son : None, et la boule swingue sans elle
+        m.JARVIS["sous_titre"] = {"phrases": ["Oui."], "k": -1, "estime": True, "t0": time.time()}
+        self.assertIsNone(m.niveau_de_sa_voix())
 
     def test_l_aide_courte(self):
         m = self.m
@@ -4667,6 +4700,82 @@ class ReprendreOuIlEnEtait(unittest.TestCase):
         self.assertEqual(J.decouper_phrases("Good evening. All systems go! Is 3.5 enough? Yes\u2026 Fine"),
                          ["Good evening.", "All systems go!", "Is 3.5 enough?", "Yes\u2026", "Fine"])
         self.assertEqual(J.decouper_phrases(""), [])
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LeMajordomeJazzy(unittest.TestCase):
+    """« Un petit peu de jazz » : sa boule et son panneau jouent avec SA voix,
+    pas avec un sinus -- l'enveloppe part avec chaque phrase."""
+
+    def test_chaque_phrase_part_avec_son_enveloppe(self):
+        syn = SyntheseFactice()
+        hp, evts = FauxHautParleur(), []
+        J.Bouche(syn, evts.append, hp).dire(3, "Bonsoir monsieur. Un peu de musique ?")
+        dits = [e for e in evts if e["evt"] == "dit"]
+        self.assertEqual(len(dits), 2)
+        for d in dits:
+            self.assertEqual(d["pas"], J.VOIX_ENVELOPPE_PAS)
+            self.assertEqual(len(d["env"]), int(np.ceil(d["duree"] / d["pas"] - 1e-9)), "une valeur par 50 ms")
+            self.assertTrue(all(isinstance(v, int) and 0 <= v <= 99 for v in d["env"]))
+            self.assertGreater(min(d["env"]), 60, "un son soutenu : haut")
+        self.assertEqual(len(hp.morceaux), 2 * 12, "la lecture garde ses tranches de 100 ms et ses 0,2 s de blanc")
+        self.assertEqual([e["evt"] for e in evts if e["evt"] != "dit"], ["debut", "fini"])
+        json.dumps(evts)                                   # passe tel quel dans la prise
+
+    def test_l_enveloppe(self):
+        f = 24000
+        self.assertEqual(J.enveloppe_voix(np.zeros(f, np.int16), f), [0] * 20, "le silence : zero")
+        self.assertEqual(J.enveloppe_voix(np.zeros(0, np.int16), f), [])
+        fort = (np.sin(np.arange(f) / 3.0) * 26000).astype(np.int16)
+        son = np.concatenate([fort[:f // 2], np.zeros(f // 2 + 100, np.int16)])
+        env = J.enveloppe_voix(son, f)
+        self.assertEqual(len(env), 21, "la derniere tranche, entamee, compte")
+        self.assertTrue(all(v >= 95 for v in env[:10]), env)
+        self.assertEqual(env[10:], [0] * 11)
+        faible = J.enveloppe_voix((fort // 30).astype(np.int16), f)
+        self.assertTrue(20 < faible[5] < env[5], "plus doux, plus bas")
+
+    def test_le_niveau_a_l_instant(self):
+        env, pas = [0, 0, 99, 99, 0, 0, 0, 0], 0.05
+        niv = lambda t: J.niveau_enveloppe(env, pas, t)
+        self.assertEqual(niv(-0.01), 0.0, "avant sa voix : rien")
+        self.assertEqual(niv(0.05), 0.0)
+        self.assertAlmostEqual(niv(0.14), 1.0, places=6, msg="le pic sur les tranches fortes")
+        self.assertLess(niv(0.101), 0.2, "l'attaque, courte")
+        # la relache : il retombe, doucement, sans remonter
+        chute = [niv(0.2 + k * 0.03) for k in range(10)]
+        self.assertTrue(all(a > b for a, b in zip(chute, chute[1:])), chute)
+        self.assertGreater(chute[1], 0.5)
+        self.assertLess(chute[-1], 0.2)
+        self.assertEqual(niv(5.0), 0.0, "longtemps apres : rien")
+        self.assertEqual(J.niveau_enveloppe([], pas, 0.1), 0.0)
+        # sans memoire : le meme instant, le meme niveau, quelle que soit la cadence
+        self.assertEqual(niv(0.23), niv(0.23))
+
+    def test_le_swing_et_les_touches(self):
+        T = J.JAZZ_TEMPS_S
+        # la croche longue (sur le temps) puis la courte, aux 2/3 du temps : ternaire
+        self.assertAlmostEqual(J.niveau_swing(0.0), 1.0)
+        self.assertGreater(J.niveau_swing(2 * T / 3 + 0.001), J.niveau_swing(2 * T / 3 - 0.001))
+        self.assertLess(J.niveau_swing(2 * T / 3 + 0.001), J.niveau_swing(T + 0.001), "l'accent est sur le temps")
+        self.assertTrue(all(0.35 <= J.niveau_swing(k * 0.013) <= 1.0 for k in range(200)))
+        self.assertEqual(J.touches_piano(0.0, 1.0), [0.0] * 7, "au silence, tout repose")
+        t = J.touches_piano(1.0, 0.0)
+        self.assertEqual([i for i, v in enumerate(t) if v == 1.0], [0, 1, 3], "Dm7 : re, fa, do")
+        self.assertEqual(len(J.touches_piano(0.5, 0.0, 12)), 12)
+        self.assertNotEqual(J.touches_piano(1.0, 0.0), J.touches_piano(1.0, 2 * T), "l'accord change")
+
+    def test_les_barres_du_panneau_suivent_sa_voix(self):
+        allume = lambda im: int((im[:44].max(axis=2) > 0).sum())
+        muet, fort = J.image_jarvis("parle", 1.0, niveau=0.0), J.image_jarvis("parle", 1.0, niveau=1.0)
+        self.assertGreater(allume(fort), allume(muet) + 100, "sa voix leve les barres")
+        self.assertTrue(np.any(np.all(fort[:44] == np.array(J.LED_COULEURS["ambre"], np.uint8), axis=2)))
+        self.assertGreater(int((muet[50:57].max(axis=2) > 0).sum()), 40, "SPEAKING, toujours")
+        st0 = J.image_jarvis("parle", 1.0, sous_titre="Bien", niveau=0.0)
+        st1 = J.image_jarvis("parle", 1.0, sous_titre="Bien", niveau=1.0)
+        self.assertGreater(allume(st1[:14]), allume(st0[:14]), "au-dessus du sous-titre aussi")
+        self.assertTrue(np.array_equal(J.image_jarvis("parle", 1.0), J.image_jarvis("parle", 1.0, niveau=None)),
+                        "sans niveau : le sinus d'avant")
 
 
 @unittest.skipUnless(PIPER, "JARVIS_PIPER_DOSSIER / JARVIS_PIPER_VOIX absents")

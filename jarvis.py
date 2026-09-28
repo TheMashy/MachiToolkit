@@ -3279,6 +3279,33 @@ def son_propre(son, frequence=None):
     return np.clip(np.round(son), -32768, 32767).astype(np.int16)
 
 
+# L'ENVELOPPE DE SA VOIX. « Un petit peu de jazz » : sa boule et les barres
+# de son panneau bougent avec ce qu'il DIT, pas avec un sinus. La voix mesure
+# le niveau de chaque tranche de 50 ms de la phrase qu'elle va jouer (0,1 ms
+# de calcul pour 6 s de son) et l'envoie avec l'evenement « dit » ; Machi
+# Tool le relit au fil du temps (niveau_enveloppe).
+VOIX_ENVELOPPE_PAS = 0.05
+
+
+def enveloppe_voix(son, frequence, pas_s=VOIX_ENVELOPPE_PAS):
+    """Le niveau (0 a 99) de chaque tranche de `pas_s` du son int16 : sa
+    puissance (RMS) en dB sous la pleine echelle, de -50 dB (0) a -10 dB (99).
+    La voix est a 80 % en crete (son_propre) : ses voyelles sonnent vers
+    -12 dB, ses consonnes vers -30 ; un silence vaut 0."""
+    import numpy as np
+    x = np.asarray(son, dtype=np.float64).reshape(-1) / 32768.0
+    if not len(x):
+        return []
+    n = max(1, int(round(pas_s * frequence)))
+    k = -(-len(x) // n)
+    compte = np.full(k, float(n))
+    compte[-1] = len(x) - (k - 1) * n                  # la derniere tranche, entamee
+    x = np.concatenate([x, np.zeros(k * n - len(x))])
+    rms = np.sqrt((x.reshape(k, n) ** 2).sum(axis=1) / compte)
+    db = 20.0 * np.log10(np.maximum(rms, 1e-9))
+    return [int(v) for v in np.round(np.clip((db + 50.0) / 40.0, 0.0, 1.0) * 99)]
+
+
 def haut_parleur_windows(frequence):
     import soundcard as sc
     haut = sc.default_speaker()
@@ -3328,7 +3355,8 @@ class Bouche:
                     for son in syn.phrases(texte_pour_piper(bout, langue), lenteur):
                         if self.couper.is_set():
                             break
-                        file_.put((k, son))
+                        # son enveloppe, calculee ici : la lecture reste libre
+                        file_.put((k, son, enveloppe_voix(son, syn.frequence)))
                     if self.couper.is_set():
                         break
             except Exception as e:
@@ -3346,14 +3374,16 @@ class Bouche:
                 if isinstance(son, Exception):
                     self.sortie({"evt": "erreur", "message": "synthese : %s" % str(son)[:160]})
                     break
-                en_cours, son = son
+                en_cours, son, env = son
                 if premiere:
                     self.sortie({"evt": "debut", "id": ident})
                     premiere = False
                 # LES SOUS-TITRES : quelle phrase commence a sonner, et combien de
-                # temps elle dure -- Machi Tool l'ecrit au meme rythme dans le panneau
+                # temps elle dure -- Machi Tool l'ecrit au meme rythme dans le panneau.
+                # Et son enveloppe (sans le silence d'apres) : sa boule joue avec.
                 self.sortie({"evt": "dit", "id": ident, "phrase": en_cours,
-                             "duree": round(len(son) / float(syn.frequence), 3)})
+                             "duree": round(len(son) / float(syn.frequence), 3),
+                             "env": env, "pas": VOIX_ENVELOPPE_PAS})
                 son = np.concatenate([son, np.zeros(int(self.silence * syn.frequence), np.int16)])
                 for i in range(0, len(son), pas):
                     if self.couper.is_set():
@@ -5634,6 +5664,24 @@ MOTS_PANNEAU = {"fr": {"ecoute": "A VOUS", "comprend": "RECU", "pense": "REFLEXI
                        "erreur": "ERROR", "fait": "DONE"}}
 
 
+def _barres_parle(m, t, niveau, cy, haut, c):
+    """Ses 12 barres ambre, centrees sur la ligne `cy`, `haut` points au plus
+    de chaque cote. Avec le niveau de sa voix : une octave de touches (celles
+    de l'accord enfoncees, les autres plus sombres), qui respire a peine dans
+    les blancs. Sans (la voix de Windows) : le sinus d'avant."""
+    if niveau is None:
+        for i in range(12):
+            h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * haut)
+            m.bloc(9 + i * 4, cy - h, 2, 2 * h + 1, c)
+        return
+    touches = touches_piano(niveau, t, 12)
+    haute = max(touches) if touches else 0.0
+    for i, v in enumerate(touches):
+        souffle = 0.05 + 0.04 * math.sin(t * 2.2 + i * 0.5)
+        h = round(max(v, souffle) * haut)
+        m.bloc(9 + i * 4, cy - h, 2, 2 * h + 1, c if v >= haute and v > 0 else _fois(c, 0.6))
+
+
 def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None, langue="en", reste=None,
                  entendu="", croix=True):
     """L'image 64 x 64 (uint8) du panneau pour cet etat, au temps t (s).
@@ -5642,7 +5690,8 @@ def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None,
     temps qu'il t'attend encore (`reste`, de 1 a 0) ; comprend : RECU,
     l'anneau immobile et trois points -- il n'ecoute plus, il lit ce que tu
     as dit ; pense : l'arc qui tourne, et ce qu'il a entendu (`entendu`) ;
-    parle : les barres, et sa reponse qui s'ecrit ; fait / erreur : un
+    parle : les barres -- qui jouent avec sa voix quand `niveau` la donne
+    (0 a 1) --, et sa reponse qui s'ecrit ; fait / erreur : un
     instant. Un autre etat : rien. En mode psychologue, le cyan devient bleu.
     La petite croix, en haut a droite : un clic sur le panneau le congedie."""
     import numpy as np
@@ -5718,19 +5767,14 @@ def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None,
         # retrecissent en haut, et ce qu'il a deja dit s'ecrit dessous,
         # les lignes les plus recentes en bas.
         c = C["ambre"]
-        for i in range(12):
-            h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * 5)
-            m.bloc(9 + i * 4, 7 - h, 2, 2 * h + 1, c)
+        _barres_parle(m, t, niveau, 7, 5, c)
         blanc = _fois(C["blanc"], 0.92)
         for k, ligne in enumerate(lignes_led(sous_titre, LED_N)[-SOUS_TITRES_LIGNES:]):
             m.texte(ligne, (LED_N - largeur_led(ligne)) // 2, 17 + k * 9, blanc)
         return np.clip(m.px, 0, 255).astype(np.uint8)
     elif etat == "parle":
         c = C["ambre"]
-        haut = 14
-        for i in range(12):
-            h = round((0.25 + 0.75 * abs(math.sin(t * 9 + i * 0.9) * math.sin(t * 2.3 + i * 0.4))) * haut)
-            m.bloc(9 + i * 4, 26 - h, 2, 2 * h + 1, c)
+        _barres_parle(m, t, niveau, 26, 14, c)
         mot = mots["parle"]
     elif etat == "erreur":
         c = C["rouge"]
@@ -5756,6 +5800,71 @@ def image_jarvis(etat, t, reponse="", mode="jarvis", sous_titre="", niveau=None,
 
 SOUS_TITRES_LIGNES = 5         # dans le panneau 64 x 64, sous les barres
 LETTRES_PAR_S = 14.0           # le debit d'une voix, quand elle ne dit pas ou elle en est
+
+
+# --------------------------- LE MAJORDOME JAZZY -------------------------
+#
+# « Un petit peu de jazz » : flegme britannique, ame de pianiste de club. Sa
+# boule et les barres de son panneau jouent avec SA voix, comme un VU-metre
+# ou de petites touches de piano -- sobre, pas de clinquant. Le niveau vient
+# de l'enveloppe que la voix envoie avec chaque phrase (enveloppe_voix) ;
+# la voix de Windows n'en envoie pas : on balance alors en croches
+# ternaires (le swing), sans elle.
+
+# Entre l'evenement « dit » et le son entendu : la phrase entre dans le tampon
+# du haut-parleur (HAUT_PARLEUR_TAMPON_S), vide pour la premiere, presque
+# plein pour les suivantes. A regler sur le PC, a l'oeil.
+VOIX_LATENCE_S = 0.08
+VOIX_ATTAQUE_S = 0.025         # le niveau monte en 25 ms...
+VOIX_RELACHE_S = 0.14          # ... et retombe en 140 ms, comme l'aiguille d'un VU-metre
+
+
+def niveau_enveloppe(env, pas_s, ecoule_s, attaque_s=VOIX_ATTAQUE_S, relache_s=VOIX_RELACHE_S):
+    """Le niveau (0 a 1) de sa voix `ecoule_s` secondes apres le debut de
+    l'enveloppe `env` (0 a 99 par tranche de `pas_s`). Il monte en `attaque_s`
+    et retombe en `relache_s` -- calcule, pas accumule : le meme instant
+    donne le meme niveau a 20 comme a 60 images par seconde. 0 avant
+    l'enveloppe, et une fois sa derniere note retombee."""
+    if not env or pas_s <= 0 or ecoule_s < 0:
+        return 0.0
+    i = int(ecoule_s / pas_s)
+    garde = int(math.ceil(5.0 * relache_s / pas_s))   # au-dela, exp(-5) : plus rien
+    if i >= len(env) + garde:
+        return 0.0
+    niveau = 0.0
+    if i < len(env):
+        dans = ecoule_s - i * pas_s
+        niveau = env[i] / 99.0 * (min(1.0, dans / attaque_s) if attaque_s > 0 else 1.0)
+    for j in range(max(0, i - garde), min(i, len(env))):
+        niveau = max(niveau, env[j] / 99.0 * math.exp(-(ecoule_s - (j + 1) * pas_s) / relache_s))
+    return max(0.0, min(1.0, niveau))
+
+
+# Le swing : des croches ternaires, la premiere longue (2/3 du temps), la
+# seconde courte et plus douce. Un medium swing, ~107 a la noire.
+JAZZ_TEMPS_S = 0.56
+# Les touches qui comptent (sur les 7 blanches d'une octave, do = 0) : un
+# II-V-I-VI en do, Dm7 G7 Cmaj7 Am7, a deux temps par accord.
+JAZZ_ACCORDS = ((1, 3, 0), (4, 6, 3), (0, 2, 6), (5, 0, 4))
+
+
+def niveau_swing(t, temps_s=JAZZ_TEMPS_S):
+    """Un niveau (0,35 a 1) qui balance en croches ternaires, au temps t :
+    accent sur le temps, la croche d'apres plus legere."""
+    b = t / temps_s
+    p = b - math.floor(b)
+    depuis, accent = (p * temps_s, 1.0) if p < 2.0 / 3 else ((p - 2.0 / 3) * temps_s, 0.65)
+    return 0.35 + 0.65 * accent * math.exp(-depuis / 0.14)
+
+
+def touches_piano(niveau, t, n=7, temps_s=JAZZ_TEMPS_S):
+    """n touches (0 a 1) pour le niveau `niveau` : celles de l'accord du
+    moment enfoncees jusqu'au niveau, les autres a 40 %. Au silence, tout
+    repose."""
+    v = max(0.0, min(1.0, float(niveau or 0.0)))
+    accord = JAZZ_ACCORDS[int(math.floor(t / (2 * temps_s))) % len(JAZZ_ACCORDS)]
+    enfoncees = {d * n // 7 for d in accord}
+    return [v if i in enfoncees else 0.4 * v for i in range(n)]
 
 
 def texte_dit(phrases, k, fraction):
