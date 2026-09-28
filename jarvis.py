@@ -6539,6 +6539,8 @@ REGLAGES_INTERDITS = {
     # ses nouveaux pouvoirs et sa parole spontanee : c'est toi qui les donnes
     "jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
     "jarvis_annoncer_taches",
+    # ce qui se dit avec lui va (ou non) au journal : c'est toi qui decides
+    "jarvis_journal",
 }
 REGLAGES_CHOIX = {
     "mode": ("applications", "ecran", "mixte", "son"),

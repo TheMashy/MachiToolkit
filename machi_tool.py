@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.65.1"
+VERSION = "1.66.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -407,6 +407,10 @@ CONFIG_DEFAUT = {
     # « Prendre des initiatives » : surchauffe, volume trop fort tard le soir,
     # longue session sans pause -- toujours annoncees (voir veiller_initiatives)
     "jarvis_initiatives": False,
+    # « Fait en sorte que les discussions de Jarvis aillent aussi dans le
+    # journal ! » : chaque echange avec le majordome, verse dans BrainDebugger
+    # (voir verser_au_journal)
+    "jarvis_journal": True,
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -6787,6 +6791,35 @@ def resumer_conversation(historique, cfg):
     return souvenir
 
 
+def verser_au_journal(dit, repondu, cfg):
+    """« FAIT EN SORTE QUE LES DISCUSSIONS DE JARVIS AILLENT AUSSI DANS LE
+    JOURNAL ! » Chaque echange avec le majordome, une fois dit, part au
+    journal de BrainDebugger (les deux bulles marquees « Jarvis »), en
+    arriere-plan : il ne retarde rien, et un echec ne dit rien a voix haute.
+    Pas ce qui est parti au compagnon (le grave, le mode psychologue) : il est
+    deja au journal. Ce qui a ete dit ne va jamais au journal local
+    (journal.log), seulement la raison d'un echec. Rend False si rien ne part."""
+    dit = str(dit or "").strip()
+    if not dit or not cfg.get("jarvis_journal", True) or not _cle_presente(cfg):
+        return False
+    corps = {"dit": dit[:JOURNAL_TOUR_MAX], "repondu": str(repondu or "").strip()[:JOURNAL_TOUR_MAX]}
+
+    def verser():
+        try:
+            _requete_bd("/api/machitool/journal", corps, cfg, 30)
+        except urllib.error.HTTPError as e:
+            # un BrainDebugger d'avant ne connait pas la route : 404, rien de plus
+            if e.code != 404:
+                print("Jarvis : l'echange n'est pas alle au journal (HTTP %d)" % e.code)
+        except Exception as e:
+            print("Jarvis : l'echange n'est pas alle au journal (%s)" % type(e).__name__)
+    _en_fond(verser)
+    return True
+
+
+JOURNAL_TOUR_MAX = 12000      # un tour de parole, au plus (TOUR_MAX de BrainDebugger)
+
+
 def clore_historique(cfg=None):
     """La conversation en mode Jarvis se termine : on s'en souvient en une
     phrase (en arriere-plan), et on repart de zero."""
@@ -10297,6 +10330,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         print("Jarvis : congedie")
         JARVIS["historique"] = (JARVIS["historique"] + [
             {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+        verser_au_journal(texte, reponse, cfg)
         clore_historique(cfg)
         JARVIS["attente_code"] = None
         envoyer_oreille({"cmd": "annuler"})
@@ -10318,6 +10352,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         return dire(reponse, suite=True, langue="fr", tour=conv)
     JARVIS["historique"] = (JARVIS["historique"] + [
         {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+    verser_au_journal(texte, reponse, cfg)
     # « IL EST RENTRE EN MODE PSYCHOLOGUE » : il ne le propose plus en passant.
     # Seule une VRAIE proposition (BrainDebugger la signale ; sinon la question
     # finale) rend un « oui » decisif -- pas « Vous n'etes plus en mode
@@ -10332,9 +10367,9 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
 
 def parler_a_jarvis(texte, cfg, conv=None):
     """Le mode Jarvis : le majordome du PC, par BrainDebugger (qui tient la cle
-    Claude) -- Sonnet, effort bas. Rien n'entre dans le journal, sauf un
-    message grave : BrainDebugger l'envoie alors au compagnon, et on passe en
-    mode psychologue."""
+    Claude) -- Sonnet, effort bas. Chaque echange va au journal une fois dit
+    (verser_au_journal, si « jarvis_journal ») ; un message grave, lui, part
+    au compagnon (qui le range), et on passe en mode psychologue."""
     L = langue_jarvis(cfg)
     if not _cle_presente(cfg):
         return signaler_erreur(phrase("cle_absente", L), conv)
@@ -10366,6 +10401,8 @@ def reponse_interrompue(texte, avance):
     JARVIS["historique"] = (JARVIS["historique"] + [
         {"role": "user", "texte": texte},
         {"role": "assistant", "texte": (str(avance.get("texte") or "") + " [interrompu]").strip()}])[-12:]
+    # au journal aussi : ta question, et ce qu'il a eu le temps de dire
+    verser_au_journal(texte, avance.get("texte"), CFG)
 
 
 _JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -14289,6 +14326,8 @@ class Panneau:
                                                 "au revoir, une appli) -- sinon, seulement la lumiere"),
                 ("jarvis_initiatives", "Prendre de petites initiatives (toujours annoncees) : surchauffe, volume "
                                        "trop fort tard le soir, une pause apres deux heures"),
+                ("jarvis_journal", "Ce qu'on se dit va aussi dans le journal de BrainDebugger (marque "
+                                   "« Jarvis »)"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
