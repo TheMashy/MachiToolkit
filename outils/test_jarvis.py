@@ -1966,7 +1966,7 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False, suspens=None)
+                        transcription_absente_dite=False, suspens=None, agenda_change=0.0)
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -3660,6 +3660,35 @@ class DansMachiTool(unittest.TestCase):
         dits = lambda: [v for v in voix if v.get("cmd") == "dire"]
         ecoutes = lambda: [o for o in oreille if o.get("cmd") == "ecouter"]
         return dits, ecoutes
+
+    def test_un_rappel_va_aussi_dans_l_agenda(self):
+        # « Assure-toi que rajouter un rappel rajoute un element a l'agenda aussi. »
+        m = self.m
+        vrais = (m._en_fond, m._requete_bd)
+        self.addCleanup(lambda: (setattr(m, "_en_fond", vrais[0]), setattr(m, "_requete_bd", vrais[1])))
+        m._en_fond = lambda f: f()
+        poses = []
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: poses.append((chemin, charge)) or {"texte": "Ajouté."}
+        self.addCleanup(lambda: [e["minuteur"].cancel() for e in m.JARVIS["minuteurs"]])
+        avant = time.time()
+        m.executer_commande(J.comprendre("rappelle-moi dans 2 heures d'appeler maman"), m.CFG)
+        self.assertEqual(len(poses), 1, "le rappel est pose dans l'agenda")
+        chemin, charge = poses[0]
+        self.assertEqual(chemin, "/api/machitool/agenda")
+        fin = time.localtime(avant + 7200)
+        self.assertEqual(charge["date"], time.strftime("%Y-%m-%d", fin))
+        self.assertIn(charge["heure"], (time.strftime("%H:%M", fin), time.strftime("%H:%M", time.localtime(avant + 7260))))
+        self.assertEqual(charge["titre"], "Appeler maman")
+        self.assertGreater(m.JARVIS["agenda_change"], 0, "la fenetre Agenda se relit")
+        # un simple minuteur n'encombre pas l'agenda
+        m.executer_commande(J.comprendre("minuteur de 10 minutes"), m.CFG)
+        self.assertEqual(len(poses), 1)
+        # Jarvis qui l'a pose lui-meme (chez BrainDebugger) : la fenetre se relit aussi
+        m.JARVIS["agenda_change"] = 0.0
+        m.JARVIS["tour"] = 7
+        m.recevoir_jarvis("mets kine mercredi", {"texte": "C'est note pour mercredi.", "agenda_modifie": True},
+                          m.CFG, 1, 7)
+        self.assertGreater(m.JARVIS["agenda_change"], 0)
 
     def test_il_parle_des_sa_premiere_phrase(self):
         # « Il met du temps a repondre » : la premiere phrase sonne pendant que

@@ -4453,6 +4453,7 @@ JARVIS = {
     "modeles": "absent", "progres": 0.0,
     "apprentissage": None,    # {"n", "total", "message", "fini"}
     "minuteurs": [],          # [{"fin", "quoi", "minuteur"}]
+    "agenda_change": 0.0,     # Jarvis vient de poser quelque chose dans l'agenda : la fenetre se relit
     # Deux modes : « jarvis » (orange, le majordome du PC) et « psy » (bleu, le
     # compagnon de BrainDebugger). Le mode psy se referme sur « non rien »,
     # « oublie », « degage »... ou apres PSY_DUREE_S sans un mot.
@@ -8428,6 +8429,8 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         raise Annule()
     if avance is not None:
         avance["fini"] = True                  # la reponse est la : la premiere phrase n'attend plus
+    if donnees.get("agenda_modifie"):
+        JARVIS["agenda_change"] = time.time()  # la fenetre Agenda, si elle est ouverte, se relit
     if donnees.get("detail"):
         # CE QUE CLAUDE A REPONDU EN ENTIER, quand Jarvis l'a consulte : il en
         # dit l'essentiel, le texte complet va dans le presse-papiers.
@@ -8636,6 +8639,21 @@ def executer_commande(a, cfg, maintenant=None):
     return None
 
 
+def rappel_dans_l_agenda(quoi, fin, cfg):
+    """Le rappel « rappelle-moi dans 2 h d'appeler maman », pose aussi dans
+    l'agenda : son jour et son heure. Rend True s'il y est."""
+    t = time.localtime(fin)
+    titre = str(quoi or "").strip()
+    titre = titre[:1].upper() + titre[1:]
+    try:
+        poser_agenda(cfg, titre[:120], time.strftime("%Y-%m-%d", t), heure=time.strftime("%H:%M", t))
+    except Exception as e:
+        print("Jarvis : rappel pas pose dans l'agenda (%s)" % type(e).__name__)
+        return False
+    JARVIS["agenda_change"] = time.time()
+    return True
+
+
 def poser_minuteur(secondes, quoi="", langue="fr"):
     secondes = max(1.0, min(24 * 3600.0, float(secondes)))
     entree = {"fin": time.time() + secondes, "quoi": quoi, "duree": secondes}
@@ -8657,6 +8675,11 @@ def poser_minuteur(secondes, quoi="", langue="fr"):
     entree["minuteur"].daemon = True
     entree["minuteur"].start()
     JARVIS["minuteurs"].append(entree)
+    if quoi and _cle_presente(CFG):
+        # « Assure-toi que rajouter un rappel rajoute un element a l'agenda
+        # aussi » : il sonne ici, ET il est dans l'agenda de BrainDebugger
+        # (la fenetre Agenda, la frise) -- meme apres un redemarrage.
+        _en_fond(lambda: rappel_dans_l_agenda(quoi, entree["fin"], CFG))
     if quoi:
         return phrase("rappel_pose", langue, _jv.dire_duree(secondes, langue))
     return phrase("minuteur", langue, _jv.dire_duree(secondes, langue))
@@ -10968,6 +10991,14 @@ class Panneau:
             if not getattr(self, "_panneau_erreur", False):
                 print("Jarvis : panneau impossible (%s)" % e)
                 self._panneau_erreur = True
+        change = JARVIS.get("agenda_change") or 0
+        if change > getattr(self, "_agenda_relu", 0):
+            # Jarvis vient d'y poser quelque chose : la fenetre ouverte le montre
+            self._agenda_relu = change
+            try:
+                self.remplir_agenda()
+            except Exception as e:
+                print("Agenda : relecture impossible (%s)" % e)
         demande = JARVIS.get("montrer_agenda") or 0
         if demande > getattr(self, "_agenda_montre", 0):
             self._agenda_montre = demande
