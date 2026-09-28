@@ -378,10 +378,12 @@ CONFIG_DEFAUT = {
     "onglets_cle": "",
     # LA BOULE DE JARVIS a l'ecran quand il est reveille ; sa place en
     # fractions de l'ecran principal (la meme a toutes les resolutions).
+    # Elle joue avec sa voix quand il parle (« un petit peu de jazz »).
     "jarvis_boule": True,
     # LE PANNEAU DE JARVIS : le contenu « Jarvis » du panneau LED 64 x 64, en
     # haut au milieu de l'ecran quand il est actif. Avec lui, la boule ne sort
-    # plus que pour aller sur l'ecran qu'il regarde.
+    # plus que quand il parle, qu'il t'ecoute, ou pour aller sur l'ecran qu'il
+    # regarde.
     "jarvis_panneau": True,
     "jarvis_boule_x": 0.97,
     "jarvis_boule_y": 0.90,
@@ -5187,6 +5189,24 @@ def sous_titre_courant(maintenant=None):
     return _jv.texte_dit(st["phrases"], st["k"], (t - st["t0"]) / max(0.1, st.get("duree") or 0.1))
 
 
+def niveau_de_sa_voix(maintenant=None):
+    """Le niveau de SA voix (0 a 1) a l'instant, lu dans l'enveloppe que la
+    voix envoie avec chaque phrase (« dit ») : sa boule et son panneau jouent
+    avec. 0 tant que le son n'a pas commence ; None quand la voix ne dit rien
+    de son son (la voix de Windows) -- on swingue alors sans elle."""
+    st = JARVIS.get("sous_titre")
+    if not st:
+        return 0.0
+    if st.get("estime"):
+        return None
+    env = st.get("enveloppe")                     # (t0, pas, niveaux), d'un seul tenant
+    if env is None:
+        return 0.0 if st.get("k", -1) < 0 else None
+    t = time.time() if maintenant is None else maintenant
+    t0, pas, niveaux = env
+    return _jv.niveau_enveloppe(niveaux, pas, t - t0 - _jv.VOIX_LATENCE_S)
+
+
 def _lire_voix(sock):
     while True:
         try:
@@ -5199,7 +5219,12 @@ def _lire_voix(sock):
         if quoi == "dit":
             st = SOUS_TITRES.get(ev.get("id"))
             if st is not None:
-                st.update(k=int(ev.get("phrase") or 0), t0=time.time(), duree=float(ev.get("duree") or 0.0))
+                t0 = time.time()
+                maj = {"k": int(ev.get("phrase") or 0), "t0": t0, "duree": float(ev.get("duree") or 0.0)}
+                if isinstance(ev.get("env"), list):
+                    # son enveloppe, avec son instant : lue d'un bloc par la boule
+                    maj["enveloppe"] = (t0, float(ev.get("pas") or _jv.VOIX_ENVELOPPE_PAS), ev["env"])
+                st.update(maj)
                 JARVIS["sous_titre"] = st
         elif quoi == "debut":
             # IL PARLE : l'oreille guette qu'on lui coupe la parole
@@ -10157,8 +10182,11 @@ class Panneau:
         self.animer()
         self.rafraichir()
         self.boule = None
-        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0}
-        self.root.after(500, self.boule_tic)
+        self.boule_objets = {}
+        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0, "t": None}
+        # une seule boucle par interface : refaire_interface en relance une
+        g = self.generation
+        self.root.after(500, lambda: g == self.generation and self.boule_tic())
 
     def refaire_interface(self, echelle):
         """Refait l'interface a l'echelle du nouvel ecran.
@@ -10842,6 +10870,10 @@ class Panneau:
 
     BOULE_TAILLE = 44
     BOULE_CLE = "#010203"            # la couleur rendue transparente
+    BOULE_TOUCHES = 7                # une octave de touches blanches, au coeur de la boule
+    BOULE_IVOIRE = (255, 244, 228)   # une touche enfoncee
+    # avec son panneau, elle ne sort que pour ca (et pour aller sur l'ecran qu'il regarde)
+    BOULE_AVEC_PANNEAU = ("parle", "ecoute")
 
     # ------------------------------------------------------------------
     #  Le panneau de Jarvis : « le meme qu'ici » -- le contenu Jarvis du
@@ -10920,7 +10952,9 @@ class Panneau:
         from PIL import Image, ImageTk
         # ce qu'il dit s'ecrit au fil de sa voix, DANS le panneau
         texte = sous_titre_courant(maintenant) if etat == "parle" else ""
-        niveau = niveau_de_la_voix(maintenant) if etat == "ecoute" else None
+        # ta voix quand il ecoute, la sienne quand il parle (None : le sinus)
+        niveau = (niveau_de_la_voix(maintenant) if etat == "ecoute" else
+                  niveau_de_sa_voix(maintenant) if etat == "parle" else None)
         reste = None
         if etat == "ecoute" and JARVIS.get("ecoute_fin") and not JARVIS.get("parole_vue"):
             reste = (float(JARVIS["ecoute_fin"]) - maintenant) / max(0.5, float(JARVIS.get("ecoute_duree") or 5.0))
@@ -10961,6 +10995,7 @@ class Panneau:
             m.grab_release()
 
     def boule_tic(self):
+        g = self.generation
         delai = 400
         try:
             delai = min(delai, self._panneau_tic())
@@ -10981,7 +11016,9 @@ class Panneau:
             if not getattr(self, "_boule_erreur", False):
                 print("Jarvis : boule impossible (%s)" % e)
                 self._boule_erreur = True
-        self.root.after(max(20, delai), self.boule_tic)
+        # la generation : apres refaire_interface, l'ancienne boucle s'arrete
+        # (sinon deux boucles, puis trois... et deux fois plus de dessin)
+        self.root.after(max(20, delai), lambda: g == self.generation and self.boule_tic())
 
     def _boule_creer(self, taille):
         tk = self.tk
@@ -11007,7 +11044,16 @@ class Panneau:
             u.SetWindowLongW(h, GWL_EXSTYLE, u.GetWindowLongW(h, GWL_EXSTYLE)
                              | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
         b.withdraw()
+        # ses objets, crees une fois et deplaces a chaque image (pas de
+        # delete("all") vingt-cinq fois par seconde) : trois anneaux, et au
+        # coeur une octave de touches, des traits aux bouts arrondis
+        largeur = max(2, int(round(taille * 0.05)))
+        anneaux = [toile.create_oval(0, 0, 0, 0, fill=self.BOULE_CLE, outline="") for _ in range(3)]
+        touches = [toile.create_line(0, 0, 0, 0, width=largeur, capstyle="round", fill=self.BOULE_CLE)
+                   for _ in range(self.BOULE_TOUCHES)]
         self.boule, self.boule_toile = b, toile
+        self.boule_objets = {"anneaux": anneaux, "touches": touches, "taille": taille,
+                             "largeur": largeur, "couleur": None}
 
     def _boule_zone(self):
         """La zone de travail de l'ecran principal (sans la barre des taches)."""
@@ -11021,21 +11067,41 @@ class Panneau:
         return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     def _boule_tic(self):
+        b = self.boule
+        st = self.boule_etat
+
+        def cache():
+            if b is not None and b.winfo_exists() and b.state() != "withdrawn":
+                b.withdraw()
         if not self.cfg.get("jarvis_boule", True) or not self.cfg.get("jarvis_actif"):
-            if self.boule is not None and self.boule.winfo_exists() and self.boule.state() != "withdrawn":
-                self.boule.withdraw()
+            cache()
+            return 500
+        # UN JEU, UNE VIDEO EN PLEIN ECRAN : rien ne se dessine par-dessus (voir
+        # animer : Tk qui dessine pendant qu'un jeu change la resolution, c'est
+        # Tcl_Panic ; la guirlande et le son disent ou il en est)
+        if plein_ecran_occupe():
+            cache()
+            st.update(alpha=0.0, x=None, t=None)
             return 500
         taille = max(24, int(self.BOULE_TAILLE * getattr(self, "echelle", 1.0)))
-        etat_boule = "attente" if self.cfg.get("jarvis_panneau", True) else JARVIS.get("etat")
+        etat = JARVIS.get("etat")
+        # « Un petit peu de jazz » : avec son panneau, elle ne sortait plus que
+        # pour regarder un ecran. Elle sort aussi quand il parle -- elle joue
+        # avec sa voix -- et quand il t'ecoute.
+        if self.cfg.get("jarvis_panneau", True) and etat not in self.BOULE_AVEC_PANNEAU:
+            etat = "attente"
+        maintenant = time.time()
         visible, x, y, couleur, rythme = _jv.cible_boule(
-            etat_boule, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), time.time(),
+            etat, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), maintenant,
             self.cfg.get("jarvis_boule_x", 0.97), self.cfg.get("jarvis_boule_y", 0.90), taille)
-        st = self.boule_etat
-        if not visible and (self.boule is None or not self.boule.winfo_exists() or self.boule.state() == "withdrawn"):
+        if not visible and (b is None or not b.winfo_exists() or b.state() == "withdrawn"):
             st["x"] = None
             return 300                                     # rien a l'ecran : rien a dessiner
-        if self.boule is None or not self.boule.winfo_exists():
+        if b is None or not b.winfo_exists() or self.boule_objets.get("taille") != taille:
+            if b is not None and b.winfo_exists():
+                b.destroy()
             self._boule_creer(taille)
+            b = self.boule
         # elle glisse vers sa cible ; elle apparait et s'efface en douceur
         if st["x"] is None:
             st["x"], st["y"] = float(x), float(y)
@@ -11043,28 +11109,63 @@ class Panneau:
         st["y"] += (y - st["y"]) * 0.25
         st["alpha"] = min(1.0, st["alpha"] + 0.15) if visible else max(0.0, st["alpha"] - 0.12)
         if st["alpha"] <= 0.0:
-            self.boule.withdraw()
-            st["x"] = None
+            b.withdraw()
+            st.update(x=None, t=None)
             return 300
-        st["phase"] += 0.08 * rythme
+        # sa respiration suit l'horloge, pas les images : la meme a toute cadence
+        dt = 0.04 if st.get("t") is None else max(0.0, min(0.25, maintenant - st["t"]))
+        st["t"] = maintenant
+        st["phase"] += 2.0 * rythme * dt
         try:
-            self.boule.attributes("-alpha", 0.92 * st["alpha"])
+            b.attributes("-alpha", 0.92 * st["alpha"])
         except Exception:
             pass
-        c = self.boule_toile
-        c.delete("all")
-        r0 = taille / 2.0
-        souffle = 0.5 + 0.5 * math.sin(st["phase"])
-        for k, frac in ((3, 1.0), (2, 0.82), (1, 0.64)):
-            r = r0 * (frac - 0.08 * (1 - souffle) * k / 3)
-            c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(hex_vers_rgb(couleur), (0, 0, 0), 0.25 * k), outline="")
-        r = r0 * (0.34 + 0.06 * souffle)
-        c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(hex_vers_rgb(couleur), (255, 255, 255), 0.45), outline="")
-        self.boule.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
-        if self.boule.state() == "withdrawn":
-            self.boule.deiconify()
-            self.boule.attributes("-topmost", True)
+        niveau, touches = self._boule_jeu(etat, maintenant)
+        self._boule_dessiner(taille, couleur, 0.5 + 0.5 * math.sin(st["phase"]), niveau, touches)
+        b.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
+        if b.state() == "withdrawn":
+            b.deiconify()
+            b.attributes("-topmost", True)
         return 40
+
+    def _boule_jeu(self, etat, maintenant):
+        """(niveau 0 a 1, touches) : ce que joue la boule a l'instant."""
+        repos = [0.0] * self.BOULE_TOUCHES
+        if etat == "parle":
+            n = niveau_de_sa_voix(maintenant)
+            if n is None:
+                # la voix de Windows ne dit rien de son son : un leger swing
+                n = 0.75 * _jv.niveau_swing(maintenant)
+            return n, _jv.touches_piano(n, maintenant, self.BOULE_TOUCHES)
+        if etat == "ecoute":
+            # ta voix fait enfler son halo, discretement ; les touches se reposent
+            return 0.5 * niveau_de_la_voix(maintenant, "voix_lisse_boule"), repos
+        return 0.0, repos
+
+    def _boule_dessiner(self, taille, couleur, souffle, niveau, touches):
+        """Deplace les objets de la boule : le halo enfle avec sa voix (dans
+        les blancs, il respire a peine), les touches de l'accord s'enfoncent
+        et s'eclairent d'ivoire."""
+        c, o = self.boule_toile, self.boule_objets
+        rvb = hex_vers_rgb(couleur)
+        if o["couleur"] != couleur:
+            o["couleur"] = couleur
+            for k, a in zip((3, 2, 1), o["anneaux"]):
+                c.itemconfigure(a, fill=melange(rvb, (0, 0, 0), 0.25 * k))
+        r0 = taille / 2.0
+        gonfle = max(0.3 * souffle, min(1.0, niveau))
+        rin = r0
+        for (k, frac), a in zip(((3, 1.0), (2, 0.82), (1, 0.64)), o["anneaux"]):
+            rin = r0 * (frac - 0.1 * (1 - gonfle) * k / 3)
+            c.coords(a, r0 - rin, r0 - rin, r0 + rin, r0 + rin)
+        pas_x, n = taille * 0.08, len(o["touches"])
+        for i, (objet, v) in enumerate(zip(o["touches"], touches)):
+            dx = (i - (n - 1) / 2.0) * pas_x
+            # jamais hors du disque sombre du milieu
+            corde = math.sqrt(max(0.0, rin * rin - dx * dx)) - o["largeur"]
+            h = max(0.5, min(corde, rin * 0.7) * max(v, 0.08 + 0.06 * souffle))
+            c.coords(objet, r0 + dx, r0 - h, r0 + dx, r0 + h)
+            c.itemconfigure(objet, fill=melange(self.BOULE_IVOIRE, rvb, 0.15 + 0.7 * max(0.0, min(1.0, v))))
 
     def animer(self):
         g = self.generation
@@ -12265,7 +12366,7 @@ class Panneau:
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
                 ("jarvis_panneau", "Son panneau en haut de l'ecran quand il est actif"),
-                ("jarvis_boule", "Une petite boule sur l'ecran qu'il regarde")):
+                ("jarvis_boule", "Une petite boule qui joue avec sa voix (et va sur l'ecran qu'il regarde)")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
