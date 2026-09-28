@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.64.0"
+VERSION = "1.64.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -378,10 +378,12 @@ CONFIG_DEFAUT = {
     "onglets_cle": "",
     # LA BOULE DE JARVIS a l'ecran quand il est reveille ; sa place en
     # fractions de l'ecran principal (la meme a toutes les resolutions).
+    # Elle joue avec sa voix quand il parle (« un petit peu de jazz »).
     "jarvis_boule": True,
     # LE PANNEAU DE JARVIS : le contenu « Jarvis » du panneau LED 64 x 64, en
     # haut au milieu de l'ecran quand il est actif. Avec lui, la boule ne sort
-    # plus que pour aller sur l'ecran qu'il regarde.
+    # plus que quand il parle, qu'il t'ecoute, ou pour aller sur l'ecran qu'il
+    # regarde.
     "jarvis_panneau": True,
     "jarvis_boule_x": 0.97,
     "jarvis_boule_y": 0.90,
@@ -4454,6 +4456,7 @@ JARVIS = {
     "apprentissage": None,    # {"n", "total", "message", "fini"}
     "minuteurs": [],          # [{"fin", "quoi", "minuteur"}]
     "avance": None,           # la reponse en cours : sa premiere phrase, dite en avance
+    "agenda_change": 0.0,     # Jarvis vient de poser quelque chose dans l'agenda : la fenetre se relit
     # Deux modes : « jarvis » (orange, le majordome du PC) et « psy » (bleu, le
     # compagnon de BrainDebugger). Le mode psy se referme sur « non rien »,
     # « oublie », « degage »... ou apres PSY_DUREE_S sans un mot.
@@ -4476,6 +4479,9 @@ JARVIS = {
     "souci": None,            # (message, t) : un souci de fond (le micro) -- sur sa page, pas a l'ecran
     "calme_jusqua": 0.0,      # on vient de le congedier : pas de replique spontanee d'ici la
     "reveil_verifie": False,  # le dernier reveil : son nom deja lu dans la transcription
+    # (ce qui a ete dit, le detail technique, t) : le dernier echec, pour sa page
+    # -- le panneau ne le montre qu'un instant
+    "derniere_erreur": None,
 }
 _OREILLE = {"proc": None, "sock": None, "echecs": 0, "prochain": 0.0}
 _OREILLE_VERROU = threading.Lock()
@@ -5188,6 +5194,24 @@ def sous_titre_courant(maintenant=None):
     return _jv.texte_dit(st["phrases"], st["k"], (t - st["t0"]) / max(0.1, st.get("duree") or 0.1))
 
 
+def niveau_de_sa_voix(maintenant=None):
+    """Le niveau de SA voix (0 a 1) a l'instant, lu dans l'enveloppe que la
+    voix envoie avec chaque phrase (« dit ») : sa boule et son panneau jouent
+    avec. 0 tant que le son n'a pas commence ; None quand la voix ne dit rien
+    de son son (la voix de Windows) -- on swingue alors sans elle."""
+    st = JARVIS.get("sous_titre")
+    if not st:
+        return 0.0
+    if st.get("estime"):
+        return None
+    env = st.get("enveloppe")                     # (t0, pas, niveaux), d'un seul tenant
+    if env is None:
+        return 0.0 if st.get("k", -1) < 0 else None
+    t = time.time() if maintenant is None else maintenant
+    t0, pas, niveaux = env
+    return _jv.niveau_enveloppe(niveaux, pas, t - t0 - _jv.VOIX_LATENCE_S)
+
+
 def _lire_voix(sock):
     while True:
         try:
@@ -5200,10 +5224,16 @@ def _lire_voix(sock):
         if quoi == "dit":
             st = SOUS_TITRES.get(ev.get("id"))
             if st is not None:
-                st.update(k=int(ev.get("phrase") or 0), t0=time.time(), duree=float(ev.get("duree") or 0.0))
+                t0 = time.time()
+                maj = {"k": int(ev.get("phrase") or 0), "t0": t0, "duree": float(ev.get("duree") or 0.0)}
+                if isinstance(ev.get("env"), list):
+                    # son enveloppe, avec son instant : lue d'un bloc par la boule
+                    maj["enveloppe"] = (t0, float(ev.get("pas") or _jv.VOIX_ENVELOPPE_PAS), ev["env"])
+                st.update(maj)
                 JARVIS["sous_titre"] = st
         elif quoi == "debut":
             # IL PARLE : l'oreille guette qu'on lui coupe la parole
+            noter_temps("voix")
             envoyer_oreille({"cmd": "parole", "actif": True})
             if ev.get("id") in SOUS_TITRES:
                 JARVIS["sous_titre"] = SOUS_TITRES[ev.get("id")]
@@ -5490,6 +5520,7 @@ class Voix:
                 self.couper.clear()
                 self.parle = True
                 dit = True
+                noter_temps("voix")
                 envoyer_oreille({"cmd": "parole", "actif": True})
                 try:
                     dit = self._sapi(texte, langue)
@@ -5714,6 +5745,15 @@ def traiter_evenement(ev):
             JARVIS["micro_absent"] = not ev.get("trouve", True)
             if JARVIS["micro_absent"]:
                 print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
+    elif quoi == "essai" and ev.get("maj"):
+        # ce qu'est devenu l'appel pas net en attente de lecture : « lent » (le
+        # moteur de transcription demarre), ou tranche au score sans lecture
+        for e in reversed(JARVIS.get("essais") or []):
+            if e.get("issue") in ("verifier", "lent"):
+                e["issue"] = str(ev.get("issue") or "")
+                break
+        if ev.get("issue") == "lent":
+            print("Jarvis : la verification tarde (moteur de transcription froid ?)")
     elif quoi == "essai":
         # L'INDICATEUR DE DETECTION : chaque mot proche de « Jarvis », sa
         # distance, les deux seuils, et ce qui en est sorti
@@ -5745,7 +5785,8 @@ def traiter_evenement(ev):
         JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=0.0, parole_vue=time.time())
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "reveil":
-        print("Jarvis : eveil (%s%s)" % (ev.get("par"), ", verifie" if ev.get("verifie") else ""))
+        print("Jarvis : eveil (%s%s)" % (ev.get("par"), ", verifie" if ev.get("verifie") else
+                                         ", sans lecture : le score a tranche" if ev.get("repli") else ""))
         # UN NOUVEAU TOUR : ce qu'il preparait pour le tour d'avant ne se dira pas
         JARVIS["tour"] = int(JARVIS.get("tour") or 0) + 1
         VOIX.taire()
@@ -5790,6 +5831,7 @@ def traiter_evenement(ev):
             fin_de_l_ecoute()
     elif quoi == "phrase":
         # IL N'ECOUTE PLUS : ca se voit tout de suite (l'oreille a joue son petit son)
+        noter_temps("phrase", ev.get("pause"), ev.get("fin_t"))
         JARVIS["ecoute_fin"] = 0.0
         a = JARVIS.get("avance")
         if (ev.get("apres_coupure") and not ev.get("breve") and a and not a.get("fini")
@@ -5840,28 +5882,39 @@ def fin_de_l_ecoute():
 
 def verifier_appel(wav64, n=None):
     """Tranche un appel pas net : « Jarvis » (meme ecorche) dans la
-    transcription -> il se reveille ; sinon, il se rendort sans un bruit."""
-    ok, lu = False, None
+    transcription -> il se reveille ; sinon, il se rendort sans un bruit.
+
+    Trois reponses : oui, non, et « illisible » (None : transcription pas
+    prete, memoire, moteur qui plante) -- alors l'oreille laisse le score
+    trancher. Un « non » sans avoir rien lu rejetait tout appel pas net, sans
+    un mot. Rend True seulement si on y a lu son nom."""
+    ok, lu = None, None
     try:
         if etat_dictee()["etat"] == "pret":
             texte = transcrire(base64.b64decode(wav64))
-            lu = _jv.nom_trouve(texte, noms_appris())
-            # parler DE lui (« j'ai l'impression que Jarvis ecoute ») n'est pas l'appeler
-            ok = lu is not None and not _jv.est_une_mention(texte, noms_appris())
+            # « J'AI GALERE A CE QU'IL S'ALLUME » : un « Jarvis » dit seul,
+            # Parakeet l'ecrit « Javi », « Chavis », « É Javi » -- la forme
+            # ecorchee confirme un appel que l'empreinte a deja trouve proche
+            lu = _jv.nom_verifie(texte, noms_appris())
+            # parler DE lui (« j'ai l'impression que Jarvis ecoute ») n'est pas
+            # l'appeler ; le bout de son finit juste apres le nom (« Jarvis il »)
+            ok = lu is not None and not _jv.est_une_mention(texte, noms_appris(), tronque=True)
     except Exception as e:
         print("Jarvis : verification impossible (%s)" % type(e).__name__)
     # le mot qui l'a confirme, pour comprendre un reveil intempestif (pas la phrase)
-    print("Jarvis : appel pas net %s" % ("confirme (« %s »)" % lu if ok else
+    print("Jarvis : appel pas net %s" % ("illisible : le score tranche" if ok is None else
+                                         "confirme (« %s »)" % lu if ok else
                                          "ecarte" + (" (on parlait de lui)" if lu else "")))
-    for e in reversed(JARVIS.get("essais") or []):
-        if e.get("issue") == "verifier":
-            e["issue"] = "confirme" if ok else "ecarte"
-            break
+    if ok is not None:
+        for e in reversed(JARVIS.get("essais") or []):
+            if e.get("issue") in ("verifier", "lent"):
+                e["issue"] = "confirme" if ok else "ecarte"
+                break
     verdict = {"cmd": "verifie", "ok": ok}
     if n is not None:
         verdict["n"] = n
     envoyer_oreille(verdict)
-    return ok
+    return bool(ok)
 
 
 def garder_facons(transcription):
@@ -5938,6 +5991,54 @@ def message_attente():
     return "Apprends-lui ta voix pour qu'il reconnaisse « Jarvis »."
 
 
+# LE GARDE-FOU DES ETATS. « Il reste bloque sur "il reflechit" jusqu'a ce que
+# je redise Jarvis » : un etat ecrit trop tard (la reponse d'un tour d'avant,
+# un « fini » que la voix n'enverra jamais) restait affiche pour toujours --
+# et bloquait les annonces. Un etat qui n'a plus de raison d'etre depuis
+# quelques secondes revient a l'attente.
+GARDE_ETATS_S = {"parle": 4.0, "pense": 10.0, "comprend": 10.0}
+_GARDE = {"cle": None, "depuis": 0.0, "sans_raison": None}
+
+
+def raison_d_etre(etat):
+    """Quelque chose justifie-t-il encore cet etat ?"""
+    if voix_occupee():
+        return True                       # il parle, ou il a encore a dire
+    if etat == "parle":
+        return False
+    # pense / comprend : une phrase en file, en travail, ou une requete en cours
+    # (une requete abandonnee qui traine encore ne compte pas)
+    return bool(_JARVIS_TRAVAIL or _TRAVAIL_COURANT.get("tour") is not None
+                or any(not v.get("annule") for v in list(_EN_VOL.values())))
+
+
+def surveiller_etats(maintenant=None):
+    """Appele chaque seconde par la veille. Rend True s'il a remis l'attente."""
+    maintenant = time.monotonic() if maintenant is None else maintenant
+    etat = JARVIS.get("etat")
+    cle = (etat, JARVIS.get("message"), JARVIS.get("tour"))
+    if cle != _GARDE["cle"]:
+        # un etat qui vient d'etre ecrit a toujours sa chance
+        _GARDE.update(cle=cle, depuis=maintenant, sans_raison=None)
+        return False
+    delai = GARDE_ETATS_S.get(etat)
+    if delai is None:
+        return False
+    if raison_d_etre(etat):
+        _GARDE["sans_raison"] = None
+        return False
+    if _GARDE["sans_raison"] is None:
+        _GARDE["sans_raison"] = maintenant
+    if maintenant - _GARDE["sans_raison"] < delai:
+        return False
+    print("Jarvis : garde-fou -- « %s » sans raison depuis %d s, retour a l'attente" % (etat, delai))
+    clore_temps("coince")
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+    _GARDE.update(cle=None, sans_raison=None)
+    return True
+
+
 def veiller_sur_jarvis(cfg):
     """Tourne dans son fil : tient l'oreille ouverte quand on l'a demande,
     la ferme sinon, et la relance si elle tombe (de plus en plus lentement)."""
@@ -6002,6 +6103,8 @@ def veiller_sur_jarvis(cfg):
                     threading.Thread(target=preparer_vad, daemon=True).start()
             if not voulu and JARVIS["etat"] != "eteint" and _OREILLE["proc"] is None:
                 JARVIS.update(etat="eteint", message="")
+            if voulu:
+                surveiller_etats()
             # une tache de fond prete : il l'annonce des qu'il est libre (sans
             # attendre la guirlande, qui peut ne pas etre branchee)
             try:
@@ -6043,14 +6146,31 @@ def fil_jarvis_travail(cfg):
         _JARVIS_TRAVAIL_SIGNAL.clear()
         while _JARVIS_TRAVAIL:
             item = _JARVIS_TRAVAIL.pop(0)
+            _TRAVAIL_COURANT.update(tour=item.get("tour"), t=time.monotonic())
+            if item.get("wav"):
+                lancer_onglets(cfg)          # pendant la transcription (voir `onglets_attendus`)
             try:
                 traiter_phrase(item["wav"], cfg, item.get("apres_coupure", False), deja_dit=item.get("deja_dit", False),
                                breve=item.get("breve", False), tour=item.get("tour"))
+                if not voix_occupee():
+                    clore_temps("sans voix")   # un son, une commande muette, une phrase en suspens
             except Annule:
-                pass                         # congedie ou rappele pendant qu'il y pensait
+                clore_temps("annule")        # congedie ou rappele pendant qu'il y pensait
             except Exception as e:
                 print("Jarvis : phrase non traitee (%s)" % type(e).__name__)
-                signaler_erreur(phrase("rate", langue_du_mode(cfg)))
+                signaler_erreur(phrase("rate", langue_du_mode(cfg)), detail="phrase non traitee : %s" % type(e).__name__)
+            finally:
+                _TRAVAIL_COURANT.update(tour=None, t=time.monotonic())
+
+
+# ce que traite le fil de travail (tour, depuis quand) : le garde-fou des etats
+# sait ainsi qu'un « pense » a encore une raison d'etre
+_TRAVAIL_COURANT = {"tour": None, "t": 0.0}
+
+
+def voix_occupee():
+    """Dit-il quelque chose, ou a-t-il quelque chose a dire ?"""
+    return bool(VOIX.parle or VOIX.attentes or getattr(VOIX, "file", None))
 
 
 def demarrer_jarvis(cfg):
@@ -6102,20 +6222,20 @@ _PHRASES = {
     "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
     "code_refuse": ("Accès refusé.", "Access denied."),
     "verrouille": ("Accès verrouillé.", "Access locked."),
-    "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
-                      "My hands on the PC are closed: Settings, Jarvis."),
+    "mains_fermees": ("Mes mains sur le PC sont fermées : ouvrez-les dans les réglages de l'assistant.",
+                      "My hands on the PC are closed: open them in the assistant settings."),
     "youtube_video": ("C'est lancé.", "Here you go."),
     "youtube_resultats": ("Les résultats de YouTube sont à l'écran.", "I've opened the YouTube results."),
     "youtube_rate": ("YouTube ne répond pas.", "YouTube isn't answering."),
     "son_rate": ("Je ne parviens pas à régler le son.", "I can't set the volume."),
     "oui": ("Oui ?", "Yes?"),
-    # sans dire son nom : sa propre voix le reveillerait
+    # AUCUNE ne dit son nom : sa propre voix le reveillerait (test : LeNomDansSesPhrases)
     "mode_psy": ("Mode psychologue. Je vous écoute. Appelez-moi par mon nom pour revenir.", None),
     "mode_jarvis": ("À votre service.", "At your service."),
     "retour": ("Content de vous revoir.", "Welcome back."),
     "lecture": ("Je n'ai pas pu lire ce que le micro m'a donné.", "I couldn't read what the microphone gave me."),
-    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.",
-                              "Transcription isn't ready yet. Have a look at the Jarvis page in Machi Tool."),
+    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page de l'assistant, dans Machi Tool.",
+                              "Transcription isn't ready yet. Have a look at the assistant page in Machi Tool."),
     "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
     "commande_ratee": ("Je crains de ne pas avoir pu le faire.", "I'm afraid I couldn't do that."),
     "rate": ("Un incident de mon côté, je le crains.", "Something went wrong on my side, I'm afraid."),
@@ -6123,8 +6243,8 @@ _PHRASES = {
                     "To answer you, I need the BrainDebugger key. It's on the Passerelle page of Machi Tool."),
     "cle_refusee": ("BrainDebugger refuse ma clé.", "BrainDebugger is refusing my key."),
     "bd_ancien_psy": ("Votre version de BrainDebugger ne sait pas encore m'écouter.", None),
-    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode Jarvis.",
-                         "Your BrainDebugger doesn't know Jarvis mode yet."),
+    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode majordome.",
+                         "Your BrainDebugger doesn't know butler mode yet."),
     "bd_sans_cle": ("BrainDebugger n'a pas de clé Claude pour me faire parler.",
                     "BrainDebugger has no Claude key to let me speak."),
     "bd_erreur": ("BrainDebugger a répondu par une erreur %s.", "BrainDebugger answered with error %s."),
@@ -6137,6 +6257,10 @@ _PHRASES = {
     "api_limite": ("Trop de demandes à Claude d'un coup. Réessayez dans une minute.",
                    "Too many requests to Claude at once. Try again in a minute."),
     "bd_injoignable": ("Je n'arrive pas à joindre BrainDebugger.", "I can't reach BrainDebugger."),
+    "bd_muet": ("BrainDebugger ne répond pas.", "BrainDebugger isn't answering."),
+    "bd_lent": ("Un instant.", "One moment."),
+    "transcription_moteur": ("Ma transcription a échoué. Le détail est sur la page de l'assistant.",
+                             "My transcription failed. The details are on the assistant page."),
     "compagnon_muet": ("Le compagnon n'a rien répondu.", None),
     "sans_reponse": ("Je n'ai rien à répondre à cela, curieusement.", "Curiously, I have nothing to say to that."),
     "dormir": ("Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool.",
@@ -6393,6 +6517,7 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
     def fin():
         if JARVIS.get("tour") != t0:
             return                                 # congedie pendant qu'il parlait
+        clore_temps("dit", t0)
         # « IL M'ECOUTE ALORS QU'IL PARLE ENCORE » : un minuteur, une annonce
         # attendent derriere sa reponse -- la suite (l'ecoute d'apres) attend
         # qu'ils soient dits, sinon le micro l'enregistre, et il se repond.
@@ -6487,15 +6612,145 @@ def dire_et_attendre(texte, langue=None, delai=30.0):
     return fini.is_set()
 
 
+# ---------- le chronometre d'un echange ----------
+#
+# « IL MET UNE PLOMBE A REPONDRE » -- mais ou ? La pause de fin de phrase, la
+# transcription, BrainDebugger (et Claude), la voix ? Chaque echange garde ses
+# temps -- des nombres, jamais ce qui a ete dit : une ligne au journal, et la
+# page Jarvis montre le dernier, pour qu'on sache enfin ce qui est lent.
+
+CHRONO = {"courant": None}          # l'echange en cours : {"tour", "mur", "pause", "t": {etape: monotonic}}
+CHRONOS = deque(maxlen=10)          # les derniers echanges, le plus recent a la fin
+_CHRONO_DERNIERES = ("bd_fin",)     # les tours d'outils : la derniere reponse compte
+
+
+def noter_temps(etape, pause=None, fin_t=None):
+    """Un point du chronometre. « phrase » ouvre un echange (l'oreille rend ta
+    phrase : `pause`, le silence qu'elle a attendu ; `fin_t`, l'heure ou tu
+    t'es tu). Les autres etapes -- transcrit, bd_envoi, bd_debut, bd_fin,
+    voix -- ne comptent que pour l'echange en cours, et la premiere fois."""
+    try:
+        m = time.monotonic()
+        if etape == "phrase":
+            if CHRONO["courant"] is not None:
+                clore_temps("interrompu")
+            debut = m
+            if fin_t is not None:
+                debut = m - max(0.0, min(60.0, time.time() - float(fin_t)))
+            elif pause is not None:
+                debut = m - max(0.0, float(pause))
+            CHRONO["courant"] = {"tour": JARVIS.get("tour"), "mur": time.time(), "pause": pause,
+                                 "t": {"fin_parole": debut, "phrase": m}}
+            return
+        c = CHRONO["courant"]
+        if c is None or c["tour"] != JARVIS.get("tour"):
+            return
+        t = c["t"]
+        # « Un instant. » (il patiente) n'est pas le premier son de la reponse
+        if etape == "voix" and "bd_envoi" in t and "bd_debut" not in t and "bd_fin" not in t:
+            return
+        if etape in _CHRONO_DERNIERES or etape not in t:
+            t[etape] = m
+    except Exception:
+        pass
+
+
+def clore_temps(issue, tour=None):
+    """Ferme l'echange en cours (dit, erreur, annule...) : ses temps vont dans
+    CHRONOS et au journal, en une ligne."""
+    c = CHRONO["courant"]
+    if c is None or (tour is not None and c["tour"] != tour):
+        return None
+    CHRONO["courant"] = None
+    try:
+        c["t"].setdefault("fin", time.monotonic())
+        r = resume_temps(c, issue)
+        CHRONOS.append(r)
+        print(ligne_temps(r))
+        return r
+    except Exception as e:
+        print("Jarvis : chronometre (%s)" % type(e).__name__)
+        return None
+
+
+def resume_temps(c, issue):
+    """Les durees d'un echange, en secondes : chaque segment, puis le premier
+    son et la fin comptes depuis le moment ou tu t'es tu."""
+    t = c["t"]
+    d = lambda a, b: round(max(0.0, t[b] - t[a]), 2) if a in t and b in t else None
+    reponse = "bd_debut" if "bd_debut" in t else "bd_fin" if "bd_fin" in t else "transcrit"
+    return {"heure": time.strftime("%H:%M:%S", time.localtime(c["mur"])), "issue": issue,
+            "chemin": "bd" if "bd_envoi" in t else "ici", "pause": c.get("pause"),
+            "fin_de_phrase": d("fin_parole", "phrase"), "transcription": d("phrase", "transcrit"),
+            "contexte": d("transcrit", "bd_envoi"), "bd": d("bd_envoi", "bd_debut" if "bd_debut" in t else "bd_fin"),
+            "bd_fin": d("bd_envoi", "bd_fin"), "voix": d(reponse, "voix"),
+            "premier_son": d("fin_parole", "voix"), "total": d("fin_parole", "fin")}
+
+
+def ligne_temps(r):
+    """La ligne du journal (datee : un journal copie dit enfin ou ca traine)."""
+    noms = (("fin_de_phrase", "fin de phrase"), ("transcription", "transcription"), ("contexte", "contexte"),
+            ("bd", "BD 1re phrase"), ("bd_fin", "BD fin"), ("voix", "voix"))
+    bouts = ["%s %.2f" % (nom, r[k]) for k, nom in noms if r.get(k) is not None]
+    fin = [("1er son a %.2f s" % r["premier_son"]) if r.get("premier_son") is not None else "sans voix"]
+    if r.get("total") is not None:
+        fin.append("fin a %.2f s" % r["total"])
+    return "Jarvis : echange de %s (%s, %s) -- %s | %s" % (r["heure"], r["chemin"], r["issue"],
+                                                        " | ".join(bouts) or "-", " | ".join(fin))
+
+
+def _secondes(x):
+    return ("%.1f s" % x).replace(".", ",")
+
+
+def texte_dernier_echange():
+    """Pour la page Jarvis : « Dernier echange (14:03) : fin de phrase 0,8 s ·
+    transcription 0,4 s · BrainDebugger 1,6 s · voix 0,2 s -- premier son a
+    3,0 s. » Et le premier son des echanges d'avant."""
+    if not CHRONOS:
+        return ""
+    r = CHRONOS[-1]
+    noms = (("fin_de_phrase", "fin de phrase"), ("transcription", "transcription"),
+            ("contexte", "contexte"), ("bd", "BrainDebugger"), ("voix", "voix"))
+    bouts = ["%s %s" % (nom, _secondes(r[k])) for k, nom in noms if r.get(k) is not None
+             and (k != "contexte" or r[k] >= 0.05)]
+    txt = "Dernier echange (%s) : %s" % (r["heure"][:5], " · ".join(bouts) or "-")
+    if r.get("premier_son") is not None:
+        txt += " -- premier son a %s" % _secondes(r["premier_son"])
+    if r.get("issue") not in ("dit",):
+        txt += " (%s)" % r["issue"]
+    avant = [_secondes(x["premier_son"]) for x in list(CHRONOS)[-6:-1] if x.get("premier_son") is not None]
+    if avant:
+        txt += ".  Avant : " + " · ".join(reversed(avant))
+    return txt + "."
+
+
+def texte_derniere_erreur(maintenant=None):
+    """Le dernier echec, lisible sur la page Jarvis pendant une demi-heure (le
+    panneau ne le montre que le temps de le dire)."""
+    e = JARVIS.get("derniere_erreur")
+    maintenant = time.time() if maintenant is None else maintenant
+    if not e or maintenant - e[2] > 1800:
+        return ""
+    return "Dernier echec (%s) : %s" % (time.strftime("%H:%M", time.localtime(e[2])), (e[1] or e[0])[:240])
+
+
 ERREUR_MONTREE_S = 2.5
 
 
-def signaler_erreur(texte, tour=None):
+def signaler_erreur(texte, tour=None, detail=None):
     """Ce qui a rate, APRES une demande : il le dit (et le panneau l'ecrit),
     ou le panneau montre ERREUR un instant. Jamais pour un souci de fond (voir
-    `souci`), et jamais pour un tour d'avant."""
+    `souci`), et jamais pour un tour d'avant.
+
+    « JE NE SAIS PAS POURQUOI CA N'A PAS MARCHE » : il dit une phrase courte ;
+    le detail technique (`detail`) va au journal et reste sur sa page."""
+    # une ligne au journal pour chaque echec (la phrase ou le detail, jamais ce qu'on a dit)
+    print("Jarvis : echec -- %s" % str(detail or texte)[:240])
     if tour is not None and JARVIS.get("tour") != tour:
         return
+    JARVIS["derniere_erreur"] = (str(texte or ""), str(detail or ""), time.time())
+    clore_temps("erreur")
     poser_led("erreur", 1.6)
     jouer_son("erreur")
     JARVIS["erreur_jusqua"] = time.time() + ERREUR_MONTREE_S
@@ -6519,35 +6774,154 @@ class Interrompu(Annule):
     mots : la suite de cette reponse ne se dira pas."""
 
 
+class BDMuet(TimeoutError):
+    """BrainDebugger n'a rien rendu -- ni premiere phrase, ni reponse -- en
+    ATTENTE_BD_MAX_S : « il ne repond pas », pas « injoignable »."""
+
+
+# « JE LUI PARLE ET PLUS RIEN » : BrainDebugger tarde (Railway qui redemarre,
+# Claude surcharge, une recherche sur le web). Sans premiere phrase, un tout
+# petit son dit qu'il y pense encore, puis « Un instant. » une fois ; au-dela
+# d'ATTENTE_BD_MAX_S, il laisse tomber et le dit.
+PATIENCE_S = 4.0
+PATIENCE_REDIRE_S = 8.0
+PATIENCE_DIRE_S = 12.0
+ATTENTE_BD_MAX_S = 90.0             # une recherche sur le web met 20 a 40 s avant sa premiere phrase
+
+# Les requetes a BrainDebugger en cours, par fil : {"r": la reponse ouverte,
+# "annule": True}. Une requete abandonnee (congedie, rappele, trop longue) est
+# fermee : le fil ne reste pas pendu a une reponse que personne n'entendra.
+_EN_VOL = {}
+
+
+def _fermer_reponse(r):
+    """Ferme une reponse ouverte depuis un autre fil. La socket d'abord (la
+    lecture en cours se debloque), puis la reponse."""
+    try:
+        sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        r.close()
+    except Exception:
+        pass
+
+
+def abandonner_requete(ident):
+    vol = _EN_VOL.get(ident)
+    if vol is None:
+        return False
+    vol["annule"] = True
+    if vol.get("r") is not None:
+        # dans son fil : fermer peut attendre que la lecture rende la main
+        threading.Thread(target=_fermer_reponse, args=(vol["r"],), daemon=True).start()
+    return True
+
+
+def requete_en_vol(ident=None):
+    """La requete de ce fil (ou de `ident`) a-t-elle ete abandonnee ? Rend son
+    entree (ou None)."""
+    return _EN_VOL.get(threading.get_ident() if ident is None else ident)
+
+
+def patienter(attente, deja_dit):
+    """Un signe pendant qu'il attend BrainDebugger : le petit son, et une fois
+    « Un instant. ». Rend True si « Un instant. » est parti."""
+    if JARVIS.get("etat") in ("pense", "comprend"):
+        JARVIS["message"] = "Jarvis reflechit... (BrainDebugger met du temps : %d s)" % attente
+    if VOIX.parle:
+        return False
+    L = langue_du_mode()
+    if (not deja_dit and attente >= PATIENCE_DIRE_S and CFG.get("jarvis_voix", True)
+            and VOIX.peut_parler()):
+        VOIX.dire(phrase("bd_lent", L), None, L)
+        return True
+    jouer_son("patience")
+    return False
+
+
 def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None, avance=None):
     """_requete_bd, mais on n'attend plus des que la conversation a change (un
     nouveau reveil, « tais-toi », un clic sur le panneau) : Annule, et la
-    reponse, si elle arrive, part a la poubelle. Il repondait encore apres
-    qu'on l'avait congedie -- et la phrase suivante attendait derriere.
-    `avance` : sa premiere phrase, dite en avance ; interrompue pour de bon
-    (voir traiter_evenement, « phrase »), c'est Interrompu."""
+    requete est fermee. Il repondait encore apres qu'on l'avait congedie -- et
+    la phrase suivante attendait derriere.
+
+    Tant qu'aucune phrase n'est venue : un signe de loin en loin (voir
+    `patienter`), et BDMuet au bout d'ATTENTE_BD_MAX_S. `avance` : sa premiere
+    phrase, dite en avance ; interrompue pour de bon (voir traiter_evenement,
+    « phrase »), c'est Interrompu."""
+    noter_temps("bd_envoi")
+    vu = {"debut": None}
+
+    def debut(texte):
+        if vu["debut"] is None:
+            vu["debut"] = time.monotonic()
+            noter_temps("bd_debut")
+        sur_debut(texte)
+    en_flux = debut if sur_debut is not None else None
     if tour is None:
-        return _requete_bd(chemin, charge, cfg, delai, sur_debut)
+        r = _requete_bd(chemin, charge, cfg, delai, en_flux)
+        noter_temps("bd_fin")
+        return r
     boite, fini = {}, threading.Event()
 
     def faire():
+        _EN_VOL[threading.get_ident()] = {"r": None, "annule": False}
         try:
-            boite["r"] = _requete_bd(chemin, charge, cfg, delai, sur_debut)
+            boite["r"] = _requete_bd(chemin, charge, cfg, delai, en_flux)
         except BaseException as e:
             boite["e"] = e
         finally:
+            _EN_VOL.pop(threading.get_ident(), None)
             fini.set()
-    threading.Thread(target=faire, daemon=True).start()
-    while not fini.wait(0.1):
-        if JARVIS.get("tour") != tour:
-            raise Annule()
-        if avance is not None and avance.get("interrompue"):
-            raise Interrompu()
+    fil = threading.Thread(target=faire, daemon=True)
+    fil.start()
+    t0, signe, dit = time.monotonic(), PATIENCE_S, False
+    try:
+        while not fini.wait(0.1):
+            if JARVIS.get("tour") != tour:
+                raise Annule()
+            if avance is not None and avance.get("interrompue"):
+                raise Interrompu()
+            attente = time.monotonic() - t0
+            if vu["debut"] is not None:
+                continue
+            if attente >= ATTENTE_BD_MAX_S:
+                raise BDMuet("rien en %d s" % ATTENTE_BD_MAX_S)
+            if attente >= signe:
+                signe = attente + PATIENCE_REDIRE_S
+                dit = patienter(attente, dit) or dit
+    except BaseException:
+        abandonner_requete(fil.ident)
+        raise
     if JARVIS.get("tour") != tour:
         raise Annule()
     if "e" in boite:
         raise boite["e"]
+    noter_temps("bd_fin")
     return boite.get("r")
+
+
+def echec_bd(e, L, tour, pour="jarvis", t0=None):
+    """Ce qu'il dit quand BrainDebugger n'a pas repondu : une erreur (voir
+    `erreur_bd`), un silence trop long (« ne repond pas ») ou pas de
+    connexion (« injoignable »). La cause exacte au journal et sur sa page
+    -- « injoignable » pouvait etre un nom introuvable, un pare-feu, une
+    reponse coupee, et personne ne savait laquelle."""
+    duree = "" if t0 is None else ", apres %.1f s" % (time.monotonic() - t0)
+    if isinstance(e, urllib.error.HTTPError):
+        corps = _corps_http(e)
+        detail = "BrainDebugger %s : %s%s" % (e.code, str(corps.get("error") or corps.get("raison")
+                                                           or e.reason or "")[:160], duree)
+        return signaler_erreur(erreur_bd(e, L, pour=pour), tour, detail=detail)
+    cause = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else e
+    muet = isinstance(cause, (TimeoutError, socket.timeout))
+    cause = cause if isinstance(cause, BaseException) else e
+    detail = "BrainDebugger %s -- %s: %s%s" % ("ne repond pas" if muet else "injoignable", type(cause).__name__,
+                                               str(cause)[:120], duree)
+    return signaler_erreur(phrase("bd_muet" if muet else "bd_injoignable", L), tour, detail=detail)
 
 
 def veut_partir(texte, brut=""):
@@ -6604,8 +6978,9 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
         return JARVIS.update(etat="attente", message=phrase("transcription_absente", "fr"))
     try:
         texte = transcrire(octets)
+        noter_temps("transcrit")
     except DicteeImpossible as e:
-        return signaler_erreur(str(e)[:160], tour)
+        return signaler_erreur(phrase("transcription_moteur", L), tour, detail=str(e)[:240])
     except Exception as e:
         print("Jarvis : transcription impossible (%s)" % type(e).__name__)
         return signaler_erreur(phrase("transcription_ratee", L), tour)
@@ -6864,16 +7239,66 @@ def _requete_bd(chemin, charge, cfg, delai, sur_debut=None):
                "X-Fuseau": "UTC" if not decalage else "Etc/GMT%+d" % -decalage}
     corps = None if charge is None else json.dumps(charge, ensure_ascii=False).encode("utf-8")
     requete = urllib.request.Request(base + chemin, data=corps, headers=entetes)
-    with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
-        if sur_debut is None or "ndjson" not in str(r.headers.get("Content-Type") or ""):
-            return json.loads(r.read().decode("utf-8"))
-        return _lire_flux_bd(r, base + chemin, sur_debut)
+    vol = requete_en_vol()
+    for essai in (1, 2):
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
+                if vol is not None:
+                    vol["r"] = r                 # abandonnee (voir `abandonner_requete`) : on la ferme
+                    if vol.get("annule"):
+                        raise Annule()
+                if sur_debut is None or "ndjson" not in str(r.headers.get("Content-Type") or ""):
+                    return json.loads(r.read().decode("utf-8"))
+                return _lire_flux_bd(r, base + chemin, sur_debut)
+        except urllib.error.URLError as e:
+            if isinstance(getattr(e, "reason", None), _ssl_erreurs()):
+                _oublier_contexte_ssl()          # un magasin de certificats perime : relu la prochaine fois
+            if essai == 2 or (vol is not None and vol.get("annule")) or not reessai_sur(e, time.monotonic() - t0):
+                raise
+            print("Jarvis : BrainDebugger -- %s, je reessaie une fois" % _cause_courte(e))
+            time.sleep(REESSAI_BD_S)
+
+
+REESSAI_BD_S = 0.8
+
+
+def _ssl_erreurs():
+    try:
+        import ssl
+        return (ssl.SSLError, ssl.CertificateError)
+    except Exception:
+        return ()
+
+
+def _cause_courte(e):
+    c = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+    c = c if isinstance(c, BaseException) else e
+    return "%s: %s" % (type(c).__name__, str(c)[:120])
+
+
+def reessai_sur(e, duree):
+    """Reessayer une requete a BrainDebugger n'est sur que si elle n'a PAS pu
+    le mettre au travail : il execute des outils (l'agenda, le carnet) pendant
+    la requete, et une seconde fois les poserait deux fois. Donc : le nom
+    introuvable, la connexion refusee ou pas etablie, la poignee de main TLS
+    (urllib ne les leve en URLError qu'avant la reponse) ; ou une page 502/503/504
+    du bord de Railway -- pas du JSON de BrainDebugger -- rendue tout de suite
+    (l'appli redemarre). Jamais une connexion coupee apres l'envoi."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (502, 503, 504) and duree < 2.0 and not _corps_http(e)
+    cause = getattr(e, "reason", None)
+    return isinstance(cause, (socket.gaierror, ConnectionRefusedError, socket.timeout, TimeoutError)
+                      + _ssl_erreurs())
 
 
 def _lire_flux_bd(r, url, sur_debut):
     """Les lignes d'une reponse en flux : l'avance, puis la fin (ou l'erreur,
     rendue comme BrainDebugger la rendait avant : une HTTPError)."""
+    vol = requete_en_vol()
     for ligne in r:
+        if vol is not None and vol.get("annule"):
+            raise Annule()                         # plus personne ne l'attend
         ligne = ligne.strip()
         if not ligne:
             continue
@@ -6919,7 +7344,7 @@ def _corps_http(e):
 def erreur_bd(e, L, pour="jarvis"):
     """Ce qu'il dit quand BrainDebugger repond une erreur -- la CAUSE, quand on
     la connait (« BrainDebugger a repondu par une erreur 502 » ne disait pas
-    quoi faire). Le detail va aussi au panneau et au journal."""
+    quoi faire). Le detail va au journal et sur sa page."""
     corps = _corps_http(e)
     detail, raison = str(corps.get("error") or ""), str(corps.get("raison") or "")
     if detail:
@@ -6932,7 +7357,9 @@ def erreur_bd(e, L, pour="jarvis"):
         return phrase("api_" + raison, L)
     if "clé API" in detail:
         return phrase("bd_sans_cle", L)
-    return phrase("bd_erreur", L, e.code) + ((" " + detail[:160]) if detail and L == "fr" else "")
+    # le detail (souvent l'anglais du SDK) ne se lit plus a voix haute : il est
+    # au journal et sur sa page (voir `echec_bd`)
+    return phrase("bd_erreur", L, e.code)
 
 
 def parler_au_compagnon(texte, cfg, tour=None):
@@ -6942,12 +7369,11 @@ def parler_au_compagnon(texte, cfg, tour=None):
     poser_led("pense")
     JARVIS.update(etat="pense", message="Le compagnon reflechit...")
     print("Jarvis : message au compagnon (%d signes)" % len(texte))
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/parler", {"texte": texte}, cfg, 180, tour)
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, "fr", pour="psy"), tour)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", "fr"), tour)
+    except Exception as e:
+        return echec_bd(e, "fr", tour, pour="psy", t0=t0)
     reponse = str((donnees or {}).get("texte") or "").strip()
     if not reponse:
         return signaler_erreur(phrase("compagnon_muet", "fr"), tour)
@@ -7586,6 +8012,50 @@ def onglets_du_moment():
     except Exception:
         return ""
     return liste_onglets([o for o in onglets if isinstance(o, dict)], par_famille=6, titre_max=60)
+
+
+# « IL MET DU TEMPS A DEMARRER » : la liste des onglets demandait jusqu'a 1,5 s
+# a l'extension (morte depuis peu, elle passait encore pour branchee), APRES la
+# transcription. Elle part maintenant PENDANT la transcription (voir
+# `fil_jarvis_travail`), et la question ne l'attend guere plus.
+ONGLETS_BUDGET_S = 0.3
+_ONGLETS_AVANCE = {"fil": None, "boite": None, "t": 0.0}
+
+
+def lancer_onglets(cfg):
+    """Demande la liste des onglets en avance, dans son fil."""
+    if not cfg.get("jarvis_pc") or not extension_branchee():
+        return None
+    boite = {}
+
+    def faire():
+        try:
+            boite["r"] = onglets_du_moment()
+        except Exception:
+            boite["r"] = ""
+    fil = threading.Thread(target=faire, daemon=True)
+    _ONGLETS_AVANCE.update(fil=fil, boite=boite, t=time.monotonic())
+    fil.start()
+    return fil
+
+
+def onglets_attendus(cfg, budget=None):
+    """La liste des onglets pour la question : celle demandee en avance (ou
+    demandee maintenant), attendue au plus `budget` secondes -- sinon rien :
+    Jarvis n'attend pas l'extension."""
+    if not cfg.get("jarvis_pc"):
+        return ""
+    budget = ONGLETS_BUDGET_S if budget is None else budget
+    a = _ONGLETS_AVANCE
+    if a["fil"] is None or time.monotonic() - a["t"] > 10.0:
+        if lancer_onglets(cfg) is None:
+            return ""
+    fil, boite = a["fil"], a["boite"]
+    a.update(fil=None, boite=None)                 # une liste sert une fois
+    fil.join(budget)
+    if "r" not in boite:
+        print("Jarvis : les onglets tardent, la question part sans eux")
+    return boite.get("r") or ""
 
 
 EXTENSION_MANIFESTE = {
@@ -8503,9 +8973,14 @@ def continuer_jarvis(etat, resultats, cfg):
     """Renvoie a BrainDebugger ce que les outils ont fait ; Jarvis continue."""
     L = langue_jarvis(cfg)
     conv = etat.get("conv")
+    if conv is not None and JARVIS.get("tour") != conv:
+        # congedie ou rappele pendant les outils : il ne repasse pas a « pense »
+        # par-dessus la nouvelle ecoute (la boule y restait coincee)
+        raise Annule()
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis agit...")
     avance = JARVIS["avance"] = {}
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"suite": etat["suite"], "resultats": resultats, "langue": L,
@@ -8514,10 +8989,8 @@ def continuer_jarvis(etat, resultats, cfg):
                                         sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
     except Interrompu:
         return reponse_interrompue(etat["texte"], avance)
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, L), conv)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", L), conv)
+    except Exception as e:
+        return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1, conv, avance)
 
 
@@ -8545,6 +9018,8 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         raise Annule()
     if avance is not None:
         avance["fini"] = True                  # la reponse est la : la premiere phrase n'attend plus
+    if donnees.get("agenda_modifie"):
+        JARVIS["agenda_change"] = time.time()  # la fenetre Agenda, si elle est ouverte, se relit
     if donnees.get("detail"):
         # CE QUE CLAUDE A REPONDU EN ENTIER, quand Jarvis l'a consulte : il en
         # dit l'essentiel, le texte complet va dans le presse-papiers.
@@ -8613,19 +9088,18 @@ def parler_a_jarvis(texte, cfg, conv=None):
     JARVIS.update(etat="pense", message="Jarvis reflechit...")
     print("Jarvis : question au majordome (%d signes)" % len(texte))
     avance = JARVIS["avance"] = {}
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                                              "onglets_ouverts": onglets_du_moment() if cfg.get("jarvis_pc") else ""},
+                                              "onglets_ouverts": onglets_attendus(cfg)},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
                                         sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
     except Interrompu:
         return reponse_interrompue(texte, avance)
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, L), conv)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", L), conv)
+    except Exception as e:
+        return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(texte, donnees, cfg, 1, conv, avance)
 
 
@@ -8805,6 +9279,21 @@ def dire_les_annonces():
             VOIX.dire(texte, None, langue)
 
 
+def rappel_dans_l_agenda(quoi, fin, cfg):
+    """Le rappel « rappelle-moi dans 2 h d'appeler maman », pose aussi dans
+    l'agenda : son jour et son heure. Rend True s'il y est."""
+    t = time.localtime(fin)
+    titre = str(quoi or "").strip()
+    titre = titre[:1].upper() + titre[1:]
+    try:
+        poser_agenda(cfg, titre[:120], time.strftime("%Y-%m-%d", t), heure=time.strftime("%H:%M", t))
+    except Exception as e:
+        print("Jarvis : rappel pas pose dans l'agenda (%s)" % type(e).__name__)
+        return False
+    JARVIS["agenda_change"] = time.time()
+    return True
+
+
 def poser_minuteur(secondes, quoi="", langue="fr"):
     secondes = max(1.0, min(24 * 3600.0, float(secondes)))
     entree = {"fin": time.time() + secondes, "quoi": quoi, "duree": secondes}
@@ -8825,6 +9314,11 @@ def poser_minuteur(secondes, quoi="", langue="fr"):
     entree["minuteur"].daemon = True
     entree["minuteur"].start()
     JARVIS["minuteurs"].append(entree)
+    if quoi and _cle_presente(CFG):
+        # « Assure-toi que rajouter un rappel rajoute un element a l'agenda
+        # aussi » : il sonne ici, ET il est dans l'agenda de BrainDebugger
+        # (la fenetre Agenda, la frise) -- meme apres un redemarrage.
+        _en_fond(lambda: rappel_dans_l_agenda(quoi, entree["fin"], CFG))
     if quoi:
         return phrase("rappel_pose", langue, _jv.dire_duree(secondes, langue))
     return phrase("minuteur", langue, _jv.dire_duree(secondes, langue))
@@ -10325,8 +10819,11 @@ class Panneau:
         self.animer()
         self.rafraichir()
         self.boule = None
-        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0}
-        self.root.after(500, self.boule_tic)
+        self.boule_objets = {}
+        self.boule_etat = {"x": None, "y": None, "phase": 0.0, "alpha": 0.0, "t": None}
+        # une seule boucle par interface : refaire_interface en relance une
+        g = self.generation
+        self.root.after(500, lambda: g == self.generation and self.boule_tic())
 
     def refaire_interface(self, echelle):
         """Refait l'interface a l'echelle du nouvel ecran.
@@ -11010,6 +11507,10 @@ class Panneau:
 
     BOULE_TAILLE = 44
     BOULE_CLE = "#010203"            # la couleur rendue transparente
+    BOULE_TOUCHES = 7                # une octave de touches blanches, au coeur de la boule
+    BOULE_IVOIRE = (255, 244, 228)   # une touche enfoncee
+    # avec son panneau, elle ne sort que pour ca (et pour aller sur l'ecran qu'il regarde)
+    BOULE_AVEC_PANNEAU = ("parle", "ecoute")
 
     # ------------------------------------------------------------------
     #  Le panneau de Jarvis : « le meme qu'ici » -- le contenu Jarvis du
@@ -11088,7 +11589,9 @@ class Panneau:
         from PIL import Image, ImageTk
         # ce qu'il dit s'ecrit au fil de sa voix, DANS le panneau
         texte = sous_titre_courant(maintenant) if etat == "parle" else ""
-        niveau = niveau_de_la_voix(maintenant) if etat == "ecoute" else None
+        # ta voix quand il ecoute, la sienne quand il parle (None : le sinus)
+        niveau = (niveau_de_la_voix(maintenant) if etat == "ecoute" else
+                  niveau_de_sa_voix(maintenant) if etat == "parle" else None)
         reste = None
         if etat == "ecoute" and JARVIS.get("ecoute_fin") and not JARVIS.get("parole_vue"):
             reste = (float(JARVIS["ecoute_fin"]) - maintenant) / max(0.5, float(JARVIS.get("ecoute_duree") or 5.0))
@@ -11129,6 +11632,7 @@ class Panneau:
             m.grab_release()
 
     def boule_tic(self):
+        g = self.generation
         delai = 400
         try:
             delai = min(delai, self._panneau_tic())
@@ -11136,6 +11640,14 @@ class Panneau:
             if not getattr(self, "_panneau_erreur", False):
                 print("Jarvis : panneau impossible (%s)" % e)
                 self._panneau_erreur = True
+        change = JARVIS.get("agenda_change") or 0
+        if change > getattr(self, "_agenda_relu", 0):
+            # Jarvis vient d'y poser quelque chose : la fenetre ouverte le montre
+            self._agenda_relu = change
+            try:
+                self.remplir_agenda()
+            except Exception as e:
+                print("Agenda : relecture impossible (%s)" % e)
         demande = JARVIS.get("montrer_agenda") or 0
         if demande > getattr(self, "_agenda_montre", 0):
             self._agenda_montre = demande
@@ -11149,7 +11661,9 @@ class Panneau:
             if not getattr(self, "_boule_erreur", False):
                 print("Jarvis : boule impossible (%s)" % e)
                 self._boule_erreur = True
-        self.root.after(max(20, delai), self.boule_tic)
+        # la generation : apres refaire_interface, l'ancienne boucle s'arrete
+        # (sinon deux boucles, puis trois... et deux fois plus de dessin)
+        self.root.after(max(20, delai), lambda: g == self.generation and self.boule_tic())
 
     def _boule_creer(self, taille):
         tk = self.tk
@@ -11175,7 +11689,16 @@ class Panneau:
             u.SetWindowLongW(h, GWL_EXSTYLE, u.GetWindowLongW(h, GWL_EXSTYLE)
                              | 0x00080000 | 0x00000020 | 0x00000080 | 0x08000000)
         b.withdraw()
+        # ses objets, crees une fois et deplaces a chaque image (pas de
+        # delete("all") vingt-cinq fois par seconde) : trois anneaux, et au
+        # coeur une octave de touches, des traits aux bouts arrondis
+        largeur = max(2, int(round(taille * 0.05)))
+        anneaux = [toile.create_oval(0, 0, 0, 0, fill=self.BOULE_CLE, outline="") for _ in range(3)]
+        touches = [toile.create_line(0, 0, 0, 0, width=largeur, capstyle="round", fill=self.BOULE_CLE)
+                   for _ in range(self.BOULE_TOUCHES)]
         self.boule, self.boule_toile = b, toile
+        self.boule_objets = {"anneaux": anneaux, "touches": touches, "taille": taille,
+                             "largeur": largeur, "couleur": None}
 
     def _boule_zone(self):
         """La zone de travail de l'ecran principal (sans la barre des taches)."""
@@ -11189,21 +11712,41 @@ class Panneau:
         return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
 
     def _boule_tic(self):
+        b = self.boule
+        st = self.boule_etat
+
+        def cache():
+            if b is not None and b.winfo_exists() and b.state() != "withdrawn":
+                b.withdraw()
         if not self.cfg.get("jarvis_boule", True) or not self.cfg.get("jarvis_actif"):
-            if self.boule is not None and self.boule.winfo_exists() and self.boule.state() != "withdrawn":
-                self.boule.withdraw()
+            cache()
+            return 500
+        # UN JEU, UNE VIDEO EN PLEIN ECRAN : rien ne se dessine par-dessus (voir
+        # animer : Tk qui dessine pendant qu'un jeu change la resolution, c'est
+        # Tcl_Panic ; la guirlande et le son disent ou il en est)
+        if plein_ecran_occupe():
+            cache()
+            st.update(alpha=0.0, x=None, t=None)
             return 500
         taille = max(24, int(self.BOULE_TAILLE * getattr(self, "echelle", 1.0)))
-        etat_boule = "attente" if self.cfg.get("jarvis_panneau", True) else JARVIS.get("etat")
+        etat = JARVIS.get("etat")
+        # « Un petit peu de jazz » : avec son panneau, elle ne sortait plus que
+        # pour regarder un ecran. Elle sort aussi quand il parle -- elle joue
+        # avec sa voix -- et quand il t'ecoute.
+        if self.cfg.get("jarvis_panneau", True) and etat not in self.BOULE_AVEC_PANNEAU:
+            etat = "attente"
+        maintenant = time.time()
         visible, x, y, couleur, rythme = _jv.cible_boule(
-            etat_boule, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), time.time(),
+            etat, JARVIS.get("mode"), JARVIS.get("regard"), self._boule_zone(), maintenant,
             self.cfg.get("jarvis_boule_x", 0.97), self.cfg.get("jarvis_boule_y", 0.90), taille)
-        st = self.boule_etat
-        if not visible and (self.boule is None or not self.boule.winfo_exists() or self.boule.state() == "withdrawn"):
+        if not visible and (b is None or not b.winfo_exists() or b.state() == "withdrawn"):
             st["x"] = None
             return 300                                     # rien a l'ecran : rien a dessiner
-        if self.boule is None or not self.boule.winfo_exists():
+        if b is None or not b.winfo_exists() or self.boule_objets.get("taille") != taille:
+            if b is not None and b.winfo_exists():
+                b.destroy()
             self._boule_creer(taille)
+            b = self.boule
         # elle glisse vers sa cible ; elle apparait et s'efface en douceur
         if st["x"] is None:
             st["x"], st["y"] = float(x), float(y)
@@ -11211,28 +11754,63 @@ class Panneau:
         st["y"] += (y - st["y"]) * 0.25
         st["alpha"] = min(1.0, st["alpha"] + 0.15) if visible else max(0.0, st["alpha"] - 0.12)
         if st["alpha"] <= 0.0:
-            self.boule.withdraw()
-            st["x"] = None
+            b.withdraw()
+            st.update(x=None, t=None)
             return 300
-        st["phase"] += 0.08 * rythme
+        # sa respiration suit l'horloge, pas les images : la meme a toute cadence
+        dt = 0.04 if st.get("t") is None else max(0.0, min(0.25, maintenant - st["t"]))
+        st["t"] = maintenant
+        st["phase"] += 2.0 * rythme * dt
         try:
-            self.boule.attributes("-alpha", 0.92 * st["alpha"])
+            b.attributes("-alpha", 0.92 * st["alpha"])
         except Exception:
             pass
-        c = self.boule_toile
-        c.delete("all")
-        r0 = taille / 2.0
-        souffle = 0.5 + 0.5 * math.sin(st["phase"])
-        for k, frac in ((3, 1.0), (2, 0.82), (1, 0.64)):
-            r = r0 * (frac - 0.08 * (1 - souffle) * k / 3)
-            c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(couleur, "#000000", 0.25 * k), outline="")
-        r = r0 * (0.34 + 0.06 * souffle)
-        c.create_oval(r0 - r, r0 - r, r0 + r, r0 + r, fill=melange(couleur, "#FFFFFF", 0.45), outline="")
-        self.boule.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
-        if self.boule.state() == "withdrawn":
-            self.boule.deiconify()
-            self.boule.attributes("-topmost", True)
+        niveau, touches = self._boule_jeu(etat, maintenant)
+        self._boule_dessiner(taille, couleur, 0.5 + 0.5 * math.sin(st["phase"]), niveau, touches)
+        b.geometry("%dx%d+%d+%d" % (taille, taille, int(st["x"]), int(st["y"])))
+        if b.state() == "withdrawn":
+            b.deiconify()
+            b.attributes("-topmost", True)
         return 40
+
+    def _boule_jeu(self, etat, maintenant):
+        """(niveau 0 a 1, touches) : ce que joue la boule a l'instant."""
+        repos = [0.0] * self.BOULE_TOUCHES
+        if etat == "parle":
+            n = niveau_de_sa_voix(maintenant)
+            if n is None:
+                # la voix de Windows ne dit rien de son son : un leger swing
+                n = 0.75 * _jv.niveau_swing(maintenant)
+            return n, _jv.touches_piano(n, maintenant, self.BOULE_TOUCHES)
+        if etat == "ecoute":
+            # ta voix fait enfler son halo, discretement ; les touches se reposent
+            return 0.5 * niveau_de_la_voix(maintenant, "voix_lisse_boule"), repos
+        return 0.0, repos
+
+    def _boule_dessiner(self, taille, couleur, souffle, niveau, touches):
+        """Deplace les objets de la boule : le halo enfle avec sa voix (dans
+        les blancs, il respire a peine), les touches de l'accord s'enfoncent
+        et s'eclairent d'ivoire."""
+        c, o = self.boule_toile, self.boule_objets
+        rvb = hex_vers_rgb(couleur)
+        if o["couleur"] != couleur:
+            o["couleur"] = couleur
+            for k, a in zip((3, 2, 1), o["anneaux"]):
+                c.itemconfigure(a, fill=melange(rvb, (0, 0, 0), 0.25 * k))
+        r0 = taille / 2.0
+        gonfle = max(0.3 * souffle, min(1.0, niveau))
+        rin = r0
+        for (k, frac), a in zip(((3, 1.0), (2, 0.82), (1, 0.64)), o["anneaux"]):
+            rin = r0 * (frac - 0.1 * (1 - gonfle) * k / 3)
+            c.coords(a, r0 - rin, r0 - rin, r0 + rin, r0 + rin)
+        pas_x, n = taille * 0.08, len(o["touches"])
+        for i, (objet, v) in enumerate(zip(o["touches"], touches)):
+            dx = (i - (n - 1) / 2.0) * pas_x
+            # jamais hors du disque sombre du milieu
+            corde = math.sqrt(max(0.0, rin * rin - dx * dx)) - o["largeur"]
+            h = max(0.5, min(corde, rin * 0.7) * max(v, 0.08 + 0.06 * souffle))
+            c.coords(objet, r0 + dx, r0 - h, r0 + dx, r0 + h)
+            c.itemconfigure(objet, fill=melange(self.BOULE_IVOIRE, rvb, 0.15 + 0.7 * max(0.0, min(1.0, v))))
 
     def animer(self):
         g = self.generation
@@ -12219,6 +12797,9 @@ class Panneau:
         self.txt_jarvis.pack(fill="x", pady=(6, 0))
         self.txt_jarvis_detail = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_jarvis_detail.pack(fill="x", pady=(2, 0))
+        # « IL MET DU TEMPS » : ou passe le temps du dernier echange, et le dernier echec
+        self.txt_jarvis_chrono = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_jarvis_chrono.pack(fill="x", pady=(2, 0))
         self.texte(f, "Dis « Jarvis », puis ta demande -- ou a la fin : « baisse le son, Jarvis ». Avant son nom, "
                       "rien ne sort du micro : un petit modele compare chaque instant a ton « Jarvis », sans "
                       "transcrire. Apres, la phrase est transcrite sur ce PC (le moteur de la dictee, telecharge "
@@ -12433,7 +13014,7 @@ class Panneau:
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
                 ("jarvis_panneau", "Son panneau en haut de l'ecran quand il est actif"),
-                ("jarvis_boule", "Une petite boule sur l'ecran qu'il regarde")):
+                ("jarvis_boule", "Une petite boule qui joue avec sa voix (et va sur l'ecran qu'il regarde)")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             self.vars_jarvis[cle] = v
             self.case(f, libelle, v, lambda c=cle: self.regler_jarvis(c)).pack(fill="x")
@@ -12574,7 +13155,8 @@ class Panneau:
         c.create_text(g, haut - self.px(3), text="REVEIL", fill=VIF, font=police, anchor="sw")
         c.create_text(x(verifie), haut - self.px(3), text="VERIFIE", fill=ETOILE, font=police, anchor="se")
         c.create_text(dr, haut - self.px(3), text="RATE", fill=BRUME, font=police, anchor="se")
-        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME}
+        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME,
+                  "lent": ETOILE, "sans_lecture": VIF, "trop_loin": BRUME}
         for k, e in enumerate(essais):
             if e.get("d") is None:
                 continue
@@ -12587,7 +13169,10 @@ class Panneau:
             e = essais[-1]
             quoi = {"reveil": "reveil direct", "confirme": "verifie : c'etait bien toi",
                     "verifier": "verification en cours...", "ecarte": "verifie : ce n'etait pas « Jarvis »",
-                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)"}
+                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)",
+                    "lent": "verification : la transcription demarre, un instant...",
+                    "sans_lecture": "pas lu a temps, mais tout pres de ta voix : reveille",
+                    "trop_loin": "pas lu a temps, et trop loin de ta voix pour deviner"}
             texte = "Dernier : %.3f -- %s." % (e["d"], quoi.get(e.get("issue"), e.get("issue")))
         else:
             texte = "Dis « Jarvis » : chaque essai apparait ici, a sa distance de ta voix apprise."
@@ -12904,6 +13489,10 @@ class Panneau:
         if n:
             details.append("%d minuteur(s)" % n)
         self.txt_jarvis_detail.configure(text=" · ".join(details))
+        if hasattr(self, "txt_jarvis_chrono"):
+            chrono = "\n".join(x for x in (texte_dernier_echange(), texte_derniere_erreur()) if x)
+            if self.txt_jarvis_chrono.cget("text") != chrono:
+                self.txt_jarvis_chrono.configure(text=chrono)
         a = JARVIS.get("apprentissage")
         self.txt_jarvis_appris.configure(text=(a or {}).get("message", ""))
         if voix_fr_choisie(self.cfg) != "piper":
@@ -13853,7 +14442,23 @@ def plus_recente(candidate, reference):
     return version_en_tuple(candidate) > version_en_tuple(reference)
 
 
+_SSL = {"contexte": None}
+
+
+def _oublier_contexte_ssl():
+    _SSL["contexte"] = None
+
+
 def _contexte_ssl():
+    """Le contexte SSL, construit une fois : relire le magasin de certificats
+    de Windows a chaque question a Jarvis coutait des dizaines de ms (il est
+    relu apres une erreur SSL, voir `_oublier_contexte_ssl`)."""
+    if _SSL["contexte"] is None:
+        _SSL["contexte"] = _nouveau_contexte_ssl()
+    return _SSL["contexte"]
+
+
+def _nouveau_contexte_ssl():
     """Le magasin de Windows passe en premier : c'est lui qui contient les
     autorites ajoutees par un antivirus ou un proxy d'entreprise, sans
     lesquelles la connexion echouerait. certifi ne sert que si ce magasin
