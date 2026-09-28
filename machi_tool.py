@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.65.0"
+VERSION = "1.65.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -16272,6 +16272,39 @@ def installer_ou_mettre_a_jour():
         return True
 
 
+COPIE_FIGEE_S = 8        # le temps qu'une copie vivante met, au plus, a se montrer
+
+
+def reveiller_ou_remplacer(attendre=None, maintenant=None, arreter=None, verrou=None):
+    """UNE COPIE TIENT DEJA LA PLACE. « Machi Tool ne s'ouvre plus : ni
+    icone, ni message » -- une copie restee figee (apres une mise a jour)
+    gardait le mutex, et chaque double-clic repartait sans un mot.
+
+    On lui demande de se montrer ; sa fenetre, si elle vit, efface la
+    demande en moins d'une seconde. Personne ne l'efface : elle est figee, on
+    la termine et CETTE copie demarre a sa place. Rend True si l'autre copie
+    a repondu (celle-ci s'en va), False si celle-ci doit demarrer."""
+    attendre = attendre or time.sleep
+    maintenant = maintenant or time.time
+    demander_panneau()
+    fin = maintenant() + COPIE_FIGEE_S
+    while maintenant() < fin:
+        if not os.path.exists(FICHIER_PANNEAU):
+            return True
+        attendre(0.25)
+    print("Une copie figee de Machi Tool tenait la place : elle est terminee.")
+    try:
+        os.remove(FICHIER_PANNEAU)
+    except OSError:
+        pass
+    (arreter or arreter_instances)(sys.executable)
+    for _ in range(20):
+        if not (verrou or deja_lance)():
+            return False
+        attendre(0.25)
+    return True
+
+
 def deja_lance():
     """Empeche deux copies simultanees."""
     try:
@@ -16518,8 +16551,6 @@ def lancer():
                 # sur l'exe et la fenetre qui parait. Cinq secondes de rien,
                 # apres un clic, se lisent comme « ca ne marche pas ».
                 time.sleep(1)
-                if relever_demande_panneau():
-                    demande_ouverture.set()
                 if relever_demande_synchro():
                     print("Synchro demandee par machitool://sync : envoi.")
                     synchroniser_activite(CFG, minimum=0)
@@ -16645,6 +16676,11 @@ def lancer():
                 TRAY["icone"].stop()
             except Exception:
                 pass
+        # « montre-toi », laisse par un second lancement : relu ICI, dans la
+        # boucle de la fenetre -- l'effacer prouve a l'autre copie que la
+        # fenetre vit (voir reveiller_ou_remplacer)
+        if relever_demande_panneau():
+            demande_ouverture.set()
         if demande_ouverture.is_set():
             demande_ouverture.clear()
             panneau.afficher()
@@ -16736,7 +16772,7 @@ def main():
     if FIGE:
         if installer_ou_mettre_a_jour():
             return
-        if deja_lance():
+        if deja_lance() and reveiller_ou_remplacer():
             return
     lancer()
 

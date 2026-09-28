@@ -45,6 +45,48 @@ class Demarrage(unittest.TestCase):
         with open(self.mt.FICHIER_CONFIG, "w", encoding="utf-8") as f:
             f.write(contenu if isinstance(contenu, str) else json.dumps(contenu))
 
+    # ---------------- une copie tient deja la place ----------------
+
+    def horloge(self):
+        t = [0.0]
+        return (lambda d: t.__setitem__(0, t[0] + d)), (lambda: t[0])
+
+    def test_une_copie_vivante_se_montre_celle_ci_s_en_va(self):
+        """« Machi Tool ne s'ouvre plus » : la copie deja lancee efface la
+        demande (sa fenetre vit) -- elle se montre, celle-ci part."""
+        mt = self.mt
+        attendre, maintenant = self.horloge()
+        tues = []
+
+        def attendre_et_repondre(d):
+            attendre(d)
+            if maintenant() >= 0.5 and os.path.exists(mt.FICHIER_PANNEAU):
+                os.remove(mt.FICHIER_PANNEAU)          # l'autre copie l'a lue
+        self.assertTrue(mt.reveiller_ou_remplacer(attendre_et_repondre, maintenant, tues.append, lambda: True))
+        self.assertEqual(tues, [], "on ne tue pas une copie vivante")
+
+    def test_une_copie_figee_est_remplacee(self):
+        """Personne n'efface la demande : la copie est figee (plus d'icone,
+        plus de fenetre, mais le mutex). On la termine et celle-ci demarre."""
+        mt = self.mt
+        attendre, maintenant = self.horloge()
+        tues, verrou = [], [True, True, False]
+        demarre = mt.reveiller_ou_remplacer(attendre, maintenant, tues.append, lambda: verrou.pop(0))
+        self.assertFalse(demarre, "celle-ci demarre a sa place")
+        self.assertEqual(tues, [sys.executable])
+        self.assertGreaterEqual(maintenant(), mt.COPIE_FIGEE_S)
+        self.assertFalse(os.path.exists(mt.FICHIER_PANNEAU), "pas de demande qui traine")
+
+    def test_la_demande_est_lue_par_la_boucle_de_la_fenetre(self):
+        # l'effacer doit prouver que la FENETRE vit : relue dans surveiller
+        # (la boucle de tkinter), plus dans un fil qui survivrait a une fenetre figee
+        src = open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8").read()
+        surveiller = src[src.index("    def surveiller():"):]
+        surveiller = surveiller[:surveiller.index("panneau.root.after(150, surveiller)")]
+        self.assertIn("relever_demande_panneau()", surveiller)
+        veille = src[src.index("    def veille_activite():"):src.index("threading.Thread(target=veille_activite")]
+        self.assertNotIn("relever_demande_panneau()", veille)
+
     # ---------------- la configuration ----------------
 
     def test_config_absente(self):
