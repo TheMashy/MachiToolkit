@@ -1966,7 +1966,7 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False, suspens=None)
+                        transcription_absente_dite=False, suspens=None, derniere_erreur=None)
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -2982,7 +2982,9 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.JARVIS["message"], "Le crédit de la clé API Claude est épuisé.")
         corps.update(error="quelque chose d'inattendu", raison="autre")
         self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
-        self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502. quelque chose d'inattendu")
+        # le detail brut du serveur ne se lit plus a voix haute : il est sur sa page
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502.")
+        self.assertIn("quelque chose d'inattendu", m.texte_derniere_erreur())
         corps.clear()
         self.phrase("Jarvis, raconte-moi une blague sur les pingouins")
         self.assertEqual(m.JARVIS["message"], "BrainDebugger a répondu par une erreur 502.", "un 502 de Railway, sans JSON")
@@ -4135,6 +4137,358 @@ class mock_urlopen:
     def __exit__(self, *a):
         self.m.urllib.request.urlopen = self.avant
         return False
+
+
+# ======================================================================
+#  ROBUSTESSE ET DIAGNOSTIC : le chronometre, la patience, les echecs
+# ======================================================================
+
+class RobustesseEtDiagnostic(unittest.TestCase):
+    """« Il met une plombe a repondre », « je lui parle et plus rien » : ou
+    passe le temps d'un echange, ce qu'il fait quand BrainDebugger tarde, et
+    ce qu'on sait d'un echec."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.m = charger_module(cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        DansMachiTool.setUp(self)
+        m = self.m
+        m.CHRONO["courant"] = None
+        m.CHRONOS.clear()
+        m._EN_VOL.clear()
+        del m._JARVIS_TRAVAIL[:]
+        m.CFG["jarvis_langue"] = "fr"
+        m._TRAVAIL_COURANT.update(tour=None, t=0.0)
+        m._GARDE.update(cle=None, sans_raison=None)
+        m._ONGLETS_AVANCE.update(fil=None, boite=None, t=0.0)
+        m.VOIX = m.Voix()
+        m.VOIX.disponible = False
+        self.sons = []
+        m.jouer_son = self.sons.append
+        consts = ("PATIENCE_S", "PATIENCE_REDIRE_S", "PATIENCE_DIRE_S", "ATTENTE_BD_MAX_S", "REESSAI_BD_S",
+                  "_requete_bd", "extension_branchee", "commande_onglets")
+        vrais = {k: getattr(m, k) for k in consts}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        vraie = urllib.request.urlopen
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", vraie))
+        m.REESSAI_BD_S = 0.0
+
+    def tearDown(self):
+        DansMachiTool.tearDown(self)
+
+    def journal(self, faire):
+        import contextlib
+        sortie = io.StringIO()
+        with contextlib.redirect_stdout(sortie):
+            faire()
+        return sortie.getvalue()
+
+    # --- le chronometre ---
+
+    def test_chaque_echange_est_chronometre_sans_rien_de_dit(self):
+        import socket as socket_
+        m = self.m
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            time.sleep(0.05)
+            sur_debut("Volontiers.")
+            time.sleep(0.05)
+            return {"texte": "Volontiers. Un pingouin entre dans un bar.", "mode": "jarvis"}
+        dits, _ = DansMachiTool._voix_et_bd(self, bd)
+        m.transcrire = lambda octets: "Jarvis, raconte-moi une blague sur les pingouins"
+        m.JARVIS["reveil_verifie"] = True
+        m.traiter_evenement({"evt": "phrase", "wav": base64.b64encode(b"RIFF....").decode(),
+                             "pause": 0.75, "fin_t": time.time() - 0.75})
+        item = m._JARVIS_TRAVAIL.pop(0)
+
+        def echange():
+            m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+            # la voix : la premiere phrase, puis la suite -- et c'est fini
+            a, b = socket_.socketpair()
+            for ev in ({"evt": "debut", "id": 1}, {"evt": "fini", "id": 1},
+                       {"evt": "debut", "id": 2}, {"evt": "fini", "id": 2}):
+                J.envoyer(a, ev)
+            a.close()
+            m._lire_voix(b)
+            b.close()
+        journal = self.journal(echange)
+        self.assertEqual([d["id"] for d in dits()], [1, 2])
+        self.assertEqual(len(m.CHRONOS), 1, journal)
+        r = m.CHRONOS[-1]
+        self.assertEqual((r["chemin"], r["issue"]), ("bd", "dit"))
+        for k in ("fin_de_phrase", "transcription", "contexte", "bd", "bd_fin", "voix", "premier_son", "total"):
+            self.assertIsNotNone(r[k], k)
+            self.assertGreaterEqual(r[k], 0.0, k)
+        self.assertGreaterEqual(r["fin_de_phrase"], 0.7)
+        self.assertGreaterEqual(r["bd"], 0.04, "BrainDebugger : jusqu'a sa premiere phrase")
+        self.assertGreaterEqual(r["bd_fin"], r["bd"])
+        self.assertGreaterEqual(r["premier_son"], r["fin_de_phrase"] + r["bd"])
+        self.assertLessEqual(r["premier_son"], r["total"])
+        ligne = [x for x in journal.splitlines() if "echange de" in x]
+        self.assertEqual(len(ligne), 1, journal)
+        for mot in ("blague", "pingouin", "Volontiers", "bar"):
+            self.assertNotIn(mot, ligne[0], "le journal ne garde jamais ce qui a ete dit")
+        self.assertRegex(m.texte_dernier_echange(),
+                         r"^Dernier echange \(\d\d:\d\d\) : fin de phrase 0,[78] s · transcription \d+,\d s · "
+                         r"(contexte \d+,\d s · )?BrainDebugger 0,\d s · voix \d+,\d s -- premier son a \d+,\d s\.$")
+
+    def test_le_chronometre_ne_grossit_pas(self):
+        m = self.m
+        def echanges():
+            for i in range(25):
+                m.JARVIS["tour"] = i
+                m.noter_temps("phrase", 0.5)
+                m.noter_temps("transcrit")
+            m.clore_temps("dit")
+        self.journal(echanges)
+        self.assertEqual(len(m.CHRONOS), 10)
+        self.assertEqual([r["issue"] for r in m.CHRONOS][-2:], ["interrompu", "dit"])
+        m.noter_temps("voix")                     # plus d'echange en cours : rien
+        self.assertIsNone(m.CHRONO["courant"])
+
+    # --- quand BrainDebugger tarde ---
+
+    def test_il_patiente_d_un_petit_son_quand_bd_tarde(self):
+        m = self.m
+        m.PATIENCE_S, m.PATIENCE_REDIRE_S, m.PATIENCE_DIRE_S = 0.1, 10.0, 100.0
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: (
+            time.sleep(0.45), {"texte": "Voila.", "mode": "jarvis"})[1]
+        tour = m.JARVIS["tour"]
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, tour))
+        self.assertEqual(self.sons.count("patience"), 1, self.sons)
+        self.assertEqual(self.dit, ["Voila."])
+
+        def bd(chemin, charge, cfg, delai, sur_debut=None):
+            sur_debut("Alors.")
+            time.sleep(0.45)
+            return {"texte": "Alors. Voila.", "mode": "jarvis"}
+        self.sons.clear()
+        m._requete_bd = bd
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, tour))
+        self.assertNotIn("patience", self.sons, "sa premiere phrase est la : pas de signe")
+
+    def test_un_instant_une_fois_si_ca_dure(self):
+        m = self.m
+        dits, _ = DansMachiTool._voix_et_bd(self, lambda chemin, charge, cfg, delai, sur_debut=None: (
+            time.sleep(0.7), {"texte": "Voila.", "mode": "jarvis"})[1])
+        m.PATIENCE_S, m.PATIENCE_REDIRE_S, m.PATIENCE_DIRE_S = 0.1, 0.1, 0.2
+        tour = m.JARVIS["tour"]
+
+        def ecouter_la_voix():
+            # la voix dit vite : « fini » arrive avant le signe suivant
+            while not m.VOIX.attentes:
+                time.sleep(0.01)
+            m.VOIX.fini(min(m.VOIX.attentes), False)
+        threading.Thread(target=ecouter_la_voix, daemon=True).start()
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, tour))
+        textes = [d["texte"] for d in dits()]
+        self.assertEqual(textes.count("Un instant."), 1, textes)
+        self.assertEqual(textes[-1], "Voila.")
+
+    def test_bd_muet_il_laisse_tomber_et_le_dit(self):
+        m = self.m
+        m.ATTENTE_BD_MAX_S = 0.3
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: time.sleep(3) or {"texte": "trop tard"}
+        t0 = time.monotonic()
+        journal = self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger ne répond pas.")
+        self.assertIn("BDMuet", m.JARVIS["derniere_erreur"][1])
+        self.assertIn("BDMuet", journal)
+
+    def test_une_requete_abandonnee_est_fermee(self):
+        m = self.m
+        fermee, lu = threading.Event(), threading.Event()
+
+        class Bloquee:
+            headers = {"Content-Type": "application/x-ndjson"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield b'{"debut": "Alors."}\n'
+                lu.set()
+                fermee.wait(5)             # BrainDebugger ecrit encore la suite
+
+            def close(self):
+                fermee.set()
+        urllib.request.urlopen = lambda req, **k: Bloquee()
+        tour = m.JARVIS["tour"]
+        threading.Timer(0.3, lambda: m.JARVIS.update(tour=tour + 1)).start()
+        with self.assertRaises(m.Annule):
+            m._requete_bd_annulable("/api/machitool/jarvis", {"texte": "x"}, m.CFG, 5, tour, sur_debut=lambda t: None)
+        self.assertTrue(lu.is_set())
+        self.assertTrue(fermee.wait(1.0), "la requete orpheline est fermee")
+        for _ in range(50):
+            if not m._EN_VOL:
+                break
+            time.sleep(0.02)
+        self.assertEqual(m._EN_VOL, {}, "le fil n'y reste pas pendu")
+
+    def test_il_reessaie_seulement_quand_c_est_sur(self):
+        import http.client
+        m = self.m
+        appels = []
+
+        def ouvrir(erreurs):
+            def faux(req, timeout=None, context=None):
+                appels.append(req)
+                if erreurs:
+                    raise erreurs.pop(0)
+                return FausseReponse(json.dumps({"texte": "Voila."}).encode())
+            return faux
+
+        def essai(*erreurs):
+            appels.clear()
+            urllib.request.urlopen = ouvrir(list(erreurs))
+            res = {}
+
+            def faire():
+                try:
+                    res["r"] = m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+                except BaseException as e:
+                    res["r"] = type(e).__name__
+            self.journal(faire)
+            return res["r"], len(appels)
+        # la connexion n'a pas pu se faire : rien n'est parti, il reessaie
+        self.assertEqual(essai(urllib.error.URLError(ConnectionRefusedError())), ({"texte": "Voila."}, 2))
+        self.assertEqual(essai(urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))),
+                         ({"texte": "Voila."}, 2))
+        # une page 502 du bord de Railway (pas du JSON), tout de suite : il reessaie
+        page = urllib.error.HTTPError("/x", 502, "Bad Gateway", {}, io.BytesIO(b"<html>Application failed</html>"))
+        self.assertEqual(essai(page), ({"texte": "Voila."}, 2))
+        # une erreur de BrainDebugger lui-meme, une coupure apres l'envoi : jamais
+        bd = urllib.error.HTTPError("/x", 502, "Bad Gateway", {}, io.BytesIO(b'{"error": "claude"}'))
+        self.assertEqual(essai(bd), ("HTTPError", 1))
+        self.assertEqual(essai(http.client.RemoteDisconnected("fermee")), ("RemoteDisconnected", 1))
+        self.assertEqual(essai(urllib.error.URLError(ConnectionResetError())), ("URLError", 1))
+        # une seule fois
+        self.assertEqual(essai(urllib.error.URLError(ConnectionRefusedError()),
+                               urllib.error.URLError(ConnectionRefusedError())), ("URLError", 2))
+
+    # --- les echecs ---
+
+    def test_un_echec_dit_court_et_garde_la_cause(self):
+        m = self.m
+
+        def panne(e):
+            def bd(chemin, charge, cfg, delai, sur_debut=None):
+                raise e
+            return bd
+        m._requete_bd = panne(urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")))
+        journal = self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertEqual(m.JARVIS["message"], "Je n'arrive pas à joindre BrainDebugger.")
+        self.assertIn("gaierror", journal)
+        self.assertIn("getaddrinfo failed", m.texte_derniere_erreur())
+        m._requete_bd = panne(socket.timeout("timed out"))
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertEqual(m.JARVIS["message"], "BrainDebugger ne répond pas.", "un silence n'est pas « injoignable »")
+        self.assertIn("timed out", m.texte_derniere_erreur())
+        self.assertEqual(m.texte_derniere_erreur(time.time() + 3600), "", "une demi-heure, pas plus")
+
+    def test_une_panne_de_transcription_se_dit_dans_la_langue(self):
+        # en anglais, la voix anglaise lisait 160 signes de francais technique
+        m = self.m
+        m.CFG["jarvis_langue"] = "en"
+
+        def casse(octets):
+            raise m.DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription")
+        m.transcrire = casse
+        self.journal(lambda: m.traiter_phrase(base64.b64encode(b"RIFF").decode(), m.CFG))
+        self.assertEqual(m.JARVIS["message"], "My transcription failed. The details are on the Jarvis page.")
+        self.assertIn("moteur de dictee", m.JARVIS["derniere_erreur"][1])
+
+    # --- avant la question ---
+
+    def test_le_contexte_ssl_se_construit_une_fois(self):
+        import ssl
+        m = self.m
+        n = []
+        vraie = ssl.create_default_context
+        self.addCleanup(lambda: setattr(ssl, "create_default_context", vraie))
+        ssl.create_default_context = lambda *a, **k: n.append(1) or vraie(*a, **k)
+        m._oublier_contexte_ssl()
+        with mock_urlopen(m, {"texte": "Voila."}):
+            m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+            apres_un = len(n)
+            m._requete_bd("/x", {"a": 1}, m.CFG, 5)
+        self.assertGreaterEqual(apres_un, 1)
+        self.assertEqual(len(n), apres_un, "le magasin de certificats n'est pas relu a chaque question")
+        self.assertIs(m._contexte_ssl(), m._contexte_ssl())
+
+    def test_les_onglets_ne_retardent_pas_la_question(self):
+        m = self.m
+        m.CFG["jarvis_pc"] = True
+        m.extension_branchee = lambda: True
+        lent = {"s": 1.5}
+        m.commande_onglets = lambda quoi, **k: time.sleep(lent["s"]) or {
+            "onglets": [{"titre": "Lo-fi beats", "url": "https://www.youtube.com/watch?v=1"}]}
+        vus = []
+        m._requete_bd = lambda chemin, charge, cfg, delai, sur_debut=None: (
+            vus.append((time.monotonic(), charge["onglets_ouverts"])), {"texte": "Voila.", "mode": "jarvis"})[1]
+        t0 = time.monotonic()
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertLess(vus[-1][0] - t0, 0.8, "l'extension lente ne fait plus attendre la question")
+        self.assertEqual(vus[-1][1], "")
+        # demandee pendant la transcription, elle est la a temps
+        lent["s"] = 0.05
+        m.lancer_onglets(m.CFG)
+        time.sleep(0.2)
+        self.journal(lambda: m.parler_a_jarvis("une question", m.CFG, m.JARVIS["tour"]))
+        self.assertIn("Lo-fi beats", vus[-1][1])
+
+    # --- le garde-fou des etats ---
+
+    def test_un_etat_sans_raison_revient_a_l_attente(self):
+        m = self.m
+        m.JARVIS.update(etat="parle", message="Je reponds.")
+        self.assertFalse(m.surveiller_etats(100.0), "un etat tout neuf a sa chance")
+        self.assertFalse(m.surveiller_etats(101.0))
+        journal = self.journal(lambda: self.assertTrue(m.surveiller_etats(105.1)))
+        self.assertIn("garde-fou", journal)
+        self.assertEqual(m.JARVIS["etat"], "attente")
+
+    def test_un_etat_qui_a_une_raison_reste(self):
+        m = self.m
+        m.JARVIS.update(etat="pense", message="Jarvis reflechit...")
+        m._TRAVAIL_COURANT["tour"] = m.JARVIS["tour"]            # il y travaille
+        for t in range(0, 40, 1):
+            self.assertFalse(m.surveiller_etats(200.0 + t))
+        m._TRAVAIL_COURANT["tour"] = None
+        m.VOIX.attentes[7] = None                              # il a encore a dire
+        m.JARVIS.update(etat="parle", message="Je reponds.")
+        for t in range(0, 40, 1):
+            self.assertFalse(m.surveiller_etats(300.0 + t))
+        m.VOIX.attentes.clear()
+        self.assertFalse(m.surveiller_etats(341.0))
+        self.assertTrue(m.surveiller_etats(346.0))
+
+    def test_rappele_pendant_les_outils_il_ne_repasse_pas_a_pense(self):
+        # « Jarvis, qu'est-ce qui joue ? » -- un outil lent -- « Jarvis » : la
+        # boule restait sur « il reflechit » jusqu'au prochain appel
+        m = self.m
+        tour = m.JARVIS["tour"]
+        m.JARVIS.update(tour=tour + 1, etat="ecoute", message="Je vous ecoute.")
+        with self.assertRaises(m.Annule):
+            m.continuer_jarvis({"texte": "x", "suite": [], "conv": tour, "tour": 1}, [], m.CFG)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        # et si l'etat etait deja ecrit trop tard, le garde-fou le rattrape
+        m.JARVIS.update(etat="pense", message="Jarvis agit...")
+        m.surveiller_etats(0.0)
+        m.surveiller_etats(1.0)
+        self.journal(lambda: m.surveiller_etats(11.5))
+        self.assertEqual(m.JARVIS["etat"], "attente")
 
 
 # ======================================================================

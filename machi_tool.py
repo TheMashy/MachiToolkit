@@ -4475,6 +4475,9 @@ JARVIS = {
     "souci": None,            # (message, t) : un souci de fond (le micro) -- sur sa page, pas a l'ecran
     "calme_jusqua": 0.0,      # on vient de le congedier : pas de replique spontanee d'ici la
     "reveil_verifie": False,  # le dernier reveil : son nom deja lu dans la transcription
+    # (ce qui a ete dit, le detail technique, t) : le dernier echec, pour sa page
+    # -- le panneau ne le montre qu'un instant
+    "derniere_erreur": None,
 }
 _OREILLE = {"proc": None, "sock": None, "echecs": 0, "prochain": 0.0}
 _OREILLE_VERROU = threading.Lock()
@@ -5203,6 +5206,7 @@ def _lire_voix(sock):
                 JARVIS["sous_titre"] = st
         elif quoi == "debut":
             # IL PARLE : l'oreille guette qu'on lui coupe la parole
+            noter_temps("voix")
             envoyer_oreille({"cmd": "parole", "actif": True})
             if ev.get("id") in SOUS_TITRES:
                 JARVIS["sous_titre"] = SOUS_TITRES[ev.get("id")]
@@ -5428,6 +5432,7 @@ class Voix:
                 self.couper.clear()
                 self.parle = True
                 dit = True
+                noter_temps("voix")
                 envoyer_oreille({"cmd": "parole", "actif": True})
                 try:
                     dit = self._sapi(texte, langue)
@@ -5726,6 +5731,7 @@ def traiter_evenement(ev):
             fin_de_l_ecoute()
     elif quoi == "phrase":
         # IL N'ECOUTE PLUS : ca se voit tout de suite (l'oreille a joue son petit son)
+        noter_temps("phrase", ev.get("pause"), ev.get("fin_t"))
         JARVIS["ecoute_fin"] = 0.0
         if JARVIS.get("etat") in ("ecoute", "attente"):
             poser_led("comprend")
@@ -5858,6 +5864,54 @@ def message_attente():
     return "Apprends-lui ta voix pour qu'il reconnaisse « Jarvis »."
 
 
+# LE GARDE-FOU DES ETATS. « Il reste bloque sur "il reflechit" jusqu'a ce que
+# je redise Jarvis » : un etat ecrit trop tard (la reponse d'un tour d'avant,
+# un « fini » que la voix n'enverra jamais) restait affiche pour toujours --
+# et bloquait les annonces. Un etat qui n'a plus de raison d'etre depuis
+# quelques secondes revient a l'attente.
+GARDE_ETATS_S = {"parle": 4.0, "pense": 10.0, "comprend": 10.0}
+_GARDE = {"cle": None, "depuis": 0.0, "sans_raison": None}
+
+
+def raison_d_etre(etat):
+    """Quelque chose justifie-t-il encore cet etat ?"""
+    if voix_occupee():
+        return True                       # il parle, ou il a encore a dire
+    if etat == "parle":
+        return False
+    # pense / comprend : une phrase en file, en travail, ou une requete en cours
+    # (une requete abandonnee qui traine encore ne compte pas)
+    return bool(_JARVIS_TRAVAIL or _TRAVAIL_COURANT.get("tour") is not None
+                or any(not v.get("annule") for v in list(_EN_VOL.values())))
+
+
+def surveiller_etats(maintenant=None):
+    """Appele chaque seconde par la veille. Rend True s'il a remis l'attente."""
+    maintenant = time.monotonic() if maintenant is None else maintenant
+    etat = JARVIS.get("etat")
+    cle = (etat, JARVIS.get("message"), JARVIS.get("tour"))
+    if cle != _GARDE["cle"]:
+        # un etat qui vient d'etre ecrit a toujours sa chance
+        _GARDE.update(cle=cle, depuis=maintenant, sans_raison=None)
+        return False
+    delai = GARDE_ETATS_S.get(etat)
+    if delai is None:
+        return False
+    if raison_d_etre(etat):
+        _GARDE["sans_raison"] = None
+        return False
+    if _GARDE["sans_raison"] is None:
+        _GARDE["sans_raison"] = maintenant
+    if maintenant - _GARDE["sans_raison"] < delai:
+        return False
+    print("Jarvis : garde-fou -- « %s » sans raison depuis %d s, retour a l'attente" % (etat, delai))
+    clore_temps("coince")
+    poser_led(None)
+    JARVIS.update(etat="attente", message=message_attente())
+    _GARDE.update(cle=None, sans_raison=None)
+    return True
+
+
 def veiller_sur_jarvis(cfg):
     """Tourne dans son fil : tient l'oreille ouverte quand on l'a demande,
     la ferme sinon, et la relance si elle tombe (de plus en plus lentement)."""
@@ -5922,6 +5976,8 @@ def veiller_sur_jarvis(cfg):
                     threading.Thread(target=preparer_vad, daemon=True).start()
             if not voulu and JARVIS["etat"] != "eteint" and _OREILLE["proc"] is None:
                 JARVIS.update(etat="eteint", message="")
+            if voulu:
+                surveiller_etats()
             # une tache de fond prete : il l'annonce des qu'il est libre (sans
             # attendre la guirlande, qui peut ne pas etre branchee)
             try:
@@ -5962,14 +6018,31 @@ def fil_jarvis_travail(cfg):
         _JARVIS_TRAVAIL_SIGNAL.clear()
         while _JARVIS_TRAVAIL:
             item = _JARVIS_TRAVAIL.pop(0)
+            _TRAVAIL_COURANT.update(tour=item.get("tour"), t=time.monotonic())
+            if item.get("wav"):
+                lancer_onglets(cfg)          # pendant la transcription (voir `onglets_attendus`)
             try:
                 traiter_phrase(item["wav"], cfg, item.get("apres_coupure", False), deja_dit=item.get("deja_dit", False),
                                breve=item.get("breve", False), tour=item.get("tour"))
+                if not voix_occupee():
+                    clore_temps("sans voix")   # un son, une commande muette, une phrase en suspens
             except Annule:
-                pass                         # congedie ou rappele pendant qu'il y pensait
+                clore_temps("annule")        # congedie ou rappele pendant qu'il y pensait
             except Exception as e:
                 print("Jarvis : phrase non traitee (%s)" % type(e).__name__)
-                signaler_erreur(phrase("rate", langue_du_mode(cfg)))
+                signaler_erreur(phrase("rate", langue_du_mode(cfg)), detail="phrase non traitee : %s" % type(e).__name__)
+            finally:
+                _TRAVAIL_COURANT.update(tour=None, t=time.monotonic())
+
+
+# ce que traite le fil de travail (tour, depuis quand) : le garde-fou des etats
+# sait ainsi qu'un « pense » a encore une raison d'etre
+_TRAVAIL_COURANT = {"tour": None, "t": 0.0}
+
+
+def voix_occupee():
+    """Dit-il quelque chose, ou a-t-il quelque chose a dire ?"""
+    return bool(VOIX.parle or VOIX.attentes or getattr(VOIX, "file", None))
 
 
 def demarrer_jarvis(cfg):
@@ -6056,6 +6129,10 @@ _PHRASES = {
     "api_limite": ("Trop de demandes à Claude d'un coup. Réessayez dans une minute.",
                    "Too many requests to Claude at once. Try again in a minute."),
     "bd_injoignable": ("Je n'arrive pas à joindre BrainDebugger.", "I can't reach BrainDebugger."),
+    "bd_muet": ("BrainDebugger ne répond pas.", "BrainDebugger isn't answering."),
+    "bd_lent": ("Un instant.", "One moment."),
+    "transcription_moteur": ("Ma transcription a échoué. Le détail est sur la page Jarvis.",
+                             "My transcription failed. The details are on the Jarvis page."),
     "compagnon_muet": ("Le compagnon n'a rien répondu.", None),
     "sans_reponse": ("Je n'ai rien à répondre à cela, curieusement.", "Curiously, I have nothing to say to that."),
     "dormir": ("Très bien. Je cesse d'écouter ; vous me réveillerez depuis Machi Tool.",
@@ -6312,6 +6389,7 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
     def fin():
         if JARVIS.get("tour") != t0:
             return                                 # congedie pendant qu'il parlait
+        clore_temps("dit", t0)
         if ecouter and oreille_vivante():
             jouer_son("eveil")
             attente = _jv.attente_suite(texte, echanges_en_cours(), mode)
@@ -6383,15 +6461,145 @@ def dire_et_attendre(texte, langue=None, delai=30.0):
     return fini.is_set()
 
 
+# ---------- le chronometre d'un echange ----------
+#
+# « IL MET UNE PLOMBE A REPONDRE » -- mais ou ? La pause de fin de phrase, la
+# transcription, BrainDebugger (et Claude), la voix ? Chaque echange garde ses
+# temps -- des nombres, jamais ce qui a ete dit : une ligne au journal, et la
+# page Jarvis montre le dernier, pour qu'on sache enfin ce qui est lent.
+
+CHRONO = {"courant": None}          # l'echange en cours : {"tour", "mur", "pause", "t": {etape: monotonic}}
+CHRONOS = deque(maxlen=10)          # les derniers echanges, le plus recent a la fin
+_CHRONO_DERNIERES = ("bd_fin",)     # les tours d'outils : la derniere reponse compte
+
+
+def noter_temps(etape, pause=None, fin_t=None):
+    """Un point du chronometre. « phrase » ouvre un echange (l'oreille rend ta
+    phrase : `pause`, le silence qu'elle a attendu ; `fin_t`, l'heure ou tu
+    t'es tu). Les autres etapes -- transcrit, bd_envoi, bd_debut, bd_fin,
+    voix -- ne comptent que pour l'echange en cours, et la premiere fois."""
+    try:
+        m = time.monotonic()
+        if etape == "phrase":
+            if CHRONO["courant"] is not None:
+                clore_temps("interrompu")
+            debut = m
+            if fin_t is not None:
+                debut = m - max(0.0, min(60.0, time.time() - float(fin_t)))
+            elif pause is not None:
+                debut = m - max(0.0, float(pause))
+            CHRONO["courant"] = {"tour": JARVIS.get("tour"), "mur": time.time(), "pause": pause,
+                                 "t": {"fin_parole": debut, "phrase": m}}
+            return
+        c = CHRONO["courant"]
+        if c is None or c["tour"] != JARVIS.get("tour"):
+            return
+        t = c["t"]
+        # « Un instant. » (il patiente) n'est pas le premier son de la reponse
+        if etape == "voix" and "bd_envoi" in t and "bd_debut" not in t and "bd_fin" not in t:
+            return
+        if etape in _CHRONO_DERNIERES or etape not in t:
+            t[etape] = m
+    except Exception:
+        pass
+
+
+def clore_temps(issue, tour=None):
+    """Ferme l'echange en cours (dit, erreur, annule...) : ses temps vont dans
+    CHRONOS et au journal, en une ligne."""
+    c = CHRONO["courant"]
+    if c is None or (tour is not None and c["tour"] != tour):
+        return None
+    CHRONO["courant"] = None
+    try:
+        c["t"].setdefault("fin", time.monotonic())
+        r = resume_temps(c, issue)
+        CHRONOS.append(r)
+        print(ligne_temps(r))
+        return r
+    except Exception as e:
+        print("Jarvis : chronometre (%s)" % type(e).__name__)
+        return None
+
+
+def resume_temps(c, issue):
+    """Les durees d'un echange, en secondes : chaque segment, puis le premier
+    son et la fin comptes depuis le moment ou tu t'es tu."""
+    t = c["t"]
+    d = lambda a, b: round(max(0.0, t[b] - t[a]), 2) if a in t and b in t else None
+    reponse = "bd_debut" if "bd_debut" in t else "bd_fin" if "bd_fin" in t else "transcrit"
+    return {"heure": time.strftime("%H:%M:%S", time.localtime(c["mur"])), "issue": issue,
+            "chemin": "bd" if "bd_envoi" in t else "ici", "pause": c.get("pause"),
+            "fin_de_phrase": d("fin_parole", "phrase"), "transcription": d("phrase", "transcrit"),
+            "contexte": d("transcrit", "bd_envoi"), "bd": d("bd_envoi", "bd_debut" if "bd_debut" in t else "bd_fin"),
+            "bd_fin": d("bd_envoi", "bd_fin"), "voix": d(reponse, "voix"),
+            "premier_son": d("fin_parole", "voix"), "total": d("fin_parole", "fin")}
+
+
+def ligne_temps(r):
+    """La ligne du journal (datee : un journal copie dit enfin ou ca traine)."""
+    noms = (("fin_de_phrase", "fin de phrase"), ("transcription", "transcription"), ("contexte", "contexte"),
+            ("bd", "BD 1re phrase"), ("bd_fin", "BD fin"), ("voix", "voix"))
+    bouts = ["%s %.2f" % (nom, r[k]) for k, nom in noms if r.get(k) is not None]
+    fin = [("1er son a %.2f s" % r["premier_son"]) if r.get("premier_son") is not None else "sans voix"]
+    if r.get("total") is not None:
+        fin.append("fin a %.2f s" % r["total"])
+    return "Jarvis : echange de %s (%s, %s) -- %s | %s" % (r["heure"], r["chemin"], r["issue"],
+                                                        " | ".join(bouts) or "-", " | ".join(fin))
+
+
+def _secondes(x):
+    return ("%.1f s" % x).replace(".", ",")
+
+
+def texte_dernier_echange():
+    """Pour la page Jarvis : « Dernier echange (14:03) : fin de phrase 0,8 s ·
+    transcription 0,4 s · BrainDebugger 1,6 s · voix 0,2 s -- premier son a
+    3,0 s. » Et le premier son des echanges d'avant."""
+    if not CHRONOS:
+        return ""
+    r = CHRONOS[-1]
+    noms = (("fin_de_phrase", "fin de phrase"), ("transcription", "transcription"),
+            ("contexte", "contexte"), ("bd", "BrainDebugger"), ("voix", "voix"))
+    bouts = ["%s %s" % (nom, _secondes(r[k])) for k, nom in noms if r.get(k) is not None
+             and (k != "contexte" or r[k] >= 0.05)]
+    txt = "Dernier echange (%s) : %s" % (r["heure"][:5], " · ".join(bouts) or "-")
+    if r.get("premier_son") is not None:
+        txt += " -- premier son a %s" % _secondes(r["premier_son"])
+    if r.get("issue") not in ("dit",):
+        txt += " (%s)" % r["issue"]
+    avant = [_secondes(x["premier_son"]) for x in list(CHRONOS)[-6:-1] if x.get("premier_son") is not None]
+    if avant:
+        txt += ".  Avant : " + " · ".join(reversed(avant))
+    return txt + "."
+
+
+def texte_derniere_erreur(maintenant=None):
+    """Le dernier echec, lisible sur la page Jarvis pendant une demi-heure (le
+    panneau ne le montre que le temps de le dire)."""
+    e = JARVIS.get("derniere_erreur")
+    maintenant = time.time() if maintenant is None else maintenant
+    if not e or maintenant - e[2] > 1800:
+        return ""
+    return "Dernier echec (%s) : %s" % (time.strftime("%H:%M", time.localtime(e[2])), (e[1] or e[0])[:240])
+
+
 ERREUR_MONTREE_S = 2.5
 
 
-def signaler_erreur(texte, tour=None):
+def signaler_erreur(texte, tour=None, detail=None):
     """Ce qui a rate, APRES une demande : il le dit (et le panneau l'ecrit),
     ou le panneau montre ERREUR un instant. Jamais pour un souci de fond (voir
-    `souci`), et jamais pour un tour d'avant."""
+    `souci`), et jamais pour un tour d'avant.
+
+    « JE NE SAIS PAS POURQUOI CA N'A PAS MARCHE » : il dit une phrase courte ;
+    le detail technique (`detail`) va au journal et reste sur sa page."""
+    # une ligne au journal pour chaque echec (la phrase ou le detail, jamais ce qu'on a dit)
+    print("Jarvis : echec -- %s" % str(detail or texte)[:240])
     if tour is not None and JARVIS.get("tour") != tour:
         return
+    JARVIS["derniere_erreur"] = (str(texte or ""), str(detail or ""), time.time())
+    clore_temps("erreur")
     poser_led("erreur", 1.6)
     jouer_son("erreur")
     JARVIS["erreur_jusqua"] = time.time() + ERREUR_MONTREE_S
@@ -6410,31 +6618,150 @@ class Annule(BaseException):
     l'attrapent pas -- il n'y a rien a dire.)"""
 
 
+class BDMuet(TimeoutError):
+    """BrainDebugger n'a rien rendu -- ni premiere phrase, ni reponse -- en
+    ATTENTE_BD_MAX_S : « il ne repond pas », pas « injoignable »."""
+
+
+# « JE LUI PARLE ET PLUS RIEN » : BrainDebugger tarde (Railway qui redemarre,
+# Claude surcharge, une recherche sur le web). Sans premiere phrase, un tout
+# petit son dit qu'il y pense encore, puis « Un instant. » une fois ; au-dela
+# d'ATTENTE_BD_MAX_S, il laisse tomber et le dit.
+PATIENCE_S = 4.0
+PATIENCE_REDIRE_S = 8.0
+PATIENCE_DIRE_S = 12.0
+ATTENTE_BD_MAX_S = 90.0             # une recherche sur le web met 20 a 40 s avant sa premiere phrase
+
+# Les requetes a BrainDebugger en cours, par fil : {"r": la reponse ouverte,
+# "annule": True}. Une requete abandonnee (congedie, rappele, trop longue) est
+# fermee : le fil ne reste pas pendu a une reponse que personne n'entendra.
+_EN_VOL = {}
+
+
+def _fermer_reponse(r):
+    """Ferme une reponse ouverte depuis un autre fil. La socket d'abord (la
+    lecture en cours se debloque), puis la reponse."""
+    try:
+        sock = getattr(getattr(getattr(r, "fp", None), "raw", None), "_sock", None)
+        if sock is not None:
+            sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        r.close()
+    except Exception:
+        pass
+
+
+def abandonner_requete(ident):
+    vol = _EN_VOL.get(ident)
+    if vol is None:
+        return False
+    vol["annule"] = True
+    if vol.get("r") is not None:
+        # dans son fil : fermer peut attendre que la lecture rende la main
+        threading.Thread(target=_fermer_reponse, args=(vol["r"],), daemon=True).start()
+    return True
+
+
+def requete_en_vol(ident=None):
+    """La requete de ce fil (ou de `ident`) a-t-elle ete abandonnee ? Rend son
+    entree (ou None)."""
+    return _EN_VOL.get(threading.get_ident() if ident is None else ident)
+
+
+def patienter(attente, deja_dit):
+    """Un signe pendant qu'il attend BrainDebugger : le petit son, et une fois
+    « Un instant. ». Rend True si « Un instant. » est parti."""
+    if JARVIS.get("etat") in ("pense", "comprend"):
+        JARVIS["message"] = "Jarvis reflechit... (BrainDebugger met du temps : %d s)" % attente
+    if VOIX.parle:
+        return False
+    L = langue_du_mode()
+    if (not deja_dit and attente >= PATIENCE_DIRE_S and CFG.get("jarvis_voix", True)
+            and VOIX.peut_parler()):
+        VOIX.dire(phrase("bd_lent", L), None, L)
+        return True
+    jouer_son("patience")
+    return False
+
+
 def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None):
     """_requete_bd, mais on n'attend plus des que la conversation a change (un
     nouveau reveil, « tais-toi », un clic sur le panneau) : Annule, et la
-    reponse, si elle arrive, part a la poubelle. Il repondait encore apres
-    qu'on l'avait congedie -- et la phrase suivante attendait derriere."""
+    requete est fermee. Il repondait encore apres qu'on l'avait congedie -- et
+    la phrase suivante attendait derriere.
+
+    Tant qu'aucune phrase n'est venue : un signe de loin en loin (voir
+    `patienter`), et BDMuet au bout d'ATTENTE_BD_MAX_S."""
+    noter_temps("bd_envoi")
+    vu = {"debut": None}
+
+    def debut(texte):
+        if vu["debut"] is None:
+            vu["debut"] = time.monotonic()
+            noter_temps("bd_debut")
+        sur_debut(texte)
+    en_flux = debut if sur_debut is not None else None
     if tour is None:
-        return _requete_bd(chemin, charge, cfg, delai, sur_debut)
+        r = _requete_bd(chemin, charge, cfg, delai, en_flux)
+        noter_temps("bd_fin")
+        return r
     boite, fini = {}, threading.Event()
 
     def faire():
+        _EN_VOL[threading.get_ident()] = {"r": None, "annule": False}
         try:
-            boite["r"] = _requete_bd(chemin, charge, cfg, delai, sur_debut)
+            boite["r"] = _requete_bd(chemin, charge, cfg, delai, en_flux)
         except BaseException as e:
             boite["e"] = e
         finally:
+            _EN_VOL.pop(threading.get_ident(), None)
             fini.set()
-    threading.Thread(target=faire, daemon=True).start()
-    while not fini.wait(0.1):
-        if JARVIS.get("tour") != tour:
-            raise Annule()
+    fil = threading.Thread(target=faire, daemon=True)
+    fil.start()
+    t0, signe, dit = time.monotonic(), PATIENCE_S, False
+    try:
+        while not fini.wait(0.1):
+            if JARVIS.get("tour") != tour:
+                raise Annule()
+            attente = time.monotonic() - t0
+            if vu["debut"] is not None:
+                continue
+            if attente >= ATTENTE_BD_MAX_S:
+                raise BDMuet("rien en %d s" % ATTENTE_BD_MAX_S)
+            if attente >= signe:
+                signe = attente + PATIENCE_REDIRE_S
+                dit = patienter(attente, dit) or dit
+    except BaseException:
+        abandonner_requete(fil.ident)
+        raise
     if JARVIS.get("tour") != tour:
         raise Annule()
     if "e" in boite:
         raise boite["e"]
+    noter_temps("bd_fin")
     return boite.get("r")
+
+
+def echec_bd(e, L, tour, pour="jarvis", t0=None):
+    """Ce qu'il dit quand BrainDebugger n'a pas repondu : une erreur (voir
+    `erreur_bd`), un silence trop long (« ne repond pas ») ou pas de
+    connexion (« injoignable »). La cause exacte au journal et sur sa page
+    -- « injoignable » pouvait etre un nom introuvable, un pare-feu, une
+    reponse coupee, et personne ne savait laquelle."""
+    duree = "" if t0 is None else ", apres %.1f s" % (time.monotonic() - t0)
+    if isinstance(e, urllib.error.HTTPError):
+        corps = _corps_http(e)
+        detail = "BrainDebugger %s : %s%s" % (e.code, str(corps.get("error") or corps.get("raison")
+                                                           or e.reason or "")[:160], duree)
+        return signaler_erreur(erreur_bd(e, L, pour=pour), tour, detail=detail)
+    cause = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else e
+    muet = isinstance(cause, (TimeoutError, socket.timeout))
+    cause = cause if isinstance(cause, BaseException) else e
+    detail = "BrainDebugger %s -- %s: %s%s" % ("ne repond pas" if muet else "injoignable", type(cause).__name__,
+                                               str(cause)[:120], duree)
+    return signaler_erreur(phrase("bd_muet" if muet else "bd_injoignable", L), tour, detail=detail)
 
 
 def veut_partir(texte, brut=""):
@@ -6491,8 +6818,9 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
         return JARVIS.update(etat="attente", message=phrase("transcription_absente", "fr"))
     try:
         texte = transcrire(octets)
+        noter_temps("transcrit")
     except DicteeImpossible as e:
-        return signaler_erreur(str(e)[:160], tour)
+        return signaler_erreur(phrase("transcription_moteur", L), tour, detail=str(e)[:240])
     except Exception as e:
         print("Jarvis : transcription impossible (%s)" % type(e).__name__)
         return signaler_erreur(phrase("transcription_ratee", L), tour)
@@ -6749,16 +7077,66 @@ def _requete_bd(chemin, charge, cfg, delai, sur_debut=None):
                "X-Fuseau": "UTC" if not decalage else "Etc/GMT%+d" % -decalage}
     corps = None if charge is None else json.dumps(charge, ensure_ascii=False).encode("utf-8")
     requete = urllib.request.Request(base + chemin, data=corps, headers=entetes)
-    with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
-        if sur_debut is None or "ndjson" not in str(r.headers.get("Content-Type") or ""):
-            return json.loads(r.read().decode("utf-8"))
-        return _lire_flux_bd(r, base + chemin, sur_debut)
+    vol = requete_en_vol()
+    for essai in (1, 2):
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl()) as r:
+                if vol is not None:
+                    vol["r"] = r                 # abandonnee (voir `abandonner_requete`) : on la ferme
+                    if vol.get("annule"):
+                        raise Annule()
+                if sur_debut is None or "ndjson" not in str(r.headers.get("Content-Type") or ""):
+                    return json.loads(r.read().decode("utf-8"))
+                return _lire_flux_bd(r, base + chemin, sur_debut)
+        except urllib.error.URLError as e:
+            if isinstance(getattr(e, "reason", None), _ssl_erreurs()):
+                _oublier_contexte_ssl()          # un magasin de certificats perime : relu la prochaine fois
+            if essai == 2 or (vol is not None and vol.get("annule")) or not reessai_sur(e, time.monotonic() - t0):
+                raise
+            print("Jarvis : BrainDebugger -- %s, je reessaie une fois" % _cause_courte(e))
+            time.sleep(REESSAI_BD_S)
+
+
+REESSAI_BD_S = 0.8
+
+
+def _ssl_erreurs():
+    try:
+        import ssl
+        return (ssl.SSLError, ssl.CertificateError)
+    except Exception:
+        return ()
+
+
+def _cause_courte(e):
+    c = getattr(e, "reason", None) if isinstance(e, urllib.error.URLError) else None
+    c = c if isinstance(c, BaseException) else e
+    return "%s: %s" % (type(c).__name__, str(c)[:120])
+
+
+def reessai_sur(e, duree):
+    """Reessayer une requete a BrainDebugger n'est sur que si elle n'a PAS pu
+    le mettre au travail : il execute des outils (l'agenda, le carnet) pendant
+    la requete, et une seconde fois les poserait deux fois. Donc : le nom
+    introuvable, la connexion refusee ou pas etablie, la poignee de main TLS
+    (urllib ne les leve en URLError qu'avant la reponse) ; ou une page 502/503/504
+    du bord de Railway -- pas du JSON de BrainDebugger -- rendue tout de suite
+    (l'appli redemarre). Jamais une connexion coupee apres l'envoi."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (502, 503, 504) and duree < 2.0 and not _corps_http(e)
+    cause = getattr(e, "reason", None)
+    return isinstance(cause, (socket.gaierror, ConnectionRefusedError, socket.timeout, TimeoutError)
+                      + _ssl_erreurs())
 
 
 def _lire_flux_bd(r, url, sur_debut):
     """Les lignes d'une reponse en flux : l'avance, puis la fin (ou l'erreur,
     rendue comme BrainDebugger la rendait avant : une HTTPError)."""
+    vol = requete_en_vol()
     for ligne in r:
+        if vol is not None and vol.get("annule"):
+            raise Annule()                         # plus personne ne l'attend
         ligne = ligne.strip()
         if not ligne:
             continue
@@ -6804,7 +7182,7 @@ def _corps_http(e):
 def erreur_bd(e, L, pour="jarvis"):
     """Ce qu'il dit quand BrainDebugger repond une erreur -- la CAUSE, quand on
     la connait (« BrainDebugger a repondu par une erreur 502 » ne disait pas
-    quoi faire). Le detail va aussi au panneau et au journal."""
+    quoi faire). Le detail va au journal et sur sa page."""
     corps = _corps_http(e)
     detail, raison = str(corps.get("error") or ""), str(corps.get("raison") or "")
     if detail:
@@ -6817,7 +7195,9 @@ def erreur_bd(e, L, pour="jarvis"):
         return phrase("api_" + raison, L)
     if "clé API" in detail:
         return phrase("bd_sans_cle", L)
-    return phrase("bd_erreur", L, e.code) + ((" " + detail[:160]) if detail and L == "fr" else "")
+    # le detail (souvent l'anglais du SDK) ne se lit plus a voix haute : il est
+    # au journal et sur sa page (voir `echec_bd`)
+    return phrase("bd_erreur", L, e.code)
 
 
 def parler_au_compagnon(texte, cfg, tour=None):
@@ -6827,12 +7207,11 @@ def parler_au_compagnon(texte, cfg, tour=None):
     poser_led("pense")
     JARVIS.update(etat="pense", message="Le compagnon reflechit...")
     print("Jarvis : message au compagnon (%d signes)" % len(texte))
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/parler", {"texte": texte}, cfg, 180, tour)
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, "fr", pour="psy"), tour)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", "fr"), tour)
+    except Exception as e:
+        return echec_bd(e, "fr", tour, pour="psy", t0=t0)
     reponse = str((donnees or {}).get("texte") or "").strip()
     if not reponse:
         return signaler_erreur(phrase("compagnon_muet", "fr"), tour)
@@ -7471,6 +7850,50 @@ def onglets_du_moment():
     except Exception:
         return ""
     return liste_onglets([o for o in onglets if isinstance(o, dict)], par_famille=6, titre_max=60)
+
+
+# « IL MET DU TEMPS A DEMARRER » : la liste des onglets demandait jusqu'a 1,5 s
+# a l'extension (morte depuis peu, elle passait encore pour branchee), APRES la
+# transcription. Elle part maintenant PENDANT la transcription (voir
+# `fil_jarvis_travail`), et la question ne l'attend guere plus.
+ONGLETS_BUDGET_S = 0.3
+_ONGLETS_AVANCE = {"fil": None, "boite": None, "t": 0.0}
+
+
+def lancer_onglets(cfg):
+    """Demande la liste des onglets en avance, dans son fil."""
+    if not cfg.get("jarvis_pc") or not extension_branchee():
+        return None
+    boite = {}
+
+    def faire():
+        try:
+            boite["r"] = onglets_du_moment()
+        except Exception:
+            boite["r"] = ""
+    fil = threading.Thread(target=faire, daemon=True)
+    _ONGLETS_AVANCE.update(fil=fil, boite=boite, t=time.monotonic())
+    fil.start()
+    return fil
+
+
+def onglets_attendus(cfg, budget=None):
+    """La liste des onglets pour la question : celle demandee en avance (ou
+    demandee maintenant), attendue au plus `budget` secondes -- sinon rien :
+    Jarvis n'attend pas l'extension."""
+    if not cfg.get("jarvis_pc"):
+        return ""
+    budget = ONGLETS_BUDGET_S if budget is None else budget
+    a = _ONGLETS_AVANCE
+    if a["fil"] is None or time.monotonic() - a["t"] > 10.0:
+        if lancer_onglets(cfg) is None:
+            return ""
+    fil, boite = a["fil"], a["boite"]
+    a.update(fil=None, boite=None)                 # une liste sert une fois
+    fil.join(budget)
+    if "r" not in boite:
+        print("Jarvis : les onglets tardent, la question part sans eux")
+    return boite.get("r") or ""
 
 
 EXTENSION_MANIFESTE = {
@@ -8388,19 +8811,22 @@ def continuer_jarvis(etat, resultats, cfg):
     """Renvoie a BrainDebugger ce que les outils ont fait ; Jarvis continue."""
     L = langue_jarvis(cfg)
     conv = etat.get("conv")
+    if conv is not None and JARVIS.get("tour") != conv:
+        # congedie ou rappele pendant les outils : il ne repasse pas a « pense »
+        # par-dessus la nouvelle ecoute (la boule y restait coincee)
+        raise Annule()
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis agit...")
     avance = {}
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"suite": etat["suite"], "resultats": resultats, "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
                                         sur_debut=lambda t: dire_en_avance(t, L, conv, avance))
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, L), conv)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", L), conv)
+    except Exception as e:
+        return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1, conv, avance)
 
 
@@ -8496,17 +8922,16 @@ def parler_a_jarvis(texte, cfg, conv=None):
     JARVIS.update(etat="pense", message="Jarvis reflechit...")
     print("Jarvis : question au majordome (%d signes)" % len(texte))
     avance = {}
+    t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                                              "onglets_ouverts": onglets_du_moment() if cfg.get("jarvis_pc") else ""},
+                                              "onglets_ouverts": onglets_attendus(cfg)},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
                                         sur_debut=lambda t: dire_en_avance(t, L, conv, avance))
-    except urllib.error.HTTPError as e:
-        return signaler_erreur(erreur_bd(e, L), conv)
-    except Exception:
-        return signaler_erreur(phrase("bd_injoignable", L), conv)
+    except Exception as e:
+        return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(texte, donnees, cfg, 1, conv, avance)
 
 
@@ -12051,6 +12476,9 @@ class Panneau:
         self.txt_jarvis.pack(fill="x", pady=(6, 0))
         self.txt_jarvis_detail = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_jarvis_detail.pack(fill="x", pady=(2, 0))
+        # « IL MET DU TEMPS » : ou passe le temps du dernier echange, et le dernier echec
+        self.txt_jarvis_chrono = self.texte(f, "", BRUME, 8, largeur=500)
+        self.txt_jarvis_chrono.pack(fill="x", pady=(2, 0))
         self.texte(f, "Dis « Jarvis », puis ta demande -- ou a la fin : « baisse le son, Jarvis ». Avant son nom, "
                       "rien ne sort du micro : un petit modele compare chaque instant a ton « Jarvis », sans "
                       "transcrire. Apres, la phrase est transcrite sur ce PC (le moteur de la dictee, telecharge "
@@ -12736,6 +13164,10 @@ class Panneau:
         if n:
             details.append("%d minuteur(s)" % n)
         self.txt_jarvis_detail.configure(text=" · ".join(details))
+        if hasattr(self, "txt_jarvis_chrono"):
+            chrono = "\n".join(x for x in (texte_dernier_echange(), texte_derniere_erreur()) if x)
+            if self.txt_jarvis_chrono.cget("text") != chrono:
+                self.txt_jarvis_chrono.configure(text=chrono)
         a = JARVIS.get("apprentissage")
         self.txt_jarvis_appris.configure(text=(a or {}).get("message", ""))
         if voix_fr_choisie(self.cfg) != "piper":
@@ -13685,7 +14117,23 @@ def plus_recente(candidate, reference):
     return version_en_tuple(candidate) > version_en_tuple(reference)
 
 
+_SSL = {"contexte": None}
+
+
+def _oublier_contexte_ssl():
+    _SSL["contexte"] = None
+
+
 def _contexte_ssl():
+    """Le contexte SSL, construit une fois : relire le magasin de certificats
+    de Windows a chaque question a Jarvis coutait des dizaines de ms (il est
+    relu apres une erreur SSL, voir `_oublier_contexte_ssl`)."""
+    if _SSL["contexte"] is None:
+        _SSL["contexte"] = _nouveau_contexte_ssl()
+    return _SSL["contexte"]
+
+
+def _nouveau_contexte_ssl():
     """Le magasin de Windows passe en premier : c'est lui qui contient les
     autorites ajoutees par un antivirus ou un proxy d'entreprise, sans
     lesquelles la connexion echouerait. certifi ne sert que si ce magasin
