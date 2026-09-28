@@ -5652,6 +5652,15 @@ def traiter_evenement(ev):
             JARVIS["micro_absent"] = not ev.get("trouve", True)
             if JARVIS["micro_absent"]:
                 print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
+    elif quoi == "essai" and ev.get("maj"):
+        # ce qu'est devenu l'appel pas net en attente de lecture : « lent » (le
+        # moteur de transcription demarre), ou tranche au score sans lecture
+        for e in reversed(JARVIS.get("essais") or []):
+            if e.get("issue") in ("verifier", "lent"):
+                e["issue"] = str(ev.get("issue") or "")
+                break
+        if ev.get("issue") == "lent":
+            print("Jarvis : la verification tarde (moteur de transcription froid ?)")
     elif quoi == "essai":
         # L'INDICATEUR DE DETECTION : chaque mot proche de « Jarvis », sa
         # distance, les deux seuils, et ce qui en est sorti
@@ -5683,7 +5692,8 @@ def traiter_evenement(ev):
         JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=0.0, parole_vue=time.time())
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "reveil":
-        print("Jarvis : eveil (%s%s)" % (ev.get("par"), ", verifie" if ev.get("verifie") else ""))
+        print("Jarvis : eveil (%s%s)" % (ev.get("par"), ", verifie" if ev.get("verifie") else
+                                         ", sans lecture : le score a tranche" if ev.get("repli") else ""))
         # UN NOUVEAU TOUR : ce qu'il preparait pour le tour d'avant ne se dira pas
         JARVIS["tour"] = int(JARVIS.get("tour") or 0) + 1
         VOIX.taire()
@@ -5769,28 +5779,39 @@ def fin_de_l_ecoute():
 
 def verifier_appel(wav64, n=None):
     """Tranche un appel pas net : « Jarvis » (meme ecorche) dans la
-    transcription -> il se reveille ; sinon, il se rendort sans un bruit."""
-    ok, lu = False, None
+    transcription -> il se reveille ; sinon, il se rendort sans un bruit.
+
+    Trois reponses : oui, non, et « illisible » (None : transcription pas
+    prete, memoire, moteur qui plante) -- alors l'oreille laisse le score
+    trancher. Un « non » sans avoir rien lu rejetait tout appel pas net, sans
+    un mot. Rend True seulement si on y a lu son nom."""
+    ok, lu = None, None
     try:
         if etat_dictee()["etat"] == "pret":
             texte = transcrire(base64.b64decode(wav64))
-            lu = _jv.nom_trouve(texte, noms_appris())
-            # parler DE lui (« j'ai l'impression que Jarvis ecoute ») n'est pas l'appeler
-            ok = lu is not None and not _jv.est_une_mention(texte, noms_appris())
+            # « J'AI GALERE A CE QU'IL S'ALLUME » : un « Jarvis » dit seul,
+            # Parakeet l'ecrit « Javi », « Chavis », « É Javi » -- la forme
+            # ecorchee confirme un appel que l'empreinte a deja trouve proche
+            lu = _jv.nom_verifie(texte, noms_appris())
+            # parler DE lui (« j'ai l'impression que Jarvis ecoute ») n'est pas
+            # l'appeler ; le bout de son finit juste apres le nom (« Jarvis il »)
+            ok = lu is not None and not _jv.est_une_mention(texte, noms_appris(), tronque=True)
     except Exception as e:
         print("Jarvis : verification impossible (%s)" % type(e).__name__)
     # le mot qui l'a confirme, pour comprendre un reveil intempestif (pas la phrase)
-    print("Jarvis : appel pas net %s" % ("confirme (« %s »)" % lu if ok else
+    print("Jarvis : appel pas net %s" % ("illisible : le score tranche" if ok is None else
+                                         "confirme (« %s »)" % lu if ok else
                                          "ecarte" + (" (on parlait de lui)" if lu else "")))
-    for e in reversed(JARVIS.get("essais") or []):
-        if e.get("issue") == "verifier":
-            e["issue"] = "confirme" if ok else "ecarte"
-            break
+    if ok is not None:
+        for e in reversed(JARVIS.get("essais") or []):
+            if e.get("issue") in ("verifier", "lent"):
+                e["issue"] = "confirme" if ok else "ecarte"
+                break
     verdict = {"cmd": "verifie", "ok": ok}
     if n is not None:
         verdict["n"] = n
     envoyer_oreille(verdict)
-    return ok
+    return bool(ok)
 
 
 def garder_facons(transcription):
@@ -6021,20 +6042,20 @@ _PHRASES = {
     "code_faux": ("Ce n'est pas le bon code. Encore une fois ?", "That's not the code. Once more?"),
     "code_refuse": ("Accès refusé.", "Access denied."),
     "verrouille": ("Accès verrouillé.", "Access locked."),
-    "mains_fermees": ("Mes mains sur le PC sont fermées : Réglages, Jarvis.",
-                      "My hands on the PC are closed: Settings, Jarvis."),
+    "mains_fermees": ("Mes mains sur le PC sont fermées : ouvrez-les dans les réglages de l'assistant.",
+                      "My hands on the PC are closed: open them in the assistant settings."),
     "youtube_video": ("C'est lancé.", "Here you go."),
     "youtube_resultats": ("Les résultats de YouTube sont à l'écran.", "I've opened the YouTube results."),
     "youtube_rate": ("YouTube ne répond pas.", "YouTube isn't answering."),
     "son_rate": ("Je ne parviens pas à régler le son.", "I can't set the volume."),
     "oui": ("Oui ?", "Yes?"),
-    # sans dire son nom : sa propre voix le reveillerait
+    # AUCUNE ne dit son nom : sa propre voix le reveillerait (test : LeNomDansSesPhrases)
     "mode_psy": ("Mode psychologue. Je vous écoute. Appelez-moi par mon nom pour revenir.", None),
     "mode_jarvis": ("À votre service.", "At your service."),
     "retour": ("Content de vous revoir.", "Welcome back."),
     "lecture": ("Je n'ai pas pu lire ce que le micro m'a donné.", "I couldn't read what the microphone gave me."),
-    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page Jarvis de Machi Tool.",
-                              "Transcription isn't ready yet. Have a look at the Jarvis page in Machi Tool."),
+    "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page de l'assistant, dans Machi Tool.",
+                              "Transcription isn't ready yet. Have a look at the assistant page in Machi Tool."),
     "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
     "commande_ratee": ("Je crains de ne pas avoir pu le faire.", "I'm afraid I couldn't do that."),
     "rate": ("Un incident de mon côté, je le crains.", "Something went wrong on my side, I'm afraid."),
@@ -6042,8 +6063,8 @@ _PHRASES = {
                     "To answer you, I need the BrainDebugger key. It's on the Passerelle page of Machi Tool."),
     "cle_refusee": ("BrainDebugger refuse ma clé.", "BrainDebugger is refusing my key."),
     "bd_ancien_psy": ("Votre version de BrainDebugger ne sait pas encore m'écouter.", None),
-    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode Jarvis.",
-                         "Your BrainDebugger doesn't know Jarvis mode yet."),
+    "bd_ancien_jarvis": ("Votre version de BrainDebugger ne connaît pas encore le mode majordome.",
+                         "Your BrainDebugger doesn't know butler mode yet."),
     "bd_sans_cle": ("BrainDebugger n'a pas de clé Claude pour me faire parler.",
                     "BrainDebugger has no Claude key to let me speak."),
     "bd_erreur": ("BrainDebugger a répondu par une erreur %s.", "BrainDebugger answered with error %s."),
@@ -12406,7 +12427,8 @@ class Panneau:
         c.create_text(g, haut - self.px(3), text="REVEIL", fill=VIF, font=police, anchor="sw")
         c.create_text(x(verifie), haut - self.px(3), text="VERIFIE", fill=ETOILE, font=police, anchor="se")
         c.create_text(dr, haut - self.px(3), text="RATE", fill=BRUME, font=police, anchor="se")
-        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME}
+        teinte = {"reveil": VIF, "confirme": VIF, "verifier": ETOILE, "ecarte": ALERTE, "rate": BRUME,
+                  "lent": ETOILE, "sans_lecture": VIF, "trop_loin": BRUME}
         for k, e in enumerate(essais):
             if e.get("d") is None:
                 continue
@@ -12419,7 +12441,10 @@ class Panneau:
             e = essais[-1]
             quoi = {"reveil": "reveil direct", "confirme": "verifie : c'etait bien toi",
                     "verifier": "verification en cours...", "ecarte": "verifie : ce n'etait pas « Jarvis »",
-                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)"}
+                    "rate": "rate -- trop loin de tes « Jarvis » (monte la facilite, ou « Calibrer encore »)",
+                    "lent": "verification : la transcription demarre, un instant...",
+                    "sans_lecture": "pas lu a temps, mais tout pres de ta voix : reveille",
+                    "trop_loin": "pas lu a temps, et trop loin de ta voix pour deviner"}
             texte = "Dernier : %.3f -- %s." % (e["d"], quoi.get(e.get("issue"), e.get("issue")))
         else:
             texte = "Dis « Jarvis » : chaque essai apparait ici, a sa distance de ta voix apprise."

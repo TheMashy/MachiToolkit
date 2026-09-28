@@ -1169,6 +1169,41 @@ class MotEveil(unittest.TestCase):
                   "Jarvis, il fait froid", "baisse le son Jarvis", "Jarvis ?"):
             self.assertFalse(J.est_une_mention(t), t)
 
+    def test_une_question_n_est_pas_une_mention(self):
+        # « Jarvis il est quelle heure ? » sans virgule : il se rendormait
+        for t in ("Jarvis il est quelle heure ?", "Jarvis il est quelle", "Jarvis elle est où ma clé",
+                  "euh Jarvis il fait combien dehors"):
+            self.assertFalse(J.est_une_mention(t), t)
+        for t in ("Jarvis il apparaît pour rien", "Jarvis il marche pas.", "Jarvis il",
+                  "j'ai l'impression que Jarvis écoute tout le temps"):
+            self.assertTrue(J.est_une_mention(t), t)
+        # le bout de son d'une verification : on ne voit pas encore la suite
+        self.assertFalse(J.est_une_mention("Jarvis il", tronque=True))
+        self.assertTrue(J.est_une_mention("Jarvis il apparaît", tronque=True))
+
+    def test_une_mention_avec_le_nom_ecorche(self):
+        # « Javi » confirme un appel pas net : il doit aussi reconnaitre une mention
+        self.assertTrue(J.est_une_mention("le Javi que j'ai codé"))
+        self.assertFalse(J.est_une_mention("Javi, allume la lumière"))
+
+    def test_le_nom_au_milieu_de_la_demande(self):
+        # « Rappelle-moi Jarvis dans dix minutes... » : le debut etait jete
+        t = J.retirer_mot_eveil("Rappelle-moi Jarvis dans dix minutes de sortir le linge", garder_avant=True)
+        self.assertEqual(t, "Rappelle-moi dans dix minutes de sortir le linge")
+        self.assertEqual(J.comprendre(t)["action"], "minuteur")
+        self.assertEqual(J.retirer_mot_eveil("Mets la musique, Jarvis, de Daft Punk"), "Mets la musique de Daft Punk")
+        self.assertEqual(J.retirer_mot_eveil("Allume, Jarvis, la lumière."), "Allume la lumière.")
+        # ... pas quand la suite est deja une commande, ni sans parole avant le nom
+        self.assertEqual(J.retirer_mot_eveil("Il fait beau aujourd hui Jarvis allume la lumière"),
+                         "allume la lumière")
+        self.assertEqual(J.retirer_mot_eveil("Salut Jarvis, allume la lumière"), "allume la lumière")
+        self.assertEqual(J.retirer_mot_eveil("Salut Jarvis, dis-moi une blague"), "dis-moi une blague")
+        self.assertEqual(J.retirer_mot_eveil("Rappelle-moi Jarvis dans dix minutes", garder_avant=False),
+                         "dans dix minutes")
+        # « merci beaucoup » n'est pas la demande : il terminait la conversation
+        self.assertEqual(J.retirer_mot_eveil("Baisse le son Jarvis, merci beaucoup."), "Baisse le son")
+        self.assertEqual(J.retirer_mot_eveil("Jarvis, allume la lumière."), "allume la lumière.")
+
 
 class Nombres(unittest.TestCase):
     def test_nombres(self):
@@ -2048,6 +2083,67 @@ class DansMachiTool(unittest.TestCase):
         m.etat_dictee = lambda: {"etat": "absent", "progres": 0.0}
         self.assertFalse(m.verifier_appel(""), "sans transcription, on ne se reveille pas au hasard")
         self.assertTrue(m.config_oreille(m.CFG)["tolerant"])
+
+    def test_un_jarvis_dit_seul_et_ecorche_confirme_l_appel(self):
+        # « J'ai galere a ce qu'il s'allume » : Parakeet ecrit un « Jarvis » dit
+        # seul « Javi », « Chavis », « É Javi » -- c'est bien lui
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        for t in ("Javi ?", "Chavis.", "É Javi.", "Ok, Javi.", "Jarbis"):
+            m.transcrire = lambda o, t=t: t
+            self.assertTrue(m.verifier_appel(base64.b64encode(b"RIFF").decode(), n=7), t)
+            self.assertEqual(envoye[-1], {"cmd": "verifie", "ok": True, "n": 7})
+        for t in ("j'avais dit", "java", "j'arrive", "le Javi que j'ai codé"):
+            m.transcrire = lambda o, t=t: t
+            self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()), t)
+            self.assertIs(envoye[-1]["ok"], False, t)
+
+    def test_le_bout_de_son_coupe_apres_le_nom_n_est_pas_une_mention(self):
+        # « Jarvis il est quelle heure ? » d'une traite : le bout de son a
+        # verifier finit sur « Jarvis il » -- ce n'est pas « Jarvis il plante »
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        for t in ("Jarvis il", "Jarvis elle est", "Jarvis il est quelle"):
+            m.transcrire = lambda o, t=t: t
+            self.assertTrue(m.verifier_appel(base64.b64encode(b"RIFF").decode()), t)
+        m.transcrire = lambda o: "Jarvis il apparaît pour rien"
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+
+    def test_sans_transcription_l_appel_est_illisible_pas_ecarte(self):
+        # « illisible » : l'oreille laisse le score trancher (tout pres du seuil,
+        # c'etait lui) -- un « non » rejetait TOUT appel pas net, sans un mot
+        m = self.m
+        envoye = []
+        m.envoyer_oreille = envoye.append
+        m.etat_dictee = lambda: {"etat": "absent", "progres": 0.0}
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode(), n=3))
+        self.assertEqual(envoye[-1], {"cmd": "verifie", "ok": None, "n": 3})
+        m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
+
+        def plus_de_memoire(o):
+            raise m.DicteeImpossible("memoire")
+        m.transcrire = plus_de_memoire
+        self.assertFalse(m.verifier_appel(base64.b64encode(b"RIFF").decode()))
+        self.assertIsNone(envoye[-1]["ok"])
+
+    def test_la_verification_lente_se_voit(self):
+        m = self.m
+        m.JARVIS["essais"] = [{"d": 0.2, "issue": "verifier"}]
+        m.traiter_evenement({"evt": "essai", "maj": True, "issue": "lent"})
+        self.assertEqual(m.JARVIS["essais"], [{"d": 0.2, "issue": "lent"}], "une mise a jour, pas un essai de plus")
+        m.traiter_evenement({"evt": "essai", "maj": True, "issue": "sans_lecture"})
+        self.assertEqual(m.JARVIS["essais"][-1]["issue"], "sans_lecture")
+
+    def test_ses_phrases_ne_disent_jamais_son_nom(self):
+        # « Mes mains sont fermees : Reglages, Jarvis. » -- sans double
+        # transmission, sa propre voix le reveillait
+        for cle, textes in self.m._PHRASES.items():
+            for t in textes:
+                if t:
+                    self.assertIsNone(self.m._jv.nom_verifie(t), (cle, t))
+                    self.assertFalse(self.m._jv.contient_nom(t), (cle, t))
 
     def test_le_sous_titre_suit_la_voix(self):
         m = self.m
@@ -5278,6 +5374,103 @@ class AppelPerduDerriereUnDoute(TresTolerant):
         self.o.commande({"cmd": "verifie", "ok": None})               # la transcription n'a pas pu tourner
         self.assertIn("reveil", self.evts())
         self.assertEqual(self.sons, ["eveil"])
+
+    test_confirme_il_se_reveille_et_la_phrase_suit = None
+    test_ecarte_il_se_rendort_sans_un_bruit = None
+    test_la_phrase_finie_avant_le_verdict_l_attend = None
+    test_net_il_se_reveille_tout_de_suite = None
+    test_sans_reponse_il_laisse_tomber = None
+
+
+class LeReveilQuiRatait(TresTolerant):
+    """« J'ai galere a ce qu'il s'allume » -- et « surtout qu'il n'apparaisse
+    pas pour rien ». Les appels pas nets qu'il perdait, sans en accepter plus."""
+
+    def verifier(self):
+        return [e for e in self.sorties if e["evt"] == "verifier"]
+
+    def test_redire_son_nom_juste_apres_un_appel_pas_net(self):
+        # « Jarvis ? ... JARVIS ! » : 2 s de surdite apres le premier
+        self.appel_pas_net()
+        self.silence(3)
+        self.dire(self.g)
+        self.assertIn("reveil", self.evts())
+        self.assertEqual(self.sons, ["eveil"])
+
+    def test_un_second_appel_pas_net_est_verifie_aussi(self):
+        self.appel_pas_net()
+        self.silence(12)
+        self.dire(self.autrement)                     # « Jarvis ? » encore, pas net
+        self.silence(J.TOLERANCE_ATTENTE + 1)
+        v = self.verifier()
+        self.assertEqual(len(v), 2, "le second appel part aussi a la verification")
+        self.o.commande({"cmd": "verifie", "ok": False, "n": v[0]["n"]})   # le premier, mal lu
+        self.assertNotIn("reveil", self.evts(), "l'autre attend encore sa lecture")
+        self.assertIsNotNone(self.o.doute)
+        self.o.commande({"cmd": "verifie", "ok": True, "n": v[1]["n"]})
+        self.assertIn("reveil", self.evts())
+
+    def test_deux_non_et_il_se_rendort(self):
+        self.appel_pas_net()
+        self.silence(12)
+        self.dire(self.autrement)
+        self.silence(J.TOLERANCE_ATTENTE + 1)
+        v = self.verifier()
+        self.o.commande({"cmd": "verifie", "ok": False, "n": v[1]["n"]})
+        self.o.commande({"cmd": "verifie", "ok": False, "n": v[0]["n"]})
+        self.assertIsNone(self.o.doute)
+        self.assertNotIn("reveil", self.evts())
+
+    def test_pas_de_carillon_au_milieu_de_la_phrase(self):
+        # « Jarvis, mets de la musique de Daft Punk » d'une traite : le verdict
+        # arrive pendant « musique »
+        self.appel_pas_net()
+        self.dire([np.random.default_rng(5).normal(size=96)] * 12)
+        self.o.commande({"cmd": "verifie", "ok": True})
+        self.assertEqual(self.sons, [], "pas de « a vous » par-dessus la personne")
+        self.assertEqual([e for e in self.evts() if e != "presque"][-1], "reveil")
+        self.silence(25)
+        self.assertIn("phrase", self.evts())
+        self.assertEqual(self.sons, ["capte"])
+
+    def test_lecture_lente_tout_pres_il_n_attend_pas(self):
+        # le moteur de transcription demarre a froid : un appel tout pres du
+        # seuil ne reste pas 20 s dans le silence
+        self.appel_pas_net()
+        n = self.verifier()[0]["n"]
+        self.o.doute["reveil"]["score"] = 1.2 * self.o.det.seuil
+        self.silence(J.VERIF_REPLI_TRAMES + 2)
+        self.assertIn("reveil", self.evts())
+        r = [e for e in self.sorties if e["evt"] == "reveil"][-1]
+        self.assertTrue(r["repli"])
+        self.assertFalse(r["verifie"], "rien n'a ete lu : la phrase devra contenir son nom")
+        self.assertEqual(self.sons, ["eveil"])
+        self.assertIn("sans_lecture", [e.get("issue") for e in self.sorties if e.get("maj")])
+        self.o.commande({"cmd": "verifie", "ok": False, "n": n})           # la lecture, en retard
+        self.assertEqual(self.o.etat, "phrase", "un verdict en retard ne coupe pas l'ecoute")
+
+    def test_lecture_lente_trop_loin_il_attend_encore(self):
+        self.appel_pas_net()                          # ~1,4 x le seuil direct
+        self.silence(J.VERIF_REPLI_TRAMES + 2)
+        self.assertNotIn("reveil", self.evts())
+        self.assertIsNotNone(self.o.doute, "il attend toujours la lecture")
+        self.assertIn("lent", [e.get("issue") for e in self.sorties if e.get("maj")], "et ca se voit")
+        self.o.commande({"cmd": "verifie", "ok": True})
+        self.assertIn("reveil", self.evts())
+
+    def test_sa_propre_voix_ne_le_reveille_pas(self):
+        # sans double transmission : « ... Reglages, Jarvis. » dans sa voix
+        self.silence(20)
+        self.o.commande({"cmd": "parole", "actif": True})
+        self.dire(self.autrement)
+        self.silence(2)
+        self.o.commande({"cmd": "parole", "actif": False})
+        self.silence(10)
+        self.assertEqual(self.verifier(), [])
+        # ... mais TON « Jarvis » appris, net, le reveille par-dessus lui
+        self.o.commande({"cmd": "parole", "actif": True})
+        self.dire(self.g)
+        self.assertIn("reveil", self.evts())
 
     test_confirme_il_se_reveille_et_la_phrase_suit = None
     test_ecarte_il_se_rendort_sans_un_bruit = None
