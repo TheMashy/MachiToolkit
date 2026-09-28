@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.67.0"
+VERSION = "1.68.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -414,6 +414,9 @@ CONFIG_DEFAUT = {
     # journal ! » : chaque echange avec le majordome, verse dans BrainDebugger
     # (voir verser_au_journal)
     "jarvis_journal": True,
+    # « Ainsi qu'annoncer une mise a jour (il peut la lancer) » : il dit qu'une
+    # version attend, qu'il s'en va l'installer, puis qu'il est revenu
+    "jarvis_annoncer_maj": True,
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -696,6 +699,8 @@ def charger_config():
         MAJ["etat"] = "a_jour"
         MAJ["message"] = "Mise a jour posee : %s vers %s." % (vue, VERSION)
         print("Mise a jour posee : %s vers %s." % (vue, VERSION))
+        # il le dit des que sa voix est prete (« Me revoila, en version... »)
+        annoncer_maj("posee", VERSION, cfg)
     return cfg
 
 
@@ -7947,7 +7952,7 @@ OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir"
                     "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda",
                     "lancer_tache", "taches", "noter_projet",
                     # Machi Tool lui-meme est a lui : jamais sous code
-                    "lumiere", "routine_lumiere", "reglages_machi"}
+                    "lumiere", "routine_lumiere", "reglages_machi", "mise_a_jour"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -9028,7 +9033,7 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": "Oublie : %s" % " ; ".join(retirees)}
         # MACHI TOOL LUI-MEME : la guirlande, ses routines, les reglages -- a lui,
         # sans les mains sur le PC (« il a tous les droits au niveau de l'application »)
-        if nom in ("lumiere", "routine_lumiere", "reglages_machi"):
+        if nom in ("lumiere", "routine_lumiere", "reglages_machi", "mise_a_jour"):
             return {"id": ident, "texte": outil_application(nom, e, cfg)}
         # SES TACHES DE FOND ET TES PROJETS : a lui aussi, sans les mains sur le PC
         if nom == "lancer_tache":
@@ -9328,9 +9333,80 @@ def outil_application(nom, e, cfg):
                 sauver_config(cfg)
             if cle.startswith("jarvis_"):
                 envoyer_oreille(config_oreille(cfg))
+            if cle == "jarvis_actif" and not v:
+                # il s'eteint : ce qu'il preparait tombe (comme « Jarvis ecoute » decoche)
+                _en_fond(terminer_conversation)
             return "%s = %s." % (cle, v)
         raise ValueError("action inconnue : %s" % a)
+    if nom == "mise_a_jour":
+        return outil_mise_a_jour(a, cfg)
     raise ValueError("outil inconnu : %s" % nom)
+
+
+# ---------- ses mises a jour ----------
+# « Fait en sorte que Jarvis puisse [...] annoncer une mise a jour (il peut la
+# lancer) ». Le meme chemin que le bouton et le menu de l'icone (`travail_maj`,
+# pose par main dans DECLENCHER_MAJ) : un seul chemin vers l'installeur.
+
+DECLENCHER_MAJ = [None]
+MAJ_ANNONCEES = set()          # (quoi, version) deja dits : une fois chacun
+MAJ_POSE_ATTENTE_S = 6.0       # le temps de dire « je reviens » avant de partir
+
+
+def etat_maj_en_texte():
+    lignes = ["Version installee : %s." % VERSION, "Etat : %s" % MAJ.get("message", "")]
+    if MAJ.get("etat") in ("disponible", "prete", "a_poser", "telechargement") and MAJ.get("version"):
+        lignes.append("Nouvelle version : %s." % MAJ["version"])
+        notes = " ".join(str(MAJ.get("notes") or "").split())
+        if notes:
+            lignes.append("Ce qu'elle change : %s" % notes[:600])
+    return "\n".join(lignes)
+
+
+def outil_mise_a_jour(action, cfg):
+    if action == "etat":
+        return etat_maj_en_texte()
+    occupe = MAJ.get("etat") in ("verification", "telechargement")
+    if action == "verifier":
+        if not occupe:
+            verifier_maj(cfg)
+        return etat_maj_en_texte()
+    if action == "installer":
+        if not FIGE:
+            raise RuntimeError("En mode script, la mise a jour se fait par git pull : rien n'a ete touche.")
+        if occupe:
+            return "Deja en cours : %s" % MAJ.get("message", "")
+        if MAJ.get("etat") == "a_poser":
+            return ("La version %s attend deja : elle se pose des que la fenetre de Machi Tool est "
+                    "refermee." % MAJ.get("version"))
+        declencher = DECLENCHER_MAJ[0]
+        if declencher is None:
+            raise RuntimeError("Les mises a jour ne sont pas encore pretes (Machi Tool demarre).")
+        declencher("installer")
+        return ("Mise a jour lancee : Machi Tool verifie, telecharge la nouvelle version s'il y en a une, "
+                "puis redemarre un instant (s'il est deja a jour, rien ne change).")
+    raise ValueError("action inconnue : %s" % action)
+
+
+def annoncer_maj(quoi, version, cfg=None):
+    """Il dit, une fois par version, qu'une mise a jour attend (« disponible »),
+    qu'il part l'installer (« pose ») ou qu'il est revenu (« posee »). Rend
+    True s'il le dit tout de suite (sinon c'est en file, ou rien)."""
+    cfg = CFG if cfg is None else cfg
+    if not version or not cfg.get("jarvis_actif") or not cfg.get("jarvis_annoncer_maj", True):
+        return False
+    if (quoi, version) in MAJ_ANNONCEES:
+        return False
+    MAJ_ANNONCEES.add((quoi, version))
+    L = langue_jarvis(cfg)
+    texte = _jv.annonce_maj(quoi, version, L)
+    if not texte:
+        return False
+    if quoi == "posee":
+        # au demarrage, sa voix n'est pas encore chargee : en file, dite des qu'elle l'est
+        ANNONCES.append((texte, L, time.time()))
+        return False
+    return annoncer(texte, L)
 
 
 # ---------- ses nouveaux pouvoirs ----------
@@ -9362,6 +9438,13 @@ def _palier(o, cfg):
     """Le palier d'un outil ici, ou None s'il sera refuse de toute facon
     (mains fermees, groupe pas permis) : inutile alors de rien demander."""
     nom = o.get("nom")
+    # « n'importe quel setting » : ceux qui lui donnent des droits, et poser
+    # une mise a jour (l'application redemarre), la personne les confirme
+    p = _jv.palier_application(nom, o.get("entree"))
+    if p == _jv.PALIER_POUVOIR:
+        return _jv.PALIER_CODE if cfg.get("jarvis_code_actif") else _jv.PALIER_OUI
+    if p:
+        return p
     if nom in OUTILS_SANS_CODE:
         return _jv.PALIER_DIRECT
     if not cfg.get("jarvis_pc"):
@@ -9372,12 +9455,22 @@ def _palier(o, cfg):
     return _jv.palier_outil(nom, o.get("entree"), OUTILS_SANS_CODE)
 
 
-def geste_oui(o):
+def geste_oui(o, langue="fr"):
     """Ce que dira la question (« Je ferme de force Discord ? ») ; leve si
     l'outil sera refuse de toute facon -- alors on ne demande rien."""
     e = o.get("entree") or {}
     if o.get("nom") == "forcer_fermeture":
         return "forcer", _joli(appli_a_fermer(e.get("cible")))
+    if o.get("nom") == "reglages_machi":
+        cle = str(e.get("cle") or "").strip()
+        if not _jv.reglage_modifiable(cle, CONFIG_DEFAUT):
+            raise ValueError("« %s » n'est pas un reglage que je peux changer." % cle)
+        return "reglage", _jv.libelle_reglage(cle, _jv.valeur_reglage(cle, CONFIG_DEFAUT, e.get("valeur")), langue)
+    if o.get("nom") == "mise_a_jour":
+        if not FIGE:
+            raise RuntimeError("En mode script, la mise a jour se fait par git pull : rien n'a ete touche.")
+        v = MAJ.get("version") if MAJ.get("etat") in ("disponible", "prete") else ""
+        return "maj_machi", v or ("the latest version" if langue == "en" else "la dernière version")
     action = e.get("action")
     return action, paquet_voulu(e.get("nom"))["nom"]
 
@@ -9386,17 +9479,17 @@ def demander_oui(etat, refus, cfg):
     """Pose la question « oui ? » si un outil du tour ne s'annule pas. Rend
     True si elle est posee (on attend la reponse)."""
     gestes, indices = [], []
+    L = langue_jarvis(cfg)
     for i, o in enumerate(etat["outils"]):
         if i in refus or _palier(o, cfg) != _jv.PALIER_OUI:
             continue
         try:
-            gestes.append(geste_oui(o))
+            gestes.append(geste_oui(o, L))
             indices.append(i)
         except Exception as ex:
             refus[i] = _texte_erreur(ex)
     if not gestes:
         return False
-    L = langue_jarvis(cfg)
     JARVIS["attente_oui"] = dict(etat, refus=refus, oui=indices, expire=time.time() + OUI_DUREE_S,
                                  tour_oui=JARVIS.get("tour"))
     print("Jarvis : il demande « oui ? » (%s)" % ", ".join(g for g, _ in gestes))
@@ -10257,6 +10350,8 @@ def capacites_jarvis(cfg):
             "initiatives": bool(cfg.get("jarvis_initiatives")),
             # Machi Tool lui-meme : la guirlande, ses routines, les reglages
             "application": True, "routines": _jv.resume_routines(cfg.get("routines_lumiere") or []),
+            # ses mises a jour : les annoncer, les lancer (« oui ? » avant)
+            "mise_a_jour": True,
             "souvenirs": souvenirs_a_envoyer(cfg),
             # ses taches de fond, et le contexte de tes projets
             "taches": True, "projets": str(cfg.get("jarvis_projets") or "")[:_jv.PROJETS_MAX],
@@ -10571,10 +10666,14 @@ def annoncer(texte, langue="fr"):
 def dire_les_annonces():
     """Depuis sa veille : ce qui attendait qu'il soit libre."""
     while ANNONCES and JARVIS.get("etat") in ("attente", "eteint", None):
-        texte, langue, t = ANNONCES.pop(0)
+        texte, langue, t = ANNONCES[0]
         if time.time() - t > ANNONCE_GARDEE_S:
+            ANNONCES.pop(0)
             continue                          # trop vieux : la notification a suffi
-        if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
+        if CFG.get("jarvis_voix", True) and not VOIX.peut_parler():
+            return                            # sa voix se charge encore : ca attend
+        ANNONCES.pop(0)
+        if CFG.get("jarvis_voix", True):
             VOIX.dire(texte, None, langue)
 
 
@@ -14427,6 +14526,7 @@ class Panneau:
                                        "trop fort tard le soir, une pause apres deux heures"),
                 ("jarvis_journal", "Ce qu'on se dit va aussi dans le journal de BrainDebugger (marque "
                                    "« Jarvis »)"),
+                ("jarvis_annoncer_maj", "Il annonce les mises a jour de Machi Tool (et peut les lancer)"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
@@ -16596,6 +16696,9 @@ def lancer():
             surveillance -- la seule qui sache si une fenetre est ouverte
             devant quelqu'un.
             """
+            # « je reviens dans un instant » -- dit AVANT que la pose le coupe
+            if annoncer_maj("pose", MAJ["version"]):
+                time.sleep(MAJ_POSE_ATTENTE_S)
             MAJ["etat"] = "a_poser"
             MAJ["demande_le"] = time.time()
             MAJ["message"] = ("Version %s prete a etre posee." % MAJ["version"])
@@ -16607,6 +16710,7 @@ def lancer():
         if CFG.get("maj_installation_auto", True):
             travail_maj("installer")
         else:
+            annoncer_maj("disponible", publication["version"])
             notifier(
                 "Nouveau build detecte" if est_build(publication["version"])
                 else "Mise a jour disponible",
@@ -16648,6 +16752,7 @@ def lancer():
             attente = max(1, int(CFG.get("maj_intervalle_heures", 6))) * 3600
 
     panneau.declencher_maj = declencher_maj
+    DECLENCHER_MAJ[0] = declencher_maj       # Jarvis passe par le meme chemin
     threading.Thread(target=veille_maj, daemon=True).start()
 
     def veille_pont():

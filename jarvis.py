@@ -5885,14 +5885,66 @@ def palier_outil(nom, entree=None, sans_code=()):
 
 
 def question_oui(gestes, langue="fr"):
-    """[("forcer"|"installer"|"mettre_a_jour", "Discord")] -> « Je ferme de
-    force Discord ? », « J'installe VLC ? » -- en une seule question."""
+    """[("forcer"|"installer"|"mettre_a_jour"|"reglage"|"maj_machi", "Discord")]
+    -> « Je ferme de force Discord ? », « J'installe VLC ? » -- en une seule
+    question."""
     if langue == "en":
-        mots = {"forcer": "force %s to close", "installer": "install %s", "mettre_a_jour": "update %s"}
+        mots = {"forcer": "force %s to close", "installer": "install %s", "mettre_a_jour": "update %s",
+                "reglage": "%s", "maj_machi": "install Machi Tool %s (it restarts for a moment)"}
         return "Shall I " + ", then ".join(mots[g] % n for g, n in gestes) + "?"
-    mots = {"forcer": "je ferme de force %s", "installer": "j'installe %s", "mettre_a_jour": "je mets à jour %s"}
+    mots = {"forcer": "je ferme de force %s", "installer": "j'installe %s", "mettre_a_jour": "je mets à jour %s",
+            "reglage": "%s",
+            "maj_machi": "j'installe Machi Tool %s (il redémarre un instant)"}
     s = ", puis ".join(mots[g] % n for g, n in gestes)
     return s[:1].upper() + s[1:] + " ?"
+
+
+# ce que ses droits s'appellent, a voix haute
+NOMS_REGLAGES = {
+    "jarvis_pc": ("mes mains sur le PC", "my hands on the PC"),
+    "jarvis_ecran": ("mes yeux sur l'écran", "my eyes on the screen"),
+    "jarvis_historique": ("l'historique de Chrome", "the Chrome history"),
+    "jarvis_code_actif": ("le code d'accès", "the access code"),
+    "jarvis_fichiers": ("l'accès aux fichiers", "file access"),
+    "jarvis_windows": ("les réglages de Windows", "the Windows settings"),
+    "jarvis_initiatives": ("mes petites initiatives", "my small initiatives"),
+    "jarvis_journal": ("nos échanges dans le journal", "our talks in the journal"),
+    "jarvis_actif": ("mon écoute", "my listening"),
+    "collecte_active": ("le journal d'activité", "the activity log"),
+    "collecte_envoi": ("l'envoi de l'activité au site", "sending the activity to the site"),
+    "collecte_titres_complets": ("les titres d'onglets complets", "full tab titles"),
+    "api_active": ("le serveur local", "the local server"),
+}
+
+
+def libelle_reglage(cle, valeur, langue="fr"):
+    """Ce que dira la question avant un reglage qui lui donne des droits :
+    « j'active l'accès aux fichiers », « je coupe le code d'accès »."""
+    en = langue == "en"
+    noms = NOMS_REGLAGES.get(cle)
+    nom = noms[1 if en else 0] if noms else cle.replace("_", " ")
+    if isinstance(valeur, bool):
+        return ("turn on %s" if valeur else "turn off %s") % nom if en else \
+            ("j'active %s" if valeur else "je coupe %s") % nom
+    return ("set %s to %s" if en else "je passe %s à %s") % (nom, valeur)
+
+
+def annonce_maj(etat, version, langue="fr"):
+    """Ce qu'il dit d'une mise a jour de Machi Tool : « disponible » (il
+    propose de l'installer), « pose » (il s'en va un instant) ou « posee »
+    (il revient, dans la nouvelle version)."""
+    en = langue == "en"
+    if etat == "disponible":
+        return ("A Machi Tool update is available: version %s. Just ask me to install it." % version if en else
+                "Une mise à jour de Machi Tool est disponible : la version %s. "
+                "Demandez-moi de l'installer quand vous voulez." % version)
+    if etat == "pose":
+        return ("Installing version %s. I'll be right back." % version if en else
+                "J'installe la version %s. Je reviens dans un instant." % version)
+    if etat == "posee":
+        return ("I'm back, in version %s." % version if en else
+                "Me revoilà, en version %s." % version)
+    return ""
 
 
 # RANGER LES FICHIERS : deplacer, renommer, corbeille, modifier un texte --
@@ -6525,23 +6577,41 @@ def resume_routines(routines):
     return "\n".join("- " + l for l in lignes)[:3000]
 
 
-# Les reglages que Jarvis ne touche pas : les cles et les codes, ce qui ouvre
-# la passerelle au reseau, et ce qui decide de ses propres droits (ses mains
-# sur le PC, ses yeux, l'historique) -- sinon les cases a cocher ne voudraient
-# plus rien dire. Les listes ont leurs propres outils.
+# « Fait en sorte que Jarvis puisse changer n'importe quel setting de
+# l'application » : tous -- sauf les cles, les codes et les identifiants (ce
+# n'est pas un reglage qu'on dit a voix haute, et une adresse changee enverrait
+# le journal ailleurs), la tuyauterie interne, et les listes (elles ont leurs
+# propres outils).
 REGLAGES_INTERDITS = {
     "api_jeton", "pont_cle", "spotify_client_id", "spotify_refresh", "onglets_cle", "jarvis_code_sel",
-    "jarvis_code_empreinte", "api_active", "api_port", "api_origines", "pont_site", "adresse",
-    "jarvis_pc", "jarvis_ecran", "jarvis_historique", "jarvis_code_actif", "collecte_active",
-    "collecte_envoi", "collecte_titres_complets", "maj_verifier", "maj_installation_auto", "maj_prereleases",
-    "maj_intervalle_heures", "config_version", "derniere_version", "jarvis_preferences", "jarvis_souvenirs",
-    "jarvis_projets", "routines_lumiere", "jarvis_raccourcis", "regles", "jarvis_astuce_voix", "jarvis_actif",
-    # ses nouveaux pouvoirs et sa parole spontanee : c'est toi qui les donnes
-    "jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
-    "jarvis_annoncer_taches",
-    # ce qui se dit avec lui va (ou non) au journal : c'est toi qui decides
-    "jarvis_journal",
+    "jarvis_code_empreinte", "api_port", "api_origines", "pont_site", "adresse",
+    "config_version", "derniere_version", "jarvis_astuce_voix",
+    "jarvis_preferences", "jarvis_souvenirs", "jarvis_projets", "routines_lumiere", "jarvis_raccourcis", "regles",
 }
+# Ceux qui lui donnent des droits, qui ouvrent une collecte ou qui levent une
+# garde : il peut les changer, mais la personne confirme a chaque fois -- le
+# code d'acces s'il est demande, sinon « oui ? » (voir palier_application).
+REGLAGES_POUVOIRS = {
+    "jarvis_pc", "jarvis_ecran", "jarvis_historique", "jarvis_code_actif", "jarvis_fichiers", "jarvis_windows",
+    "jarvis_initiatives", "jarvis_journal", "jarvis_actif", "collecte_active", "collecte_envoi",
+    "collecte_titres_complets", "api_active",
+}
+PALIER_POUVOIR = "pouvoir"   # le code d'acces s'il est demande, sinon « oui ? »
+
+
+def palier_application(nom, entree=None):
+    """Le palier des outils de l'application qui ne sont pas « directs » :
+    un reglage qui lui donne des droits (PALIER_POUVOIR), installer une mise a
+    jour (PALIER_OUI : l'application redemarre). None : le palier habituel."""
+    e = entree if isinstance(entree, dict) else {}
+    if nom == "reglages_machi" and e.get("action") == "changer" \
+            and str(e.get("cle") or "").strip() in REGLAGES_POUVOIRS:
+        return PALIER_POUVOIR
+    if nom == "mise_a_jour" and e.get("action") == "installer":
+        return PALIER_OUI
+    return None
+
+
 REGLAGES_CHOIX = {
     "mode": ("applications", "ecran", "mixte", "son"),
     "son_bande": ("graves", "mediums", "aigus", "tout"),
