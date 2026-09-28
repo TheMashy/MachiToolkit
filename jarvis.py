@@ -798,6 +798,105 @@ def wav_de(echantillons, frequence=FREQ):
     return buf.getvalue()
 
 
+# ----------------------------------------------------------------------
+#  LA LANGUE DES REPONSES D'UN MOT
+#
+#  « Non » ecrit « Não », « Ouais » ecrit « Wait », « D'accord » ecrit « Thank
+#  you », « Rien » ecrit « Yeah » : Parakeet devine la langue a l'oreille, et
+#  une demi-seconde de parole ne lui en dit pas assez -- il derive vers
+#  l'anglais, le portugais, le polonais. Aux questions de Jarvis (« Je la
+#  lance ? »), c'est justement ce qu'on repond. onnx-asr n'a pas d'option de
+#  langue pour ce modele.
+#
+#  LE REMEDE, MESURE : une PORTEUSE -- « Je vous ecoute. », dit par sa voix
+#  francaise, rendu une fois en memoire -- placee devant la reponse. Le modele
+#  entend du francais, puis la reponse, et l'ecrit en francais ; on ne garde
+#  que les mots dates APRES la porteuse. Mesure sur le vrai modele : « Non »
+#  6/6 (0/6 sans), « Ouais » 6/6 (lu « Oui »), « Rien » 5/6. Seulement pour une
+#  parole courte : au-dela d'une seconde, le modele a de quoi choisir seul
+#  (« Non c'est bon » 6/6 sans rien). « Stop » n'en profite pas (2/6) : on ne
+#  compte pas dessus pour la coupure.
+# ----------------------------------------------------------------------
+
+ANCRE_COURT_S = 1.2           # parole plus courte : on ancre la langue
+ANCRE_BLANC_S = 0.2           # entre la porteuse et la reponse
+ANCRE_AVANT_S = 0.4           # ce qu'on garde avant le premier mot de la reponse
+ANCRE_JETON_S = 0.3           # la duree du dernier jeton, que sa date ne compte pas
+_ESPACES_ASR = re.compile(r"\A\s|\s\B|(\s)\b")     # la regle d'onnx-asr pour ses jetons
+
+
+def texte_apres(jetons, dates, t0):
+    """Le texte des jetons dates a partir de `t0` (secondes). Les jetons de
+    Parakeet marquent le debut d'un mot par « ▁ » (onnx-asr l'a deja change en
+    espace) ; le point final de la porteuse deborde souvent la coupure (« .
+    Oui. ») : la ponctuation de tete s'en va."""
+    morceaux = [str(j).replace("▁", " ") for j, t in zip(jetons or [], dates or [])
+                if t is not None and float(t) >= t0]
+    texte = _ESPACES_ASR.sub(lambda m: " " if m.group(1) else "", "".join(morceaux))
+    return re.sub(r"^[\s.,;:!?…»«-]+", "", texte).strip()
+
+
+def dates_des_mots(jetons, dates):
+    """Les dates des jetons qui portent des lettres. La ponctuation est datee
+    bien apres le mot -- le point de « Não. » tombait 1,5 s plus loin, et le
+    mot passait pour une longue phrase."""
+    if jetons is None:
+        return [float(t) for t in (dates or []) if t is not None]
+    return [float(t) for j, t in zip(jetons, dates or []) if t is not None and re.search(r"\w", str(j))]
+
+
+def parole_courte(dates, seuil=ANCRE_COURT_S, jetons=None):
+    """La parole reconnue dure-t-elle moins que `seuil` ? (rien reconnu : oui)"""
+    dates = dates_des_mots(jetons, dates)
+    return not dates or (max(dates) - min(dates) + ANCRE_JETON_S) < seuil
+
+
+def son_ancre(son, porteuse, frequence, debut=None):
+    """(porteuse + blanc + reponse, date a partir de laquelle lire). Le son de
+    la reponse commence un peu avant son premier mot (`debut`, en secondes) :
+    une fenetre de suite peut attendre plusieurs secondes avant qu'on parle,
+    et la porteuse doit rester tout pres. Elle est ramenee au niveau de la
+    reponse -- un micro lointain, une porteuse a pleine voix, ca ne colle pas."""
+    import numpy as np
+    son = np.asarray(son, dtype=np.float32).reshape(-1)
+    porteuse = np.asarray(porteuse, dtype=np.float32).reshape(-1)
+    if debut is not None:
+        son = son[max(0, int((float(debut) - ANCRE_AVANT_S) * frequence)):]
+    niveau = float(np.percentile(np.abs(son), 99)) if len(son) else 0.0
+    niveau_p = float(np.percentile(np.abs(porteuse), 99)) if len(porteuse) else 0.0
+    gain = min(1.5, max(0.05, niveau / niveau_p)) if niveau_p > 0 and niveau > 0 else 1.0
+    x = np.concatenate([porteuse * gain, np.zeros(int(ANCRE_BLANC_S * frequence), np.float32), son])
+    return x, len(porteuse) / float(frequence) + ANCRE_BLANC_S / 2
+
+
+def reconnaitre(modele, son, frequence, porteuse=None):
+    """Le texte d'un son, par le moteur de la dictee -- ancre en francais si
+    la parole est courte et qu'on a une porteuse (a la meme frequence)."""
+    if porteuse is None or not hasattr(modele, "with_timestamps"):
+        return str(modele.recognize(son, sample_rate=frequence) or "").strip()
+    dates = modele.with_timestamps()
+    r = dates.recognize(son, sample_rate=frequence)
+    texte = str(getattr(r, "text", "") or "").strip()
+    t = dates_des_mots(getattr(r, "tokens", None), getattr(r, "timestamps", None))
+    if not parole_courte(t):
+        return texte
+    x, t0 = son_ancre(son, porteuse, frequence, debut=min(t) if t else None)
+    r2 = dates.recognize(x, sample_rate=frequence)
+    return texte_apres(getattr(r2, "tokens", None), getattr(r2, "timestamps", None), t0) or texte
+
+
+def en_16k(son, frequence):
+    """Un son de synthese (int16, a sa frequence) -> int16 a 16 kHz, celle du
+    micro et de la transcription."""
+    import numpy as np
+    son = np.asarray(son, dtype=np.float64).reshape(-1)
+    if not len(son) or int(frequence) == FREQ:
+        return np.round(son).astype(np.int16)
+    n = int(len(son) * FREQ // int(frequence))
+    x = np.interp(np.arange(n) * (float(frequence) / FREQ), np.arange(len(son)), son)
+    return np.clip(np.round(x), -32768, 32767).astype(np.int16)
+
+
 # ======================================================================
 #  LES SONS
 # ======================================================================
@@ -1776,6 +1875,13 @@ def comprendre(texte, raccourcis=()):
     t = re.sub(r"^(?:s'il te plait|stp|dis|dis moi|est ce que tu peux|tu peux|peux tu|"
                r"tu pourrais|pourrais tu|please|could you|can you|would you|will you)\s+", "", t)
     t = re.sub(r"\s+(?:s'il te plait|stp|merci|please|thanks|thank you)$", "", t)
+    # « METS » S'ENTEND « MAIS » : /me/ s'ecrit le plus souvent « Mais », ou
+    # « Met », « Mes » -- mesure, 7 « mets » sur 8 (« Mais un minuteur de 18. »,
+    # « Mais la lumiere en vert. »), qui partaient chez BrainDebugger au lieu de
+    # se faire ici, tout de suite. Seulement en tete et devant ce qui suit un
+    # « mets » ; pour lire la commande -- le texte envoye ailleurs ne change pas.
+    t = re.sub(r"^(?:mais|met|mes|mai)\s+(?=(?:la|le|les|l'|un|une|du|des|de|moi|ma|mon|mes|en)\b)",
+               "mets ", t)
     mots = t.split()
 
     if t in _SILENCE:
@@ -3749,6 +3855,14 @@ class Bouche:
         self.sortie(ev)
 
 
+def rendre_en_memoire(syn, texte):
+    """Un texte dit par cette voix, en WAV 16 kHz -- en memoire, jamais joue."""
+    import numpy as np
+    sons = list(syn.phrases(texte_pour_piper(texte, getattr(syn, "langue", "fr"))))
+    son = np.concatenate(sons) if sons else np.zeros(0, np.int16)
+    return wav_de(en_16k(son, syn.frequence))
+
+
 def voix_enfant(port, secret, lecteur=None):
     """Le processus de la voix. Attend « charger », puis des « dire »."""
     s = socket.create_connection(("127.0.0.1", int(port)), timeout=30)
@@ -3811,6 +3925,13 @@ def voix_enfant(port, secret, lecteur=None):
             elif c.get("cmd") == "dire" and etat["bouche"] is not None:
                 etat["bouche"].dire(c.get("id"), c.get("texte", ""), float(c.get("lenteur", 1.0)),
                                     c.get("cle"))
+            elif c.get("cmd") == "rendre" and etat["bouche"] is not None:
+                # la porteuse de la transcription (voir `reconnaitre`) : dite en
+                # memoire, pas au haut-parleur, et rendue a Machi Tool
+                syn = etat["bouche"].syns.get(c.get("cle"))
+                if syn is not None:
+                    sortie({"evt": "rendu", "id": c.get("id"), "cle": c.get("cle"),
+                            "wav": base64.b64encode(rendre_en_memoire(syn, c.get("texte", ""))).decode("ascii")})
         except Exception as e:
             sortie({"evt": "erreur", "cle": c.get("cle") if c.get("cmd") == "charger" else None,
                     "message": "%s : %s" % (type(e).__name__, str(e)[:160])})

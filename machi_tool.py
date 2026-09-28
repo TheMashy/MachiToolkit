@@ -4188,11 +4188,27 @@ DICTEE_ENFANT_ARG = "--moteur-dictee"
 DICTEE_MEMOIRE_MIN_MO = 1500        # en dessous, charger 1 Go gelerait le PC
 DICTEE_DEMARRAGE_S = 90             # l'exe se decompresse avant de repondre
 DICTEE_REPONSE_S = 300              # premier chargement + transcription
-_MOTEUR = {"proc": None, "sock": None, "vu": 0.0}
+# UN MOTEUR DEJA CHARGE rend une phrase en une fraction de seconde (0,3 s pour
+# 3 s de son, 1,1 s pour 10 s). Les 300 s du premier chargement ne valent
+# plus : un moteur qui cale (la memoire qui pagine, un jeu qui prend tout)
+# tenait Jarvis « Je transcris... » cinq minutes, les phrases suivantes
+# empilees derriere. Large quand meme : 30 s, plus une seconde par seconde de son.
+DICTEE_REPONSE_CHAUD_S = 30.0
+DICTEE_REPONSE_PAR_S = 1.0
+# la porteuse (voir jarvis.reconnaitre) ne part qu'avec un son court : une
+# fenetre de suite (quelques secondes d'attente, puis un mot), pas un monologue
+DICTEE_ANCRE_MAX_S = 15.0
+_MOTEUR ={"proc": None, "sock": None, "vu": 0.0, "charge": False}
 
 
 class DicteeImpossible(RuntimeError):
-    """Une raison qu'on peut dire telle quelle a la personne."""
+    """Une raison qu'on peut dire telle quelle a la personne -- sur la page de
+    la dictee. Jarvis, lui, dit `cle` (une phrase courte, dans sa langue :
+    voir _PHRASES) ; la raison technique va au journal."""
+
+    def __init__(self, message, cle="transcription_ratee"):
+        super().__init__(message)
+        self.cle = cle
 
 
 def memoire_libre_mo():
@@ -4228,9 +4244,11 @@ def _commande_moteur(port, secret):
     return [sys.executable, os.path.abspath(__file__), DICTEE_ENFANT_ARG, str(port), secret]
 
 
-def _arreter_moteur():
+def _arreter_moteur(attente=3):
+    """Arrete le moteur : il finit proprement s'il le peut en `attente`
+    secondes, sinon on le tue (0 : un moteur qui cale, tue tout de suite)."""
     sock, proc = _MOTEUR["sock"], _MOTEUR["proc"]
-    _MOTEUR.update(sock=None, proc=None)
+    _MOTEUR.update(sock=None, proc=None, charge=False)
     if sock is not None:
         try:
             _envoyer_trame(sock, b"")                 # « c'est fini »
@@ -4242,7 +4260,9 @@ def _arreter_moteur():
             pass
     if proc is not None and proc.poll() is None:
         try:
-            proc.wait(timeout=3)
+            if attente <= 0:
+                raise TimeoutError()
+            proc.wait(timeout=attente)
         except Exception:
             try:
                 proc.kill()
@@ -4264,7 +4284,7 @@ def _moteur_vivant():
         raise DicteeImpossible(
             "pas assez de memoire libre pour la dictee (%d Mo, il en faut %d) — "
             "ferme des applications ; Handy garde peut-etre le meme modele ouvert"
-            % (libre, DICTEE_MEMOIRE_MIN_MO))
+            % (libre, DICTEE_MEMOIRE_MIN_MO), cle="memoire_pleine")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         srv.bind(("127.0.0.1", 0))
@@ -4295,8 +4315,45 @@ def _moteur_vivant():
             raise DicteeImpossible("le moteur de dictee n'a pas repondu comme prevu")
     finally:
         srv.close()
-    _MOTEUR.update(proc=proc, sock=sock, vu=time.time())
+    _MOTEUR.update(proc=proc, sock=sock, vu=time.time(), charge=False)
     return sock
+
+
+def moteur_chaud():
+    """Le moteur tourne-t-il, son modele deja charge (il a deja repondu) ?"""
+    proc = _MOTEUR["proc"]
+    return bool(proc is not None and proc.poll() is None and _MOTEUR["sock"] is not None
+                and _MOTEUR.get("charge"))
+
+
+def _delai_reponse(duree_s):
+    """Combien attendre la reponse du moteur : le premier chargement a droit a
+    DICTEE_REPONSE_S ; un moteur charge, a bien moins (voir DICTEE_REPONSE_CHAUD_S)."""
+    if not _MOTEUR.get("charge"):
+        return DICTEE_REPONSE_S
+    return DICTEE_REPONSE_CHAUD_S + DICTEE_REPONSE_PAR_S * max(0.0, float(duree_s))
+
+
+def _moteur_charge(psutil_=None, windows=None):
+    """Le moteur vient de repondre pour la premiere fois : son modele est
+    charge. La priorite basse le protegeait pendant ce chargement (1 Go lu
+    d'un coup) ; ensuite, pendant un jeu, elle l'affamait -- une phrase de
+    0,3 s s'etirait. Il repasse en priorite normale : il n'a de toute facon que
+    la moitie des coeurs (_options_onnx)."""
+    if _MOTEUR.get("charge"):
+        return False
+    _MOTEUR["charge"] = True
+    proc = _MOTEUR["proc"]
+    if proc is None or not (os.name == "nt" if windows is None else windows):
+        return False
+    try:
+        if psutil_ is None:
+            import psutil as psutil_
+        psutil_.Process(proc.pid).nice(psutil_.NORMAL_PRIORITY_CLASS)
+        return True
+    except Exception as e:
+        print("Dictee : priorite inchangee (%s)" % type(e).__name__)
+        return False
 
 
 def entete_wav(octets):
@@ -4305,8 +4362,17 @@ def entete_wav(octets):
         return w.getnchannels(), w.getframerate(), w.getnframes(), w.getsampwidth()
 
 
-def transcrire(octets):
-    """Le texte dit dans ce WAV. Le son ne touche jamais le disque."""
+def transcrire(octets, porteuse=None):
+    """Le texte dit dans ce WAV. Le son ne touche jamais le disque.
+
+    `porteuse` (un WAV a la meme frequence, en memoire) : de quoi ancrer la
+    langue d'une reponse d'un mot (voir jarvis.reconnaitre) -- le moteur ne
+    s'en sert que si la parole est courte.
+
+    UN MOTEUR QUI MEURT EN PLEINE PHRASE (un plantage natif) : la phrase est
+    encore la, en memoire ; on relance un moteur et on la lui redonne, une
+    fois. Jamais apres un simple depassement du delai : sous une memoire qui
+    pagine, recharger 1 Go aggraverait tout."""
     if etat_dictee()["etat"] != "pret":
         raise RuntimeError("le modele de dictee n'est pas pret")
     try:
@@ -4319,22 +4385,48 @@ def transcrire(octets):
         raise ValueError("frequence non prise en charge : %s" % frequence)
     if n < frequence * 0.2:
         return ""                                   # un clic, pas une phrase
-    with _DICTEE_VERROU:
-        sock = _moteur_vivant()
+    trame = octets
+    if porteuse and n <= frequence * DICTEE_ANCRE_MAX_S:
         try:
-            _envoyer_trame(sock, octets)
-            reponse = json.loads(_recevoir_trame(sock).decode("utf-8"))
-        except (OSError, ConnectionError, ValueError):
-            proc = _MOTEUR["proc"]
-            code = proc.poll() if proc is not None else None
-            _arreter_moteur()
-            libre = memoire_libre_mo()
-            conseil = (" — il ne restait que %d Mo de memoire libre" % libre
-                       if libre is not None and libre < 3 * DICTEE_MEMOIRE_MIN_MO else "")
-            print("Dictee : le moteur s'est arrete (code %s)" % code)
-            raise DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription%s. "
-                                   "Machi Tool, lui, tourne toujours." % conseil)
+            ok = entete_wav(porteuse)[1] == frequence
+        except Exception:
+            ok = False
+        if ok:
+            trame = json.dumps({"wav": base64.b64encode(octets).decode("ascii"),
+                                "porteuse": base64.b64encode(porteuse).decode("ascii")}).encode("ascii")
+    with _DICTEE_VERROU:
+        for essai in (0, 1):
+            sock = _moteur_vivant()
+            try:
+                sock.settimeout(_delai_reponse(n / float(frequence)))
+                _envoyer_trame(sock, trame)
+                reponse = json.loads(_recevoir_trame(sock).decode("utf-8"))
+                break
+            except (OSError, ConnectionError, ValueError) as e:
+                proc = _MOTEUR["proc"]
+                code = proc.poll() if proc is not None else None
+                if code is None and proc is not None and not isinstance(e, socket.timeout):
+                    # la connexion tombe un instant avant que le processus ait fini de mourir
+                    try:
+                        code = proc.wait(timeout=2)
+                    except Exception:
+                        code = None
+                _arreter_moteur(0 if isinstance(e, socket.timeout) else 3)
+                libre = memoire_libre_mo()
+                memoire_ok = libre is None or libre >= DICTEE_MEMOIRE_MIN_MO
+                if essai == 0 and code is not None and memoire_ok:
+                    print("Dictee : le moteur est tombe en pleine phrase (code %s), je le relance" % code)
+                    continue
+                conseil = (" — il ne restait que %d Mo de memoire libre" % libre
+                           if libre is not None and libre < 3 * DICTEE_MEMOIRE_MIN_MO else "")
+                print("Dictee : le moteur s'est arrete (code %s, %s)" % (code, type(e).__name__))
+                raise DicteeImpossible("le moteur de dictee s'est arrete en pleine transcription%s. "
+                                       "Machi Tool, lui, tourne toujours." % conseil,
+                                       cle="transcription_ratee" if memoire_ok else "memoire_pleine")
         _MOTEUR["vu"] = time.time()
+        if "erreur" not in reponse:
+            _moteur_charge()
+    trame = None
     _programmer_dechargement()
     if "erreur" in reponse:
         raise DicteeImpossible("le moteur de dictee a echoue : %s" % reponse["erreur"])
@@ -4366,8 +4458,17 @@ def moteur_dictee_enfant(port, secret, charger=None):
             try:
                 if modele is None:
                     modele = (charger or _charger_modele_dictee)()
+                porteuse = None
+                if not wav.startswith(b"RIFF"):
+                    # une reponse courte de Jarvis : le son, et sa porteuse
+                    d = json.loads(wav.decode("ascii"))
+                    wav = base64.b64decode(d["wav"])
+                    if d.get("porteuse"):
+                        porteuse, f_p = son_depuis_wav(base64.b64decode(d["porteuse"]))
                 son, frequence = son_depuis_wav(wav)
-                reponse = {"texte": str(modele.recognize(son, sample_rate=frequence) or "").strip()}
+                if porteuse is not None and f_p != frequence:
+                    porteuse = None
+                reponse = {"texte": _jv.reconnaitre(modele, son, frequence, porteuse)}
             except Exception as e:
                 reponse = {"erreur": "%s : %s" % (type(e).__name__, str(e)[:200])}
             wav = None
@@ -4384,13 +4485,113 @@ _DICTEE_MINUTEUR = [None]
 
 def delai_dechargement(cfg=None, libre=None):
     """Combien de temps le moteur reste charge sans servir : dix minutes ; une
-    heure si Jarvis ecoute et que la memoire le permet."""
+    heure si Jarvis ecoute et que la memoire le permet ; une demi-heure si
+    Jarvis ecoute et qu'il reste encore de la marge (voir entretenir_dictee)."""
     cfg = CFG if cfg is None else cfg
     if cfg.get("jarvis_actif"):
         libre = memoire_libre_mo() if libre is None else libre
         if libre is None or libre >= DICTEE_GARDER_MEMOIRE_MO:
             return DICTEE_GARDER_JARVIS_S
+        if libre >= DICTEE_GARDER_MARGE_MO:
+            return DICTEE_GARDER_SERRE_S
     return DICTEE_DECHARGER_S
+
+
+# ---------------------------------------------------------------------
+#  LE MOTEUR TENU CHAUD PENDANT QUE JARVIS ECOUTE.
+#
+#  « Jarvis, allume la lumiere » apres le demarrage, ou apres le dejeuner :
+#  plusieurs secondes de « Je transcris... » -- l'exe se decompresse, puis
+#  1 Go de modele se charge. Rien ne le chargeait avant qu'on ait deja parle.
+#
+#  LE COMPROMIS MEMOIRE / ATTENTE, tant que « Ecouter Jarvis » est coche :
+#    - au demarrage de l'oreille, le moteur se charge ~45 s plus tard (pas
+#      pendant que le PC finit de demarrer), si la memoire le permet ENCORE
+#      une fois le modele charge (DICTEE_GARDER_MEMOIRE_MO libres, + le modele) ;
+#    - s'il reste assez de memoire, il reste charge : une transcription de
+#      silence toutes les 20 minutes garde ses pages en memoire (Windows les
+#      aurait rendues au disque) et repousse son dechargement ;
+#    - si la memoire se resserre (un jeu), plus d'entretien : il part 30 min
+#      apres sa derniere phrase s'il reste DICTEE_GARDER_MARGE_MO libres, 10
+#      min sinon -- et en dessous de DICTEE_MEMOIRE_MIN_MO, il ne se charge pas.
+#  Decoche, rien de tout ca : la dictee du site garde ses dix minutes.
+# ---------------------------------------------------------------------
+
+DICTEE_MODELE_MO = 1000                  # le moteur charge : ~1 Go
+DICTEE_GARDER_SERRE_S = 30 * 60
+DICTEE_GARDER_MARGE_MO = DICTEE_MEMOIRE_MIN_MO + 500
+DICTEE_ENTRETIEN_S = 20 * 60
+DICTEE_PRECHAUFFE_DELAI_S = 45
+_ENTRETIEN = {"prechauffe_a": 0.0, "en_cours": False}
+
+
+def memoire_pour_garder(charge=True, libre=None):
+    """Assez de memoire pour garder le moteur (`charge`), ou pour le charger
+    et qu'il en reste autant ensuite ? (Inconnue : oui.)"""
+    libre = memoire_libre_mo() if libre is None else libre
+    return libre is None or libre >= DICTEE_GARDER_MEMOIRE_MO + (0 if charge else DICTEE_MODELE_MO)
+
+
+def moteur_vivant():
+    proc = _MOTEUR["proc"]
+    return proc is not None and proc.poll() is None and _MOTEUR["sock"] is not None
+
+
+def programmer_prechauffage(maintenant=None):
+    """L'oreille demarre : le moteur se chargera dans DICTEE_PRECHAUFFE_DELAI_S."""
+    t = time.time() if maintenant is None else maintenant
+    if not _ENTRETIEN["prechauffe_a"]:
+        _ENTRETIEN["prechauffe_a"] = t + DICTEE_PRECHAUFFE_DELAI_S
+
+
+def entretenir_dictee(cfg, maintenant=None, lancer=None):
+    """A chaque tour de veille : precharge le moteur quand c'est l'heure, ou
+    l'entretient. Rend ce qui a ete lance (« prechauffe », « entretien ») ou None."""
+    lancer = lancer or (lambda f: threading.Thread(target=f, daemon=True).start())
+    if not cfg.get("jarvis_actif") or not dictee_possible() or etat_dictee()["etat"] != "pret":
+        return None
+    t = time.time() if maintenant is None else maintenant
+    if not moteur_vivant():
+        a = _ENTRETIEN["prechauffe_a"]
+        if a and t >= a:
+            _ENTRETIEN["prechauffe_a"] = 0.0
+            if memoire_pour_garder(charge=False):
+                lancer(prechauffer_dictee)
+                return "prechauffe"
+        return None
+    if (t - _MOTEUR["vu"] >= DICTEE_ENTRETIEN_S and not _ENTRETIEN["en_cours"]
+            and memoire_pour_garder(charge=True)):
+        _ENTRETIEN["en_cours"] = True
+        lancer(garder_au_chaud)
+        return "entretien"
+    return None
+
+
+def garder_au_chaud():
+    """Une transcription de silence (0,4 s) : le modele est relu, ses pages
+    restent en memoire, et il repousse son depart. Si une vraie phrase est en
+    cours, rien : elle fait deja ce travail."""
+    try:
+        if not _DICTEE_VERROU.acquire(blocking=False):
+            return False
+        try:
+            if not moteur_vivant():
+                return False
+            sock = _MOTEUR["sock"]
+            sock.settimeout(_delai_reponse(0.4))
+            _envoyer_trame(sock, _jv.wav_de(__import__("numpy").zeros(int(_jv.FREQ * 0.4), dtype="int16")))
+            _recevoir_trame(sock)
+            _MOTEUR["vu"] = time.time()
+        except Exception as e:
+            print("Dictee : entretien impossible (%s)" % type(e).__name__)
+            _arreter_moteur()
+            return False
+        finally:
+            _DICTEE_VERROU.release()
+        _programmer_dechargement()
+        return True
+    finally:
+        _ENTRETIEN["en_cours"] = False
 
 
 def _programmer_dechargement():
@@ -5259,6 +5460,8 @@ def _lire_voix(sock):
         elif quoi == "fini":
             envoyer_oreille({"cmd": "parole", "actif": False})
             VOIX.fini(ev.get("id"), bool(ev.get("coupe")), ev.get("reste"))
+        elif quoi == "rendu":
+            recevoir_porteuse(ev)            # la porteuse de la transcription
         elif quoi == "erreur":
             print("Jarvis : voix : %s" % str(ev.get("message"))[:200])
             # La voix anglaise n'a pas pu se charger : on le DIT, au lieu de
@@ -5693,6 +5896,9 @@ def traiter_evenement(ev):
             JARVIS.update(etat="attente", message=message_attente())
         if not ev.get("vad") and vad_present():
             envoyer_oreille({"cmd": "vad"})
+        # l'oreille demarre : le moteur de transcription se chargera sous peu,
+        # avant le premier « Jarvis » (voir entretenir_dictee)
+        programmer_prechauffage()
         if "micro" in ev:
             # Le micro qu'il ecoute vraiment -- et s'il n'est pas celui choisi
             # (debranche), on le dit plutot que d'ecouter ailleurs en silence.
@@ -5719,6 +5925,10 @@ def traiter_evenement(ev):
         # « Jarvis » passe pres du seuil sans le franchir : on le garde pour
         # l'afficher, avec de quoi y remedier.
         JARVIS["presque"] = (float(ev.get("distance") or 0), float(ev.get("seuil") or 0), time.time())
+        # quelqu'un vient peut-etre de l'appeler : le moteur se reveille (rien s'il l'est)
+        if (CFG.get("jarvis_actif") and dictee_possible() and not moteur_vivant()
+                and memoire_pour_garder(charge=False)):
+            threading.Thread(target=prechauffer_dictee, daemon=True).start()
     elif quoi == "voix_niveau":
         t = time.time()
         JARVIS["voix_niveau"] = (float(ev.get("v") or 0.0), t)
@@ -5749,6 +5959,11 @@ def traiter_evenement(ev):
         # UN NOUVEAU TOUR : ce qu'il preparait pour le tour d'avant ne se dira pas
         JARVIS["tour"] = int(JARVIS.get("tour") or 0) + 1
         VOIX.taire()
+        if etat_dictee()["etat"] != "pret":
+            # RIEN NE POURRA ETRE TRANSCRIT (le modele se telecharge, ou a rate) :
+            # il ne t'invite pas a parler dans le vide -- il dit ou il en est
+            envoyer_oreille({"cmd": "annuler"})
+            return dire_transcription_indisponible(langue_du_mode())
         mode_courant()
         # « Quand Jarvis s'allume, il doit toujours etre en mode Jarvis (meme
         # s'il etait en psychologue avant). » La seance continue tant qu'on se
@@ -6125,6 +6340,7 @@ def veiller_sur_jarvis(cfg):
                 if not vad_present() and time.time() - _VAD["essaye"] > 6 * 3600:
                     _VAD["essaye"] = time.time()
                     threading.Thread(target=preparer_vad, daemon=True).start()
+                veiller_sur_la_transcription(cfg)
             if not voulu and JARVIS["etat"] != "eteint" and _OREILLE["proc"] is None:
                 JARVIS.update(etat="eteint", message="")
             if voulu:
@@ -6215,14 +6431,137 @@ def prechauffer_dictee():
         try:
             sock = _moteur_vivant()
             silence = _jv.wav_de(__import__("numpy").zeros(int(_jv.FREQ * 0.4), dtype="int16"))
+            sock.settimeout(_delai_reponse(0.4))
             _envoyer_trame(sock, silence)
             _recevoir_trame(sock)
             _MOTEUR["vu"] = time.time()
+            _moteur_charge()
         except Exception as e:
             print("Jarvis : prechauffage impossible (%s)" % type(e).__name__)
             _arreter_moteur()
             return
     _programmer_dechargement()
+
+
+# ---------- la porteuse : la langue des reponses d'un mot ----------
+#
+# « Non » transcrit « Não », « Ouais » transcrit « Wait » (voir
+# jarvis.reconnaitre) : une phrase dite par SA voix francaise, rendue une fois
+# en memoire par le processus de la voix, ancre la langue. Jamais sur le disque.
+
+PORTEUSE_TEXTE = {"fr": "Je vous écoute."}
+PORTEUSE_REDEMANDE_S = 60
+_PORTEUSE = {"fr": None, "demande": 0.0}
+
+
+def porteuse_pour(langue):
+    """Le WAV de la porteuse de cette langue, rendu par la voix chargee en ce
+    moment -- ou None (pas de voix neuronale, ou pas encore rendue)."""
+    p = _PORTEUSE.get(langue) if langue in PORTEUSE_TEXTE else None
+    if p and p.get("sig") and p["sig"] == _VOIX_ENFANT.get("charge"):
+        return p["wav"]
+    return None
+
+
+def demander_porteuse(maintenant=None):
+    """La voix francaise est chargee et la porteuse manque (ou vient d'une
+    voix d'avant) : on la demande -- quand Jarvis ne fait rien, pour ne pas
+    retarder une reponse. La voix peut la perdre (« taire » vide sa file) :
+    on redemande, au plus une fois par minute."""
+    t = time.time() if maintenant is None else maintenant
+    if porteuse_pour("fr") is not None or not voix_prete("fr"):
+        return False
+    if JARVIS.get("etat") != "attente" or t - _PORTEUSE["demande"] < PORTEUSE_REDEMANDE_S:
+        return False
+    _PORTEUSE["demande"] = t
+    return envoyer_voix({"cmd": "rendre", "id": "porteuse", "cle": "fr", "texte": PORTEUSE_TEXTE["fr"]})
+
+
+def recevoir_porteuse(ev):
+    """Le processus de la voix rend la porteuse (evenement « rendu »)."""
+    cle = str(ev.get("cle") or "")
+    if cle not in PORTEUSE_TEXTE or not ev.get("wav"):
+        return False
+    try:
+        wav = base64.b64decode(ev["wav"])
+        if entete_wav(wav)[1] != _jv.FREQ:
+            return False
+    except Exception:
+        return False
+    _PORTEUSE[cle] = {"wav": wav, "sig": _VOIX_ENFANT.get("charge")}
+    return True
+
+
+def transcrire_phrase(octets, langue):
+    """transcrire, avec la porteuse de la langue quand on l'a."""
+    p = porteuse_pour(langue)
+    return transcrire(octets, porteuse=p) if p else transcrire(octets)
+
+
+# ---------- quand la transcription n'est pas la ----------
+#
+# « Un telechargement rate, et Jarvis est sourd pour de bon. » Le modele de
+# la dictee (456 Mo) peut rater sa venue (un reseau qui flanche) : rien ne
+# reessayait tant que Machi Tool tournait, et Jarvis ne le disait qu'une
+# fois -- ensuite chaque appel sonnait, on parlait dans le vide, et rien.
+
+DICTEE_RELANCES_S = (60, 5 * 60, 30 * 60)
+DICTEE_DIRE_S = 120                  # l'etat de la transcription, dit au plus toutes les 2 min
+_DICTEE_RELANCE = {"prochain": 0.0, "n": 0}
+
+
+def relancer_dictee_si_ratee(maintenant=None, lancer=None):
+    """La preparation du modele a echoue : on la retente apres 1 min, puis 5,
+    puis toutes les 30. Rend True si un essai part."""
+    t = time.time() if maintenant is None else maintenant
+    if not dictee_possible() or DICTEE.get("etat") != "erreur":
+        if DICTEE.get("etat") == "pret":
+            _DICTEE_RELANCE.update(prochain=0.0, n=0)
+        return False
+    if not _DICTEE_RELANCE["prochain"]:
+        _DICTEE_RELANCE["prochain"] = t + DICTEE_RELANCES_S[0]
+        return False
+    if t < _DICTEE_RELANCE["prochain"]:
+        return False
+    n = _DICTEE_RELANCE["n"] = _DICTEE_RELANCE["n"] + 1
+    _DICTEE_RELANCE["prochain"] = t + DICTEE_RELANCES_S[min(n, len(DICTEE_RELANCES_S) - 1)]
+    print("Dictee : nouvel essai de preparation (%d)" % n)
+    (lancer or (lambda f: threading.Thread(target=f, daemon=True).start()))(preparer_dictee)
+    return True
+
+
+def etat_de_la_transcription(langue):
+    """Ce qu'il dit quand on l'appelle et qu'il ne peut pas transcrire."""
+    d = etat_dictee()
+    if d.get("etat") == "preparation":
+        return phrase("transcription_telecharge", langue, int(round(float(d.get("progres") or 0) * 100)))
+    if d.get("etat") == "erreur":
+        return phrase("transcription_reessaie", langue)
+    return phrase("transcription_absente", langue)
+
+
+def veiller_sur_la_transcription(cfg):
+    """A chaque tour de veille, l'oreille ouverte : un modele rate se retente,
+    le moteur se precharge ou s'entretient, la porteuse se demande."""
+    for f in (relancer_dictee_si_ratee, lambda: entretenir_dictee(cfg), demander_porteuse):
+        try:
+            f()
+        except Exception as e:
+            print("Jarvis : transcription, veille (%s)" % type(e).__name__)
+
+
+def dire_transcription_indisponible(langue, tour=None, maintenant=None):
+    """Il ne peut pas transcrire : il le dit (au plus toutes les deux minutes ;
+    entre-temps, le son d'erreur et le panneau)."""
+    t = time.time() if maintenant is None else maintenant
+    texte = etat_de_la_transcription(langue)
+    if t - float(JARVIS.get("dictee_dite") or 0.0) >= DICTEE_DIRE_S:
+        JARVIS["dictee_dite"] = t
+        return signaler_erreur(texte, tour)
+    poser_led("erreur", 1.6)
+    jouer_son("erreur")
+    JARVIS["erreur_jusqua"] = t + ERREUR_MONTREE_S
+    JARVIS.update(etat="attente", message=texte)
 
 
 PSY_DUREE_S = 180            # le mode psy se referme apres trois minutes sans un mot
@@ -6261,6 +6600,12 @@ _PHRASES = {
     "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page de l'assistant, dans Machi Tool.",
                               "Transcription isn't ready yet. Have a look at the assistant page in Machi Tool."),
     "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
+    "transcription_telecharge": ("Ma transcription se télécharge encore : %d pour cent.",
+                                 "My transcription is still downloading: %d percent."),
+    "transcription_reessaie": ("Ma transcription n'a pas pu se préparer. Je réessaie.",
+                               "My transcription couldn't get ready. I'm trying again."),
+    "memoire_pleine": ("Il me manque de la mémoire pour vous comprendre. Fermez une application, je vous prie.",
+                       "I'm short of memory to understand you. Please close an application."),
     "commande_ratee": ("Je crains de ne pas avoir pu le faire.", "I'm afraid I couldn't do that."),
     "rate": ("Un incident de mon côté, je le crains.", "Something went wrong on my side, I'm afraid."),
     "cle_absente": ("Pour vous répondre, il me faut la clé de BrainDebugger : page Passerelle de Machi Tool.",
@@ -6966,17 +7311,20 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
     except Exception:
         return signaler_erreur(phrase("lecture", L), tour)
     if etat_dictee()["etat"] != "pret":
-        # dit UNE fois : ensuite, sa page le dit -- pas a chaque appel
-        if not JARVIS.get("transcription_absente_dite"):
-            JARVIS["transcription_absente_dite"] = True
-            return signaler_erreur(phrase("transcription_absente", L), tour)
-        poser_led(None)
-        return JARVIS.update(etat="attente", message=phrase("transcription_absente", "fr"))
+        # ce qu'il en est (un telechargement a 42 %, un nouvel essai) -- dit au
+        # plus toutes les deux minutes, pas une seule fois pour toujours
+        return dire_transcription_indisponible(L, tour)
+    if dictee_possible() and not moteur_chaud():
+        # le moteur se charge (l'exe, puis 1 Go) : l'attente a une raison visible
+        JARVIS.update(message="Je prepare la transcription...")
     try:
-        texte = transcrire(octets)
+        texte = transcrire_phrase(octets, L)
         noter_temps("transcrit")
     except DicteeImpossible as e:
-        return signaler_erreur(phrase("transcription_moteur", L), tour, detail=str(e)[:240])
+        # la raison technique au journal et sur la page ; a voix haute, une phrase courte, dans sa langue
+        print("Jarvis : transcription impossible (%s)" % str(e)[:200])
+        return signaler_erreur(phrase(getattr(e, "cle", None) or "transcription_moteur", L), tour,
+                               detail=str(e)[:240])
     except Exception as e:
         print("Jarvis : transcription impossible (%s)" % type(e).__name__)
         return signaler_erreur(phrase("transcription_ratee", L), tour)
@@ -12761,6 +13109,11 @@ class Panneau:
     #  Page Jarvis
     # ------------------------------------------------------------------
 
+    def reessayer_dictee(self):
+        """Le modele de la transcription, tout de suite (pas au prochain essai)."""
+        _DICTEE_RELANCE.update(prochain=0.0, n=0)
+        threading.Thread(target=preparer_dictee, daemon=True).start()
+
     def page_jarvis(self):
         # « UNE PASSE DE SIMPLICITE » : en haut ce qui sert tous les jours -- l'ecouter,
         # ta voix, ses mains ; le reste est replie, une section a la fois.
@@ -12777,6 +13130,11 @@ class Panneau:
         # « IL MET DU TEMPS » : ou passe le temps du dernier echange, et le dernier echec
         self.txt_jarvis_chrono = self.texte(f, "", BRUME, 8, largeur=500)
         self.txt_jarvis_chrono.pack(fill="x", pady=(2, 0))
+        # la transcription a rate sa venue : un bouton pour ne pas attendre le prochain essai
+        ligne_dictee = tk.Frame(f, bg=NUIT)
+        ligne_dictee.pack(fill="x", pady=(2, 0))
+        self.bt_dictee = self.bouton(ligne_dictee, "Reessayer la transcription", self.reessayer_dictee,
+                                     compact=True)
         self.texte(f, "Dis « Jarvis », puis ta demande -- ou a la fin : « baisse le son, Jarvis ». Avant son nom, "
                       "rien ne sort du micro : un petit modele compare chaque instant a ton « Jarvis », sans "
                       "transcrire. Apres, la phrase est transcrite sur ce PC (le moteur de la dictee, telecharge "
@@ -13457,6 +13815,19 @@ class Panneau:
         d = etat_dictee()
         details.append("transcription : " + {"pret": "prete", "preparation": "preparation %d %%" % (d["progres"] * 100),
                                              "absent": "pas encore installee", "erreur": "erreur"}.get(d["etat"], d["etat"]))
+        if d["etat"] == "erreur":
+            # POURQUOI, et quand il reessaie -- plus « erreur » tout court, sans suite
+            details[-1] += " (%s)" % (d.get("message") or "raison inconnue")
+            if _DICTEE_RELANCE["prochain"] > time.time():
+                details[-1] += ", nouvel essai dans %d min" % max(1, round((_DICTEE_RELANCE["prochain"]
+                                                                           - time.time()) / 60))
+        if hasattr(self, "bt_dictee"):
+            voir = d["etat"] == "erreur"
+            if voir != bool(self.bt_dictee.winfo_manager()):
+                if voir:
+                    self.bt_dictee.pack(side="left")
+                else:
+                    self.bt_dictee.pack_forget()
         n_voix, n_auto = len(gabarits_jarvis()), len(gabarits_auto())
         details.append(("voix apprise (%d facons%s)" % (n_voix, ", + %d gardees seul" % n_auto if n_auto else ""))
                        if n_voix else "voix pas encore apprise")

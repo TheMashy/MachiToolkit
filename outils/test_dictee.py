@@ -170,16 +170,39 @@ class Dictee(unittest.TestCase):
 # Machi Tool et rend un texte. FAUX_MOURIR le fait tomber en pleine phrase,
 # FAUX_SECRET lui fait donner un mauvais secret.
 FAUX_ENFANT = r"""
-import importlib.util, os, sys
+import importlib.util, os, sys, time
 spec = importlib.util.spec_from_file_location("mt_enfant", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+N = [0]
 class Faux:
     def recognize(self, son, sample_rate=16000):
+        N[0] += 1
         if os.environ.get("FAUX_MOURIR"):
             os._exit(3)
+        une_fois = os.environ.get("FAUX_MOURIR_UNE_FOIS")
+        if une_fois and not os.path.exists(une_fois):
+            open(une_fois, "w").close()
+            os._exit(3)
+        if os.environ.get("FAUX_DORMIR") and N[0] >= 2:
+            time.sleep(float(os.environ["FAUX_DORMIR"]))
         return "%s|%d|%d|%d" % (os.environ.get("FAUX_TEXTE", "bonjour"), len(son), sample_rate, os.getpid())
+class R:
+    def __init__(self, text, tokens, timestamps):
+        self.text, self.tokens, self.timestamps = text, tokens, timestamps
+class Ancre:
+    # sans contexte il derive ; avec la porteuse devant (un son plus long), il lit juste
+    def with_timestamps(self):
+        return Dates()
+    def recognize(self, son, sample_rate=16000):
+        return Dates().recognize(son, sample_rate).text
+class Dates:
+    def recognize(self, son, sample_rate=16000):
+        if len(son) <= sample_rate * 1.0:
+            return R("Não.", ["▁Não", "."], [0.3, 0.9])
+        return R("Je vous écoute. Non.", ["▁Je", "▁vous", "▁écoute", ".", "▁Non", "."],
+                 [0.1, 0.3, 0.5, 1.02, 1.5, 1.7])
 secret = os.environ.get("FAUX_SECRET") or sys.argv[3]
-m.moteur_dictee_enfant(sys.argv[2], secret, charger=lambda: Faux())
+m.moteur_dictee_enfant(sys.argv[2], secret, charger=lambda: Ancre() if os.environ.get("FAUX_ANCRE") else Faux())
 """
 
 
@@ -247,10 +270,77 @@ class MoteurAPart(unittest.TestCase):
             self.m.transcrire(wav(1.0))
         self.assertIn("tourne toujours", str(e.exception))
         self.assertIsNone(self.m._MOTEUR["proc"])
+        # un moteur qui tombe est relance une fois pour la meme phrase (v1.65) :
+        # qui retombe, c'est fini pour cette phrase -- deux lancements
+        self.assertEqual(len(self.lances), 2)
         # ...et la phrase suivante relance un moteur neuf.
         os.environ.pop("FAUX_MOURIR")
         self.assertTrue(self.m.transcrire(wav(1.0)).startswith("bonjour|"))
+        self.assertEqual(len(self.lances), 3)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_un_moteur_qui_tombe_en_pleine_phrase_est_relance_et_la_phrase_lue(self):
+        """La phrase etait perdue : il fallait rappeler Jarvis, et payer quand
+        meme un moteur froid."""
+        os.environ["FAUX_MOURIR_UNE_FOIS"] = os.path.join(self.tmp, "deja_tombe")
+        self.addCleanup(os.environ.pop, "FAUX_MOURIR_UNE_FOIS", None)
+        self.assertTrue(self.m.transcrire(wav(1.0)).startswith("bonjour|"))
         self.assertEqual(len(self.lances), 2)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_un_moteur_charge_qui_cale_ne_bloque_pas_cinq_minutes(self):
+        """300 s de delai pour chaque phrase : un moteur qui calait tenait
+        Jarvis « Je transcris... » cinq minutes. Charge, il a bien moins -- et
+        on ne relance pas un moteur qui cale (sous une memoire qui pagine,
+        recharger 1 Go aggraverait tout)."""
+        os.environ["FAUX_DORMIR"] = "4"
+        self.addCleanup(os.environ.pop, "FAUX_DORMIR", None)
+        self.m.DICTEE_REPONSE_CHAUD_S = 0.5
+        self.m.DICTEE_REPONSE_PAR_S = 0.0
+        self.m.transcrire(wav(1.0))                  # le chargement : la premiere reponse
+        self.assertTrue(self.m.moteur_chaud())
+        t0 = time.time()
+        with self.assertRaises(self.m.DicteeImpossible):
+            self.m.transcrire(wav(1.0))
+        self.assertLess(time.time() - t0, 2.5)
+        self.assertEqual(len(self.lances), 1, "un moteur qui cale n'est pas relance")
+
+    def test_la_priorite_remonte_une_fois_le_modele_charge(self):
+        vus = []
+
+        class FauxPsutil:
+            NORMAL_PRIORITY_CLASS = 32
+
+            class Process:
+                def __init__(self, pid):
+                    self.pid = pid
+
+                def nice(self, v):
+                    vus.append((self.pid, v))
+
+        class Proc:
+            pid = 4242
+
+            def poll(self):
+                return 0
+        self.m._MOTEUR.update(proc=Proc(), charge=False)
+        self.assertTrue(self.m._moteur_charge(FauxPsutil, windows=True))
+        self.assertFalse(self.m._moteur_charge(FauxPsutil, windows=True))
+        self.assertEqual(vus, [(4242, 32)], "une seule fois, apres le chargement")
+        self.m._MOTEUR["charge"] = False
+        self.assertFalse(self.m._moteur_charge(FauxPsutil, windows=False))
+        self.assertEqual(len(vus), 1)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_porteuse_ancre_la_langue_d_une_reponse_courte(self):
+        """« Non » transcrit « Não » : avec la porteuse, « Non »."""
+        os.environ["FAUX_ANCRE"] = "1"
+        self.addCleanup(os.environ.pop, "FAUX_ANCRE", None)
+        self.assertEqual(self.m.transcrire(wav(1.0)), "Não.")
+        self.assertEqual(self.m.transcrire(wav(1.0), porteuse=wav(1.0)), "Non.")
+        # une porteuse a une autre frequence ne part pas
+        self.assertEqual(self.m.transcrire(wav(1.0), porteuse=wav(1.0, frequence=22050)), "Não.")
+        self.assertEqual(len(self.lances), 1)
 
     def test_pas_assez_de_memoire_on_ne_lance_rien(self):
         self.m.memoire_libre_mo = lambda: 600
@@ -258,6 +348,7 @@ class MoteurAPart(unittest.TestCase):
             self.m.transcrire(wav(1.0))
         self.assertIn("600 Mo", str(e.exception))
         self.assertIn("Handy", str(e.exception))
+        self.assertEqual(e.exception.cle, "memoire_pleine", "Jarvis dit une phrase courte, pas celle-ci")
         self.assertEqual(self.lances, [], "le moteur a ete lance malgre le manque de memoire")
 
     def test_un_imposteur_sans_le_secret_est_refuse(self):
