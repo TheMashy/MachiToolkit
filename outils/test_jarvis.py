@@ -2296,6 +2296,264 @@ class Protocole(unittest.TestCase):
 
 
 # ======================================================================
+#  SES NOUVEAUX POUVOIRS : les decisions (jarvis.py, sans disque ni Windows)
+# ======================================================================
+
+class SesNouveauxPouvoirs(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.d, ignore_errors=True))
+        d = self.d
+        self.home = os.path.join(d, "Users", "moi")
+        self.docs = os.path.join(self.home, "Documents")
+        self.machi = os.path.join(self.home, "AppData", "Local", "MachiTool")
+        self.windows = os.path.join(d, "Windows")
+        self.prog = os.path.join(d, "Program Files")
+        self.startup = os.path.join(self.home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu",
+                                    "Programs", "Startup")
+        for p in (self.docs, self.machi, self.windows, self.prog, self.startup,
+                  os.path.join(self.home, "Desktop", "Démarrage"), os.path.join(self.docs, "Rangement")):
+            os.makedirs(p, exist_ok=True)
+        self.systeme = J.dossiers_systeme({"SystemRoot": self.windows, "ProgramFiles": self.prog,
+                                           "APPDATA": os.path.join(self.home, "AppData", "Roaming")})
+        self.bases = [self.home, self.docs]
+        self.gardes = (self.systeme, self.bases, [self.machi])
+
+    def fichier(self, *chemin, contenu="x"):
+        p = os.path.join(*chemin)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(contenu)
+        return p
+
+    def test_le_palier_de_chaque_outil(self):
+        # « selon la gravite » : le code pour les fichiers et Windows, un oui
+        # avant ce qui ne s'annule pas, le reste directement
+        sans = {"musique", "lumiere"}
+        P = J.palier_outil
+        self.assertEqual(P("musique", {}, sans), "direct")
+        self.assertEqual(P("lumiere", {}, sans), "direct")
+        for nom in J.OUTILS_FICHIERS:
+            self.assertEqual(P(nom, {}, sans), "code", nom)
+        for a in ("lire", "lister"):
+            self.assertEqual(P("reglage_windows", {"action": a}, sans), "direct", a)
+        for a in ("activer", "desactiver", "choisir"):
+            self.assertEqual(P("reglage_windows", {"action": a}, sans), "code", a)
+        self.assertEqual(P("forcer_fermeture", {"cible": "Discord"}, sans), "oui")
+        self.assertEqual(P("installer_appli", {"action": "chercher"}, sans), "direct")
+        for a in ("installer", "mettre_a_jour"):
+            self.assertEqual(P("installer_appli", {"action": a}, sans), "oui", a)
+        self.assertEqual(J.groupe_outil("corbeille"), "fichiers")
+        self.assertEqual(J.groupe_outil("installer_appli"), "windows")
+        self.assertIsNone(J.groupe_outil("ouvrir"))
+        self.assertEqual(J.question_oui([("forcer", "Discord")]), "Je ferme de force Discord ?")
+        self.assertEqual(J.question_oui([("installer", "VLC")]), "J'installe VLC ?")
+        self.assertEqual(J.question_oui([("forcer", "Discord"), ("mettre_a_jour", "VLC")]),
+                         "Je ferme de force Discord, puis je mets à jour VLC ?")
+        self.assertEqual(J.question_oui([("installer", "VLC")], "en"), "Shall I install VLC?")
+
+    def test_jamais_le_systeme_ni_les_dossiers_de_base(self):
+        R = lambda ch, source=True: J.refus_chemin(ch, *self.gardes, source=source)
+        self.assertIsNone(R(self.fichier(self.docs, "a.txt")))
+        self.assertIn("racine", R(os.path.abspath(os.sep)))
+        self.assertIn("systeme", R(self.fichier(self.windows, "win.ini")))
+        self.assertIn("systeme", R(os.path.join(self.prog, "Appli")))
+        self.assertIn("je n'y touche pas", R(self.fichier(self.startup, "lance.lnk")))
+        self.assertIn("Demarrage", R(self.fichier(self.home, "Desktop", "Démarrage", "x.txt")))
+        self.assertIn("Machi Tool", R(self.fichier(self.machi, "config.json")))
+        for base in (self.home, self.docs):
+            self.assertIn("dossier de base", R(base), base)
+        self.assertIn("dossier de base", R(os.path.dirname(self.home)), "ce qui contient un dossier de base")
+        self.assertIn("dossier de base", R(os.path.join(self.home, "AppData")), "ce qui contient Machi Tool")
+        self.assertIsNone(R(self.docs, source=False), "on peut y ranger")
+        self.assertIn("systeme", R(self.windows, source=False), "mais jamais vers le systeme")
+
+    def test_deplacer_et_renommer_sans_ecraser_ni_creer_un_programme(self):
+        a = self.fichier(self.docs, "notes.txt")
+        rang = os.path.join(self.docs, "Rangement")
+        self.assertEqual(J.preparer_deplacement(a, rang, *self.gardes), (a, os.path.join(rang, "notes.txt")))
+        self.fichier(rang, "notes.txt")
+        self.assertEqual(J.preparer_deplacement(a, rang, *self.gardes)[1], os.path.join(rang, "notes (2).txt"),
+                         "jamais par-dessus : un nom libre")
+        self.assertEqual(J.preparer_deplacement(a, os.path.join(rang, "idees.md"), *self.gardes)[1],
+                         os.path.join(rang, "idees.md"), "un chemin complet : le nouveau nom")
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, self.windows, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, self.startup, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, self.machi, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(self.docs, rang, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_deplacement(a, os.path.join(rang, "notes.bat"), *self.gardes)
+        with self.assertRaises(ValueError):
+            J.preparer_deplacement(rang, os.path.join(rang, "dedans"), *self.gardes)
+        with self.assertRaises(FileNotFoundError):
+            J.preparer_deplacement(os.path.join(self.docs, "absent.txt"), rang, *self.gardes)
+        with self.assertRaises(FileNotFoundError):
+            J.preparer_deplacement(a, os.path.join(self.docs, "Nulle part", "x.txt"), *self.gardes)
+        script = self.fichier(self.docs, "outil.bat")
+        self.assertTrue(J.preparer_deplacement(script, rang, *self.gardes), "un script deja script se range")
+        # renommer
+        self.assertEqual(J.preparer_renommage(a, "Idees.txt", *self.gardes)[1], os.path.join(self.docs, "Idees.txt"))
+        self.fichier(self.docs, "pris.txt")
+        self.assertEqual(J.preparer_renommage(a, "pris.txt", *self.gardes)[1], os.path.join(self.docs, "pris (2).txt"))
+        for mauvais in ("..\\ailleurs.txt", "a/b.txt", "", "CON.txt", "..", "x?.txt"):
+            with self.assertRaises(ValueError, msg=mauvais):
+                J.preparer_renommage(a, mauvais, *self.gardes)
+        for exe in ("notes.exe", "notes.ps1", "notes.bat.", "notes.lnk", "notes.vbs"):
+            with self.assertRaises(PermissionError, msg=exe):
+                J.preparer_renommage(a, exe, *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_renommage(self.docs, "Docs", *self.gardes)
+        with self.assertRaises(PermissionError):
+            J.preparer_renommage(self.fichier(self.windows, "system.ini"), "s.ini", *self.gardes)
+
+    def test_modifier_un_texte(self):
+        t, n = J.appliquer_modification("ligne 1\r\nligne 2\r\n", [{"avant": "ligne 2\n", "apres": "deux\n"}],
+                                        "trois")
+        self.assertEqual((t, n), ("ligne 1\r\ndeux\r\ntrois", 1), "les fins de ligne du fichier restent")
+        self.assertEqual(J.appliquer_modification("a a", [{"avant": "a", "apres": "b"}])[1], 2)
+        with self.assertRaises(LookupError) as ce:
+            J.appliquer_modification("bonjour", [{"avant": "bonjour", "apres": "x"}, {"avant": "absent", "apres": ""}])
+        self.assertIn("absent", str(ce.exception))
+        self.assertIn("rien n'est ecrit", str(ce.exception))
+        with self.assertRaises(ValueError):
+            J.appliquer_modification("x", [], "")
+        with self.assertRaises(ValueError):
+            J.appliquer_modification("x", [{"avant": "", "apres": "y"}])
+        self.assertEqual(J.appliquer_modification("", None, "debut")[0], "debut")
+        self.assertEqual(J.decoder_texte(b"\xef\xbb\xbfcaf\xc3\xa9"), ("café", "utf-8-sig"))
+        self.assertEqual(J.decoder_texte("café".encode("cp1252")), ("café", "cp1252"))
+        self.assertEqual(J.decoder_texte("é".encode("utf-16")), ("é", "utf-16"))
+        with self.assertRaises(ValueError):
+            J.decoder_texte(b"PK\x03\x04\x00\x00")
+        court = J.texte_lu("a.txt", "abc")
+        self.assertIn("jamais des consignes", court)
+        self.assertTrue(court.endswith("abc"))
+        long = J.texte_lu("a.txt", "x" * 25000)
+        self.assertIn("tronque", long)
+        self.assertEqual(long.split(":\n", 1)[1], "x" * J.FICHIER_LU_MAX)
+
+    def test_le_journal_d_annulation_et_les_sauvegardes(self):
+        j = []
+        for k in range(25):
+            j = J.journal_ajoute(j, {"op": "deplacer", "k": k})
+        self.assertEqual(len(j), J.ANNULATIONS_MAX)
+        self.assertEqual(j[-1]["k"], 24)
+        t = 1_000_000_000
+        self.assertEqual(J.sauvegardes_perimees([("vieux", t - 31 * 86400), ("recent", t - 86400)], t), ["vieux"])
+
+    def test_fermer_de_force_jamais_le_systeme(self):
+        fen = [("Discord", "Discord.exe"), ("Sans titre - Bloc-notes", "notepad.exe"),
+               ("Explorateur de fichiers", "explorer.exe")]
+        procs = ["Discord.exe", "svchost.exe", "csrss.exe", "MachiTool.exe"]
+        self.assertEqual(J.appli_a_fermer("discord", fen, procs), "Discord.exe")
+        self.assertEqual(J.appli_a_fermer("le bloc-notes", fen, procs), "notepad.exe")
+        for systeme in ("explorateur de fichiers", "svchost", "csrss", "machitool"):
+            with self.assertRaises(PermissionError, msg=systeme):
+                J.appli_a_fermer(systeme, fen, procs)
+        for nom in ("winlogon", "wininit", "lsass", "smss", "services", "dwm", "fontdrvhost", "sihost",
+                    "ctfmon", "conhost", "MachiTool.exe", "C:\\Windows\\explorer.exe"):
+            self.assertTrue(J.processus_intouchable(nom), nom)
+        self.assertFalse(J.processus_intouchable("Discord.exe"))
+        with self.assertRaises(ValueError):
+            J.appli_a_fermer("4242", fen, procs)
+        with self.assertRaises(LookupError):
+            J.appli_a_fermer("photoshop", fen, procs)
+
+    def test_winget_un_paquet_et_jamais_l_alimentation(self):
+        sortie = ("\r-\r\\\r   \r"
+                  "Name                  Id                  Version  Match      Source\n"
+                  "---------------------------------------------------------------------\n"
+                  "VLC media player      VideoLAN.VLC        3.0.21   Moniker: vlc winget\n"
+                  "VLC UWP               9NBLGGH4VVNH        Unknown             msstore\n"
+                  "\n2 packages\n")
+        res = J.lire_winget(sortie)
+        self.assertEqual([(r["nom"], r["id"], r["version"]) for r in res],
+                         [("VLC media player", "VideoLAN.VLC", "3.0.21"), ("VLC UWP", "9NBLGGH4VVNH", "Unknown")])
+        fr = ("Nom       ID               Version Source\n---------------------------------------\n"
+              "Discord   Discord.Discord  1.0.9   winget\n")
+        self.assertEqual(J.lire_winget(fr)[0]["id"], "Discord.Discord")
+        self.assertEqual(J.lire_winget("Aucun package ne correspond"), [])
+        self.assertEqual(J.choisir_paquet("VideoLAN.VLC", res)["id"], "VideoLAN.VLC")
+        self.assertEqual(J.choisir_paquet("vlc media player", res)["id"], "VideoLAN.VLC")
+        with self.assertRaises(LookupError):
+            J.choisir_paquet("vlc", res)                       # deux candidats : lequel ?
+        with self.assertRaises(LookupError):
+            J.choisir_paquet("rien", [])
+        for p in ("Shutdown Timer Classic", "Wise Auto Shutdown", "Microsoft.PowerToys", "Sleep Timer",
+                  "Minuteur d'arrêt", "Hibernate Trigger"):
+            self.assertTrue(J.paquet_touche_a_l_alimentation(p), p)
+        for p in ("VideoLAN.VLC", "Discord", "7zip.7zip"):
+            self.assertFalse(J.paquet_touche_a_l_alimentation(p), p)
+        for plusieurs in ("vlc, discord", "vlc et discord", "--all", "all", "tout"):
+            with self.assertRaises(ValueError, msg=plusieurs):
+                J.nom_de_paquet(plusieurs)
+        self.assertEqual(J.nom_de_paquet("--id VideoLAN.VLC"), "id VideoLAN.VLC", "pas d'option cachee")
+
+    def test_les_reglages_de_windows_une_liste_fermee(self):
+        self.assertEqual(J.reglage_windows_valide("Wi-Fi", "activer"), ("wifi", "activer"))
+        self.assertEqual(J.reglage_windows_valide("sortie audio", "lister"), ("sortie_audio", "lister"))
+        with self.assertRaises(ValueError):
+            J.reglage_windows_valide("pare-feu", "desactiver")
+        with self.assertRaises(ValueError):
+            J.reglage_windows_valide("wifi", "lister")
+        s = J.script_radio("bluetooth", True)
+        self.assertIn("'Bluetooth'", s)
+        self.assertIn("SetStateAsync('On')", s)
+        self.assertNotIn("SetStateAsync", J.script_radio("wifi"))
+        self.assertFalse(J._ALIMENTATION_TEXTE.search(s))
+        for r in J.REGLAGES_WINDOWS:
+            self.assertTrue(J.PAGES_PARAMETRES[r].startswith("ms-settings:"))
+            self.assertFalse(J.touche_a_l_alimentation(J.PAGES_PARAMETRES[r]))
+
+    def test_la_porte_de_la_parole_spontanee(self):
+        t = 1_000_000.0
+        s = {"maintenant": t, "actif": True, "etat": "attente", "mode": "jarvis", "heure": 15, "inactivite_s": 5}
+        R = J.parole_spontanee_refusee
+        self.assertIsNone(R(s))
+        for cle, val, raison in (("actif", False, "eteint"), ("etat", "ecoute", "occupe"), ("mode", "psy", "psy"),
+                                 ("en_attente", True, "attend une reponse"), ("voix_occupee", True, "parle deja"),
+                                 ("plein_ecran", True, "plein ecran"), ("calme_jusqua", t + 60, "calme"),
+                                 ("grave_jusqua", t + 60, "apres une seance grave"), ("heure", 23, "nuit"),
+                                 ("heure", 7, "nuit"), ("inactivite_s", 301, "absent"),
+                                 ("recentes", [t - 100, t - 200, t - 300], "plafond")):
+            self.assertEqual(R(dict(s, **{cle: val})), raison, cle)
+        self.assertIsNone(R(dict(s, heure=2), nuit_permise=True))
+        self.assertIsNone(R(dict(s, recentes=[t - 4000] * 5)), "le plafond est par heure")
+
+    def test_chaque_initiative(self):
+        t = 1_000_000.0
+        s = {"maintenant": t, "heure": 15}
+        C = J.choisir_initiative
+        self.assertIsNone(C(s, {}))
+        c = C(dict(s, temp_cpu=96, tjmax=100), {})
+        self.assertEqual((c["cle"], c["nuit_permise"]), ("surchauffe", True))
+        self.assertIn("processeur est à 96 °C", c["texte"])
+        self.assertIsNone(C(dict(s, temp_cpu=85, tjmax=100), {}))
+        self.assertEqual(C(dict(s, temp_cpu=82, tjmax=85), {})["cle"], "surchauffe", "pres de sa limite")
+        self.assertIn("carte graphique", C(dict(s, temp_gpu=90), {})["texte"])
+        self.assertIsNone(C(dict(s, temp_gpu=90), {"surchauffe": t - 60}), "pas deux fois en une demi-heure")
+        self.assertIsNone(C(dict(s, volume=80), {}), "l'apres-midi, le volume est a toi")
+        c = C(dict(s, heure=23, volume=80), {})
+        self.assertEqual((c["cle"], c["volume"]), ("volume_soir", 40))
+        self.assertEqual(c["texte"], "Il est tard : j'ai baissé le volume à 40 %.")
+        self.assertIsNone(C(dict(s, heure=23, volume=55), {}))
+        self.assertIsNone(C(dict(s, heure=0, volume=80), {"volume_soir": t - 3600}))
+        c = C(dict(s, activite_continue_s=2 * 3600 + 1), {})
+        self.assertEqual(c["cle"], "pause")
+        self.assertIsNone(C(dict(s, activite_continue_s=3 * 3600), {"pause": t - 3600}), "une fois")
+        self.assertIn("break", C(dict(s, activite_continue_s=3 * 3600, langue="en"), {})["texte"])
+
+    def test_ses_droits_ne_se_donnent_pas(self):
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
+                    "jarvis_annoncer_taches"):
+            self.assertIn(cle, J.REGLAGES_INTERDITS, cle)
+
+
+# ======================================================================
 #  CE QUE CE CODE NE FAIT PAS
 # ======================================================================
 
@@ -2371,8 +2629,14 @@ class DansMachiTool(unittest.TestCase):
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
                         transcription_absente_dite=False, suspens=None, agenda_change=0.0,
                         voix_lisse_boule=0.0, derniere_erreur=None, coupe_contexte="", ecoute_avant=0.0,
-                        muet_depuis=None, avance=None, dictee_dite=0.0)
+                        muet_depuis=None, avance=None, dictee_dite=0.0,
+                        attente_oui=None)
         del m.ANNONCES[:]
+        # ses nouveaux pouvoirs : ni journal d'annulation ni initiatives d'un test a l'autre
+        m.ANNULATIONS["liste"] = None
+        m.INITIATIVES.update(recentes=[], deja={}, actif_depuis=None, grave_jusqua=0.0, mesures={},
+                             mesure_t=0.0, mesure_en_cours=False)
+        m._WINGET["recherches"].clear()
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -5257,6 +5521,403 @@ class DansMachiTool(unittest.TestCase):
         m._VOIX_ENFANT["charge"] = "fr:piper:gilles"
         self.assertIsNone(m.porteuse_pour("fr"))
 
+    # ---------- ses nouveaux pouvoirs, dans Machi Tool ----------
+
+    def pouvoirs(self, fichiers=True, windows=True):
+        """Les mains ouvertes, un faux PC : un dossier personnel temporaire,
+        une fausse corbeille. Rend (ex, maison, corbeille)."""
+        m = self.m
+        maison = tempfile.mkdtemp(dir=self.tmp)
+        for d in ("Documents", "Desktop", "Downloads"):
+            os.makedirs(os.path.join(maison, d))
+        bac = tempfile.mkdtemp(dir=self.tmp)
+        vrais = {k: getattr(m, k) for k in ("bases_dossiers", "envoyer_a_la_corbeille", "restaurer_de_la_corbeille")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        self.vrais_pouvoirs = vrais
+        m.bases_dossiers = lambda: {"home": maison, "documents": os.path.join(maison, "Documents"),
+                                    "desktop": os.path.join(maison, "Desktop"),
+                                    "downloads": os.path.join(maison, "Downloads")}
+
+        def jeter(ch):
+            shutil.move(ch, os.path.join(bac, os.path.basename(ch)))
+
+        def restaurer(ch):
+            shutil.move(os.path.join(bac, os.path.basename(ch)), ch)
+            return True
+        m.envoyer_a_la_corbeille, m.restaurer_de_la_corbeille = jeter, restaurer
+        m.CFG.update(jarvis_pc=True, jarvis_fichiers=fichiers, jarvis_windows=windows)
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        return ex, maison, bac
+
+    def ecrire(self, chemin, contenu="bonjour\n"):
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(contenu)
+        return chemin
+
+    def test_ses_nouveaux_pouvoirs_sont_fermes_par_defaut(self):
+        m = self.m
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives"):
+            self.assertIs(m.CONFIG_DEFAUT[cle], False, cle)
+        c = m.capacites_jarvis(m.CFG)
+        self.assertEqual((c["fichiers"], c["windows"], c["initiatives"]), (False, False, False))
+        m.CFG.update(jarvis_pc=True, jarvis_fichiers=True, jarvis_windows=True, jarvis_initiatives=True)
+        c = m.capacites_jarvis(m.CFG)
+        self.assertEqual((c["fichiers"], c["windows"], c["initiatives"]), (True, True, True))
+        m.CFG["jarvis_pc"] = False
+        c = m.capacites_jarvis(m.CFG)
+        self.assertEqual((c["fichiers"], c["windows"]), (False, False), "sans ses mains, rien")
+        # ...et il ne peut pas se les donner
+        ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
+                    "jarvis_annoncer_taches"):
+            self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": cle, "valeur": "oui"}), cle)
+        m.CFG["jarvis_pc"] = True
+        m.CFG["jarvis_fichiers"] = m.CFG["jarvis_windows"] = False
+        self.assertIn("pas permis", ex("corbeille", {"chemin": "Documents\\a.txt"})["erreur"])
+        self.assertIn("pas permis", ex("reglage_windows", {"reglage": "wifi", "action": "lire"})["erreur"])
+
+    @unittest.skipIf(os.name == "nt", "hors Windows seulement")
+    def test_hors_windows_une_erreur_claire(self):
+        ex, _, _ = self.pouvoirs()
+        for nom, e in (("reglage_windows", {"reglage": "wifi", "action": "activer"}),
+                       ("reglage_windows", {"reglage": "sortie_audio", "action": "lister"}),
+                       ("forcer_fermeture", {"cible": "Discord"}),
+                       ("installer_appli", {"action": "chercher", "nom": "vlc"})):
+            self.assertIn("Windows", ex(nom, e)["erreur"], nom)
+
+    def test_ranger_les_fichiers_et_tout_annuler(self):
+        m = self.m
+        ex, maison, bac = self.pouvoirs()
+        docs = os.path.join(maison, "Documents")
+        a = self.ecrire(os.path.join(docs, "facture.txt"))
+        os.makedirs(os.path.join(docs, "Factures"))
+        # deplacer, puis annuler
+        r = ex("deplacer", {"source": "Documents\\facture.txt", "destination": "Documents\\Factures"})
+        self.assertIn("Deplace", r["texte"])
+        self.assertTrue(os.path.isfile(os.path.join(docs, "Factures", "facture.txt")))
+        self.assertIn("revenu", ex("annuler_fichier", {})["texte"])
+        self.assertTrue(os.path.isfile(a))
+        # renommer, puis annuler
+        self.assertIn("Renomme", ex("renommer", {"chemin": "Documents\\facture.txt", "nouveau_nom": "f.txt"})["texte"])
+        self.assertTrue(os.path.isfile(os.path.join(docs, "f.txt")))
+        ex("annuler_fichier", {})
+        self.assertTrue(os.path.isfile(a))
+        # modifier (une copie d'avant), puis annuler
+        r = ex("modifier_fichier", {"chemin": a, "remplacements": [{"avant": "bonjour", "apres": "bonsoir"}],
+                                    "ajouter_a_la_fin": "merci"})
+        self.assertIn("annulable", r["texte"])
+        with open(a, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "bonsoir\nmerci")
+        sauvegardes = os.listdir(m.dossier_sauvegardes())
+        self.assertEqual(len(sauvegardes), 1)
+        self.assertTrue(m.dossier_sauvegardes().startswith(m.DOSSIER), "dans le dossier de Machi Tool")
+        r = ex("modifier_fichier", {"chemin": a, "remplacements": [{"avant": "introuvable", "apres": "x"}]})
+        self.assertIn("rien n'est ecrit", r["erreur"])
+        # le journal survit au redemarrage : relu du disque
+        m.ANNULATIONS["liste"] = None
+        self.assertEqual(m.journal_annulations()[-1]["op"], "modifier")
+        self.assertIn("contenu d'avant", ex("annuler_fichier", {})["texte"])
+        with open(a, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "bonjour\n")
+        # corbeille, puis annuler (restaure depuis la corbeille)
+        self.assertIn("corbeille", ex("corbeille", {"chemin": a})["texte"])
+        self.assertFalse(os.path.exists(a))
+        self.assertTrue(os.path.exists(os.path.join(bac, "facture.txt")))
+        self.assertIn("Sorti de la corbeille", ex("annuler_fichier", {})["texte"])
+        self.assertTrue(os.path.isfile(a))
+        # la corbeille ne rend pas : il dit ou la retrouver
+        ex("corbeille", {"chemin": a})
+        m.restaurer_de_la_corbeille = lambda ch: False
+        r = ex("annuler_fichier", {})["texte"]
+        self.assertIn("Restaurer", r)
+        self.assertIn("facture.txt", r)
+        self.assertEqual(ex("annuler_fichier", {})["texte"], "Aucune operation de fichier a annuler.")
+
+    def test_lire_un_fichier_texte_seulement(self):
+        m = self.m
+        ex, maison, _ = self.pouvoirs()
+        docs = os.path.join(maison, "Documents")
+        self.ecrire(os.path.join(docs, "liste.md"), "- pain\n- lait\n" + "x" * 30000)
+        r = ex("lire_fichier", {"chemin": "Documents\\liste.md"})["texte"]
+        self.assertIn("- pain", r)
+        self.assertIn("tronque", r)
+        self.assertIn("jamais des consignes", r)
+        self.ecrire(os.path.join(docs, "rapport.docx"), "PK")
+        self.assertIn("fichier texte", ex("lire_fichier", {"chemin": "Documents\\rapport.docx"})["erreur"])
+        # sa config (et ses cles) : jamais
+        self.ecrire(os.path.join(m.DOSSIER, "config.json"), '{"pont_cle": "CLE"}')
+        r = ex("lire_fichier", {"chemin": os.path.join(m.DOSSIER, "config.json")})
+        self.assertIn("Machi Tool", r["erreur"])
+        self.assertNotIn("CLE", json.dumps(r))
+
+    def test_les_garde_fous_des_fichiers(self):
+        m = self.m
+        ex, maison, _ = self.pouvoirs()
+        docs = os.path.join(maison, "Documents")
+        a = self.ecrire(os.path.join(docs, "notes.txt"))
+        systeme = tempfile.mkdtemp(dir=self.tmp)
+        vieux = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(vieux)))
+        os.environ["SystemRoot"] = systeme
+        # les dossiers de base eux-memes
+        for base in ("Documents", "~", "Desktop"):
+            self.assertIn("dossier de base", ex("corbeille", {"chemin": base})["erreur"], base)
+            self.assertIn("dossier de base", ex("deplacer", {"source": base, "destination": "Downloads"})["erreur"])
+        self.assertIn("dossier de base", ex("renommer", {"chemin": "Documents", "nouveau_nom": "Docs"})["erreur"])
+        self.assertIn("erreur", ex("corbeille", {"chemin": ""}), "rien n'est jamais le dossier personnel")
+        # le systeme, vers ou depuis
+        self.assertIn("systeme", ex("deplacer", {"source": a, "destination": systeme})["erreur"])
+        s = self.ecrire(os.path.join(systeme, "win.ini"))
+        self.assertIn("systeme", ex("corbeille", {"chemin": s})["erreur"])
+        self.assertIn("systeme", ex("modifier_fichier", {"chemin": s, "ajouter_a_la_fin": "x"})["erreur"])
+        # Machi Tool
+        c = self.ecrire(os.path.join(m.DOSSIER, "config.json"), "{}")
+        self.assertIn("Machi Tool", ex("corbeille", {"chemin": c})["erreur"])
+        self.assertIn("Machi Tool", ex("deplacer", {"source": a, "destination": m.DOSSIER})["erreur"])
+        # une extension de programme
+        self.assertIn("programme", ex("renommer", {"chemin": a, "nouveau_nom": "notes.bat"})["erreur"])
+        self.assertIn("programme", ex("deplacer", {"source": a, "destination": os.path.join(docs, "n.ps1")})["erreur"])
+        # modifier : un fichier texte seulement
+        exe = self.ecrire(os.path.join(docs, "outil.exe"), "MZ")
+        self.assertIn("fichier texte", ex("modifier_fichier", {"chemin": exe, "ajouter_a_la_fin": "x"})["erreur"])
+        bat = self.ecrire(os.path.join(docs, "outil.bat"), "echo")
+        self.assertIn("fichier texte", ex("modifier_fichier", {"chemin": bat, "ajouter_a_la_fin": "shutdown"})["erreur"])
+        self.assertTrue(os.path.isfile(a), "rien n'a bouge")
+        self.assertEqual(m.journal_annulations(), [])
+
+    def test_la_corbeille_hors_windows_le_dit(self):
+        m = self.m
+        ex, maison, _ = self.pouvoirs()
+        a = self.ecrire(os.path.join(maison, "Documents", "a.txt"))
+        m.envoyer_a_la_corbeille = self.vrais_pouvoirs["envoyer_a_la_corbeille"]
+        r = ex("corbeille", {"chemin": a})
+        self.assertIn("Windows", r["erreur"])
+        self.assertTrue(os.path.isfile(a), "jamais de suppression")
+
+    def test_les_paliers_code_direct_oui(self):
+        m = self.m
+        envoyes, maison = self.mains([self.outil("deplacer", {"source": "Documents\\a.txt",
+                                                              "destination": "Documents\\Rangement"}),
+                                      {"texte": "Rangé.", "mode": "jarvis"},
+                                      self.outil("reglage_windows", {"reglage": "wifi", "action": "lire"}, "t2"),
+                                      {"texte": "Le Wi-Fi est actif.", "mode": "jarvis"},
+                                      self.outil("lumiere", {"action": "couleur", "couleur": "rouge"}, "t3"),
+                                      {"texte": "Rouge.", "mode": "jarvis"}])
+        m.CFG.update(jarvis_fichiers=True, jarvis_windows=True)
+        self.ecrire(os.path.join(maison, "Documents", "a.txt"))
+        os.makedirs(os.path.join(maison, "Documents", "Rangement"))
+        vrai = m.reglage_windows
+        self.addCleanup(lambda: setattr(m, "reglage_windows", vrai))
+        m.reglage_windows = lambda r, a="lire", appareil="": "Wi-Fi active."
+        # les fichiers : le code
+        self.phrase("Jarvis, range a.txt dans Rangement")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+        self.assertTrue(os.path.isfile(os.path.join(maison, "Documents", "a.txt")), "rien avant le code")
+        self.phrase("4 8 1 5")
+        self.assertTrue(os.path.isfile(os.path.join(maison, "Documents", "Rangement", "a.txt")))
+        # lire un reglage de Windows, la lumiere : directement, meme session fermee
+        m.JARVIS["acces_jusqua"] = 0.0
+        self.phrase("Jarvis, le wifi est allumé ?")
+        self.assertEqual(envoyes[3]["resultats"][0]["texte"], "Wi-Fi active.")
+        self.phrase("Jarvis, fais une ambiance de feu")
+        self.assertIn("Guirlande", envoyes[5]["resultats"][0]["texte"])
+        self.assertEqual(self.dit[-1], "Rouge.")
+        self.assertEqual(self.dit.count("Code d'accès ?"), 1)
+
+    def fermer_discord(self, reponses, **kw):
+        m = self.m
+        tues = []
+        vrais = {k: getattr(m, k) for k in ("fenetres_ouvertes", "processus_ouverts", "terminer_processus")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        m.fenetres_ouvertes = lambda: [(1, "Discord", "Discord.exe"), (2, "Explorateur", "explorer.exe")]
+        m.processus_ouverts = lambda: [(10, "Discord.exe"), (11, "Discord.exe"), (4, "explorer.exe")]
+        m.terminer_processus = lambda pids: tues.extend(pids) or len(pids)
+        envoyes, maison = self.mains(reponses, **kw)
+        m.CFG.update(jarvis_fichiers=True, jarvis_windows=True)
+        return envoyes, tues, maison
+
+    def test_le_oui_avant_de_fermer_de_force(self):
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "Discord"}),
+                                                {"texte": "Discord est fermé.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, Discord est planté, occupe-t'en")
+        self.assertEqual(self.dit[-1], "Je ferme de force Discord ?")
+        self.assertEqual(tues, [], "rien avant le oui")
+        self.assertTrue(m.JARVIS["attente_oui"])
+        self.phrase("Oui, vas-y.")
+        self.assertEqual(sorted(tues), [10, 11])
+        self.assertIn("Ferme de force", envoyes[1]["resultats"][0]["texte"])
+        self.assertEqual(self.dit[-1], "Discord est fermé.")
+        self.assertIsNone(m.JARVIS["attente_oui"])
+
+    def test_le_oui_refuse_ou_autre_chose(self):
+        m = self.m
+        for reponse in ("non", "euh attends, quelle heure est-il ?"):
+            self.dit.clear()
+            envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "Discord"}),
+                                                    {"texte": "Très bien, je n'y touche pas.", "mode": "jarvis"}],
+                                                   code_actif=False)
+            self.phrase("Jarvis, Discord est planté, occupe-t'en")
+            self.assertEqual(self.dit[-1], "Je ferme de force Discord ?")
+            self.phrase(reponse)
+            self.assertEqual(tues, [], reponse)
+            self.assertEqual(envoyes[1]["resultats"][0]["erreur"], m.REFUS_OUI, reponse)
+            self.assertEqual(self.dit[-1], "Très bien, je n'y touche pas.")
+
+    def test_le_oui_expire(self):
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "Discord"}),
+                                                {"texte": "Oui ?", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, Discord est planté, occupe-t'en")
+        m.JARVIS["attente_oui"]["expire"] = time.time() - 1
+        m.veiller_initiatives(m.CFG)                  # la veille le laisse tomber
+        self.assertIsNone(m.JARVIS["attente_oui"])
+        self.phrase("Jarvis, oui")
+        self.assertEqual(tues, [], "vingt secondes passees : rien")
+        # un nouvel appel aussi l'efface
+        m.JARVIS["attente_oui"] = {"tour_oui": m.JARVIS["tour"] - 1, "expire": time.time() + 20}
+        self.assertFalse(m.oui_en_attente())
+
+    def test_jamais_un_processus_du_systeme(self):
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([self.outil("forcer_fermeture", {"cible": "explorateur"}),
+                                                {"texte": "Je ne peux pas.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, l'explorateur est planté, occupe-t'en")
+        self.assertNotIn("Je ferme", " ".join(self.dit), "refuse d'avance : il ne demande rien")
+        self.assertIn("jamais de force", envoyes[1]["resultats"][0]["erreur"])
+        self.assertEqual(tues, [])
+
+    def test_le_code_d_abord_puis_le_oui(self):
+        m = self.m
+        envoyes, tues, maison = self.fermer_discord([
+            {"texte": "", "mode": "jarvis",
+             "outils": [{"id": "a", "nom": "corbeille", "entree": {"chemin": "Documents\\vieux.txt"}},
+                        {"id": "b", "nom": "forcer_fermeture", "entree": {"cible": "Discord"}}],
+             "suite": [{"role": "user", "content": "x"}]},
+            {"texte": "Voilà.", "mode": "jarvis"}])
+        bac = []
+        vrai = m.envoyer_a_la_corbeille
+        self.addCleanup(lambda: setattr(m, "envoyer_a_la_corbeille", vrai))
+        m.envoyer_a_la_corbeille = lambda ch: (bac.append(ch), os.remove(ch))
+        v = self.ecrire(os.path.join(maison, "Documents", "vieux.txt"))
+        self.phrase("Jarvis, fais le ménage comme convenu")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+        self.phrase("4815")
+        self.assertEqual(self.dit[-1], "Je ferme de force Discord ?")
+        self.assertEqual((bac, tues), ([], []), "tout attend le oui")
+        self.phrase("oui")
+        self.assertEqual((bac, sorted(tues)), ([v], [10, 11]))
+        self.assertEqual([r["id"] for r in envoyes[1]["resultats"]], ["a", "b"])
+        self.assertEqual(self.dit[-1], "Voilà.")
+
+    def test_installer_une_appli_avec_un_oui(self):
+        m = self.m
+        commandes, fonds = [], []
+        vrais = {k: getattr(m, k) for k in ("_winget", "_en_fond")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+
+        def winget(args, delai):
+            commandes.append(list(args))
+            if args[0] == "search":
+                if "shutdown" in args[1].lower():
+                    return 0, "Name Id Version\n------------------\nShutdown Timer  Timer.Arret  1.0\n"
+                return 0, ("Name              Id            Version\n------------------------------------\n"
+                           "VLC media player  VideoLAN.VLC  3.0.21\n")
+            return 0, "Installe"
+        m._winget = winget
+        m._en_fond = fonds.append
+        installation = lambda: [f for f in fonds if "installer_appli" in f.__qualname__]
+        envoyes, maison = self.mains([self.outil("installer_appli", {"action": "chercher", "nom": "vlc"}),
+                                      {"texte": "Je trouve VLC.", "mode": "jarvis"},
+                                      self.outil("installer_appli", {"action": "installer", "nom": "vlc"}, "t2"),
+                                      {"texte": "C'est lancé.", "mode": "jarvis"},
+                                      self.outil("installer_appli", {"action": "installer", "nom": "shutdown timer"}, "t3"),
+                                      {"texte": "Non.", "mode": "jarvis"}], code_actif=False)
+        m.CFG.update(jarvis_windows=True)
+        self.phrase("Jarvis, occupe-toi de VLC")
+        self.assertIn("VideoLAN.VLC", envoyes[1]["resultats"][0]["texte"], "chercher : directement")
+        self.phrase("Jarvis, occupe-toi de VLC pour de bon")
+        self.assertEqual(self.dit[-1], "J'installe VLC media player ?")
+        self.assertFalse(any(c[0] == "install" for c in commandes))
+        self.phrase("oui")
+        self.assertEqual(len(installation()), 1)
+        installation()[0]()                                # l'installation, en fond
+        (install,) = [c for c in commandes if c[0] == "install"]
+        self.assertEqual(install[:4], ["install", "--id", "VideoLAN.VLC", "--exact"])
+        self.assertIn("--silent", install)
+        self.assertFalse(any("--all" in c or "all" in c for c in commandes), "jamais tout d'un coup")
+        self.assertEqual(self.dit[-1], "C'est fait : VLC media player est installé.")
+        self.phrase("Jarvis, occupe-toi du minuteur")
+        self.assertIn("ni fermer la session", envoyes[5]["resultats"][0]["erreur"])
+        self.assertEqual(self.dit.count("J'installe VLC media player ?"), 1)
+        self.assertEqual(len([d for d in self.dit if d.startswith("J'installe")]), 1, "pas de question")
+
+    def initiative(self, t, **signaux):
+        self.m.CFG["jarvis_langue"] = "fr"
+        s = dict({"actif": True, "etat": "attente", "mode": "jarvis", "en_attente": False, "voix_occupee": False,
+                  "plein_ecran": False, "calme_jusqua": 0.0, "heure": 15, "inactivite_s": 5}, **signaux)
+        return self.m.veiller_initiatives(self.m.CFG, maintenant=t, signaux=s)
+
+    def test_la_porte_des_initiatives(self):
+        m = self.m
+        t = time.time()
+        chaud = {"temp_cpu": 96, "tjmax": 100}
+        self.assertIsNone(self.initiative(t, **chaud), "pas permises par defaut")
+        m.CFG["jarvis_initiatives"] = True
+        for raison, s in (("psy", {"mode": "psy"}), ("plein ecran", {"plein_ecran": True}),
+                          ("parle", {"voix_occupee": True}), ("calme", {"calme_jusqua": t + 60}),
+                          ("absent", {"inactivite_s": 600}), ("code", {"en_attente": True})):
+            self.assertIsNone(self.initiative(t, **dict(chaud, **s)), raison)
+        m.INITIATIVES["actif_depuis"] = t - 3 * 3600
+        self.assertIsNone(self.initiative(t, heure=2), "la nuit, pas de pause proposee")
+        self.assertIn("pause", self.initiative(t, heure=15))
+        m.INITIATIVES.update(recentes=[], deja={}, actif_depuis=None)
+        # une seance grave : une heure de silence
+        m.JARVIS["psy_grave"] = True
+        self.initiative(t)
+        m.JARVIS["psy_grave"] = False
+        self.assertIsNone(self.initiative(t + 60, **chaud), "juste apres une seance grave")
+        m.INITIATIVES["grave_jusqua"] = 0.0
+        # la surchauffe parle, meme la nuit ; trois par heure au plus
+        self.assertIn("processeur", self.initiative(t, heure=3, **chaud))
+        self.assertIn("processeur", self.dit[-1], "annoncee (notification : la voix est coupee)")
+        m.INITIATIVES["deja"].clear()
+        self.assertTrue(self.initiative(t + 1, temp_gpu=95))
+        m.INITIATIVES["deja"].clear()
+        self.assertTrue(self.initiative(t + 2, **chaud))
+        m.INITIATIVES["deja"].clear()
+        self.assertIsNone(self.initiative(t + 3, **chaud), "plafond : trois par heure")
+        m.INITIATIVES["deja"].clear()
+        self.assertTrue(self.initiative(t + 3601, **chaud))
+
+    def test_chaque_initiative_dans_machi_tool(self):
+        m = self.m
+        m.CFG["jarvis_initiatives"] = True
+        regle = []
+        vrai = m.regler_son
+        self.addCleanup(lambda: setattr(m, "regler_son", vrai))
+        m.regler_son = lambda action, appli="", niveau=None: regle.append((action, appli, niveau)) or "ok"
+        t = time.time()
+        # tard le soir, trop fort : il baisse a 40 % et le dit
+        self.assertIsNone(self.initiative(t, heure=23, volume=55))
+        self.assertEqual(self.initiative(t, heure=23, volume=80), "Il est tard : j'ai baissé le volume à 40 %.")
+        self.assertEqual(regle, [("regler", "", 40)])
+        self.assertEqual(self.dit[-1], "Il est tard : j'ai baissé le volume à 40 %.")
+        self.assertIsNone(self.initiative(t + 60, heure=23, volume=80), "une fois par soiree")
+        # deux heures sans pause : il la propose, une fois
+        t = t + 10000
+        m.INITIATIVES["actif_depuis"] = None
+        self.assertIsNone(self.initiative(t))
+        self.assertIn("pause", self.initiative(t + 2 * 3600 + 5))
+        self.assertIsNone(self.initiative(t + 2 * 3600 + 900), "une seule fois")
+        self.initiative(t + 3 * 3600, inactivite_s=900)                # une vraie pause
+        self.initiative(t + 3 * 3600 + 10)
+        self.assertIsNone(self.initiative(t + 4 * 3600))
+        self.assertIn("pause", self.initiative(t + 5 * 3600 + 20))
+        # sans signaux injectes (hors Windows) : rien ne casse
+        m.INITIATIVES["deja"]["pause"] = t
+        self.assertIsNone(m.veiller_initiatives(m.CFG))
+
 
 class TranscriptionAncree(unittest.TestCase):
     """« Non » transcrit « Não », « Ouais » transcrit « Wait » : une porteuse
@@ -5331,7 +5992,6 @@ class TranscriptionAncree(unittest.TestCase):
         w = J.rendre_en_memoire(Syn(), "Je vous écoute.")
         with wave.open(io.BytesIO(w)) as ww:
             self.assertEqual((ww.getframerate(), ww.getnframes()), (16000, 16000))
-
 
 class mock_urlopen:
     def __init__(self, m, reponse):

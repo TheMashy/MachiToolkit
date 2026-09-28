@@ -353,6 +353,11 @@ CONFIG_DEFAUT = {
     # d'acces dit a voix haute. Du code, on ne garde qu'une empreinte.
     "jarvis_pc": False,
     "jarvis_ecran": False,
+    # « Ranger les fichiers » (deplacer, renommer, corbeille, modifier un texte
+    # -- annulable) et « Reglages de Windows » (Wi-Fi, Bluetooth, mode sombre,
+    # sortie audio, fermer une appli bloquee, installer) : ses nouveaux pouvoirs.
+    "jarvis_fichiers": False,
+    "jarvis_windows": False,
     # « Faire en sorte qu'il n'y ait plus de code d'acces a demander » : il agit
     # directement. Le code reste possible, si on coche la case qui le demande.
     "jarvis_code_actif": False,
@@ -399,6 +404,9 @@ CONFIG_DEFAUT = {
     "jarvis_suite": True,             # apres sa reponse, il ecoute la suite sans mot d'eveil
     "jarvis_suite_questions": False,  # ... seulement quand il a pose une question
     "jarvis_repliques_spontanees": False,   # ses routines parlent aussi au reveil, a l'au revoir, pour une appli
+    # « Prendre des initiatives » : surchauffe, volume trop fort tard le soir,
+    # longue session sans pause -- toujours annoncees (voir veiller_initiatives)
+    "jarvis_initiatives": False,
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -4683,6 +4691,7 @@ JARVIS = {
     # (ce qui a ete dit, le detail technique, t) : le dernier echec, pour sa page
     # -- le panneau ne le montre qu'un instant
     "derniere_erreur": None,
+    "attente_oui": None,      # « Je ferme de force Discord ? » : les outils qui attendent un oui
 }
 _OREILLE = {"proc": None, "sock": None, "echecs": 0, "prochain": 0.0}
 _OREILLE_VERROU = threading.Lock()
@@ -6432,6 +6441,7 @@ def veiller_sur_jarvis(cfg):
                 annoncer_taches(cfg)
             except Exception as e:
                 print("Jarvis : annonce impossible (%s)" % e)
+            veiller_initiatives(cfg)         # ses petites initiatives (et le « oui ? » qui expire)
             # LA VOIX : un processus a part, ses voix chargees tant qu'il ecoute.
             # Relancee si elle tombe, rechargee si on en change.
             veut_voix = voulu and cfg.get("jarvis_voix", True)
@@ -7498,7 +7508,7 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
     suite = bool(suspens["suite"]) if suspens else bool(JARVIS.get("suite_active"))
     JARVIS["suite_active"] = False
     deja_dit = bool(deja_dit or (suspens or {}).get("deja_dit"))
-    code = JARVIS.get("attente_code")
+    code = JARVIS.get("attente_code") or oui_en_attente()
     if (not code and not apres_coupure and not breve and not sans_suspens and brut.strip()
             and (suspens is None or suspens.get("n", 0) < _jv.SUSPENS_MAX)
             and _jv.phrase_suspendue(brut, L)
@@ -7539,6 +7549,8 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
     if premiere and not coupe and texte == brut.strip() and not _jv.contient_nom(brut, noms):
         texte = retirer_nom_ecorche(texte, noms)
     JARVIS["entendu"] = texte
+    if code and not JARVIS.get("attente_code"):
+        return repondre_au_oui(texte, brut, cfg)      # « Je ferme de force Discord ? » -- « oui »
     if code:
         # LA REPONSE A « CODE D'ACCES ? » -- comparee ici, jamais journalisee
         # ni envoyee. « Annule », « degage » : on laisse tomber.
@@ -7892,7 +7904,9 @@ def parler_au_compagnon(texte, cfg, tour=None):
 OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir", "oublier",
                     "lancer_appli", "fenetre", "son", "pc", "youtube", "onglets", "temperatures",
                     "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda",
-                    "lancer_tache", "taches", "noter_projet"}
+                    "lancer_tache", "taches", "noter_projet",
+                    # Machi Tool lui-meme est a lui : jamais sous code
+                    "lumiere", "routine_lumiere", "reglages_machi"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -8986,6 +9000,8 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": "Note dans les projets : %s -- %s" % (e.get("projet"), e.get("note"))}
         if not cfg.get("jarvis_pc"):
             return {"id": ident, "erreur": "Les mains de Jarvis sur le PC sont fermees (Machi Tool > Reglages > Jarvis)."}
+        if _jv.groupe_outil(nom):              # ranger les fichiers, reglages de Windows
+            return {"id": ident, "texte": outil_pouvoir(nom, e, cfg)}
         if nom == "rechercher_google":
             ou = ouvrir_dans_chrome(_jv.adresse_google(e.get("recherche")))
             return {"id": ident, "texte": "Recherche Google ouverte dans %s." % ou}
@@ -9145,25 +9161,32 @@ def executer_outil(outil, cfg):
 def outils_de_jarvis(etat, cfg):
     """Les outils d'un tour : ceux qui touchent aux fichiers ou a l'ecran
     attendent le code (ou une session ouverte) ; ceux-la mis a part, on
-    execute, on renvoie, et Jarvis continue -- cinq tours au plus."""
+    execute, on renvoie, et Jarvis continue -- cinq tours au plus.
+
+    « Selon la gravite » (voir _jv.palier_outil) : le code d'abord (s'il en
+    faut un), puis le « oui ? » pour ce qui ne s'annule pas (fermer de force,
+    installer), puis tout s'execute. `etat["refus"]` : {rang: erreur} deja
+    decides (code verrouille, « non » a la question)."""
     L = langue_jarvis(cfg)
     outils = etat["outils"]
+    refus = dict(etat.get("refus") or {})
     # mains fermees : ces outils seront refuses, inutile de demander le code
-    besoin = [o for o in outils if o.get("nom") not in OUTILS_SANS_CODE] if cfg.get("jarvis_pc") else []
+    besoin = [i for i, o in enumerate(outils) if i not in refus and _palier(o, cfg) == _jv.PALIER_CODE]
     if besoin and cfg.get("jarvis_code_actif") and not acces_ouvert():
         if time.time() < float(JARVIS.get("verrou_jusqua") or 0):
-            refus = "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
-            return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
-                                           else {"id": o.get("id"), "erreur": refus} for o in outils], cfg)
-        if not code_regle(cfg):
-            refus = ("Aucun code d'acces n'est regle dans Machi Tool (Reglages > Jarvis) : les dossiers, "
-                     "les fichiers et l'ecran restent fermes.")
-            return continuer_jarvis(etat, [executer_outil(o, cfg) if o not in besoin
-                                           else {"id": o.get("id"), "erreur": refus} for o in outils], cfg)
-        JARVIS["attente_code"] = dict(etat, expire=time.time() + 30, essais=0)
-        print("Jarvis : code d'acces demande")
-        return dire(phrase("code_demande", L), suite="toujours", langue=L, tour=etat.get("conv"))
-    return continuer_jarvis(etat, [executer_outil(o, cfg) for o in outils], cfg)
+            refus.update({i: "Acces verrouille apres trois codes faux : reessayer dans quelques minutes."
+                          for i in besoin})
+        elif not code_regle(cfg):
+            refus.update({i: "Aucun code d'acces n'est regle dans Machi Tool (Reglages > Jarvis) : les dossiers, "
+                             "les fichiers et l'ecran restent fermes." for i in besoin})
+        else:
+            JARVIS["attente_code"] = dict(etat, refus=refus, expire=time.time() + 30, essais=0)
+            print("Jarvis : code d'acces demande")
+            return dire(phrase("code_demande", L), suite="toujours", langue=L, tour=etat.get("conv"))
+    if not etat.get("oui_donne") and demander_oui(etat, refus, cfg):
+        return None
+    return continuer_jarvis(etat, [{"id": o.get("id"), "erreur": refus[i]} if i in refus else executer_outil(o, cfg)
+                                   for i, o in enumerate(outils)], cfg)
 
 
 def repondre_au_code(texte, cfg):
@@ -9267,6 +9290,741 @@ def outil_application(nom, e, cfg):
             return "%s = %s." % (cle, v)
         raise ValueError("action inconnue : %s" % a)
     raise ValueError("outil inconnu : %s" % nom)
+
+
+# ---------- ses nouveaux pouvoirs ----------
+# « Ranger les fichiers », « Reglages de Windows », « Prendre des
+# initiatives » -- et « selon la gravite » : le code d'acces pour les
+# fichiers et Windows, un simple « oui ? » avant ce qui ne s'annule pas
+# (fermer de force une appli, installer), le reste directement. Les decisions
+# sont dans jarvis.py (palier_outil, refus_chemin, choisir_initiative...) ;
+# ici, les gestes, le journal d'annulation et les sauvegardes. Aucune saisie
+# clavier simulee, aucun presse-papiers.
+
+OUI_DUREE_S = 20
+REFUS_OUI = "Refuse par la personne : rien n'a ete fait."
+ANNULATIONS = {"liste": None}          # le journal d'annulation (lu du disque une fois)
+_WINGET = {"recherches": {}}
+WINGET_RECHERCHE_S = 300
+INITIATIVES = {"recentes": [], "deja": {}, "actif_depuis": None, "grave_jusqua": 0.0,
+               "mesures": {}, "mesure_t": 0.0, "mesure_en_cours": False}
+INITIATIVE_MESURE_S = 60               # temperatures et volume, lus hors de la veille
+
+
+def _texte_erreur(ex):
+    if isinstance(ex, (ValueError, LookupError, RuntimeError)):
+        return str(ex)[:300]
+    return "%s : %s" % (type(ex).__name__, str(ex)[:300])
+
+
+def _palier(o, cfg):
+    """Le palier d'un outil ici, ou None s'il sera refuse de toute facon
+    (mains fermees, groupe pas permis) : inutile alors de rien demander."""
+    nom = o.get("nom")
+    if nom in OUTILS_SANS_CODE:
+        return _jv.PALIER_DIRECT
+    if not cfg.get("jarvis_pc"):
+        return None
+    groupe = _jv.groupe_outil(nom)
+    if groupe and not cfg.get("jarvis_" + groupe):
+        return None
+    return _jv.palier_outil(nom, o.get("entree"), OUTILS_SANS_CODE)
+
+
+def geste_oui(o):
+    """Ce que dira la question (« Je ferme de force Discord ? ») ; leve si
+    l'outil sera refuse de toute facon -- alors on ne demande rien."""
+    e = o.get("entree") or {}
+    if o.get("nom") == "forcer_fermeture":
+        return "forcer", _joli(appli_a_fermer(e.get("cible")))
+    action = e.get("action")
+    return action, paquet_voulu(e.get("nom"))["nom"]
+
+
+def demander_oui(etat, refus, cfg):
+    """Pose la question « oui ? » si un outil du tour ne s'annule pas. Rend
+    True si elle est posee (on attend la reponse)."""
+    gestes, indices = [], []
+    for i, o in enumerate(etat["outils"]):
+        if i in refus or _palier(o, cfg) != _jv.PALIER_OUI:
+            continue
+        try:
+            gestes.append(geste_oui(o))
+            indices.append(i)
+        except Exception as ex:
+            refus[i] = _texte_erreur(ex)
+    if not gestes:
+        return False
+    L = langue_jarvis(cfg)
+    JARVIS["attente_oui"] = dict(etat, refus=refus, oui=indices, expire=time.time() + OUI_DUREE_S,
+                                 tour_oui=JARVIS.get("tour"))
+    print("Jarvis : il demande « oui ? » (%s)" % ", ".join(g for g, _ in gestes))
+    dire(_jv.question_oui(gestes, L), suite="toujours", langue=L, tour=etat.get("conv"))
+    return True
+
+
+def oui_en_attente():
+    """La question « oui ? » attend-elle sa reponse ? Pas apres 20 s, ni
+    apres un nouvel appel : le silence, c'est non (rien n'est fait)."""
+    att = JARVIS.get("attente_oui")
+    if not att:
+        return False
+    if att.get("tour_oui") != JARVIS.get("tour") or time.time() > float(att.get("expire") or 0):
+        JARVIS["attente_oui"] = None
+        print("Jarvis : « oui ? » reste sans reponse -- rien n'est fait")
+        return False
+    return True
+
+
+def repondre_au_oui(texte, brut, cfg):
+    """La phrase qui suit « Je ferme de force Discord ? ». Un oui franc fait ;
+    tout le reste annule (« refuse par la personne »), et Jarvis le sait."""
+    att = JARVIS.get("attente_oui") or {}
+    JARVIS["attente_oui"] = None
+    if _jv.renvoi(texte) or _jv.renvoi(brut) or _jv.adieu(texte):
+        return terminer_conversation()
+    att["conv"] = JARVIS.get("tour")
+    if _jv.normaliser(texte).replace("-", " ").strip(" '") in _OUI:
+        print("Jarvis : oui")
+        return outils_de_jarvis(dict(att, oui_donne=True), cfg)
+    print("Jarvis : pas de oui -- rien n'est fait")
+    refus = dict(att.get("refus") or {})
+    refus.update({i: REFUS_OUI for i in att.get("oui") or []})
+    return outils_de_jarvis(dict(att, refus=refus, oui_donne=True), cfg)
+
+
+def outil_pouvoir(nom, e, cfg):
+    """Les outils des groupes « fichiers » et « windows ». Rend le texte du
+    resultat ; leve ce qui ne va pas (executer_outil le dit a Jarvis)."""
+    groupe = _jv.groupe_outil(nom)
+    if groupe == "fichiers" and not cfg.get("jarvis_fichiers"):
+        raise RuntimeError("Ranger les fichiers n'est pas permis dans Machi Tool (Reglages > Jarvis).")
+    if groupe == "windows" and not cfg.get("jarvis_windows"):
+        raise RuntimeError("Les reglages de Windows ne sont pas permis dans Machi Tool (Reglages > Jarvis).")
+    if nom == "reglage_windows":
+        return reglage_windows(e.get("reglage"), e.get("action") or "lire", e.get("appareil") or "")
+    if nom == "forcer_fermeture":
+        return forcer_fermeture(e.get("cible"))
+    if nom == "installer_appli":
+        return installer_appli(e.get("action"), e.get("nom"), cfg)
+    if nom == "annuler_fichier":
+        return annuler_fichier()
+    bases = bases_dossiers()
+
+    def chemin(cle):
+        # jamais « rien » compris comme le dossier personnel
+        if not str(e.get(cle) or "").strip():
+            raise ValueError("%s vide" % cle)
+        return _jv.resoudre_chemin(e.get(cle), bases)
+    if nom == "lire_fichier":
+        return lire_fichier_texte(chemin("chemin"))
+    if nom == "deplacer":
+        return deplacer_fichier(chemin("source"), chemin("destination"), bases)
+    if nom == "renommer":
+        return renommer_fichier(chemin("chemin"), e.get("nouveau_nom"), bases)
+    if nom == "corbeille":
+        return jeter_fichier(chemin("chemin"), bases)
+    if nom == "modifier_fichier":
+        return modifier_fichier_texte(chemin("chemin"), e.get("remplacements"), e.get("ajouter_a_la_fin") or "")
+    raise ValueError("outil inconnu : %s" % nom)
+
+
+# --- RANGER LES FICHIERS -----------------------------------------------
+
+def dossiers_machi():
+    """Le dossier de Machi Tool (sa config, ses cles) et celui de son programme."""
+    prog = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    return [DOSSIER, prog]
+
+
+def _gardes(bases=None):
+    """(dossiers du systeme, dossiers de base, dossiers de Machi Tool)."""
+    return (_jv.dossiers_systeme(os.environ), list((bases or bases_dossiers()).values()), dossiers_machi())
+
+
+def _fichier_annulations():
+    return os.path.join(dossier_jarvis(), "annulations.json")
+
+
+def dossier_sauvegardes():
+    return os.path.join(dossier_jarvis(), "sauvegardes")
+
+
+def journal_annulations():
+    if ANNULATIONS["liste"] is None:
+        try:
+            with open(_fichier_annulations(), encoding="utf-8") as f:
+                ANNULATIONS["liste"] = [o for o in (json.load(f) or []) if isinstance(o, dict)]
+        except Exception:
+            ANNULATIONS["liste"] = []
+    return ANNULATIONS["liste"]
+
+
+def _ecrire_annulations():
+    os.makedirs(dossier_jarvis(), exist_ok=True)
+    ch = _fichier_annulations()
+    with open(ch + ".part", "w", encoding="utf-8") as f:
+        json.dump(ANNULATIONS["liste"] or [], f, ensure_ascii=False)
+    os.replace(ch + ".part", ch)
+
+
+def noter_annulation(operation):
+    ANNULATIONS["liste"] = _jv.journal_ajoute(journal_annulations(), dict(operation, t=time.time()))
+    _ecrire_annulations()
+
+
+def purger_sauvegardes(maintenant=None):
+    """Les copies d'avant une modification : trente jours, pas plus."""
+    d = dossier_sauvegardes()
+    try:
+        fichiers = [(n, os.path.getmtime(os.path.join(d, n))) for n in os.listdir(d)]
+    except OSError:
+        return []
+    perimees = _jv.sauvegardes_perimees(fichiers, time.time() if maintenant is None else maintenant)
+    for n in perimees:
+        try:
+            os.remove(os.path.join(d, n))
+        except OSError:
+            pass
+    return perimees
+
+
+def _fichier_texte(ch):
+    """Un fichier TEXTE qui existe, hors du systeme et de Machi Tool."""
+    systeme, _, machi = _gardes()
+    if not os.path.isfile(ch):
+        raise FileNotFoundError("pas de fichier ici : %s" % ch)
+    r = _jv.refus_chemin(ch, systeme, (), machi)
+    if r:
+        raise PermissionError(r)
+    ext = os.path.splitext(ch)[1].lower()
+    if ext not in _jv.EXTENSIONS_TEXTE:
+        raise PermissionError("seulement un fichier texte (%s), pas « %s »"
+                              % (" ".join(sorted(_jv.EXTENSIONS_TEXTE)), ext or "sans extension"))
+    return ch
+
+
+def lire_fichier_texte(ch):
+    ch = _fichier_texte(ch)
+    with open(ch, "rb") as f:
+        octets = f.read(_jv.FICHIER_MODIFIABLE_MAX)
+    texte, _ = _jv.decoder_texte(octets)
+    return _jv.texte_lu(ch, texte)
+
+
+def deplacer_fichier(source, destination, bases=None):
+    systeme, b, machi = _gardes(bases)
+    src, cible = _jv.preparer_deplacement(source, destination, systeme, b, machi)
+    shutil.move(src, cible)
+    noter_annulation({"op": "deplacer", "de": src, "vers": cible})
+    return "Deplace : %s -> %s (annulable)." % (src, cible)
+
+
+def renommer_fichier(chemin, nouveau_nom, bases=None):
+    systeme, b, machi = _gardes(bases)
+    src, cible = _jv.preparer_renommage(chemin, nouveau_nom, systeme, b, machi)
+    os.rename(src, cible)
+    noter_annulation({"op": "renommer", "de": src, "vers": cible})
+    return "Renomme : %s -> %s (annulable)." % (os.path.basename(src), os.path.basename(cible))
+
+
+def jeter_fichier(chemin, bases=None):
+    """A la corbeille de Windows -- jamais une suppression definitive."""
+    systeme, b, machi = _gardes(bases)
+    src = os.path.normpath(os.path.abspath(chemin))
+    if not os.path.exists(src):
+        raise FileNotFoundError("rien a cet endroit : %s" % src)
+    r = _jv.refus_chemin(src, systeme, b, machi, source=True)
+    if r:
+        raise PermissionError(r)
+    envoyer_a_la_corbeille(src)
+    if os.path.exists(src):
+        raise RuntimeError("Windows ne l'a pas mis a la corbeille : %s" % src)
+    noter_annulation({"op": "corbeille", "chemin": src})
+    return "A la corbeille : %s (annulable)." % src
+
+
+def envoyer_a_la_corbeille(chemin):
+    """SHFileOperation avec « annulable » (FOF_ALLOWUNDO) : la Corbeille. Un
+    lecteur sans corbeille (cle USB, reseau) est refuse -- Windows y
+    supprimerait pour de bon."""
+    if os.name != "nt":
+        raise OSError("la corbeille ne se pilote que sous Windows")
+    import ctypes
+    from ctypes import wintypes
+    racine = os.path.splitdrive(chemin)[0] + "\\"
+    if ctypes.WinDLL("kernel32").GetDriveTypeW(racine) != 3:            # DRIVE_FIXED
+        raise PermissionError("pas de corbeille sur ce lecteur (amovible ou reseau) : je ne supprime jamais "
+                              "pour de bon")
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+    # FO_DELETE ; FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING (Windows
+    # previent s'il allait supprimer au lieu de jeter)
+    op = SHFILEOPSTRUCTW(None, 3, chemin + "\0", None, 0x40 | 0x10 | 0x4 | 0x4000, False, None, None)
+    r = ctypes.WinDLL("shell32").SHFileOperationW(ctypes.byref(op))
+    if r or op.fAnyOperationsAborted:
+        raise OSError("la corbeille a refuse (code %s)" % r)
+
+
+def restaurer_de_la_corbeille(chemin):
+    """Le remet a sa place depuis la Corbeille (le verbe « undelete » du
+    shell). Rend True si c'est fait."""
+    if os.name != "nt":
+        raise OSError("la corbeille ne se pilote que sous Windows")
+    import pythoncom
+    import win32com.client
+    pythoncom.CoInitialize()
+    bac = win32com.client.Dispatch("Shell.Application").NameSpace(10)
+    dossier, nom = os.path.split(chemin)
+    trouve = None
+    for item in bac.Items():
+        try:
+            origine = str(item.ExtendedProperty("System.Recycle.DeletedFrom") or "")
+        except Exception:
+            origine = ""
+        origine = origine or str(bac.GetDetailsOf(item, 1) or "")
+        if os.path.normcase(origine.rstrip("\\")) == os.path.normcase(dossier.rstrip("\\")) and \
+                str(item.Name) in (nom, os.path.splitext(nom)[0]):
+            trouve = item
+    if trouve is None:
+        return False
+    trouve.InvokeVerb("undelete")
+    for _ in range(30):
+        if os.path.exists(chemin):
+            return True
+        time.sleep(0.1)
+    return os.path.exists(chemin)
+
+
+def modifier_fichier_texte(ch, remplacements, ajout=""):
+    """Un fichier TEXTE modifie : chaque « avant » doit y etre (sinon rien
+    n'est ecrit) ; une copie d'avant est gardee (annulable, trente jours)."""
+    ch = _fichier_texte(ch)
+    if os.path.getsize(ch) > _jv.FICHIER_MODIFIABLE_MAX:
+        raise ValueError("fichier trop gros pour que je le reecrive (%d octets)" % os.path.getsize(ch))
+    with open(ch, "rb") as f:
+        texte, encodage = _jv.decoder_texte(f.read())
+    nouveau, n = _jv.appliquer_modification(texte, remplacements, ajout)
+    try:
+        octets = nouveau.encode(encodage)
+    except UnicodeEncodeError:
+        raise ValueError("ces caracteres ne tiennent pas dans l'encodage du fichier (%s)" % encodage)
+    purger_sauvegardes()
+    os.makedirs(dossier_sauvegardes(), exist_ok=True)
+    sauve = _jv.chemin_libre(os.path.join(dossier_sauvegardes(), time.strftime("%Y%m%d-%H%M%S-")
+                                          + os.path.basename(ch)))
+    shutil.copy2(ch, sauve)
+    with open(ch, "wb") as f:
+        f.write(octets)
+    noter_annulation({"op": "modifier", "chemin": ch, "sauvegarde": sauve})
+    return "Modifie : %s (%d remplacement%s%s). La version d'avant est gardee : annulable." % (
+        ch, n, "s" if n > 1 else "", ", ajout a la fin" if ajout else "")
+
+
+def annuler_fichier():
+    """« Annule » : defait la derniere operation de fichier de Jarvis."""
+    journal = journal_annulations()
+    if not journal:
+        return "Aucune operation de fichier a annuler."
+    op = journal[-1]
+    ANNULATIONS["liste"] = journal[:-1]
+    _ecrire_annulations()
+    systeme, _, machi = _gardes()
+    if op.get("op") in ("deplacer", "renommer"):
+        de, vers = op.get("de") or "", op.get("vers") or ""
+        if not os.path.exists(vers):
+            raise LookupError("Introuvable, je ne peux pas le remettre : %s (deplace ou supprime depuis ?)" % vers)
+        r = _jv.refus_chemin(de, systeme, (), machi)
+        if r:
+            raise PermissionError(r)
+        retour = de
+        if os.path.exists(de) and os.path.normcase(de) != os.path.normcase(vers):
+            retour = _jv.chemin_libre(de)
+        shutil.move(vers, retour)
+        return "Annule : %s est revenu a %s." % (os.path.basename(vers), retour)
+    if op.get("op") == "modifier":
+        ch, sauve = op.get("chemin") or "", op.get("sauvegarde") or ""
+        if not os.path.isfile(sauve):
+            raise LookupError("La copie d'avant n'existe plus (plus de %d jours ?) : %s" % (_jv.SAUVEGARDE_JOURS, ch))
+        shutil.copyfile(sauve, ch)
+        return "Annule : %s a retrouve son contenu d'avant." % ch
+    if op.get("op") == "corbeille":
+        ch = op.get("chemin") or ""
+        if os.path.exists(ch):
+            return "Il est deja revenu : %s." % ch
+        try:
+            ok = restaurer_de_la_corbeille(ch)
+        except Exception as ex:
+            print("Jarvis : corbeille -- %s" % ex)
+            ok = False
+        if ok:
+            return "Sorti de la corbeille : %s." % ch
+        return ("Je n'arrive pas a le sortir de la corbeille moi-meme : « %s » y est (il venait de %s). "
+                "Dans la Corbeille : clic droit, Restaurer." % (os.path.basename(ch), os.path.dirname(ch)))
+    raise ValueError("operation inconnue dans le journal : %s" % op.get("op"))
+
+
+# --- QUELQUES REGLAGES DE WINDOWS -----------------------------------------
+
+def _commande(args, delai):
+    """Une commande Windows standard, sans fenetre, avec un delai. Rend
+    (code, sortie)."""
+    if os.name != "nt":
+        raise OSError("%s : seulement sous Windows" % os.path.basename(args[0]))
+    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=delai,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def _powershell(script, delai=25):
+    exe = shutil.which("powershell") or os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                                                     "WindowsPowerShell", "v1.0", "powershell.exe")
+    return _commande([exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], delai)
+
+
+def ouvrir_parametres(reglage):
+    page = _jv.PAGES_PARAMETRES[reglage]
+    startfile_sur(page)
+    return page
+
+
+def reglage_windows(reglage, action="lire", appareil=""):
+    """Wi-Fi, Bluetooth, mode sombre, sortie audio, ne pas deranger : une
+    liste fermee. Ce qui ne se fait pas sans administrateur ou sans API
+    publique ouvre la bonne page des Parametres, et le dit."""
+    r, a = _jv.reglage_windows_valide(reglage, action)
+    if os.name != "nt":
+        raise OSError("les reglages de Windows ne se pilotent que sous Windows")
+    if r == "ne_pas_deranger":
+        page = ouvrir_parametres(r)
+        return ("Windows ne laisse pas une appli lire ni changer « Ne pas deranger » : la page des Parametres "
+                "est ouverte (%s), c'est un clic." % page)
+    try:
+        if r in ("wifi", "bluetooth"):
+            return _radio(r, a)
+        if r == "mode_sombre":
+            return _mode_sombre(a)
+        return _sortie_audio(a, appareil)
+    except (ValueError, LookupError):
+        raise
+    except Exception as ex:
+        print("Jarvis : reglage %s impossible (%s)" % (r, ex))
+        page = ouvrir_parametres(r)
+        return "Je n'y arrive pas directement (%s) : la page des Parametres est ouverte (%s)." % (
+            _texte_erreur(ex)[:120], page)
+
+
+def _radio(genre, action):
+    nom = {"wifi": "Wi-Fi", "bluetooth": "Bluetooth"}[genre]
+    code, sortie = _powershell(_jv.script_radio(genre, None if action == "lire" else action == "activer"))
+    etat = ([l.strip() for l in sortie.splitlines() if l.strip()] or [""])[-1]
+    if etat == "ABSENT":
+        return "Pas de %s sur ce PC." % nom
+    if etat not in ("On", "Off"):
+        raise RuntimeError("l'API Radios ne repond pas (%s)" % " ".join(sortie.split())[-120:])
+    if action != "lire" and etat != ("On" if action == "activer" else "Off"):
+        raise RuntimeError("Windows a refuse")
+    return "%s %s." % (nom, "active" if etat == "On" else "desactive")
+
+
+def _mode_sombre(action):
+    import winreg
+    cle = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+    if action == "lire":
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cle) as k:
+            clair = winreg.QueryValueEx(k, "AppsUseLightTheme")[0]
+        return "Mode sombre %s." % ("desactive" if clair else "active")
+    clair = 0 if action == "activer" else 1
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cle, 0, winreg.KEY_SET_VALUE) as k:
+        for n in ("AppsUseLightTheme", "SystemUsesLightTheme"):
+            winreg.SetValueEx(k, n, 0, winreg.REG_DWORD, clair)
+    import ctypes
+    res = ctypes.c_size_t(0)
+    # WM_SETTINGCHANGE « ImmersiveColorSet » : les fenetres ouvertes suivent
+    ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "ImmersiveColorSet", 0x2, 3000, ctypes.byref(res))
+    return "Mode sombre %s." % ("active" if action == "activer" else "desactive")
+
+
+def sorties_audio():
+    """([(id, nom)], id de celle par defaut) : les sorties audio actives."""
+    import comtypes
+    from pycaw.pycaw import AudioUtilities, IMMDeviceEnumerator
+    try:
+        from pycaw.constants import CLSID_MMDeviceEnumerator
+    except ImportError:
+        from pycaw.pycaw import CLSID_MMDeviceEnumerator
+    comtypes.CoInitialize()
+    en = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER)
+    coll = en.EnumAudioEndpoints(0, 1)                   # eRender, DEVICE_STATE_ACTIVE
+    out = []
+    for i in range(coll.GetCount()):
+        dev = coll.Item(i)
+        ident = dev.GetId()
+        try:
+            nom = AudioUtilities.CreateDevice(dev).FriendlyName or ident
+        except Exception:
+            nom = ident
+        out.append((ident, nom))
+    return out, en.GetDefaultAudioEndpoint(0, 1).GetId()
+
+
+def poser_sortie_audio(ident):
+    """La sortie par defaut, pour les trois roles de Windows (IPolicyConfig,
+    l'interface du panneau Son ; en echec, la page des Parametres s'ouvre)."""
+    import comtypes
+    from comtypes import GUID, COMMETHOD, HRESULT, IUnknown
+    from ctypes import c_void_p, c_wchar_p, c_int
+    vide = lambda n: COMMETHOD([], HRESULT, n, (["in"], c_void_p, "a"))
+
+    class IPolicyConfig(IUnknown):
+        _iid_ = GUID("{f8679f50-850a-41cf-9c72-430f290290c8}")
+        _methods_ = [vide(n) for n in ("GetMixFormat", "GetDeviceFormat", "ResetDeviceFormat", "SetDeviceFormat",
+                                        "GetProcessingPeriod", "SetProcessingPeriod", "GetShareMode", "SetShareMode",
+                                        "GetPropertyValue", "SetPropertyValue")] + [
+            COMMETHOD([], HRESULT, "SetDefaultEndpoint", (["in"], c_wchar_p, "ident"), (["in"], c_int, "role")),
+            vide("SetEndpointVisibility")]
+    comtypes.CoInitialize()
+    pc = comtypes.CoCreateInstance(GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}"), IPolicyConfig,
+                                   comtypes.CLSCTX_ALL)
+    for role in (0, 1, 2):
+        pc.SetDefaultEndpoint(ident, role)
+
+
+def _sortie_audio(action, appareil):
+    sorties, defaut = sorties_audio()
+    if action == "lire":
+        return "Sortie audio : %s." % next((n for i, n in sorties if i == defaut), "inconnue")
+    if action == "lister":
+        return "Sorties audio : %s." % " ; ".join(n + (" (celle en service)" if i == defaut else "")
+                                                   for i, n in sorties)
+    trouves = _jv.choisir(appareil, [(n, i) for i, n in sorties], seuil=40)
+    if not trouves:
+        raise LookupError("Aucune sortie audio ne s'appelle « %s » (il y a : %s)."
+                          % (appareil, ", ".join(n for _, n in sorties) or "aucune"))
+    if len(trouves) > 1:
+        raise LookupError("Plusieurs sorties correspondent : %s. Laquelle ?" % ", ".join(n for n, _ in trouves))
+    nom, ident = trouves[0]
+    poser_sortie_audio(ident)
+    return "Le son sort maintenant par %s." % nom
+
+
+# --- FERMER UNE APPLI BLOQUEE -----------------------------------------------
+
+def processus_ouverts():
+    """[(pid, nom de l'exe)]."""
+    if os.name != "nt":
+        raise OSError("fermer une appli de force ne se fait que sous Windows")
+    import psutil
+    return [(p.info["pid"], p.info["name"] or "") for p in psutil.process_iter(["pid", "name"])]
+
+
+def terminer_processus(pids):
+    if os.name != "nt":
+        raise OSError("fermer une appli de force ne se fait que sous Windows")
+    import psutil
+    tues = []
+    for pid in pids:
+        try:
+            p = psutil.Process(pid)
+            p.kill()
+            tues.append(p)
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(tues, timeout=5)
+    return len(tues)
+
+
+def appli_a_fermer(cible):
+    """L'exe designe par le nom d'une fenetre ou d'une appli (jamais un PID)."""
+    processus = [n for _, n in processus_ouverts()]          # hors Windows : l'erreur claire, d'abord
+    return _jv.appli_a_fermer(cible, [(t, p) for _, t, p in fenetres_ouvertes()], processus)
+
+
+def forcer_fermeture(cible):
+    exe = appli_a_fermer(cible)
+    moi = {os.getpid(), os.getppid()}
+    pids = [pid for pid, n in processus_ouverts() if n.lower() == exe.lower() and pid not in moi]
+    if not pids:
+        raise LookupError("« %s » ne tourne plus." % _joli(exe))
+    n = terminer_processus(pids)
+    return "Ferme de force : %s (%d processus)." % (_joli(exe), n)
+
+
+# --- INSTALLER UNE APPLI (winget) ---------------------------------------------
+
+def _winget(args, delai):
+    exe = shutil.which("winget") if os.name == "nt" else None
+    if os.name == "nt" and not exe:
+        raise RuntimeError("winget est absent (le « Programme d'installation d'application » du Microsoft Store).")
+    return _commande([exe or "winget"] + list(args) + ["--accept-source-agreements", "--disable-interactivity"],
+                     delai)
+
+
+def chercher_paquets(nom):
+    n = _jv.nom_de_paquet(nom)
+    vu = _WINGET["recherches"].get(n.lower())
+    if vu and time.time() - vu[0] < WINGET_RECHERCHE_S:
+        return vu[1]
+    _, sortie = _winget(["search", n], 60)
+    res = _jv.lire_winget(sortie)
+    _WINGET["recherches"][n.lower()] = (time.time(), res)
+    return res
+
+
+def paquet_voulu(nom):
+    """Le paquet (un seul) ; jamais un paquet qui gere l'alimentation du PC."""
+    n = _jv.nom_de_paquet(nom)
+    if _jv.paquet_touche_a_l_alimentation(n):
+        raise PermissionError(_jv.REFUS_ALIMENTATION)
+    p = _jv.choisir_paquet(n, chercher_paquets(n))
+    if _jv.paquet_touche_a_l_alimentation(p["nom"], p["id"]):
+        raise PermissionError(_jv.REFUS_ALIMENTATION)
+    return p
+
+
+def installer_appli(action, nom, cfg):
+    """chercher : ce que winget connait ; installer / mettre_a_jour : UN
+    paquet, sans interaction ni redemarrage -- jamais « upgrade --all ».
+    L'installation tourne en fond ; il dit quand c'est fini."""
+    if action == "chercher":
+        n = _jv.nom_de_paquet(nom)
+        res = chercher_paquets(n)
+        if not res:
+            return "winget ne trouve rien pour « %s »." % n
+        return "Trouve par winget : %s." % " ; ".join("%s (%s%s)" % (r["nom"], r["id"],
+                                                                        ", " + r["version"] if r["version"] else "")
+                                                         for r in res[:8])
+    if action not in ("installer", "mettre_a_jour"):
+        raise ValueError("action : chercher | installer | mettre_a_jour")
+    p = paquet_voulu(nom)
+    args = ["install" if action == "installer" else "upgrade", "--id", p["id"], "--exact", "--silent",
+            "--accept-package-agreements"]
+    _en_fond(lambda: finir_installation(action, p, args, cfg))
+    return "%s de %s (%s) lancee par winget, en fond : Machi Tool dira quand c'est fini." % (
+        "Installation" if action == "installer" else "Mise a jour", p["nom"], p["id"])
+
+
+def finir_installation(action, p, args, cfg):
+    try:
+        code, sortie = _winget(args, 1800)
+    except Exception as ex:
+        code, sortie = -1, str(ex)
+    L = langue_jarvis(cfg)
+    ok = code == 0
+    print("Jarvis : winget %s %s -> %s%s" % (args[0], p["id"], code,
+                                             "" if ok else " (%s)" % " ".join(str(sortie).split())[-200:]))
+    if L == "en":
+        texte = ("%s is %s." % (p["nom"], "installed" if action == "installer" else "up to date") if ok
+                 else "The %s of %s failed." % ("installation" if action == "installer" else "update", p["nom"]))
+    else:
+        texte = ("C'est fait : %s est %s." % (p["nom"], "installé" if action == "installer" else "à jour") if ok
+                 else "L'%s de %s a échoué." % ("installation" if action == "installer" else "mise à jour", p["nom"]))
+    annoncer_resultat(texte, cfg)
+    return texte
+
+
+def annoncer_resultat(texte, cfg):
+    """Un resultat qui arrive plus tard : dit s'il est libre, sinon en notification."""
+    if (JARVIS.get("etat") in ("attente", None) and JARVIS.get("mode") != "psy"
+            and not (JARVIS.get("attente_code") or JARVIS.get("attente_oui"))):
+        return dire(texte, suite=False, langue=langue_jarvis(cfg), tour=JARVIS.get("tour"))
+    n = JARVIS_CROCHETS.get("notifier")
+    if n:
+        n("Jarvis", texte)
+
+
+# --- SES PETITES INITIATIVES, toujours annoncees -----------------------------
+
+def _mesurer_pour_initiatives():
+    """Temperatures et volume, dans un fil a part : nvidia-smi peut prendre six
+    secondes, et la veille ne doit jamais attendre."""
+    m = {"t": time.time()}
+    try:
+        cpu = _jv.lire_coretemp(memoire_coretemp())
+        if cpu:
+            m.update(cpu=max(cpu["temperatures"]), tjmax=cpu.get("tjmax"))
+    except Exception:
+        pass
+    try:
+        temps = [g["temperature"] for g in _jv.lire_nvidia_smi(sortie_nvidia_smi()) if g.get("temperature") is not None]
+        if temps:
+            m["gpu"] = max(temps)
+    except Exception:
+        pass
+    try:
+        import comtypes
+        comtypes.CoInitialize()
+        v = _volume_general()
+        if not v.GetMute():
+            m["volume"] = round(v.GetMasterVolumeLevelScalar() * 100)
+    except Exception:
+        pass
+    INITIATIVES.update(mesures=m, mesure_en_cours=False)
+
+
+def _lancer_mesures(t):
+    if os.name == "nt" and not INITIATIVES["mesure_en_cours"] and t - INITIATIVES["mesure_t"] >= INITIATIVE_MESURE_S:
+        INITIATIVES.update(mesure_t=t, mesure_en_cours=True)
+        _en_fond(_mesurer_pour_initiatives)
+
+
+def signaux_initiatives(cfg, t):
+    m = INITIATIVES["mesures"] if t - float(INITIATIVES["mesures"].get("t") or 0) < 5 * 60 else {}
+    return {"actif": bool(cfg.get("jarvis_actif")), "etat": JARVIS.get("etat"), "mode": JARVIS.get("mode"),
+            "en_attente": bool(JARVIS.get("attente_code") or JARVIS.get("attente_oui") or JARVIS.get("suite_active")),
+            "voix_occupee": bool(getattr(VOIX, "parle", False) or getattr(VOIX, "file", None)
+                                 or getattr(VOIX, "attentes", None)),
+            "plein_ecran": plein_ecran_occupe(t), "calme_jusqua": JARVIS.get("calme_jusqua"),
+            "heure": time.localtime(t).tm_hour, "inactivite_s": secondes_inactivite(),
+            "temp_cpu": m.get("cpu"), "tjmax": m.get("tjmax"), "temp_gpu": m.get("gpu"), "volume": m.get("volume")}
+
+
+def suivre_activite(inactivite_s, t):
+    """Depuis quand tu es sur le PC sans pause (cinq minutes loin = une pause).
+    Apres une pause, la proposition d'en faire une peut revenir."""
+    if inactivite_s >= _jv.INITIATIVE_PRESENCE_S:
+        INITIATIVES["actif_depuis"] = None
+        INITIATIVES["deja"].pop("pause", None)
+        return 0.0
+    if INITIATIVES["actif_depuis"] is None:
+        INITIATIVES["actif_depuis"] = t
+    return t - INITIATIVES["actif_depuis"]
+
+
+def veiller_initiatives(cfg, maintenant=None, signaux=None):
+    """Depuis sa veille (chaque seconde) : une petite initiative, TOUJOURS
+    annoncee (a voix haute, ou en notification si la voix est coupee) -- si
+    on les a permises, et si la porte commune le laisse parler. Rend ce
+    qu'il a dit, ou None. `signaux` : pour les tests, ce que le PC dirait."""
+    try:
+        t = time.time() if maintenant is None else maintenant
+        oui_en_attente()                          # un « oui ? » reste sans reponse : il expire
+        if not cfg.get("jarvis_initiatives"):
+            return None
+        if JARVIS.get("psy_grave"):
+            INITIATIVES["grave_jusqua"] = t + _jv.INITIATIVE_APRES_GRAVE_S
+        if signaux is None:
+            _lancer_mesures(t)
+            signaux = signaux_initiatives(cfg, t)
+        s = dict(signaux, maintenant=t, langue=langue_jarvis(cfg), recentes=INITIATIVES["recentes"],
+                 grave_jusqua=max(float(signaux.get("grave_jusqua") or 0), INITIATIVES["grave_jusqua"]))
+        s["activite_continue_s"] = suivre_activite(float(s.get("inactivite_s") or 0), t)
+        choix = _jv.choisir_initiative(s, INITIATIVES["deja"])
+        if not choix or _jv.parole_spontanee_refusee(s, choix["nuit_permise"]):
+            return None
+        if choix.get("volume") is not None:
+            regler_son("regler", "", choix["volume"])
+        INITIATIVES["recentes"] = [x for x in INITIATIVES["recentes"] if t - x < 3600] + [t]
+        INITIATIVES["deja"][choix["cle"]] = t
+        print("Jarvis : initiative (%s)" % choix["cle"])
+        dire(choix["texte"], suite=False, langue=langue_jarvis(cfg), tour=JARVIS.get("tour"))
+        return choix["texte"]
+    except Exception as e:
+        print("Jarvis : initiative impossible (%s)" % e)
+        return None
 
 
 # ---------- ses taches de fond ----------
@@ -9453,6 +10211,9 @@ def capacites_jarvis(cfg):
             "spotify": pc and spotify_connecte(cfg),
             "onglets": pc and extension_branchee(),
             "fenetre_agenda": pc,
+            # ses nouveaux pouvoirs : ranger les fichiers, reglages de Windows, initiatives
+            "fichiers": pc and bool(cfg.get("jarvis_fichiers")), "windows": pc and bool(cfg.get("jarvis_windows")),
+            "initiatives": bool(cfg.get("jarvis_initiatives")),
             # Machi Tool lui-meme : la guirlande, ses routines, les reglages
             "application": True, "routines": _jv.resume_routines(cfg.get("routines_lumiere") or []),
             "souvenirs": souvenirs_a_envoyer(cfg),
@@ -13340,7 +14101,9 @@ class Panneau:
         self.separateur(f, 12, 8)
         self.titre(f, "ses mains sur le pc").pack(fill="x", pady=(0, 4))
         self.texte(f, "Musique, Spotify, applis et jeux, fenetres, son, luminosite, onglets, notes, dossiers et "
-                      "fichiers. Il ne supprime, ne deplace ni ne modifie jamais un fichier existant, et ne peut "
+                      "fichiers. Il ne deplace, ne renomme, ne jette (a la corbeille) ni ne modifie un fichier que "
+                      "si tu coches « Ranger les fichiers » -- et tout s'annule (« annule ») ; il ne supprime jamais "
+                      "pour de bon, ne touche ni a Windows ni a Machi Tool, et ne peut "
                       "ni eteindre, ni redemarrer, ni mettre en veille le PC, ni fermer ta session. Il agit sans "
                       "code : quiconque l'appelle dans la piece peut lui demander tes dossiers (le code d'acces, "
                       "plus bas, l'evite). Noms de dossiers et captures partent le temps de la reponse, sans "
@@ -13355,6 +14118,18 @@ class Panneau:
         self.case(f, "Il peut chercher dans l'historique du navigateur (lu sur le PC, seules les pages trouvees partent)",
                   self.var_jarvis_historique,
                   lambda: self.regler_mains("jarvis_historique", self.var_jarvis_historique)).pack(fill="x")
+        self.var_jarvis_fichiers = tk.IntVar(value=1 if self.cfg.get("jarvis_fichiers") else 0)
+        self.case(f, "Ranger les fichiers (deplacer, renommer, corbeille, modifier un fichier texte -- annulable)",
+                  self.var_jarvis_fichiers,
+                  lambda: self.regler_mains("jarvis_fichiers", self.var_jarvis_fichiers)).pack(fill="x")
+        self.var_jarvis_windows = tk.IntVar(value=1 if self.cfg.get("jarvis_windows") else 0)
+        self.case(f, "Reglages de Windows (Wi-Fi, Bluetooth, mode sombre, sortie audio, ne pas deranger, fermer "
+                     "une appli bloquee, installer une appli)",
+                  self.var_jarvis_windows,
+                  lambda: self.regler_mains("jarvis_windows", self.var_jarvis_windows)).pack(fill="x")
+        self.texte(f, "Avec le code d'acces, il le demande avant les fichiers et Windows ; avant de fermer de force "
+                      "une appli ou d'installer quoi que ce soit, il demande toujours « oui ? ».",
+                   BRUME, 8, largeur=500).pack(fill="x")
         ligne = tk.Frame(f, bg=NUIT)
         ligne.pack(fill="x", pady=(8, 0))
         self.bouton(ligne, "Ouvrir l'agenda", self.ouvrir_agenda, compact=True).pack(side="left")
@@ -13512,6 +14287,8 @@ class Panneau:
                 ("jarvis_suite_questions", "... seulement quand il vient de poser une question"),
                 ("jarvis_repliques_spontanees", "Ses routines parlent aussi sans qu'on l'appelle (reveil, "
                                                 "au revoir, une appli) -- sinon, seulement la lumiere"),
+                ("jarvis_initiatives", "Prendre de petites initiatives (toujours annoncees) : surchauffe, volume "
+                                       "trop fort tard le soir, une pause apres deux heures"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
