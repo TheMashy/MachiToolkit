@@ -2007,6 +2007,8 @@ def pour_la_voix(texte, plafond=1200, lien="le lien"):
     t = re.sub(r"https?://\S+", lien, t)
     t = re.sub(r"[*_`#>|~]+", "", t)
     t = re.sub(r"^\s*[-•]\s+", "", t, flags=re.M)
+    # une liste numerotee (« 1. Ouvre Spotify ») : pas « un. » lu comme une phrase
+    t = re.sub(r"^\s*\d{1,2}[.)]\s+", "", t, flags=re.M)
     t = "".join(c for c in t if not (unicodedata.category(c) in ("So", "Cs", "Sk")
                                      or 0x1F000 <= ord(c) <= 0x1FAFF))
     t = re.sub(r"\s+", " ", t).strip()
@@ -2125,10 +2127,16 @@ class Phonemiseur:
         return " ".join(m.strip() for m in morceaux if m.strip())
 
     def phrases(self, texte):
-        """[[phonemes de la phrase 1], [phrase 2], ...] -- des caracteres NFD."""
+        """[[phonemes de la phrase 1], [phrase 2], ...] -- des caracteres NFD.
+
+        \u00ab 45.5 \u00bb, \u00ab 6:30 \u00bb, \u00ab 1,500 \u00bb, \u00ab 3,5 \u00bb : une ponctuation COLLEE a ce
+        qui suit n'est pas une coupure -- espeak recoit le nombre entier et le
+        lit (\u00ab point five \u00bb, \u00ab six thirty \u00bb, \u00ab trois virgule cinq \u00bb) ; avant,
+        il lisait \u00ab quarante-cinq. cinq degres \u00bb, en deux phrases."""
         sortie, courante = [], ""
-        for bout, ponct in re.findall(r"([^.?!,:;\u2026]+)([.?!,:;\u2026]*)", texte):
-            if not bout.strip():
+        for m in re.finditer(r"(.+?)([.?!,:;\u2026]+)(?=\s|$)|(.+?)$", str(texte or "").strip(), re.S):
+            bout, ponct = (m.group(1) or m.group(3) or ""), (m.group(2) or "")
+            if not re.search(r"\w", bout):
                 continue
             p = self._proposition(bout.strip())
             if not p:
@@ -2210,10 +2218,25 @@ def decouper_phrases(texte):
 
 def texte_pour_piper(texte, langue="fr"):
     """Une seule ligne (piper lit ligne par ligne) et des nombres qui se disent.
-    « 18h30 » est francais : en anglais, espeak lit « 18:30 » tout seul."""
-    t = pour_la_voix(texte, lien="the link" if langue == "en" else "le lien")
-    if langue != "en":
+    « 18h30 » est francais : en anglais, espeak lit « 18:30 » tout seul.
+    « 14h » n'est pas « quatorze ache », « 45°C » pas « quarante-cinq se »
+    (le signe degre, un symbole, disparaissait), « M. Dupont » pas deux
+    phrases (« em. » puis « Dupont. »)."""
+    en = langue == "en"
+    t = re.sub(r"(\d)\s*°\s*C(?![A-Za-z])", r"\1 degrees" if en else r"\1 degrés", str(texte or ""))
+    t = re.sub(r"(\d)\s*°", r"\1 degrees" if en else r"\1 degrés", t)
+    if en:
+        for abr, mot in (("Mr", "Mister"), ("Mrs", "Missus"), ("Dr", "Doctor"), ("St", "Saint")):
+            t = re.sub(r"\b%s\.(?=\s+[A-Z])" % abr, mot, t)
+        t = re.sub(r"\be\.g\.,?", "for example,", t)
+        t = re.sub(r"\bi\.e\.,?", "that is,", t)
+    t = pour_la_voix(t, lien="the link" if en else "le lien")
+    if not en:
         t = re.sub(r"(\d{1,2})\s*h\s*(\d{2})\b", r"\1 heures \2", t)
+        t = re.sub(r"\b(\d{1,2})\s*h\b(?!\s*\d)", lambda m: m.group(1) + (" heure" if int(m.group(1)) <= 1
+                                                                         else " heures"), t)
+        t = re.sub(r"\bM\.(?=\s+[A-ZÀ-Ý])", "monsieur", t)
+        t = re.sub(r"\bMme\.?(?=\s+[A-ZÀ-Ý])", "madame", t)
     return t.replace("\n", " ").strip()
 
 
@@ -3783,47 +3806,135 @@ class Bouche:
         self.lecteur = lecteur or haut_parleur_windows
         self.silence = silence
         self.couper = threading.Event()
+        self.travaux = []            # les textes recus : leur calcul est deja parti
+        self._hp = None              # (frequence, contexte, lecteur) : le haut-parleur ouvert
 
     @property
     def syn(self):
         return next(iter(self.syns.values()))
 
-    def dire(self, ident, texte, lenteur=1.0, cle=None):
-        """Phrase par phrase : si on lui coupe la parole, « fini » dit ce qui
-        restait (`reste`, a partir de la phrase coupee) -- et s'il s'avere que
-        personne n'avait parle, Jarvis reprend la."""
-        import numpy as np
+    def preparer(self, ident, texte, lenteur=1.0, cle=None):
+        """« UN BLANC D'UNE SECONDE ENTRE SA PREMIERE PHRASE ET LA SUITE » : la
+        suite ne se calculait qu'une fois la premiere phrase dite. Le calcul
+        d'un texte part donc DES QU'IL ARRIVE, pendant que le precedent sonne.
+        Chaque texte a son propre arret : « taire » les arrete tous, et le
+        texte suivant ne ranime pas celui qu'on a coupe."""
         syn = self.syns.get(cle) or self.syn
         langue = getattr(syn, "langue", "fr")
-        self.couper.clear()
         file_ = queue.Queue(maxsize=3)
         fin = object()
+        arret = threading.Event()
         phrases = decouper_phrases(texte) or [texte]
+        travail = {"id": ident, "syn": syn, "file": file_, "fin": fin, "arret": arret,
+                   "phrases": phrases, "rate": None}
+
+        def mettre(x):
+            # jamais bloque pour toujours sur une file que plus personne ne lit
+            while not arret.is_set():
+                try:
+                    file_.put(x, timeout=0.2)
+                    return
+                except queue.Full:
+                    pass
 
         def produire():
+            k = 0
             try:
                 for k, bout in enumerate(phrases):
                     for son in syn.phrases(texte_pour_piper(bout, langue), lenteur):
-                        if self.couper.is_set():
+                        if arret.is_set():
                             break
                         # son enveloppe, calculee ici : la lecture reste libre
-                        file_.put((k, son, enveloppe_voix(son, syn.frequence)))
-                    if self.couper.is_set():
+                        mettre((k, son, enveloppe_voix(son, syn.frequence)))
+                    if arret.is_set():
                         break
             except Exception as e:
-                file_.put(e)
-            file_.put(fin)
+                travail["rate"] = k              # la phrase qui n'a pas pu se calculer
+                mettre(e)
+            mettre(fin)
 
+        self.travaux.append(travail)
         threading.Thread(target=produire, daemon=True).start()
+        return travail
+
+    def taire(self):
+        """Coupe ce qui sonne, et arrete le calcul de tout ce qui attendait."""
+        self.couper.set()
+        for t in list(self.travaux):
+            t["arret"].set()
+        del self.travaux[:]
+
+    def ouvert(self):
+        return self._hp is not None
+
+    def _ouvrir(self, frequence):
+        if self._hp is not None and self._hp[0] == frequence:
+            return self._hp[2]
+        self.fermer()
+        contexte = self.lecteur(frequence)
+        hp = contexte.__enter__()
+        self._hp = (frequence, contexte, hp)
+        return hp
+
+    def fermer(self):
+        h, self._hp = self._hp, None
+        if h is not None:
+            try:
+                h[1].__exit__(None, None, None)
+            except Exception:
+                pass
+
+    def _jouer(self, frequence, morceau):
+        """Un dixieme de seconde. Le haut-parleur a change en route (un casque
+        debranche, l'ecran HDMI en veille) : on rouvre celui de Windows -- le
+        nouveau -- et on rejoue ce morceau, une fois. Faux s'il ne peut pas."""
+        for essai in (0, 1):
+            try:
+                self._ouvrir(frequence).play(morceau)
+                return True
+            except Exception as e:
+                self.fermer()
+                if essai:
+                    self.sortie({"evt": "erreur", "message": "haut-parleur : %s" % str(e)[:160]})
+        return False
+
+    def dire(self, ident, texte, lenteur=1.0, cle=None, travail=None, garder=False):
+        """Phrase par phrase : si on lui coupe la parole, « fini » dit ce qui
+        restait (`reste`, a partir de la phrase coupee) -- et s'il s'avere que
+        personne n'avait parle, Jarvis reprend la. `travail` : son calcul deja
+        parti (`preparer`) ; `garder` : le haut-parleur reste ouvert pour le
+        texte suivant, qui attend deja.
+
+        LA VOIX EN ECHEC (le haut-parleur perdu deux fois, une phrase qui ne se
+        calcule pas) : « fini » le dit (`rate`), avec ce qui n'a pas ete dit --
+        Machi Tool le fait dire autrement, au lieu de faire comme s'il avait
+        repondu."""
+        import numpy as np
+        if travail is None:
+            travail = self.preparer(ident, texte, lenteur, cle)
+        syn, file_, fin, arret, phrases = (travail["syn"], travail["file"], travail["fin"], travail["arret"],
+                                           travail["phrases"])
+        self.couper.clear()
         pas = syn.frequence // 10
-        coupe, premiere, en_cours = False, True, 0
-        with self.lecteur(syn.frequence) as hp:
+        coupe, rate, premiere, en_cours = False, None, True, 0
+        try:
+            try:
+                self._ouvrir(syn.frequence)
+            except Exception:
+                self.fermer()                    # on reessaiera au premier morceau
             while True:
-                son = file_.get()
+                if self.couper.is_set() or arret.is_set():
+                    coupe = True
+                    break
+                try:
+                    son = file_.get(timeout=0.05)
+                except queue.Empty:
+                    continue
                 if son is fin:
                     break
                 if isinstance(son, Exception):
                     self.sortie({"evt": "erreur", "message": "synthese : %s" % str(son)[:160]})
+                    rate = travail["rate"] or 0
                     break
                 en_cours, son, env = son
                 if premiere:
@@ -3837,21 +3948,33 @@ class Bouche:
                              "env": env, "pas": VOIX_ENVELOPPE_PAS})
                 son = np.concatenate([son, np.zeros(int(self.silence * syn.frequence), np.int16)])
                 for i in range(0, len(son), pas):
-                    if self.couper.is_set():
+                    if self.couper.is_set() or arret.is_set():
                         coupe = True
                         break
-                    hp.play(son[i:i + pas].astype(np.float32) / 32768.0)
-                if coupe:
+                    if not self._jouer(syn.frequence, son[i:i + pas].astype(np.float32) / 32768.0):
+                        rate = en_cours
+                        break
+                if coupe or rate is not None:
                     break
-        # Le producteur peut attendre une place dans la file : on la vide.
-        while not file_.empty():
+        finally:
+            # Le producteur s'arrete, et on vide sa file.
+            arret.set()
+            while not file_.empty():
+                try:
+                    file_.get_nowait()
+                except queue.Empty:
+                    break
             try:
-                file_.get_nowait()
-            except queue.Empty:
-                break
+                self.travaux.remove(travail)
+            except ValueError:
+                pass
+            if not garder:
+                self.fermer()
         ev = {"evt": "fini", "id": ident, "coupe": coupe}
         if coupe:
             ev["reste"] = " ".join(phrases[en_cours:])
+        elif rate is not None:
+            ev.update(rate=True, reste=" ".join(phrases[rate:]))
         self.sortie(ev)
 
 
@@ -3884,26 +4007,47 @@ def voix_enfant(port, secret, lecteur=None):
                 c = recevoir(s)
                 if c is None:
                     break
-                # « taire » n'attend pas son tour : il coupe la phrase en cours.
+                # « taire » n'attend pas son tour : il coupe la phrase en cours,
+                # et jette les textes qui attendaient -- PAS le reste : un
+                # « charger » jete laissait la voix francaise jamais chargee.
                 if c.get("cmd") == "taire":
                     if etat["bouche"] is not None:
-                        etat["bouche"].couper.set()
+                        etat["bouche"].taire()
+                    gardees = []
                     while True:
                         try:
-                            commandes.get_nowait()
+                            x = commandes.get_nowait()
                         except queue.Empty:
                             break
+                        if x is not None and x.get("cmd") != "dire":
+                            gardees.append(x)
+                    for x in gardees:
+                        commandes.put(x)
                     continue
+                if c.get("cmd") == "dire" and etat["bouche"] is not None:
+                    # son calcul part tout de suite, pendant que le precedent sonne
+                    try:
+                        c["travail"] = etat["bouche"].preparer(c.get("id"), c.get("texte", ""),
+                                                               float(c.get("lenteur", 1.0)), c.get("cle"))
+                    except Exception:
+                        pass
                 commandes.put(c)
         except Exception:
             pass
         if etat["bouche"] is not None:
-            etat["bouche"].couper.set()
+            etat["bouche"].taire()
         commandes.put(None)
 
     threading.Thread(target=lire, daemon=True).start()
     while True:
-        c = commandes.get()
+        b = etat["bouche"]
+        try:
+            # le haut-parleur reste ouvert entre deux textes qui se suivent ;
+            # rien ne vient : on le rend
+            c = commandes.get(timeout=0.5) if b is not None and b.ouvert() else commandes.get()
+        except queue.Empty:
+            b.fermer()
+            continue
         if c is None:
             break
         try:
@@ -3924,7 +4068,9 @@ def voix_enfant(port, secret, lecteur=None):
                 sortie({"evt": "pret", "cle": cle, "frequence": syn.frequence})
             elif c.get("cmd") == "dire" and etat["bouche"] is not None:
                 etat["bouche"].dire(c.get("id"), c.get("texte", ""), float(c.get("lenteur", 1.0)),
-                                    c.get("cle"))
+                                    c.get("cle"), travail=c.get("travail"), garder=True)
+                if commandes.empty():
+                    etat["bouche"].fermer()
             elif c.get("cmd") == "rendre" and etat["bouche"] is not None:
                 # la porteuse de la transcription (voir `reconnaitre`) : dite en
                 # memoire, pas au haut-parleur, et rendue a Machi Tool

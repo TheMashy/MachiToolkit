@@ -4656,6 +4656,7 @@ JARVIS = {
     "modeles": "absent", "progres": 0.0,
     "apprentissage": None,    # {"n", "total", "message", "fini"}
     "minuteurs": [],          # [{"fin", "quoi", "minuteur"}]
+    "avance": None,           # la reponse en cours : sa premiere phrase, dite en avance
     "agenda_change": 0.0,     # Jarvis vient de poser quelque chose dans l'agenda : la fenetre se relit
     # Deux modes : « jarvis » (orange, le majordome du PC) et « psy » (bleu, le
     # compagnon de BrainDebugger). Le mode psy se referme sur « non rien »,
@@ -5458,8 +5459,12 @@ def _lire_voix(sock):
             if ev.get("cle") == "en" or (ev.get("cle") == "fr" and kokoro_fr_pret(CFG)):
                 KOKORO.update(etat="pret", message="")
         elif quoi == "fini":
-            envoyer_oreille({"cmd": "parole", "actif": False})
-            VOIX.fini(ev.get("id"), bool(ev.get("coupe")), ev.get("reste"))
+            # la suite de la meme reponse attend deja derriere : l'oreille ne
+            # croit pas qu'il s'est tu entre les deux (elle guette toujours
+            # qu'on lui coupe la parole)
+            if not any(i != ev.get("id") for i in VOIX.attentes):
+                envoyer_oreille({"cmd": "parole", "actif": False})
+            VOIX.fini(ev.get("id"), bool(ev.get("coupe")), ev.get("reste"), rate=bool(ev.get("rate")))
         elif quoi == "rendu":
             recevoir_porteuse(ev)            # la porteuse de la transcription
         elif quoi == "erreur":
@@ -5475,7 +5480,7 @@ def _lire_voix(sock):
         n = _VOIX_ENFANT["echecs"]
         _VOIX_ENFANT.update(sock=None, pret=False, charge=None, echecs=n + 1,
                             prochain=time.time() + JARVIS_RELANCE_S[min(n, len(JARVIS_RELANCE_S) - 1)])
-        VOIX.enfant_perdu()
+        VOIX.enfant_perdu(redire=True)
 
 
 class Voix:
@@ -5502,6 +5507,8 @@ class Voix:
         self.n = 0
         self.verrou = threading.Lock()
         self.enchaine = {}          # ident -> celui dont il est la suite (sa reponse, apres la phrase d'avance)
+        self.coupes = set()         # les textes qu'on lui a coupes (voir `rejoindre`)
+        self.repris = {}            # ident coupe -> celui qui l'a repris (coupe pour rien)
 
     def peut_parler(self):
         return voix_prete() or self.disponible
@@ -5541,6 +5548,9 @@ class Voix:
             if fin:
                 fin()
             return
+        self._par_windows(texte, fin, langue)
+
+    def _par_windows(self, texte, fin, langue):
         JARVIS["sous_titre"] = {"phrases": [texte], "k": -1, "estime": True, "t0": time.time()}
         self.file.append((texte, fin, langue))
         self.signal.set()
@@ -5561,8 +5571,13 @@ class Voix:
                 self.en_cours[ident] = (texte, fin, langue)
             return True
 
-    def fini(self, ident, coupe, reste=None):
-        self.en_cours.pop(ident, None)
+    def fini(self, ident, coupe, reste=None, rate=False):
+        """`rate` : la voix n'a pas pu le dire (un casque debranche en pleine
+        phrase, une synthese en echec). « Silence, puis le carillon d'ecoute
+        comme s'il avait repondu » : ce qui n'a pas ete dit passe par la voix
+        de Windows, et la suite (l'ecoute d'apres) attend qu'elle l'ait dit ;
+        sans elle, une notification le montre et le souci s'affiche."""
+        dit = self.en_cours.pop(ident, None)
         if coupe and reste and self.reprise and self.reprise["id"] == ident:
             # a partir de la phrase coupee
             self.reprise["texte"] = (reste + " " + self.reprise.get("apres", "")).strip()
@@ -5570,32 +5585,77 @@ class Voix:
             fin = self.attentes.pop(ident, None)
         if not self.attentes:
             self.parle = False
+        if rate and not coupe:
+            a_dire = str(reste or (dit[0] if dit else "") or "").strip()
+            langue = dit[2] if dit else "fr"
+            print("Jarvis : la voix neuronale n'a pas pu parler%s" % (", la voix de Windows reprend"
+                                                                      if a_dire and self.disponible else ""))
+            if a_dire and self.disponible:
+                self._par_windows(a_dire, fin, langue)
+                return
+            if a_dire:
+                n = JARVIS_CROCHETS.get("notifier")
+                if n:
+                    n("Jarvis", _jv.pour_la_voix(a_dire, 240))
+                souci("La voix n'a pas pu parler : sa reponse est dans la notification.")
         if fin and not coupe:
             try:
                 fin()
             except Exception:
                 pass
 
-    def enfant_perdu(self):
+    def enfant_perdu(self, redire=False):
         """La voix est tombee en pleine phrase : on ne laisse pas la suite
-        (la guirlande, l'ecoute d'apres) attendre une fin qui ne viendra pas."""
+        (la guirlande, l'ecoute d'apres) attendre une fin qui ne viendra pas.
+        `redire` : tombee toute seule (pas arretee expres) -- ce qu'elle avait
+        a dire passe par la voix de Windows, et la suite attend qu'il soit dit."""
         attentes, self.attentes = self.attentes, {}
+        en_cours = self.en_cours
         self.en_cours, self.reprise = {}, None
         self.parle = False
         # l'oreille ne doit pas croire qu'il parle encore (elle ne cherchait plus son nom)
         envoyer_oreille({"cmd": "parole", "actif": False})
-        for fin in attentes.values():
+        for ident in sorted(attentes):
+            fin = attentes[ident]
+            if redire and self.disponible and ident in en_cours:
+                texte, _, langue = en_cours[ident]
+                self._par_windows(texte, fin, langue)
+                continue
             if fin:
                 try:
                     fin()
                 except Exception:
                     pass
 
+    def rejoindre(self, ident, reste, fin):
+        """LA SUITE D'UNE REPONSE dont la premiere phrase est partie en avance
+        (`ident`). « Je lui coupe la parole pendant sa premiere phrase, il se
+        tait, puis la suite arrive quand meme » : si cette phrase a ete coupee,
+        la suite ne se dit pas -- elle rejoint ce qu'il reprendra si personne
+        ne parlait (avec la vraie fin : l'ecoute d'apres), et disparait si on
+        lui a vraiment parle. Deja reprise (coupe pour rien) : la suite se dit
+        derriere la reprise. Rend l'ident derriere lequel dire la suite, ou
+        None s'il n'y a rien a dire maintenant."""
+        while ident in self.coupes and ident in self.repris:
+            ident = self.repris[ident]
+        if ident not in self.coupes:
+            return ident
+        r = self.reprise
+        if r and r["id"] == ident:
+            r["texte"] = (r["texte"] + " " + reste).strip()
+            r["apres"] = (r.get("apres", "") + " " + reste).strip()
+            r["fin"] = fin
+        return None
+
     def taire(self, garder=False):
         """Il se tait. `garder` : on vient de lui couper la parole -- on garde
         ce qu'il disait, pour le reprendre si personne ne parlait en fait."""
         self.reprise = None
         if garder and self.en_cours:
+            self.coupes.update(self.en_cours)
+            for vieux in [i for i in self.coupes if i < self.n - 20]:
+                self.coupes.discard(vieux)
+                self.repris.pop(vieux, None)
             # la voix dit ses textes dans l'ordre : celui qui sonne est le plus
             # ancien ; ceux qui attendaient, « taire » les jette (sans « fini »)
             # -- sauf la suite de la MEME reponse (sa premiere phrase dite en
@@ -5624,7 +5684,9 @@ class Voix:
         r, self.reprise = self.reprise, None
         if not r or not r.get("texte") or time.time() - r["t"] > 30.0:
             return False
-        self.dire(r["texte"], r["fin"], r["langue"])
+        ident = self.dire(r["texte"], r["fin"], r["langue"])
+        if ident is not None:
+            self.repris[r["id"]] = ident          # la suite de sa reponse viendra derriere
         return True
 
     def oublier_reprise(self):
@@ -5972,7 +6034,6 @@ def traiter_evenement(ev):
         JARVIS["reveil_verifie"] = bool(ev.get("verifie"))
         poser_mode("jarvis")
         JARVIS.update(suite_active=False, attente_code=None, entendu="", fait_jusqua=0.0)
-        declencher_routines("evenement", "reveil", CFG)
         if ev.get("deja_fini"):
             # « Jarvis, allume la lumiere » dit d'une traite pendant qu'il
             # verifiait l'appel : il n'ecoute plus, il lit
@@ -5983,6 +6044,9 @@ def traiter_evenement(ev):
             poser_led("ecoute")
             JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=time.time() + attente,
                           ecoute_duree=attente, parole_vue=0.0)
+        # la lumiere de la routine du reveil -- APRES l'ecoute ouverte : sa
+        # replique ne se dit pas par-dessus la demande qui commence
+        declencher_routines("evenement", "reveil", CFG)
         # Le moteur de transcription se reveille PENDANT qu'on parle : sa
         # premiere phrase apres un long silence ne paie pas son chargement.
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
@@ -6015,6 +6079,13 @@ def traiter_evenement(ev):
         JARVIS["ecoute_avant"] = (float(JARVIS.get("ecoute_fin") or 0.0)
                                   if JARVIS.get("etat") == "ecoute" and JARVIS.get("suite_active") else 0.0)
         JARVIS["ecoute_fin"] = 0.0
+        a = JARVIS.get("avance")
+        if (ev.get("apres_coupure") and not ev.get("breve") and a and not a.get("fini")
+                and a.get("id") in VOIX.coupes and a.get("tour") == JARVIS.get("tour")):
+            # ON LUI A VRAIMENT PARLE par-dessus sa premiere phrase (des mots,
+            # pas un bruit bref) : la reponse qu'il attendait encore n'est plus
+            # la question -- il n'attend plus BrainDebugger pour t'ecouter
+            a["interrompue"] = True
         if JARVIS.get("etat") in ("ecoute", "attente"):
             poser_led("comprend")
             JARVIS.update(etat="comprend", message="Je transcris...")
@@ -6209,9 +6280,18 @@ def reprendre_apres_coupure():
     if not VOIX.reprise:
         return False
     print("Jarvis : coupe pour rien, il reprend")
-    if VOIX.reprise.get("fin") is None:
-        # un minuteur, une annonce : rien ne le remettait « a l'ecoute » apres
-        VOIX.reprise["fin"] = lambda: (poser_led(None), JARVIS.update(etat="attente", message=message_attente()))
+    fin, tour = VOIX.reprise.get("fin"), JARVIS.get("tour")
+
+    def puis():
+        # un minuteur, une annonce -- ou sa premiere phrase, dite en avance, dont
+        # la suite ne viendra plus : rien ne le remettait « a l'ecoute » apres,
+        # et il restait « parle » pour toujours
+        if fin:
+            fin()
+        if JARVIS.get("etat") == "parle" and JARVIS.get("tour") == tour:
+            poser_led(None)
+            JARVIS.update(etat="attente", message=message_attente())
+    VOIX.reprise["fin"] = puis
     poser_led("parle")
     JARVIS.update(etat="parle", message="Je reprends.")
     if VOIX.reprendre():
@@ -6348,6 +6428,7 @@ def veiller_sur_jarvis(cfg):
             # une tache de fond prete : il l'annonce des qu'il est libre (sans
             # attendre la guirlande, qui peut ne pas etre branchee)
             try:
+                dire_les_annonces()
                 annoncer_taches(cfg)
             except Exception as e:
                 print("Jarvis : annonce impossible (%s)" % e)
@@ -6887,6 +6968,23 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
         if JARVIS.get("tour") != t0:
             return                                 # congedie pendant qu'il parlait
         clore_temps("dit", t0)
+        # « IL M'ECOUTE ALORS QU'IL PARLE ENCORE » : un minuteur, une annonce
+        # attendent derriere sa reponse -- la suite (l'ecoute d'apres) attend
+        # qu'ils soient dits, sinon le micro l'enregistre, et il se repond.
+        plus_tard = [i for i in list(getattr(VOIX, "attentes", None) or {}) if i is not None]
+        if plus_tard:
+            dernier = max(plus_tard)
+            avant = VOIX.attentes.get(dernier)
+
+            def puis():
+                if avant:
+                    try:
+                        avant()
+                    except Exception:
+                        pass
+                fin()
+            if VOIX.rattacher(dernier, puis):
+                return
         if ecouter and oreille_vivante():
             jouer_son("eveil")
             attente = _jv.attente_suite(texte, echanges_en_cours(), mode)
@@ -6903,6 +7001,12 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
             except Exception:
                 pass
     if ident_deja is not None:
+        # on lui a coupe la parole pendant cette premiere phrase : la suite
+        # attend la reprise (ou disparait), et l'etat reste celui de l'ecoute
+        ident_deja = VOIX.rejoindre(ident_deja, reste, fin)
+        if ident_deja is None:
+            print("Jarvis : on lui avait coupe la parole, la suite ne se dit pas maintenant")
+            return
         # la premiere phrase sonne (ou a sonne) : la suite derriere elle
         poser_led("parle")
         JARVIS.update(etat="parle", message="Je reponds.")
@@ -7114,6 +7218,11 @@ class Annule(BaseException):
     l'attrapent pas -- il n'y a rien a dire.)"""
 
 
+class Interrompu(Annule):
+    """On lui a coupe la parole pendant sa premiere phrase, et c'etaient des
+    mots : la suite de cette reponse ne se dira pas."""
+
+
 class BDMuet(TimeoutError):
     """BrainDebugger n'a rien rendu -- ni premiere phrase, ni reponse -- en
     ATTENTE_BD_MAX_S : « il ne repond pas », pas « injoignable »."""
@@ -7182,14 +7291,16 @@ def patienter(attente, deja_dit):
     return False
 
 
-def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None):
+def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None, avance=None):
     """_requete_bd, mais on n'attend plus des que la conversation a change (un
     nouveau reveil, « tais-toi », un clic sur le panneau) : Annule, et la
     requete est fermee. Il repondait encore apres qu'on l'avait congedie -- et
     la phrase suivante attendait derriere.
 
     Tant qu'aucune phrase n'est venue : un signe de loin en loin (voir
-    `patienter`), et BDMuet au bout d'ATTENTE_BD_MAX_S."""
+    `patienter`), et BDMuet au bout d'ATTENTE_BD_MAX_S. `avance` : sa premiere
+    phrase, dite en avance ; interrompue pour de bon (voir traiter_evenement,
+    « phrase »), c'est Interrompu."""
     noter_temps("bd_envoi")
     vu = {"debut": None}
 
@@ -7221,6 +7332,8 @@ def _requete_bd_annulable(chemin, charge, cfg, delai, tour=None, sur_debut=None)
         while not fini.wait(0.1):
             if JARVIS.get("tour") != tour:
                 raise Annule()
+            if avance is not None and avance.get("interrompue"):
+                raise Interrompu()
             attente = time.monotonic() - t0
             if vu["debut"] is not None:
                 continue
@@ -7457,7 +7570,9 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
             return
         if nature == "attente" and _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=True):
             return
-        # on lui a vraiment parle -- son nom compris (« Jarvis ? » pour le couper)
+        # on lui a vraiment parle -- son nom compris (« Jarvis ? » pour le couper) :
+        # rien de ce qu'il disait ne repart derriere (ni la suite de sa reponse)
+        VOIX.taire()
         VOIX.oublier_reprise()
     # CHEZ LE PSYCHOLOGUE, la phrase brute d'abord : son nom, « reviens »,
     # « arrete », « je veux plus du psy » -- avant que le nom soit retire.
@@ -9357,14 +9472,16 @@ def continuer_jarvis(etat, resultats, cfg):
         raise Annule()
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis agit...")
-    avance = {}
+    avance = JARVIS["avance"] = {}
     t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"suite": etat["suite"], "resultats": resultats, "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40]},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
-                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance))
+                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
+    except Interrompu:
+        return reponse_interrompue(etat["texte"], avance)
     except Exception as e:
         return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(etat["texte"], donnees, cfg, int(etat.get("tour") or 1) + 1, conv, avance)
@@ -9463,7 +9580,7 @@ def parler_a_jarvis(texte, cfg, conv=None):
     poser_led("pense")
     JARVIS.update(etat="pense", message="Jarvis reflechit...")
     print("Jarvis : question au majordome (%d signes)" % len(texte))
-    avance = {}
+    avance = JARVIS["avance"] = {}
     t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
@@ -9471,10 +9588,23 @@ def parler_a_jarvis(texte, cfg, conv=None):
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
                                               "onglets_ouverts": onglets_attendus(cfg)},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
-                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance))
+                                        sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
+    except Interrompu:
+        return reponse_interrompue(texte, avance)
     except Exception as e:
         return echec_bd(e, L, conv, t0=t0)
     return recevoir_jarvis(texte, donnees, cfg, 1, conv, avance)
+
+
+def reponse_interrompue(texte, avance):
+    """On lui a coupe la parole pendant sa premiere phrase : il n'attend plus
+    la suite pour t'ecouter. L'historique garde ce que tu avais demande et ce
+    qu'il a eu le temps de dire -- BrainDebugger sait ou vous en etiez."""
+    avance["fini"] = True
+    print("Jarvis : interrompu pendant sa premiere phrase, il t'ecoute")
+    JARVIS["historique"] = (JARVIS["historique"] + [
+        {"role": "user", "texte": texte},
+        {"role": "assistant", "texte": (str(avance.get("texte") or "") + " [interrompu]").strip()}])[-12:]
 
 
 _JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -9603,6 +9733,45 @@ def executer_commande(a, cfg, maintenant=None):
     return None
 
 
+# CE QU'IL DIT SANS QU'ON LUI AIT PARLE (un minuteur, un rappel) : jamais par-
+# dessus une conversation. Le son et la notification tout de suite ; la
+# phrase, des qu'il est libre (voir `dire_les_annonces`, depuis sa veille).
+ANNONCES = []
+ANNONCE_GARDEE_S = 600
+
+
+def annoncer(texte, langue="fr"):
+    """« Le minuteur sonne pendant qu'il m'ecoute : il l'enregistre et se
+    repond. » Libre, il le dit ; une fenetre d'ecoute d'apres ou personne n'a
+    encore parle, il la referme et le dit ; en pleine conversation (il
+    t'ecoute, transcrit, reflechit, parle), ca attend qu'il ait fini.
+    Rend True s'il le dit maintenant."""
+    if not (CFG.get("jarvis_voix", True) and VOIX.peut_parler()):
+        return False
+    etat = JARVIS.get("etat")
+    if (etat == "ecoute" and JARVIS.get("suite_active") and not JARVIS.get("parole_vue")
+            and not JARVIS.get("suspens") and not JARVIS.get("attente_code")):
+        envoyer_oreille({"cmd": "annuler"})
+        poser_led(None)
+        JARVIS.update(etat="attente", suite_active=False, ecoute_fin=0.0, message=message_attente())
+        etat = "attente"
+    if etat in ("attente", "eteint", None):
+        VOIX.dire(texte, None, langue)
+        return True
+    ANNONCES.append((texte, langue, time.time()))
+    return False
+
+
+def dire_les_annonces():
+    """Depuis sa veille : ce qui attendait qu'il soit libre."""
+    while ANNONCES and JARVIS.get("etat") in ("attente", "eteint", None):
+        texte, langue, t = ANNONCES.pop(0)
+        if time.time() - t > ANNONCE_GARDEE_S:
+            continue                          # trop vieux : la notification a suffi
+        if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
+            VOIX.dire(texte, None, langue)
+
+
 def rappel_dans_l_agenda(quoi, fin, cfg):
     """Le rappel « rappelle-moi dans 2 h d'appeler maman », pose aussi dans
     l'agenda : son jour et son heure. Rend True s'il y est."""
@@ -9632,8 +9801,7 @@ def poser_minuteur(secondes, quoi="", langue="fr"):
         notifier = JARVIS_CROCHETS.get("notifier")
         if notifier:
             notifier("Jarvis", texte)
-        if CFG.get("jarvis_voix", True) and VOIX.peut_parler():
-            VOIX.dire(texte, None, langue)
+        annoncer(texte, langue)
 
     entree["minuteur"] = threading.Timer(secondes, sonner)
     entree["minuteur"].daemon = True
