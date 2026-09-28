@@ -79,6 +79,20 @@ class Commandes(unittest.TestCase):
         a = J.comprendre(texte)
         return a and a["action"]
 
+    def test_mets_ecrit_mais(self):
+        """« Mets un minuteur de dix minutes » transcrit « Mais un minuteur... » :
+        la commande partait chez BrainDebugger au lieu de se faire ici."""
+        a = J.comprendre("Mais un minuteur de 10 minutes.")
+        self.assertEqual((a["action"], a["secondes"]), ("minuteur", 600))
+        self.assertEqual(self.action("Mais la lumière en bleu."), "lumiere_couleur")
+        self.assertEqual(self.action("Met la lumière en rouge"), "lumiere_couleur")
+        self.assertEqual(self.action("Mes la lumière en vert"), "lumiere_couleur")
+        # un vrai « mais » reste une phrase pour le compagnon
+        self.assertIsNone(J.comprendre("Mais la lumière est déjà allumée ?"))
+        self.assertIsNone(J.comprendre("Mais non"))
+        self.assertIsNone(J.comprendre("Mais moi je veux dormir"))
+        self.assertIsNone(J.comprendre("Mes enfants sont là"))
+
     def test_la_lumiere(self):
         self.assertEqual(self.action("Allume la lumière."), "lumiere_on")
         self.assertEqual(self.action("éteins la lumière"), "lumiere_off")
@@ -1966,7 +1980,7 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False, suspens=None)
+                        transcription_absente_dite=False, suspens=None, dictee_dite=0.0)
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -4118,6 +4132,272 @@ class DansMachiTool(unittest.TestCase):
                        "speaker_id_map": {"jessica": 0, "pierre": 1}}, fj)
         self.assertEqual(m.piper_pret(m.CFG)["locuteur"], 1)
 
+    # ---- la transcription telle que Jarvis s'en sert ----
+
+    def remplacer(self, **kw):
+        for nom, valeur in kw.items():
+            self.addCleanup(setattr, self.m, nom, getattr(self.m, nom))
+            setattr(self.m, nom, valeur)
+
+    def moteur_factice(self, vu):
+        """Un moteur « vivant » sans processus : de quoi juger l'entretien."""
+        m = self.m
+
+        class Proc:
+            pid = 1
+
+            def poll(self):
+                return None
+        self.addCleanup(m._MOTEUR.update, proc=None, sock=None, vu=0.0, charge=False)
+        m._MOTEUR.update(proc=Proc(), sock=object(), vu=vu, charge=True)
+
+    def test_le_moteur_se_precharge_apres_le_demarrage_de_l_oreille(self):
+        """« Le premier Jarvis paie le deballage et 652 Mo de modele » : rien ne
+        chargeait le moteur avant qu'on ait parle. L'oreille prete, il se
+        charge ~45 s plus tard -- si la memoire le permet encore, lui charge."""
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True, envoyer_oreille=lambda o: True)
+        self.addCleanup(m._ENTRETIEN.update, prechauffe_a=0.0, en_cours=False)
+        m._ENTRETIEN.update(prechauffe_a=0.0, en_cours=False)
+        m.CFG["jarvis_actif"] = True
+        t0 = time.time()
+        m.traiter_evenement({"evt": "pret", "micro": "x", "trouve": True})
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 1, lances.append), "pas pendant que le PC demarre")
+        self.remplacer(memoire_libre_mo=lambda: 3700)
+        self.assertEqual(m.entretenir_dictee(m.CFG, t0 + 60, lances.append), "prechauffe")
+        self.assertEqual(lances, [m.prechauffer_dictee])
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 120, lances.append), "une seule fois par oreille")
+        # peu de memoire : 1 Go de plus gelerait le PC -- il attendra qu'on l'appelle
+        m.traiter_evenement({"evt": "pret", "micro": "x", "trouve": True})
+        self.remplacer(memoire_libre_mo=lambda: 3000)
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 200, lances.append))
+        self.assertEqual(len(lances), 1)
+        # Jarvis decoche : rien
+        m.CFG["jarvis_actif"] = False
+        m.traiter_evenement({"evt": "pret", "micro": "x", "trouve": True})
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t0 + 900, lances.append))
+
+    def test_le_moteur_est_entretenu_tant_que_la_memoire_le_permet(self):
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True, memoire_libre_mo=lambda: 2600)
+        self.addCleanup(m._ENTRETIEN.update, prechauffe_a=0.0, en_cours=False)
+        m.CFG["jarvis_actif"] = True
+        t = time.time()
+        self.moteur_factice(vu=t - 5 * 60)
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t, lances.append), "servi il y a 5 min : rien a faire")
+        m._MOTEUR["vu"] = t - 21 * 60
+        self.assertEqual(m.entretenir_dictee(m.CFG, t, lances.append), "entretien")
+        self.assertEqual(lances, [m.garder_au_chaud])
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t, lances.append), "un entretien a la fois")
+        m._ENTRETIEN["en_cours"] = False
+        # la memoire se resserre (un jeu) : plus d'entretien, il partira de lui-meme
+        self.remplacer(memoire_libre_mo=lambda: 2100)
+        self.assertIsNone(m.entretenir_dictee(m.CFG, t, lances.append))
+        self.assertEqual(len(lances), 1)
+
+    def test_le_delai_de_dechargement_reste_fini(self):
+        m = self.m
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": True}, libre=4000), m.DICTEE_GARDER_JARVIS_S)
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": True}, libre=2100), 30 * 60,
+                         "Jarvis ecoute, encore de la marge : une demi-heure, pas dix minutes")
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": True}, libre=1600), m.DICTEE_DECHARGER_S)
+        self.assertEqual(m.delai_dechargement({"jarvis_actif": False}, libre=9000), m.DICTEE_DECHARGER_S)
+
+    def test_presque_reconnu_reveille_le_moteur(self):
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True, memoire_libre_mo=lambda: 8000,
+                       prechauffer_dictee=lambda: lances.append(1))
+        m.CFG["jarvis_actif"] = True
+        m.traiter_evenement({"evt": "presque", "distance": 0.2, "seuil": 0.18})
+        fin = time.time() + 2
+        while not lances and time.time() < fin:
+            time.sleep(0.01)
+        self.assertEqual(lances, [1])
+
+    def test_un_modele_rate_se_retente_de_plus_en_plus_lentement(self):
+        """« Un telechargement rate rend Jarvis sourd pour de bon. »"""
+        m = self.m
+        lances = []
+        self.remplacer(dictee_possible=lambda: True)
+        self.addCleanup(m._DICTEE_RELANCE.update, prochain=0.0, n=0)
+        self.addCleanup(m.DICTEE.update, etat="absent")
+        m._DICTEE_RELANCE.update(prochain=0.0, n=0)
+        m.DICTEE.update(etat="erreur", message="delai depasse")
+        t = 1000.0
+        self.assertFalse(m.relancer_dictee_si_ratee(t, lances.append))
+        self.assertFalse(m.relancer_dictee_si_ratee(t + 30, lances.append))
+        self.assertTrue(m.relancer_dictee_si_ratee(t + 61, lances.append), "une minute apres")
+        self.assertEqual(lances, [m.preparer_dictee])
+        self.assertFalse(m.relancer_dictee_si_ratee(t + 200, lances.append))
+        self.assertTrue(m.relancer_dictee_si_ratee(t + 61 + 301, lances.append), "puis cinq")
+        self.assertFalse(m.relancer_dictee_si_ratee(t + 61 + 301 + 600, lances.append))
+        self.assertTrue(m.relancer_dictee_si_ratee(t + 61 + 301 + 1801, lances.append), "puis trente")
+        self.assertEqual(len(lances), 3)
+
+    def test_un_appel_sans_transcription_ne_fait_pas_parler_dans_le_vide(self):
+        m = self.m
+        envoye = []
+        self.remplacer(prechauffer_dictee=lambda: None)
+        m.envoyer_oreille = envoye.append
+        m.etat_dictee = lambda: {"etat": "preparation", "progres": 0.42}
+        m.traiter_evenement({"evt": "reveil", "par": "voix", "score": 0.1})
+        self.assertNotEqual(m.JARVIS["etat"], "ecoute")
+        self.assertIn({"cmd": "annuler"}, envoye)
+        self.assertIn("42", m.JARVIS["message"])
+
+    def test_la_transcription_absente_se_dit_encore_apres_la_premiere_fois(self):
+        m = self.m
+        self.addCleanup(m.DICTEE.update, etat="absent")
+        sons = []
+        m.jouer_son = sons.append
+        m.etat_dictee = lambda: {"etat": "erreur", "progres": 0.0}
+        vus = self.espions()
+        for _ in range(3):
+            m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+            self.assertEqual(m.JARVIS["message"], m.phrase("transcription_reessaie", m.langue_du_mode()),
+                             "il se taisait des la deuxieme fois")
+        self.assertEqual(sons.count("erreur"), 3)
+        self.assertEqual(vus, {"jarvis": [], "psy": []})
+        # deux minutes plus tard, il le redit a voix haute
+        dit = m.JARVIS["dictee_dite"]
+        m.JARVIS["dictee_dite"] = dit - 121
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertGreater(m.JARVIS["dictee_dite"], dit - 121)
+
+    def test_une_panne_de_moteur_se_dit_court_et_dans_sa_langue(self):
+        """La phrase technique (150 caracteres, en francais meme en anglais)
+        n'est plus lue : elle va au journal."""
+        m = self.m
+        m.CFG["jarvis_langue"] = "en"
+
+        def panne(octets):
+            raise m.DicteeImpossible("pas assez de memoire libre pour la dictee (900 Mo, il en faut 1500)",
+                                     cle="memoire_pleine")
+        m.transcrire = panne
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(m.JARVIS["message"], m.phrase("memoire_pleine", "en"))
+        self.assertNotIn("Mo", m.JARVIS["message"])
+
+    def test_le_moteur_froid_se_voit_au_panneau(self):
+        m = self.m
+        vus = []
+        self.remplacer(dictee_possible=lambda: True)
+        m.transcrire = lambda octets: vus.append(m.JARVIS["message"]) or "Jarvis, quelle heure est-il ?"
+        self.espions()
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus, ["Je prepare la transcription..."])
+        vus.clear()
+        self.moteur_factice(vu=time.time())
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus, ["Je transcris..."])
+
+    def test_la_porteuse_part_avec_une_phrase_francaise(self):
+        m = self.m
+        self.addCleanup(m._PORTEUSE.update, fr=None, demande=0.0)
+        self.addCleanup(m._VOIX_ENFANT.update, charge=None)
+        m._PORTEUSE.update(fr=None, demande=0.0)
+        m._VOIX_ENFANT["charge"] = "fr:kokoro:fr_jarvis"
+        vus, envoye = [], []
+        m.transcrire = lambda octets, porteuse=None: vus.append(porteuse) or "Non."
+        # pas encore rendue : on la demande a la voix, au plus une fois par minute
+        m.voix_prete = lambda cle=None: True
+        m.envoyer_voix = lambda o: envoye.append(o) or True
+        self.assertTrue(m.demander_porteuse(1000.0))
+        self.assertEqual(envoye, [{"cmd": "rendre", "id": "porteuse", "cle": "fr", "texte": "Je vous écoute."}])
+        self.assertFalse(m.demander_porteuse(1030.0))
+        self.assertEqual(m.transcrire_phrase(b"RIFF", "fr"), "Non.")
+        self.assertEqual(vus, [None])
+        porteuse = J.wav_de(np.zeros(8000, np.int16)) if NUMPY else b""
+        if not NUMPY:
+            return
+        self.assertTrue(m.recevoir_porteuse({"evt": "rendu", "cle": "fr",
+                                             "wav": base64.b64encode(porteuse).decode()}))
+        m.transcrire_phrase(b"RIFF", "fr")
+        m.transcrire_phrase(b"RIFF", "en")
+        self.assertEqual(vus[1:], [porteuse, None], "en francais seulement")
+        self.assertFalse(m.demander_porteuse(2000.0), "deja la")
+        # une autre voix chargee : cette porteuse ne vaut plus
+        m._VOIX_ENFANT["charge"] = "fr:piper:gilles"
+        self.assertIsNone(m.porteuse_pour("fr"))
+
+
+class TranscriptionAncree(unittest.TestCase):
+    """« Non » transcrit « Não », « Ouais » transcrit « Wait » : une porteuse
+    francaise devant la reponse ancre la langue ; on ne garde que ce qui suit."""
+
+    def test_le_texte_apres_la_porteuse(self):
+        jetons = ["▁Je", "▁vous", "▁é", "coute", ".", "▁Non", "."]
+        dates = [0.1, 0.3, 0.5, 0.6, 1.2, 1.9, 2.1]
+        self.assertEqual(J.texte_apres(jetons, dates, 1.6), "Non.")
+        # le point final de la porteuse deborde la coupure
+        self.assertEqual(J.texte_apres(jetons, dates, 1.1), "Non.")
+        # onnx-asr a deja change « ▁ » en espace
+        self.assertEqual(J.texte_apres([" Oui", ",", " mer", "ci", "."], [2.0, 2.2, 2.3, 2.4, 2.5], 1.6),
+                         "Oui, merci.")
+        self.assertEqual(J.texte_apres(jetons, dates, 5.0), "")
+        self.assertEqual(J.texte_apres(None, None, 0), "")
+
+    def test_seulement_pour_une_parole_courte(self):
+        self.assertTrue(J.parole_courte([]))
+        self.assertTrue(J.parole_courte([3.1, 3.3]))
+        self.assertFalse(J.parole_courte([0.5, 0.9, 1.3, 1.8]))
+        # mesure : le point de « Não. » est date 1,5 s apres le mot
+        self.assertTrue(J.parole_courte([1.0, 2.6], jetons=["▁Não", "."]))
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_reconnaitre_ancre_seulement_ce_qui_est_court(self):
+        class R:
+            def __init__(self, texte, jetons, dates):
+                self.text, self.tokens, self.timestamps = texte, jetons, dates
+
+        class Faux:
+            """Sans contexte, il derive ; avec la porteuse (un son plus long), il lit juste."""
+            def __init__(self, court=True):
+                self.court, self.sons = court, []
+
+            def with_timestamps(self):
+                return self
+
+            def recognize(self, son, sample_rate=16000):
+                self.sons.append(len(son))
+                if len(self.sons) == 1:
+                    if not self.court:
+                        return R("Non c'est bon.", [" Non", " c", "'", "est", " bon", "."], [1.0, 1.4, 1.5, 1.7, 2.2, 2.6])
+                    return R("Não.", [" Não", "."], [2.0, 2.2])
+                t0 = porteuse_s
+                return R("Je vous écoute. Non.", [" Je", " vous", " écoute", ".", " Non", "."],
+                         [0.1, 0.3, 0.5, t0 + 0.05, t0 + 0.4, t0 + 0.6])
+        porteuse_s = 1.0
+        son = np.zeros(16000 * 3, np.float32)
+        son[32000:36000] = 0.3
+        porteuse = np.full(16000, 0.5, np.float32)
+        f = Faux()
+        self.assertEqual(J.reconnaitre(f, son, 16000, porteuse), "Non.")
+        # la porteuse est pres du mot : le son d'avant (l'attente) est coupe
+        self.assertLess(f.sons[1], len(porteuse) + len(son))
+        f = Faux(court=False)
+        self.assertEqual(J.reconnaitre(f, son, 16000, porteuse), "Non c'est bon.")
+        self.assertEqual(len(f.sons), 1, "une phrase longue ne paie pas un second passage")
+        class Nu:
+            def recognize(self, son, sample_rate=16000):
+                return "Não."
+        self.assertEqual(J.reconnaitre(Nu(), son, 16000, None), "Não.", "sans porteuse, comme avant")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_porteuse_rendue_en_memoire(self):
+        class Syn:
+            frequence, langue = 24000, "fr"
+
+            def phrases(self, texte, lenteur=1.0):
+                yield np.full(12000, 1000, np.int16)
+                yield np.full(12000, -1000, np.int16)
+        w = J.rendre_en_memoire(Syn(), "Je vous écoute.")
+        with wave.open(io.BytesIO(w)) as ww:
+            self.assertEqual((ww.getframerate(), ww.getnframes()), (16000, 16000))
+
 
 class mock_urlopen:
     def __init__(self, m, reponse):
@@ -4540,6 +4820,10 @@ class ProcessusReel(unittest.TestCase):
             m.dossier_jarvis = lambda: MODELES
             m._commande_oreille = lambda port, secret: [sys.executable, script, str(port), secret,
                                                         MODELES, npy]
+            # la transcription prete (sans elle, un reveil ne fait plus parler
+            # dans le vide depuis la v1.65) -- sans lancer de vrai moteur
+            m.etat_dictee = lambda: {"etat": "pret", "progres": 1.0}
+            m.prechauffer_dictee = lambda: None
             etats = []
             origine = m.traiter_evenement
 
@@ -4703,6 +4987,34 @@ class VoixEnMemoire(unittest.TestCase):
         J.envoyer(c, {"cmd": "dire", "id": 1, "texte": "Mode psychologue. Je vous écoute."})
         self.assertEqual(J.recevoir(c), {"evt": "debut", "id": 1})
         self.assertEqual(J.recevoir(c), {"evt": "fini", "id": 1, "coupe": False})
+        J.envoyer(c, None)
+        c.close()
+        fil.join(5)
+        self.assertFalse(fil.is_alive())
+
+    def test_la_porteuse_rendue_par_le_processus_de_la_voix(self):
+        """La porteuse de la transcription (« Non » lu « Não ») : dite en
+        memoire par la voix francaise, a 16 kHz -- jamais au haut-parleur."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        hp = FauxHautParleur()
+        fil = threading.Thread(target=J.voix_enfant, args=(srv.getsockname()[1], "S3CRET", hp), daemon=True)
+        fil.start()
+        c, _ = srv.accept()
+        srv.close()
+        taille = int.from_bytes(c.recv(4), "big")
+        self.assertEqual(c.recv(taille), b"S3CRET")
+        J.envoyer(c, {"cmd": "charger", "bibliotheque": bibli_de_test(), "donnees": PIPER_DOSSIER,
+                      "modele": PIPER_VOIX, "espeak": "fr"})
+        self.assertEqual(J.recevoir(c)["evt"], "pret")
+        J.envoyer(c, {"cmd": "rendre", "id": "porteuse", "cle": "fr", "texte": "Je vous écoute."})
+        ev = J.recevoir(c)
+        self.assertEqual((ev["evt"], ev["id"], ev["cle"]), ("rendu", "porteuse", "fr"))
+        with wave.open(io.BytesIO(base64.b64decode(ev["wav"]))) as w:
+            self.assertEqual(w.getframerate(), 16000)
+            self.assertGreater(w.getnframes(), 8000)
+        self.assertEqual(hp.morceaux, [], "la porteuse ne passe pas par le haut-parleur")
         J.envoyer(c, None)
         c.close()
         fil.join(5)
