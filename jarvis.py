@@ -5914,6 +5914,10 @@ NOMS_REGLAGES = {
     "collecte_envoi": ("l'envoi de l'activité au site", "sending the activity to the site"),
     "collecte_titres_complets": ("les titres d'onglets complets", "full tab titles"),
     "api_active": ("le serveur local", "the local server"),
+    "maj_installation_auto": ("l'installation automatique des mises à jour", "automatic update installs"),
+    "maj_verifier": ("la recherche des mises à jour", "update checks"),
+    "maj_prereleases": ("les versions d'essai", "test builds"),
+    "jarvis_annoncer_maj": ("mes annonces de mises à jour", "my update announcements"),
 }
 
 
@@ -6595,6 +6599,8 @@ REGLAGES_POUVOIRS = {
     "jarvis_pc", "jarvis_ecran", "jarvis_historique", "jarvis_code_actif", "jarvis_fichiers", "jarvis_windows",
     "jarvis_initiatives", "jarvis_journal", "jarvis_actif", "collecte_active", "collecte_envoi",
     "collecte_titres_complets", "api_active",
+    # installer redemarre l'application : lever cette garde se confirme aussi
+    "maj_installation_auto", "maj_verifier", "maj_prereleases", "jarvis_annoncer_maj",
 }
 PALIER_POUVOIR = "pouvoir"   # le code d'acces s'il est demande, sinon « oui ? »
 

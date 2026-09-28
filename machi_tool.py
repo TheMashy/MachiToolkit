@@ -9231,8 +9231,23 @@ def outils_de_jarvis(etat, cfg):
             return dire(phrase("code_demande", L), suite="toujours", langue=L, tour=etat.get("conv"))
     if not etat.get("oui_donne") and demander_oui(etat, refus, cfg):
         return None
-    return continuer_jarvis(etat, [{"id": o.get("id"), "erreur": refus[i]} if i in refus else executer_outil(o, cfg)
-                                   for i, o in enumerate(outils)], cfg)
+    # UN DROIT DONNE DANS CE LOT N'OUVRE PAS LE RESTE DU LOT. Rien n'a encore
+    # tourne : `avant` est le palier de chacun tel que la personne l'a vu.
+    # Pendant l'execution, un outil ferme au depart (son groupe s'ouvre en
+    # route) ou qui demande un « oui » qu'elle n'a pas donne pour lui est
+    # refuse -- le tour suivant le reproposera, par son code ou sa question.
+    avant = {i: _palier(o, cfg) for i, o in enumerate(outils)}
+    confirmes = set(etat.get("oui") or []) if etat.get("oui_donne") else set()
+    resultats = []
+    for i, o in enumerate(outils):
+        if i not in refus:
+            maintenant = _palier(o, cfg)
+            if avant[i] is None and maintenant is not None:
+                refus[i] = REFUS_MEME_LOT
+            elif maintenant == _jv.PALIER_OUI and i not in confirmes:
+                refus[i] = REFUS_SANS_OUI
+        resultats.append({"id": o.get("id"), "erreur": refus[i]} if i in refus else executer_outil(o, cfg))
+    return continuer_jarvis(etat, resultats, cfg)
 
 
 def repondre_au_code(texte, cfg):
@@ -9329,18 +9344,44 @@ def outil_application(nom, e, cfg):
             if cle == "mode":
                 executer_commande({"action": "mode", "mode": v}, cfg)
             else:
+                avant = cfg.get(cle)
                 cfg[cle] = v
+                if cle == "collecte_active":
+                    cfg["collecte_envoi"] = v        # un seul interrupteur, comme dans la fenetre
                 sauver_config(cfg)
+                appliquer_reglage(cle, avant, v, cfg)
             if cle.startswith("jarvis_"):
                 envoyer_oreille(config_oreille(cfg))
             if cle == "jarvis_actif" and not v:
                 # il s'eteint : ce qu'il preparait tombe (comme « Jarvis ecoute » decoche)
                 _en_fond(terminer_conversation)
+            # la fenetre des reglages le montre -- et ne le reecrira pas a l'ancienne valeur
+            REGLAGES_A_RELIRE.add(cle)
+            if cle == "collecte_active":
+                REGLAGES_A_RELIRE.add("collecte_envoi")
             return "%s = %s." % (cle, v)
         raise ValueError("action inconnue : %s" % a)
     if nom == "mise_a_jour":
         return outil_mise_a_jour(a, cfg)
     raise ValueError("outil inconnu : %s" % nom)
+
+
+# Les reglages changes hors de la fenetre (Jarvis, le menu de l'icone) : la
+# boucle de la fenetre les relit (Panneau.relire_reglages), sinon « Enregistrer »
+# y reecrirait l'ancienne valeur. Jamais de Tk hors de son fil : un ensemble,
+# vide par `surveiller`.
+REGLAGES_A_RELIRE = set()
+
+
+def appliquer_reglage(cle, avant, v, cfg):
+    """Ce que la fenetre fait en plus d'ecrire la valeur : sans ca, « coupe le
+    journal d'activite » etait note mais le journal continuait."""
+    if cle == "collecte_active" and bool(avant) != bool(v):
+        demarrer_activite(cfg)                  # arrete ou relance le fil du journal
+    elif cle == "api_active" and bool(avant) != bool(v):
+        _en_fond(lambda: demarrer_api(cfg))     # arrete ou relance le serveur local
+    elif cle == "jarvis_pc" and not v:
+        JARVIS["acces_jusqua"] = 0.0            # ses mains fermees : la session aussi
 
 
 # ---------- ses mises a jour ----------
@@ -9349,8 +9390,25 @@ def outil_application(nom, e, cfg):
 # pose par main dans DECLENCHER_MAJ) : un seul chemin vers l'installeur.
 
 DECLENCHER_MAJ = [None]
+REFUS_MAJ_DECOCHE = ("« Il annonce les mises a jour (et peut les lancer) » est decoche dans ses options : "
+                     "je ne lance pas la mise a jour.")
 MAJ_ANNONCEES = set()          # (quoi, version) deja dits : une fois chacun
 MAJ_POSE_ATTENTE_S = 6.0       # le temps de dire « je reviens » avant de partir
+
+
+MAJ_JARVIS_LIBRE_S = 60       # au plus, avant de poser malgre tout
+
+
+def attendre_jarvis_libre(borne=MAJ_JARVIS_LIBRE_S, pas=0.5):
+    """Attend (dans le fil des mises a jour) qu'il ne soit plus en train de
+    comprendre, reflechir ou parler -- ni d'attendre une reponse -- pour que
+    la pose ne le coupe pas au milieu d'une phrase."""
+    fin = time.time() + borne
+    while time.time() < fin and ETAT.get("en_marche", True) and (
+            JARVIS.get("etat") in ("comprend", "pense", "parle")
+            or (JARVIS.get("etat") == "ecoute" and (JARVIS.get("parole_vue") or JARVIS.get("attente_oui")
+                                                   or JARVIS.get("attente_code")))):
+        time.sleep(pas)
 
 
 def etat_maj_en_texte():
@@ -9368,10 +9426,14 @@ def outil_mise_a_jour(action, cfg):
         return etat_maj_en_texte()
     occupe = MAJ.get("etat") in ("verification", "telechargement")
     if action == "verifier":
-        if not occupe:
+        # une version deja telechargee ou qui attend d'etre posee ne redevient
+        # pas « disponible » (la pose en attente serait perdue)
+        if not occupe and MAJ.get("etat") not in ("prete", "a_poser"):
             verifier_maj(cfg)
         return etat_maj_en_texte()
     if action == "installer":
+        if not cfg.get("jarvis_annoncer_maj", True):
+            raise RuntimeError(REFUS_MAJ_DECOCHE)
         if not FIGE:
             raise RuntimeError("En mode script, la mise a jour se fait par git pull : rien n'a ete touche.")
         if occupe:
@@ -9402,6 +9464,13 @@ def annoncer_maj(quoi, version, cfg=None):
     texte = _jv.annonce_maj(quoi, version, L)
     if not texte:
         return False
+    if quoi != "posee" and (JARVIS.get("mode") == "psy" or JARVIS.get("attente_oui") or JARVIS.get("attente_code")
+                            or time.time() < float(JARVIS.get("calme_jusqua") or 0) - CALME_S + 60):
+        # pas chez le psychologue, pas pendant une question, pas juste apres
+        # un conge : la notification suffit, la verification suivante
+        # redira « disponible »
+        MAJ_ANNONCEES.discard((quoi, version))
+        return False
     if quoi == "posee":
         # au demarrage, sa voix n'est pas encore chargee : en file, dite des qu'elle l'est
         ANNONCES.append((texte, L, time.time()))
@@ -9420,6 +9489,9 @@ def annoncer_maj(quoi, version, cfg=None):
 
 OUI_DUREE_S = 20
 REFUS_OUI = "Refuse par la personne : rien n'a ete fait."
+REFUS_MEME_LOT = ("Pas permis au moment de la demande (le droit vient d'etre donne dans ce meme tour) : "
+                  "rien n'a ete fait -- redemande-le maintenant.")
+REFUS_SANS_OUI = "Pas fait : ce geste demande un « oui » de la personne, qu'elle n'a pas donne pour lui."
 ANNULATIONS = {"liste": None}          # le journal d'annulation (lu du disque une fois)
 _WINGET = {"recherches": {}}
 WINGET_RECHERCHE_S = 300
@@ -9442,7 +9514,11 @@ def _palier(o, cfg):
     # une mise a jour (l'application redemarre), la personne les confirme
     p = _jv.palier_application(nom, o.get("entree"))
     if p == _jv.PALIER_POUVOIR:
-        return _jv.PALIER_CODE if cfg.get("jarvis_code_actif") else _jv.PALIER_OUI
+        # chaque fois un « J'active ... ? » qui NOMME le reglage : une session
+        # de code ouverte pour autre chose (dix minutes) ne le couvre jamais --
+        # sinon un texte qu'il vient de lire pourrait lui faire couper le code.
+        # Avec le code, et pas de session : le code d'abord, puis la question.
+        return _jv.PALIER_CODE if cfg.get("jarvis_code_actif") and not acces_ouvert() else _jv.PALIER_OUI
     if p:
         return p
     if nom in OUTILS_SANS_CODE:
@@ -9467,6 +9543,8 @@ def geste_oui(o, langue="fr"):
             raise ValueError("« %s » n'est pas un reglage que je peux changer." % cle)
         return "reglage", _jv.libelle_reglage(cle, _jv.valeur_reglage(cle, CONFIG_DEFAUT, e.get("valeur")), langue)
     if o.get("nom") == "mise_a_jour":
+        if not CFG.get("jarvis_annoncer_maj", True):
+            raise RuntimeError(REFUS_MAJ_DECOCHE)
         if not FIGE:
             raise RuntimeError("En mode script, la mise a jour se fait par git pull : rien n'a ete touche.")
         v = MAJ.get("version") if MAJ.get("etat") in ("disponible", "prete") else ""
@@ -10350,8 +10428,8 @@ def capacites_jarvis(cfg):
             "initiatives": bool(cfg.get("jarvis_initiatives")),
             # Machi Tool lui-meme : la guirlande, ses routines, les reglages
             "application": True, "routines": _jv.resume_routines(cfg.get("routines_lumiere") or []),
-            # ses mises a jour : les annoncer, les lancer (« oui ? » avant)
-            "mise_a_jour": True,
+            # ses mises a jour : les annoncer, les lancer (« oui ? » avant) -- si c'est coche
+            "mise_a_jour": bool(cfg.get("jarvis_annoncer_maj", True)),
             "souvenirs": souvenirs_a_envoyer(cfg),
             # ses taches de fond, et le contexte de tes projets
             "taches": True, "projets": str(cfg.get("jarvis_projets") or "")[:_jv.PROJETS_MAX],
@@ -10639,6 +10717,7 @@ def executer_commande(a, cfg, maintenant=None):
 # phrase, des qu'il est libre (voir `dire_les_annonces`, depuis sa veille).
 ANNONCES = []
 ANNONCE_GARDEE_S = 600
+ANNONCE_VOIX_ATTENTE_S = 90   # sa voix pas encore chargee : on l'attend, puis celle de Windows
 
 
 def annoncer(texte, langue="fr"):
@@ -10651,7 +10730,8 @@ def annoncer(texte, langue="fr"):
         return False
     etat = JARVIS.get("etat")
     if (etat == "ecoute" and JARVIS.get("suite_active") and not JARVIS.get("parole_vue")
-            and not JARVIS.get("suspens") and not JARVIS.get("attente_code")):
+            and not JARVIS.get("suspens") and not JARVIS.get("attente_code")
+            and not JARVIS.get("attente_oui")):
         envoyer_oreille({"cmd": "annuler"})
         poser_led(None)
         JARVIS.update(etat="attente", suite_active=False, ecoute_fin=0.0, message=message_attente())
@@ -10670,8 +10750,13 @@ def dire_les_annonces():
         if time.time() - t > ANNONCE_GARDEE_S:
             ANNONCES.pop(0)
             continue                          # trop vieux : la notification a suffi
-        if CFG.get("jarvis_voix", True) and not VOIX.peut_parler():
-            return                            # sa voix se charge encore : ca attend
+        if CFG.get("jarvis_voix", True):
+            if not VOIX.peut_parler():
+                return                        # aucune voix encore : ca attend
+            cle = "en" if langue == "en" else "fr"
+            attendue = any(c.get("cle") == cle for c in charges_voix(CFG))
+            if attendue and not voix_prete(cle) and time.time() - t < ANNONCE_VOIX_ATTENTE_S:
+                return                        # SA voix se charge encore : ca attend (puis Windows)
         ANNONCES.pop(0)
         if CFG.get("jarvis_voix", True):
             VOIX.dire(texte, None, langue)
@@ -14564,6 +14649,65 @@ class Panneau:
                       "d'ecouter » (il se coupe pour de bon), « apprends ma voix ». Tout le reste va a Jarvis.",
                    BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
 
+    # la cle de config -> la variable de la fenetre qui l'ecrit dans
+    # `enregistrer`, quand son nom n'est pas « var_<cle> » (voir relire_reglages)
+    VARIABLES_REGLAGES = {
+        "collecte_active": "var_act", "collecte_envoi": "var_act", "api_active": "var_api",
+        "collecte_titres_complets": "var_act_titres", "collecte_intervalle_heures": "var_act_intervalle",
+        "reaction_processeur": "var_cpu", "echelle_interface": "var_echelle", "eteindre_en_partant": "var_eteindre",
+        "pont_presence": "var_presence", "pont_presence_suit_humeur": "var_presence_humeur",
+        "pont_presence_grace": "var_presence_grace", "pont_affecte_leds": "var_affecte_leds",
+        "mode": "var_mode", "ecran_source": "var_source", "ecran_saturation": "var_sat",
+        "douceur_ecran": "var_douceur_ecran", "ecran_finesse": "var_finesse", "ecran_cible": "var_cible_ecran",
+        "ecran_noir": "var_ecran_noir", "ecran_blanc": "var_ecran_blanc", "ecran_gamma": "var_ecran_gamma",
+        "ecran_luminance_min": "var_ecran_plancher", "ecran_luminosite_base": "var_ecran_base",
+        "ecran_suit_filtre_bleu": "var_filtre_bleu", "ecran_balance_temp": "var_balance_temp",
+        "ecran_balance_tint": "var_balance_tint", "led_blanc_kelvin": "var_led_kelvin",
+        "ecran_filtre_force": "var_filtre_force", "son_bande": "var_bande", "son_palette": "var_palette",
+        "son_sensibilite": "var_sens", "son_attaque": "var_attaque", "son_chute": "var_chute",
+        "son_plancher": "var_plancher", "son_cible": "var_cible", "son_saturation_fixe": "var_sat_fixe",
+        "son_luminosite_fixe": "var_lum_fixe", "jarvis_sensibilite": "var_jarvis_sens",
+        "jarvis_lenteur": "var_jarvis_lenteur", "jarvis_actif": "var_jarvis",
+        "maj_verifier": "var_maj_verifier", "maj_installation_auto": "var_maj_auto", "maj_prereleases": "var_maj_pre",
+    }
+    CHAMPS_REGLAGES = {"jarvis_appellation": "champ_appellation", "pont_presence_indice": "champ_presence",
+                       "pont_presence_couleur": "champ_presence_couleur"}
+
+    def relire_reglages(self, cles):
+        """Remet d'accord la fenetre avec des reglages changes ailleurs (Jarvis,
+        le menu de l'icone). Sans ca, « Enregistrer » -- pour n'importe quelle
+        autre case -- reecrivait l'ancienne valeur par-dessus : un journal
+        d'activite coupe par Jarvis se rallumait tout seul."""
+        for cle in cles:
+            if cle not in self.cfg:
+                continue
+            valeur = self.cfg[cle]
+            champ = getattr(self, self.CHAMPS_REGLAGES.get(cle, ""), None)
+            if champ is not None:
+                try:
+                    champ.delete(0, "end")
+                    champ.insert(0, str(valeur))
+                except Exception:
+                    pass
+                continue
+            var = (getattr(self, "curseurs", {}).get(cle) or getattr(self, "vars_jarvis", {}).get(cle)
+                   or getattr(self, self.VARIABLES_REGLAGES.get(cle, "var_" + cle), None))
+            if var is None:
+                continue
+            try:
+                if isinstance(var, self.tk.IntVar):
+                    var.set(1 if valeur is True else 0 if valeur is False else int(valeur))
+                elif isinstance(var, self.tk.StringVar):
+                    var.set(str(valeur))
+                else:
+                    var.set(valeur)
+            except Exception:
+                pass
+        try:
+            self.peindre_boutons_jarvis()
+        except Exception:
+            pass
+
     def basculer_jarvis(self):
         self.cfg["jarvis_actif"] = bool(self.var_jarvis.get())
         sauver_config(self.cfg)
@@ -16671,10 +16815,7 @@ def lancer():
         grand panneau, a un clic depuis l'icone (la case des options suit)."""
         CFG["jarvis_panneau"] = not CFG.get("jarvis_panneau", False)
         sauver_config(CFG)
-        try:
-            panneau.vars_jarvis["jarvis_panneau"].set(1 if CFG["jarvis_panneau"] else 0)
-        except Exception:
-            pass
+        REGLAGES_A_RELIRE.add("jarvis_panneau")     # la case suit, relue dans la boucle de la fenetre
 
     def travail_maj(quoi):
         if quoi == "installer":
@@ -16706,7 +16847,9 @@ def lancer():
             surveillance -- la seule qui sache si une fenetre est ouverte
             devant quelqu'un.
             """
-            # « je reviens dans un instant » -- dit AVANT que la pose le coupe
+            # « je reviens dans un instant » -- dit AVANT que la pose le coupe :
+            # s'il ecoute, reflechit ou parle, on le laisse finir (borne)
+            attendre_jarvis_libre()
             if annoncer_maj("pose", MAJ["version"]):
                 time.sleep(MAJ_POSE_ATTENTE_S)
             MAJ["etat"] = "a_poser"
@@ -16937,6 +17080,11 @@ def lancer():
         # fenetre vit (voir reveiller_ou_remplacer)
         if relever_demande_panneau():
             demande_ouverture.set()
+        # des reglages changes par Jarvis ou le menu de l'icone : la fenetre les relit
+        if REGLAGES_A_RELIRE:
+            cles = set(REGLAGES_A_RELIRE)
+            REGLAGES_A_RELIRE.difference_update(cles)
+            sans_faute("Relecture des reglages", panneau.relire_reglages, cles)
         if demande_ouverture.is_set():
             demande_ouverture.clear()
             panneau.afficher()

@@ -179,6 +179,41 @@ class AL_Ecran(unittest.TestCase):
             M.CFG.update(vieux)
             M.JARVIS["etat"] = etat
 
+    def test_la_fenetre_relit_les_reglages_changes_ailleurs(self):
+        """Revue : un journal d'activite coupe par Jarvis se rallumait au premier
+        « Enregistrer », la fenetre reecrivant ses vieilles cases."""
+        p = self.p
+        garde = {k: M.CFG.get(k) for k in ("collecte_active", "jarvis_panneau", "mode", "jarvis_appellation")}
+        try:
+            p.var_act.set(1)
+            M.CFG.update(collecte_active=False, jarvis_panneau=True, mode="son", jarvis_appellation="Capitaine")
+            p.relire_reglages({"collecte_active", "jarvis_panneau", "mode", "jarvis_appellation", "cle_inconnue"})
+            self.assertEqual(p.var_act.get(), 0)
+            self.assertEqual(p.vars_jarvis["jarvis_panneau"].get(), 1)
+            self.assertEqual(p.var_mode.get(), "son")
+            self.assertEqual(p.champ_appellation.get(), "Capitaine")
+        finally:
+            M.CFG.update(garde)
+
+    def test_chaque_case_enregistree_se_relit(self):
+        """Toute variable que `enregistrer` recopie dans la config doit pouvoir
+        etre remise d'accord par relire_reglages -- sinon Jarvis la change, et
+        « Enregistrer » la remet a l'ancienne valeur."""
+        import re
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "machi_tool.py"),
+                   encoding="utf-8").read()
+        corps = src[src.index("    def enregistrer(self):"):]
+        corps = corps[:corps.index("\n    def ", 10)]
+        paires = re.findall(r'self\.cfg\["(\w+)"\] = [^\n]*?self\.(var_\w+)\.get\(\)', corps)
+        self.assertGreater(len(paires), 30)
+        for cle, var in paires:
+            trouvee = M.Panneau.VARIABLES_REGLAGES.get(cle, "var_" + cle)
+            self.assertEqual(trouvee, var, cle)
+        for cle, champ in re.findall(r'self\.cfg\["(\w+)"\] = [^\n]*?self\.(champ_\w+)\.get\(\)', corps):
+            if cle in M._jv.REGLAGES_INTERDITS:
+                continue                  # jamais change par Jarvis
+            self.assertEqual(M.Panneau.CHAMPS_REGLAGES.get(cle), champ, cle)
+
     def test_la_boule_seule_et_sa_legende(self):
         """« Jarvis ne devrait afficher que la petite bulle, plus la grande
         fenetre, le texte peut s'afficher en minuscule a cote (ecran 4K) » : pas
