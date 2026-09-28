@@ -397,6 +397,11 @@ def charger_vad(dossier):
 # qu'il s'allume ».) Sans verdict, le score tranche (VERIF_REPLI_FACTEUR).
 VERIF_ATTENTE_TRAMES = 250         # 20 s pour le verdict (un moteur de transcription qui demarre a froid)
 VERIF_REPLI_FACTEUR = 1.3          # sans transcription, un appel pas net passe s'il est sous 1,3 fois le seuil direct
+# « Il ne m'a pas entendu » : le moteur froid met 5 a 25 s a lire l'appel, en
+# silence. Au bout de 2,5 s sans verdict, un appel tout pres du seuil (voir
+# VERIF_REPLI_FACTEUR) n'attend plus la lecture ; les autres l'attendent encore.
+VERIF_REPLI_TRAMES = 31
+SA_VOIX_TRAMES = 6                 # apres qu'il a parle : le temps que sa voix quitte la piece
 AVANT_TRAMES = 50                  # 4 s de son avant l'eveil (la demande dite avant le nom)
 VERIF_TRAMES = 32                  # ce qu'on transcrit pour verifier un appel : 2,6 s
 
@@ -506,7 +511,11 @@ class Detecteur:
         d = self.en_doute
         if d is not None and self.n - d[0] >= TOLERANCE_ATTENTE:
             self.en_doute = None
-            self.repos_jusqua = self.n + 25
+            # « Jarvis ? ... JARVIS ! » : pas 2 s de surdite apres un appel pas
+            # net -- l'oreille continue de chercher pendant qu'on le verifie, et
+            # le « JARVIS ! » net qui suit le reveille tout de suite. (Le meme
+            # mot ne ressort pas : la comparaison s'ancre a la fin de ce qui se dit.)
+            self.repos_jusqua = self.n + TOLERANCE_ATTENTE
             return (d[1] + "_a_verifier", d[2])
         return None
 
@@ -997,20 +1006,42 @@ def nom_verifie(texte, noms=()):
     return None
 
 
-_POLITESSE = re.compile(r"^(?:s'? ?il (?:te|vous) plait|stp|svp|merci|please|ok|hein|allez|vas-y)$")
+# (« merci beaucoup » etait une demande : « Baisse le son Jarvis, merci
+# beaucoup » devenait un merci, et il terminait la conversation sans rien baisser)
+_POLITESSE = re.compile(r"^(?:s'? ?il (?:te|vous) plait|stp|svp|merci(?: beaucoup| bien| d'avance| a toi| a vous)?"
+                        r"|please|thanks|thank you|ok|hein|allez|vas-y)$")
 _AMORCES = re.compile(r"^(?:(?:ok|okay|hey|he|eh|dis|dites|euh|bon|alors|allez)(?:[\s,!.]+|$))+", re.I)
 _REMPLISSAGE = frozenset("euh heu hum hmm bah ben bon alors dis dites hey he eh".split())
+# ce qui precede le nom sans etre une demande (« Salut Jarvis, ... », « Non Jarvis, ... »)
+_SALUTS = _REMPLISSAGE | frozenset("salut bonjour bonsoir coucou merci oui ouais non mais oh ah tiens yo ok okay "
+                                   "allez hello hi please".split())
+TETE_MOTS_MAX = 6                  # « Rappelle-moi, Jarvis, ... » : une tete de demande est courte
 
 
-def _est_le_nom(mot, noms=()):
+def _est_le_nom(mot, noms=(), ecorche=False):
     """Ce mot est-il son nom (« Jarvis », « Charvis », ou tel que la
-    transcription l'a ecrit quand tu l'as appris) ?"""
+    transcription l'a ecrit quand tu l'as appris) ? `ecorche` : aussi tel que
+    Parakeet l'ecrit dit seul (« Javi », « Chavis », voir nom_verifie)."""
     m = normaliser(mot).replace("'", "").strip(" -")
     if not m:
         return False
+    if ecorche and 4 <= len(m) <= 10 and m not in _PAS_LUI and _NOM_ECORCHE.match(m):
+        return True
     return bool(_EVEIL.match(m)) or (m in {str(n) for n in noms or () if n and nom_plausible(n)}) or \
         (4 <= len(m) <= 9 and _distance_mots(m, "jarvis") <= 2 and m[0] in "jgcdzs"
          and "r" in m and ("v" in m or "w" in m))
+
+
+def _tete_de_demande(avant):
+    """Ce qui precede le nom DANS LA MEME PHRASE, sans les « euh », « salut »,
+    « non » du debut : « Rappelle-moi Jarvis dans dix minutes » -> « Rappelle-moi »."""
+    avant = str(avant or "").strip()
+    if not avant or re.search(r"[.!?…]$", avant):
+        return ""                       # « ... hier soir. Jarvis, ... » : une autre phrase
+    mots = re.split(r"[.!?…]\s+", avant)[-1].split()
+    while mots and normaliser(mots[0]).replace("'", "").strip(" ,;:!-") in _SALUTS | {""}:
+        mots = mots[1:]
+    return " ".join(mots).strip(" ,;:-")
 
 
 def retirer_mot_eveil(texte, noms=(), garder_avant=True):
@@ -1037,6 +1068,15 @@ def retirer_mot_eveil(texte, noms=(), garder_avant=True):
         reste = re.sub(r"^[\s,.;:!?…-]+", "", " ".join(suite)).strip()
         utile = [w for w in normaliser(reste).split() if w]
         if utile and not _POLITESSE.match(" ".join(utile)) and not all(_POLITESSE.match(w) for w in utile):
+            # LE NOM AU MILIEU DE LA DEMANDE (« Rappelle-moi Jarvis dans dix
+            # minutes de sortir le linge », « Mets la musique, Jarvis, de Daft
+            # Punk ») : le debut est a elle -- on le jetait. Seulement une tete
+            # courte, dite pour de vrai (`garder_avant`), et quand ce qui suit
+            # n'est pas deja une commande a lui seul (« il fait beau aujourd'hui
+            # Jarvis allume la lumiere » reste « allume la lumiere »).
+            tete = _tete_de_demande(" ".join(mots[:i])) if garder_avant else ""
+            if tete and len(tete.split()) <= TETE_MOTS_MAX and comprendre(reste) is None:
+                return tete + " " + reste
             return reste
         if not garder_avant:
             return ""
@@ -1066,10 +1106,23 @@ _APRES_MENTION = frozenset("il elle etait fait marche marchait apparait apparais
                            "plante bugue beugue m'a m'enerve s'est comprend comprenait".split())
 
 
-def est_une_mention(texte, noms=()):
+_INTERROGATIFS = frozenset("quel quelle quels quelles ou comment combien quand pourquoi qui quoi est-ce".split())
+_AUXILIAIRES_QUESTION = frozenset("est a va".split())
+
+
+def est_une_mention(texte, noms=(), tronque=False):
+    """Parle-t-on DE lui (voir _AVANT_MENTION) ? Son nom se reconnait aussi
+    ecorche (« le Javi que j'ai code ») : c'est la forme qui confirme un
+    appel pas net, elle doit aussi reconnaitre une mention.
+
+    « Jarvis il est quelle heure ? » est une QUESTION, pas une mention : le
+    nom en tete, puis une question (un « ? », un « quelle », « ou »...).
+    `tronque` : le bout de son d'une verification finit juste apres le nom
+    (« Jarvis il ») -- on ne voit pas encore la suite ; la phrase entiere
+    tranchera."""
     mots = str(texte or "").split()
     for i, m in enumerate(mots):
-        if not _est_le_nom(m, noms):
+        if not _est_le_nom(m, noms, ecorche=True):
             continue
         if i == len(mots) - 1 or re.search(r"[,.;:!?…]$", m):
             return False                        # « ..., Jarvis » / « Jarvis, ... » : un appel
@@ -1079,6 +1132,13 @@ def est_une_mention(texte, noms=()):
         if avant and avant[0] in _AVANT_MENTION:
             return True
         if apres in _APRES_MENTION or (apres == "est" and not suivant.startswith("ce")):
+            if not _tete_de_demande(" ".join(mots[:i])):
+                # le nom en tete (apres « euh », « ok ») : une question ?
+                suite = [normaliser(w).strip(" -") for w in mots[i + 1:]]
+                if str(texte).rstrip().endswith("?") or any(w in _INTERROGATIFS for w in suite[:3]):
+                    return False
+                if tronque and (len(suite) == 1 or (len(suite) == 2 and suite[1] in _AUXILIAIRES_QUESTION)):
+                    return False
             return True
         return False
     return False
@@ -2773,6 +2833,8 @@ class Oreille:
         self.auto_attente = []        # les facons de l'appeler a garder si la conversation est reelle
         self.doute = None             # un appel pas net, que Machi Tool verifie : {"n", "fin", "ev"}
         self.essai = None             # le plus proche de « Jarvis » dans ce qui se dit en ce moment
+        self.il_parle = False         # SA voix sort des haut-parleurs (quoi que dise la coupure)
+        self.il_parle_fin = -999      # la trame ou elle s'est tue
 
     def _arreter_parole(self):
         self.parole = False
@@ -2849,13 +2911,25 @@ class Oreille:
         elif cmd == "verifie":
             # Machi Tool a transcrit l'appel pas net : c'etait « Jarvis », ou pas.
             # Un verdict en retard, pour un AUTRE appel, ne compte pas.
-            n = c.get("n")
-            if n is not None and self.doute is not None and int(n) != int(self.doute["n"]):
-                return
-            ok = c.get("ok")
+            n, ok, d = c.get("n"), c.get("ok"), self.doute
+            if n is not None and d is not None:
+                ns = d.setdefault("ns", [d["n"]])
+                if int(n) not in ns:
+                    return
+                if ok is not True and len(ns) > 1:
+                    # « Jarvis ? ... Jarvis ? » : l'autre appel de la meme phrase
+                    # attend encore sa lecture -- un seul « oui » suffit
+                    ns.remove(int(n))
+                    d["illisible"] = d.get("illisible") or ok is None
+                    return
+            if ok is False and d is not None and d.get("illisible"):
+                ok = None                 # l'autre n'a pas pu etre lu : le score tranche
             self._verdict(None if ok is None else bool(ok))
         elif cmd == "parole":
             # Jarvis commence ou finit de parler (le processus de la voix le dit)
+            self.il_parle = bool(c.get("actif"))
+            if not self.il_parle:
+                self.il_parle_fin = self.det.n
             if c.get("actif") and self.reglages.get("couper", True) and self.loopback is not None:
                 if self.coupure is None:
                     self.coupure = Coupure()
@@ -2888,14 +2962,45 @@ class Oreille:
         kw.setdefault("duree_max", float(self.reglages.get("duree_max", PHRASE_MAX_S)))
         return Phrase(self.det.parle_phrase, doux=self.det.parle_phrase_doux, **kw)
 
-    def _verdict(self, ok):
-        d, self.doute = self.doute, None
+    def _repli(self, d):
+        """Sans lecture : un des appels de ce doute etait-il tout pres du seuil ?"""
+        appels = [(d["reveil"]["par"], d["reveil"]["score"])] + list(d.get("autres") or [])
+        return any(p == "voix" and s <= VERIF_REPLI_FACTEUR * self.det.seuil for p, s in appels)
+
+    def _issue(self, issue):
+        # pour l'indicateur de detection : ce qu'est devenu le dernier « a verifier »
+        self.sortie({"evt": "essai", "maj": True, "issue": issue})
+
+    def _reverifier(self, ev):
+        """« Jarvis ? ... Jarvis ? » : un second appel pas net pendant qu'on
+        verifie le premier. Il etait avale (et si le premier etait mal lu, la
+        phrase entiere tombait) : il part a la verification lui aussi, et un
+        seul « c'etait lui » suffit."""
+        d = self.doute
+        par = ev[0].replace("_a_verifier", "")
+        d.setdefault("ns", [d["n"]]).append(self.det.n)
+        d["dernier"] = self.det.n
+        d.setdefault("autres", []).append((par, float(ev[1])))
+        self._signaler_essai(ev[1] if par == "voix" else None, "verifier", ev[0])
+        wav = wav_de(self.det.son_d_avant(VERIF_TRAMES))
+        self.sortie({"evt": "verifier", "wav": base64.b64encode(wav).decode("ascii"),
+                     "par": par, "score": round(float(ev[1]), 4), "n": self.det.n})
+
+    def _verdict(self, ok, provisoire=False, net=False):
+        d = self.doute
         if d is None:
             return
+        lu = ok is not None
         if ok is None:
             # PERSONNE N'A PU LIRE (transcription pas prete, memoire, moteur froid
             # trop long) : le score tranche -- tout pres du seuil, c'etait lui
-            ok = d["reveil"]["par"] == "voix" and d["reveil"]["score"] <= VERIF_REPLI_FACTEUR * self.det.seuil
+            ok = self._repli(d)
+            if provisoire and not ok:
+                # la lecture tarde, et il est trop loin pour deviner : on l'attend encore
+                self._issue("lent")
+                return
+            self._issue("sans_lecture" if ok else "trop_loin")
+        self.doute = None
         fin = d.get("fin")
         if not ok:
             # seulement SA phrase : pas celle d'un appel net arrive depuis
@@ -2910,20 +3015,30 @@ class Oreille:
             # la verification a pris plus que l'attente : on ecoute a nouveau
             fin = None
             self.phrase, self.etat = self._nouvelle_phrase(attente=5.0), "phrase"
-        reveil = dict(d["reveil"], verifie=True)
+        # sans lecture, ce n'est pas « verifie » : la phrase devra contenir son
+        # nom, comme apres un reveil direct (Machi Tool le controle)
+        reveil = dict(d["reveil"], verifie=lu)
+        if not lu:
+            reveil["repli"] = True
         if fin is not None:
             # tu as deja tout dit pendant qu'il verifiait : « capte », il s'en occupe
             reveil["deja_fini"] = True
             son = "capte"
+        elif not net and self.phrase is not None and self.phrase.parole:
+            # TU PARLES ENCORE (« Jarvis, mets de la musique de Daft Punk » d'une
+            # traite) : le carillon « a vous » tombait sur « musique », et dans
+            # l'enregistrement. Rien : le « capte » de la fin dira qu'il a entendu.
+            # (Un « JARVIS ! » net qui tranche, lui, sonne juste apres le nom.)
+            son = None
         else:
             # « a vous » : le carillon, et une attente entiere a partir de lui
             son = "eveil"
-            if self.phrase is not None and not self.phrase.parole:
+            if self.phrase is not None:
                 self.phrase.attente = self.phrase.t + 5.0
                 self.phrase.ignorer = self.phrase.t + 0.3
                 self.phrase.precoce = 0
                 reveil["attente"] = 5.0
-        if self.reglages.get("son", True):
+        if son and self.reglages.get("son", True):
             self.jouer(son)
         self.sortie(reveil)
         if fin is not None:
@@ -2977,10 +3092,18 @@ class Oreille:
         en_doute = (self.doute is not None and self.etat == "phrase"
                     and self.phrase is not None and self.phrase is self.doute.get("phrase"))
         ev = self.det.trame(x, chercher=((self.etat == "veille" and not lui) or en_doute))
+        if (ev is not None and not lui and not (ev[0] == "voix" and self.det.proche_manuel)
+                and (self.il_parle or self.det.n - self.il_parle_fin <= SA_VOIX_TRAMES)):
+            # SA PROPRE VOIX dit « Jarvis » (sans double transmission prete, ou
+            # juste apres sa derniere syllabe) : seul un « Jarvis » appris a la
+            # main, net, le reveille -- pas un appel pas net, ni « Hey Jarvis »
+            ev = None
         if ev is not None and en_doute:
             if not ev[0].endswith("_a_verifier"):
                 self._signaler_essai(ev[1] if ev[0] == "voix" else None, "reveil", ev[0])
-                self._verdict(True)
+                self._verdict(True, net=True)
+            elif self.det.n - self.doute.get("dernier", self.doute["n"]) > self.det.longueur_mot():
+                self._reverifier(ev)
             ev = None
         for a in self.auto_attente + ([self.candidat] if self.candidat else []):
             self._prendre(a)
@@ -3008,6 +3131,11 @@ class Oreille:
                              "seuil": round(float(self.det.seuil), 4)})
         if self.doute is not None and self.det.n - self.doute["n"] > VERIF_ATTENTE_TRAMES:
             self._verdict(None)           # pas de reponse de Machi Tool : le score tranche
+        elif (self.doute is not None and not self.doute.get("repli")
+              and self.det.n - self.doute["n"] > VERIF_REPLI_TRAMES):
+            # la lecture tarde (moteur froid) : tout pres du seuil, il n'attend plus
+            self.doute["repli"] = True
+            self._verdict(None, provisoire=True)
         # L'INDICATEUR DE DETECTION : a chaque mot entendu, a quelle distance de
         # ton « Jarvis » il etait, et ce qui en est sorti -- des nombres, rien d'autre.
         if self.etat == "veille" and ev is None:
