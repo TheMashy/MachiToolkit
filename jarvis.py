@@ -689,6 +689,10 @@ PHRASE_PAUSE_S = 0.75
 PHRASE_DEBUT_S = 2.0          # « on vient de commencer » : moins de 2 s de parole
 PHRASE_MAX_S = 30.0           # une demande ; le mode psychologue en laisse plus (voir PHRASE_PSY_MAX_S)
 PHRASE_PSY_MAX_S = 60.0
+# « JE ME SENS... [1,2 s] ...COMPLETEMENT VIDE » : chez le psychologue on parle
+# lentement, avec des silences ; la pause de 0,75 s coupait la pensee en deux
+# (et la seconde moitie, dite pendant qu'il transcrivait, etait perdue).
+PHRASE_PSY_PAUSE_S = 1.6
 PAROLE_MIN_TRAMES = 2         # moins que ca, ce n'etait pas une phrase (une touche, une porte)
 
 
@@ -733,8 +737,10 @@ class Phrase:
         return PHRASE_PAUSE_DEBUT_S if self.n_parole * TRAME_S < PHRASE_DEBUT_S else PHRASE_PAUSE_S
 
     def trame(self, x, rms):
-        """Rend None tant que ca continue, « fini » ou « vide »."""
-        self.morceaux.append(self.np.asarray(x, dtype=self.np.int16))
+        """Rend None tant que ca continue, « fini » ou « vide ». (`x` None :
+        une trame deja dans `avant`, qu'on ne fait que compter.)"""
+        if x is not None:
+            self.morceaux.append(self.np.asarray(x, dtype=self.np.int16))
         self.t += TRAME_S
         if self.fin_du_mot > 0:
             self.fin_du_mot -= 1
@@ -751,7 +757,13 @@ class Phrase:
         else:
             self.silence += TRAME_S
         if self.parole and self.silence >= self.pause_permise():
-            return "fini" if (self.n_parole >= PAROLE_MIN_TRAMES or self.deja_dit) else "vide"
+            if self.n_parole >= PAROLE_MIN_TRAMES or self.deja_dit:
+                return "fini"
+            # UN EFFLEUREMENT, PAS UNE PHRASE : la queue de sa voix (une enceinte
+            # Bluetooth en retard), la reverberation, le carillon. Il fermait
+            # l'ecoute a 1,5 s -- « je vous ecoute encore » et il se rendormait
+            # avant qu'on reponde. On oublie ce bout et on attend jusqu'au bout.
+            self.parole, self.n_parole = False, 0
         if not self.parole and self.precoce >= 2 and self.silence >= self.pause_permise() + 0.5:
             return "fini"
         if not self.parole and self.deja_dit and self.t >= PHRASE_DEJA_DITE_S:
@@ -2249,7 +2261,9 @@ class SyntheseKokoro:
 #    - taper au clavier pendant qu'il parle : 1,4 % des reponses coupees pour
 #      rien -- 7 % avec un clavier dont toutes les touches sonnent a la meme
 #      hauteur, tape vite. Il reprend alors sa phrase.
-#  Et « Jarvis ! » par-dessus le coupe toujours, par le mot d'eveil.
+#  Et « Jarvis ! » par-dessus le coupe aussi, par le mot d'eveil -- un appel
+#  net seulement, et jamais pendant une phrase ou il dit lui-meme son nom
+#  (voir `Oreille.trame`) : sous son echo, la coupure seule ne l'entend pas.
 #
 #  CE QUI NE CHANGE PAS : la reference ne sert qu'a ca, en memoire et en
 #  puissances par bande ; elle n'est ni transcrite, ni gardee, ni envoyee, et
@@ -2571,6 +2585,10 @@ class Coupure:
             if self.volume:
                 E, mesure = self._mesurer_le_volume(M, E, X)
                 sur = mesure or t - self.t_arme > self.vol_attente
+            # SANS REFERENCE RECENTE, l'echo predit vaut zero et sa propre voix
+            # passerait pour quelqu'un : pas de decision (un casque, lui, envoie
+            # des blocs -- muets, mais des blocs)
+            sur = sur and any((k - j) in self.grille for j in range(15))
             if E.sum() > 4.0 * self.bruit.sum():
                 self.echo_typ.append(float(E.sum()))
             if self.vois_suite:
@@ -2649,6 +2667,7 @@ class Loopback:
                 pass
         try:
             with self.ouvrir() as rec:
+                self.erreur = None                # rouverte : une erreur passee ne compte plus
                 while self.actif.is_set():
                     b = rec.record(numframes=COUPURE_SF)
                     t = self.horloge()
@@ -2716,12 +2735,14 @@ def micro_windows(nom="", annoncer=None):
     import numpy as np
     import soundcard as sc
     micro, trouve = choisir_micro(sc.all_microphones, nom, sc.default_microphone)
-    if annoncer:
-        annoncer(str(getattr(micro, "name", "")), trouve)
     ident = getattr(micro, "id", None)
     # un tampon de 640 ms : la verification du micro (toutes les 10 s) peut
     # prendre plus que les 80 ms d'une trame sans couper ce qu'on dit
     with micro.recorder(samplerate=FREQ, channels=1, blocksize=TRAME * 8) as r:
+        # « pret » seulement une fois le micro OUVERT : annonce avant, il
+        # effacait l'erreur d'un micro refuse, toutes les trois secondes
+        if annoncer:
+            annoncer(str(getattr(micro, "name", "")), trouve)
         vu, muet = time.monotonic(), None
         while True:
             b = r.record(numframes=TRAME)
@@ -2744,6 +2765,47 @@ def micro_windows(nom="", annoncer=None):
                 except Exception:
                     pass
             yield x
+
+
+# « LA TELE, UNE CHANSON : IL NE S'ARRETE PLUS D'ECOUTER. » Le VAD entend
+# une voix dans la tele (c'en est une), et les portes de parole ne se
+# comparaient qu'au bruit de fond : la phrase restait ouverte jusqu'a 30 s,
+# la fenetre de suite se remplissait de la tele, et il lui repondait. On
+# mesure donc la voix DU FOND pendant qu'il dort (ni toi, ni lui ne parlez),
+# et, pendant la phrase, une trame doit depasser ce fond -- jamais plus que
+# le tiers de TA voix (le fond ne doit pas te couper). Piece calme : le fond
+# est nul, rien ne change.
+FOND_TRAMES = 125             # 10 s de veille observees
+FOND_VIEUX = 375              # au-dela de 30 s, ce qu'on a entendu ne dit plus rien du fond
+FOND_PART_MAX = 0.35          # le fond compte au plus pour 35 % de ta voix
+FOND_MIN_TRAMES = 5
+
+
+class FondSonore:
+    """Les voix du fond (tele, musique chantee, radio), vues en veille."""
+
+    def __init__(self):
+        self.obs = deque(maxlen=FOND_TRAMES)
+
+    def observer(self, n, rms, voix):
+        """`voix` : la trame etait une voix assez forte pour ouvrir une phrase."""
+        self.obs.append((int(n), float(rms), bool(voix)))
+
+    def niveau(self, n, jusqua, ref):
+        """Le 90e centile des voix du fond vues jusqu'a la trame `jusqua` (pas
+        au-dela : c'etait deja toi), plafonne a FOND_PART_MAX de `ref`, ta voix.
+        0 sans reference ou sans voix au fond."""
+        if not ref or ref <= 0:
+            return 0.0
+        v = sorted(r for i, r, voix in self.obs if voix and n - FOND_VIEUX <= i <= jusqua)
+        if len(v) < FOND_MIN_TRAMES:
+            return 0.0
+        return min(v[int(0.9 * (len(v) - 1))], FOND_PART_MAX * float(ref))
+
+
+def _mediane(valeurs):
+    v = sorted(valeurs)
+    return v[len(v) // 2] if v else 0.0
 
 
 class Oreille:
@@ -2773,13 +2835,49 @@ class Oreille:
         self.auto_attente = []        # les facons de l'appeler a garder si la conversation est reelle
         self.doute = None             # un appel pas net, que Machi Tool verifie : {"n", "fin", "ev"}
         self.essai = None             # le plus proche de « Jarvis » dans ce qui se dit en ce moment
+        # Jarvis parle-t-il (quel que soit le loopback) ; et son propre nom
+        # est-il dans ce qu'il dit (le mot d'eveil ne cherche pas alors)
+        self.jarvis_parle = False
+        self.nom_dans_sa_voix = True
+        self.parole_t = 0.0           # quand il a commence a parler
+        self.dernier_bloc = None      # l'arrivee du dernier bloc de reference
+        # LA DERNIERE PHRASE, un instant : si Machi Tool la lit « en suspens »
+        # (« mets la musique de... »), la suite s'y raccroche -- le trou compris
+        self.derniere = None          # {"n": trame de fin, "pcm": son}
+        self.fond = FondSonore()
+        self.forts = []               # les niveaux de ta voix dans la phrase en cours
+        self.niveau_conv = None       # ... et dans la derniere phrase finie
 
     def _arreter_parole(self):
         self.parole = False
+        self.jarvis_parle = False
         if self.coupure is not None:
             self.coupure.desarmer()
         if self.loopback is not None:
             self.loopback.arreter()
+
+    def _reference(self):
+        """Verse la reference arrivee dans la coupure, et dit si elle VIT.
+        « IL SE COUPE LUI-MEME » : une sortie son changee ou un loopback tombe,
+        et l'echo predit valait zero -- sa propre voix passait pour quelqu'un
+        qui lui coupe la parole, au bout d'une seconde et demie. Sans reference
+        fraiche (un bloc dans les 0,3 s ; une demi-seconde pour demarrer), on ne
+        coupe pas, et le mot d'eveil cherche de nouveau."""
+        c, lb = self.coupure, self.loopback
+        if c is None or lb is None:
+            return False
+        while True:
+            try:
+                t_b, b = lb.blocs.popleft()
+            except IndexError:
+                break
+            c.reference(b, t_b)
+            self.dernier_bloc = t_b
+        maintenant = self.horloge()
+        if getattr(lb, "erreur", None):
+            return False
+        return ((self.dernier_bloc is not None and maintenant - self.dernier_bloc <= 0.3)
+                or maintenant - self.parole_t < 0.5)
 
     def _coupe(self, x):
         """Jarvis parle : la personne vient-elle de lui couper la parole ?"""
@@ -2787,12 +2885,6 @@ class Oreille:
         c = self.coupure
         if c is None or self.loopback is None:
             return False
-        while True:
-            try:
-                t_b, b = self.loopback.blocs.popleft()
-            except IndexError:
-                break
-            c.reference(b, t_b)
         return c.micro(np.asarray(x, dtype=np.float32) / 32768.0, self.horloge())
 
     def etat_coupure(self):
@@ -2827,13 +2919,30 @@ class Oreille:
         if cmd == "config":
             self.configurer(c)
         elif cmd == "ecouter":
-            # La suite d'une conversation : on ecoute sans mot d'eveil. (Si on
-            # est deja en train de lui parler, on ne jette pas ce qui se dit.)
-            if self.etat == "phrase" and self.phrase is not None and self.phrase.parole:
+            # La suite d'une conversation : on ecoute sans mot d'eveil.
+            attente = float(c.get("attente", 5.0))
+            duree_max = float(c.get("duree_max", PHRASE_MAX_S))
+            # « pause » : le psychologue laisse plus de silence avant de conclure
+            pause = float(c["pause"]) if c.get("pause") else None
+            if self.etat == "phrase" and self.phrase is not None and (self.apres_coupure or self.phrase.parole):
+                # DEJA EN TRAIN DE LUI PARLER -- ou on vient de lui couper la
+                # parole (« Voulez-vous que je le lance ? » -- « Oui ! » dit dans
+                # son dernier silence : la fin de sa voix et la coupure se
+                # croisent). On ne jette ni le debut, ni la coupure : on prolonge.
+                ph = self.phrase
+                ph.attente = max(ph.attente, ph.t + attente)
+                ph.duree_max = max(ph.duree_max, duree_max)
+                if pause is not None:
+                    ph.silence_fin = pause
+                self.doute = None         # c'est la suite de la conversation
                 return
-            self.phrase = self._nouvelle_phrase(attente=float(c.get("attente", 5.0)),
-                                                ignorer=float(c.get("ignorer", 0.35)),
-                                                duree_max=float(c.get("duree_max", PHRASE_MAX_S)))
+            reprise = bool(c.get("reprise")) and self.derniere is not None
+            if reprise:
+                self.phrase = self._phrase_reprise(attente, duree_max, pause, bool(c.get("debut", True)))
+            else:
+                self.phrase = self._nouvelle_phrase(attente=attente, ignorer=float(c.get("ignorer", 0.35)),
+                                                    duree_max=duree_max, silence_fin=pause,
+                                                    fond=self._fond(self.det.n, self.niveau_conv))
             self.etat = "phrase"
             self.apres_coupure = False
             self.doute = None             # un appel pas net en attente ne mange plus la suite
@@ -2846,6 +2955,7 @@ class Oreille:
             self.phrase, self.appris, self.etat = None, None, "veille"
             self.auto_attente = []
             self.doute = None
+            self.derniere = None
         elif cmd == "verifie":
             # Machi Tool a transcrit l'appel pas net : c'etait « Jarvis », ou pas.
             # Un verdict en retard, pour un AUTRE appel, ne compte pas.
@@ -2855,16 +2965,29 @@ class Oreille:
             ok = c.get("ok")
             self._verdict(None if ok is None else bool(ok))
         elif cmd == "parole":
-            # Jarvis commence ou finit de parler (le processus de la voix le dit)
+            # Jarvis commence ou finit de parler (le processus de la voix le dit).
+            # « nom » : son propre nom est dans ce qu'il dit.
+            if c.get("actif"):
+                if not self.jarvis_parle:
+                    self.parole_t = self.horloge()
+                self.jarvis_parle = True
+                self.nom_dans_sa_voix = bool(c.get("nom", True))
             if c.get("actif") and self.reglages.get("couper", True) and self.loopback is not None:
                 if self.coupure is None:
                     self.coupure = Coupure()
                 self.loopback.blocs.clear()
+                if not self.parole:
+                    self.dernier_bloc = None
                 self.loopback.demarrer()
                 self.coupure.armer(self.horloge())
                 self.parole = True
-            else:
+            elif not c.get("actif"):
                 self._arreter_parole()
+            elif self.parole:
+                # la coupure vient d'etre desactivee : il parle encore, sans elle
+                jarvis = self.jarvis_parle
+                self._arreter_parole()
+                self.jarvis_parle = jarvis
         elif cmd == "vad":
             # le detecteur de voix vient d'arriver sur le disque : on le prend
             # sans relancer l'oreille
@@ -2884,9 +3007,60 @@ class Oreille:
                      "par": par.replace("_a_verifier", ""), "direct": round(float(self.det.seuil), 4),
                      "verifie": round(float(self.det.seuil_verifie), 4)})
 
-    def _nouvelle_phrase(self, **kw):
+    def _nouvelle_phrase(self, fond=0.0, **kw):
         kw.setdefault("duree_max", float(self.reglages.get("duree_max", PHRASE_MAX_S)))
-        return Phrase(self.det.parle_phrase, doux=self.det.parle_phrase_doux, **kw)
+        self.forts = []
+        parle, doux = self.det.parle_phrase, self.det.parle_phrase_doux
+        if fond > 0:
+            # la tele au fond : ta voix doit la depasser (voir FondSonore)
+            forts = []
+
+            def parle(r, p=parle):
+                ok = p(r) and r > 1.5 * fond
+                if ok:
+                    forts.append(r)
+                return ok
+
+            def doux(r, d=doux):
+                return d(r) and r > max(1.2 * fond, 0.15 * _mediane(forts[-50:]))
+        ph = Phrase(parle, doux=doux, **kw)
+        ph.fond = fond
+        return ph
+
+    def _fond(self, jusqua, ref):
+        """Le niveau des voix du fond, pour une phrase qui commence (voir FondSonore)."""
+        return self.fond.niveau(self.det.n, jusqua, ref or self.det.niveau_appris)
+
+    def _phrase_reprise(self, attente, duree_max, pause, debut=True):
+        """LA SUITE D'UNE PHRASE EN SUSPENS. « Mets la musique de... Daft
+        Punk » : la phrase s'etait fermee sur la pause, Machi Tool l'a lue --
+        et « Daft Punk », dit pendant ce temps-la, tombait dans le vide (il
+        n'ecoutait plus). La phrase reprend donc depuis la fin de la
+        precedente : le trou est dans le son d'avant, et ce qui s'y est deja
+        dit compte comme parole. Et si la precedente est encore la, elle est
+        devant : la transcription lit la phrase ENTIERE, avec son contexte
+        (« Daft Punk » seul devenait un mot russe)."""
+        import numpy as np
+        d = self.derniere
+        k = max(0, self.det.n - d["n"])
+        trou = self.det.son_d_avant(k) if k else np.zeros(0, np.int16)
+        complet = k <= len(self.det.avant)
+        entier = complet and debut and len(d["pcm"]) <= PHRASE_MAX_S * FREQ
+        avant = np.concatenate([d["pcm"], trou]) if entier else trou if complet else self.det.son_d_avant()
+        ph = self._nouvelle_phrase(avant=avant, attente=attente, ignorer=0.0, duree_max=duree_max,
+                                   silence_fin=pause, fond=self._fond(d["n"], self.niveau_conv))
+        ph.avec_debut = entier
+        # le trou, trame par trame, compte comme s'il avait ete ecoute
+        n = min(k, len(self.det.niveaux), len(self.det.voix))
+        if n:
+            vad, p0 = self.det.vad, self.det.p_voix
+            for r, p in zip(list(self.det.niveaux)[-n:], list(self.det.voix)[-n:]):
+                self.det.p_voix = p if vad is not None else None
+                ph.trame(None, r)
+                self.forts += [r] if self.det.parle_phrase(r) else []
+            self.det.p_voix = p0
+            ph.attente += ph.t            # l'attente part de maintenant
+        return ph
 
     def _verdict(self, ok):
         d, self.doute = self.doute, None
@@ -2929,6 +3103,11 @@ class Oreille:
         if fin is not None:
             self._sortir_phrase(*fin)
 
+    @staticmethod
+    def np_concat(morceaux):
+        import numpy as np
+        return np.concatenate(morceaux) if morceaux else np.zeros(0, np.int16)
+
     def _sortir_phrase(self, ev, a_garder):
         self.sortie(ev)
         for a in a_garder:
@@ -2966,17 +3145,32 @@ class Oreille:
     def trame(self, x):
         import numpy as np
         rms = float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
-        # PENDANT QU'IL PARLE, SA PROPRE VOIX dit parfois « Jarvis » : quand la
-        # double transmission est prete, c'est elle qui l'interrompt (« Jarvis,
-        # stop » compris) -- le mot d'eveil ne cherche pas.
-        lui = (self.parole and self.coupure is not None and self.coupure.pret()
+        # PENDANT QU'IL PARLE, la double transmission l'interrompt quand elle
+        # est prete ET que sa reference vit (voir `_reference`). Le mot
+        # d'eveil cherche aussi : sur un portable, les haut-parleurs contre le
+        # micro, personne ne parle plus fort que son echo, et « Jarvis, stop »
+        # ne le coupait jamais. Mais seulement un appel NET, et pas s'il dit
+        # lui-meme son nom dans cette phrase (sa voix le reveillerait).
+        ref_ok = self.parole and self._reference()
+        lui = (ref_ok and self.coupure is not None and self.coupure.pret()
                and self.reglages.get("couper", True))
+        il_parle = self.jarvis_parle or self.parole
         # UN APPEL PAS NET EN COURS DE VERIFICATION : on continue de chercher. Un
         # « JARVIS ! » net pendant qu'on verifie le premier le reveille tout de
         # suite (la phrase en cours continue) ; sinon ce second appel etait avale.
         en_doute = (self.doute is not None and self.etat == "phrase"
                     and self.phrase is not None and self.phrase is self.doute.get("phrase"))
-        ev = self.det.trame(x, chercher=((self.etat == "veille" and not lui) or en_doute))
+        chercher = self.etat == "veille" and not (lui and self.nom_dans_sa_voix)
+        ev = self.det.trame(x, chercher=chercher or en_doute)
+        if ev is not None and il_parle and not en_doute and ev[0].endswith("_a_verifier"):
+            # pendant qu'il parle, un appel pas net est sa propre voix : on ne
+            # verifie rien, et il continue de parler
+            ev = None
+        # la voix du fond : en veille, quand ni lui ni personne ne s'adresse a lui
+        if self.etat == "veille" and not il_parle:
+            self.fond.observer(self.det.n, rms, self.det.humaine(VAD_SEUIL_SUITE) and self.det.parle_doucement(rms))
+        if self.derniere is not None and self.det.n - self.derniere["n"] > AVANT_TRAMES:
+            self.derniere = None          # la suite n'est plus attendue : le son s'efface
         if ev is not None and en_doute:
             if not ev[0].endswith("_a_verifier"):
                 self._signaler_essai(ev[1] if ev[0] == "voix" else None, "reveil", ev[0])
@@ -3031,10 +3225,17 @@ class Oreille:
             # (« tu peux mettre la musique de Daft Punk, Jarvis »), sinon juste
             # le mot -- pas la tele ou la fin de sa reponse d'avant.
             deja = self.det.parlait_avant()
-            avant = self.det.son_d_avant(None if deja else self.det.longueur_mot() + GABARIT_DEBUT + 8)
+            long_avant = AVANT_TRAMES if deja else self.det.longueur_mot() + GABARIT_DEBUT + 8
+            avant = self.det.son_d_avant(None if deja else long_avant)
+            # ta voix, sur le mot qu'on vient d'entendre : le fond n'en prend jamais plus du tiers
+            k = self.det.longueur_mot() + 2
+            ref = _mediane(r for r, q in zip(list(self.det.niveaux)[-k:], list(self.det.voix)[-k:])
+                           if q >= VAD_SEUIL and self.det.parle_doucement(r)) or None
+            self.derniere = None
             self.phrase = self._nouvelle_phrase(avant=avant[:-TRAME] if len(avant) > TRAME else None,
                                                 deja_dit=deja,
-                                                fin_du_mot=self.det.queue_proche if ev[0] == "voix" else 0)
+                                                fin_du_mot=self.det.queue_proche if ev[0] == "voix" else 0,
+                                                fond=self._fond(self.det.n - long_avant, ref))
             # La trame courante est dans « avant » : on ne la compte pas deux fois,
             # mais elle ne fait pas partie de la fenetre d'apres-carillon non plus.
             self.phrase.morceaux.append(np.asarray(x, dtype=np.int16))
@@ -3053,7 +3254,7 @@ class Oreille:
                 self.doute = None             # un appel net remplace un appel pas net encore en cours
                 self.sortie(reveil)
             return
-        if self.parole and self.etat == "veille" and self._coupe(x):
+        if ref_ok and self.etat == "veille" and self._coupe(x):
             # ON LUI COUPE LA PAROLE : il se tait (Machi Tool s'en charge), et la
             # phrase commence un peu AVANT la decision -- la voix y etait deja.
             # Si personne ne parle dans la seconde et demie, c'etait pour rien :
@@ -3067,12 +3268,18 @@ class Oreille:
             return
         if self.etat == "phrase" and self.phrase is not None:
             fin = self.phrase.trame(x, rms)
+            if self.det.parle_phrase(rms):
+                self.forts.append(rms)
             if fin in ("fini", "vide"):
                 apres, self.apres_coupure = self.apres_coupure, False
                 ev = {"evt": "vide"}
                 if fin == "fini":
                     ev = {"evt": "phrase", "wav": base64.b64encode(self.phrase.wav()).decode("ascii"),
                           "deja_dit": bool(self.phrase.deja_dit)}
+                    if getattr(self.phrase, "avec_debut", False):
+                        ev["avec_debut"] = True       # la phrase en suspens est devant
+                    if len(self.forts) >= 3:
+                        self.niveau_conv = _mediane(self.forts)
                 elif apres:
                     # « STOP » DIT PAR-DESSUS SA VOIX : le mot est souvent deja fini
                     # quand la coupure se decide, et il ne restait que du silence.
@@ -3082,6 +3289,9 @@ class Oreille:
                           "breve": True}
                 # on lui a vraiment parle : ces facons de l'appeler etaient bien des appels
                 a_garder, self.auto_attente = (self.auto_attente if fin == "fini" else []), []
+                if ev["evt"] == "phrase":
+                    # gardee un instant, en memoire : la suite s'y raccroche si elle est en suspens
+                    self.derniere = {"n": self.det.n, "pcm": self.np_concat(self.phrase.morceaux)}
                 if self.doute is not None and self.doute.get("phrase") is self.phrase:
                     # la phrase est finie avant le verdict : elle l'attend
                     self.doute["fin"] = (ev, a_garder)
@@ -4738,6 +4948,32 @@ _SUSPENS_EN = frozenset("""the a an and or but to of for with in on at by from i
 SUSPENS_ECOUTE_S = 3.0        # le temps de reprendre sa phrase
 SUSPENS_MAX = 2               # deux reprises au plus, puis elle part telle quelle
 
+# LE PETIT MOT MAL ECRIT. Un « de » ou un « a » suivi d'un silence n'a pas de
+# contexte a droite : la transcription le colle au mot d'avant ou en fait un
+# nom. Mesure : « Baisse le sonde. », « Allume la lumiere dent. », « Ouvre le
+# dossier d'e. », « Envoie un message A. ». On ne reconnait que les formes
+# qui NE PEUVENT PAS finir une phrase francaise -- jamais « donc », « sures »,
+# « d'un » ou un « a » seul (« il y en a », « il a ») : ce sont de vraies fins.
+_SUSPENS_NOMS = frozenset("""son musique volume dossier playlist fichier lumiere lumieres lampe
+    video videos chanson film message minuteur rappel page onglet""".split())
+_SUSPENS_DETERMINANTS = frozenset("""le la les l' un une des du de d' mes tes ses nos vos leurs ma ta sa
+    mon ton son ce cet cette ces aux au""".split())
+
+
+def _suspens_ecorche(mots):
+    """Le dernier mot est-il un « de » / « a » que la transcription a reecrit ?"""
+    dernier = sans_accents(mots[-1])
+    avant = sans_accents(mots[-2]) if len(mots) >= 2 else ""
+    if dernier == "d'e":
+        return True                               # « le dossier d'e »
+    if dernier == "sonde" and avant in ("le", "du", "au"):
+        return True                               # « le son de » : « la sonde » est feminine
+    if dernier == "d'eux" and avant in ("dossier", "musique", "playlist", "volume"):
+        return True
+    if dernier in ("dent", "dents", "a") and avant in _SUSPENS_NOMS:
+        return True                               # « la lumiere de(nt) », « un message a »
+    return False
+
 
 def phrase_suspendue(texte, langue="fr"):
     """« Mets la musique de... » : la phrase n'est pas finie."""
@@ -4753,7 +4989,102 @@ def phrase_suspendue(texte, langue="fr"):
         return False                              # « mets-la », « donne-le »
     if dernier.endswith("'"):
         return True                               # « l' », « d' », « qu' »
+    if langue != "en" and _suspens_ecorche(mots):
+        return True
     return dernier in _SUSPENS_FR or (langue == "en" and dernier in _SUSPENS_EN)
+
+
+def joindre_suspens(debut, suite):
+    """La phrase en suspens et sa suite, transcrites a part. Guide par le
+    « toc », on redit souvent tout : « mets la musique de » + « mets la
+    musique de Daft Punk » -- la suite seule suffit alors."""
+    debut, suite = str(debut or "").strip(), str(suite or "").strip()
+    if not suite:
+        return debut
+    nd = normaliser(debut).rstrip(" .,;:!?\u2026")
+    ns = normaliser(suite)
+    if nd and len(nd.split()) >= 2 and ns.startswith(nd):
+        return suite
+    return (debut + " " + suite).strip()
+
+
+# ---------------------- CE QU'ON DIT PAR-DESSUS SA VOIX ------------------
+#
+# La phrase d'apres une coupure commence 0,6 s AVANT la decision : c'est
+# surtout SA voix (l'echo), et la transcription l'ecrit. « Stop » devenait
+# « operational. Stop. » (pas compris), une toux devenait « systems are
+# operational » (et il repondait a sa propre phrase).
+
+def _mots_norm(texte):
+    return [m for m in re.split(r"[^a-z0-9']+", normaliser(texte).replace("\u2019", "'")) if m]
+
+
+def sans_sa_voix(texte, contexte):
+    """Retire du DEBUT de `texte` les mots qui sont un morceau contigu de
+    `contexte` (ce qu'il disait au moment de la coupure). Rend '' si tout le
+    texte en est un morceau. Jamais la fin : sa queue se melange aux mots de
+    la personne, on ne les mangerait pas."""
+    import difflib
+    brut = str(texte or "").strip()
+    mots = brut.split()
+    ctx = _mots_norm(contexte)
+    if not mots or not ctx:
+        return brut
+    norm = [(_mots_norm(m) or [""])[0] for m in mots]
+
+    def pareil(a, b):
+        return a == b or (len(a) >= 3 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.8)
+    meilleur = 0
+    for j in range(len(ctx)):
+        k = 0
+        while k < len(norm) and j + k < len(ctx) and norm[k] and pareil(norm[k], ctx[j + k]):
+            k += 1
+        # tout le texte, trois mots de suite, ou un bout que la transcription a
+        # ferme d'un point (« operational. Stop. ») : c'etait lui
+        if k and (k == len(norm) or k >= 3 or re.search(r"[.,;:!?\u2026]$", mots[k - 1])):
+            meilleur = max(meilleur, k)
+    if meilleur >= len(mots):
+        return ""
+    if not meilleur:
+        return brut
+    return re.sub(r"^[\s,.;:!?\u2026-]+", "", " ".join(mots[meilleur:])).strip()
+
+
+def queue_de_sa_voix(texte, reponse):
+    """« Je vous ecoute encore un instant » -- et la fenetre entendait la fin
+    de SA phrase (« sir. »), qui revenait des haut-parleurs en retard : envoyee
+    comme ta reponse. Vrai si `texte` n'est que les derniers mots de `reponse`
+    (jamais apres une question : « du the ou du cafe ? » -- « du cafe »)."""
+    rep = str(reponse or "").strip()
+    if not rep or rep.endswith("?"):
+        return False
+    mots, fin = _mots_norm(texte), _mots_norm(rep)
+    return bool(mots) and len(mots) <= 4 and len(mots) <= len(fin) and fin[-len(mots):] == mots
+
+
+# UN « MM-HMM » N'EST PAS UNE QUESTION. Dit par-dessus lui : « continue »
+# (il reprend) ; « attends » : il se tait et ecoute la suite sans repondre.
+_RELANCE = frozenset("""mm mmm mhm mh hm hmm hum uh-huh uhhuh mm-hmm mmhmm oui ouais ouai yeah yep yes right
+    ok okay d'accord dac voila""".split()) | {"je vois", "uh huh", "i see"}
+_PATIENCE = re.compile(r"^(?:(?:non|no|euh|heu|oh|ah)[\s,]+)*(?:attends?|attendez|wait|hold on|une seconde|"
+                       r"une minute|un instant|deux secondes|minute|euh|heu|hum|um|uh|er|erm)"
+                       r"(?:[\s,]+(?:jarvis|stp|s'il te plait|a second|a sec|a minute))?$")
+
+
+def nature_coupure(texte):
+    """Ce qu'on a dit par-dessus lui : « relance » (un seul « mm », « oui »,
+    « d'accord » -- continue), « attente » (« attends », « euh » -- une
+    seconde), ou None (une vraie demande). « Ok ok », « oui oui oui » ne sont
+    pas une relance : dits par-dessus lui, ils veulent dire « ca suffit »."""
+    t = normaliser(texte).replace("\u2019", "'").strip(" .,;:!?\u2026-")
+    t = re.sub(r"[\s,.!?\u2026]+", " ", t).strip()
+    if not t:
+        return None
+    if t in _RELANCE:
+        return "relance"
+    if _PATIENCE.match(t):
+        return "attente"
+    return None
 
 
 def reste_a_dire(reponse, deja):

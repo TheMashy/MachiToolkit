@@ -1322,6 +1322,19 @@ class FinDePhrase(unittest.TestCase):
         fin, t = self.jouer("p" * 900, duree_max=J.PHRASE_PSY_MAX_S)      # le psychologue en laisse plus
         self.assertAlmostEqual(t, J.PHRASE_PSY_MAX_S, delta=0.09)
 
+    def test_un_effleurement_ne_ferme_pas_l_ecoute(self):
+        """« Je vous ecoute encore un instant » -- et il se rendormait 1,5 s
+        plus tard : la queue de sa voix (une enceinte Bluetooth en retard), la
+        reverberation. Un bout de moins de deux trames ne ferme plus la fenetre."""
+        for seq in ("...ppp", "....pp"):
+            fin, t = self.jouer(seq + "." * 110, attente=8.0, ignorer=0.35)
+            self.assertEqual((fin, t), ("vide", 8.0), seq)
+        # une vraie reponse, meme courte, apres l'effleurement
+        fin, t = self.jouer("....pp" + "." * 20 + "pppp" + "." * 30, attente=8.0, ignorer=0.35)
+        self.assertEqual(fin, "fini")
+        # et un nom dit a la fin de la demande reste fini
+        self.assertEqual(self.jouer(".pp" + "." * 30, deja_dit=True, ignorer=0.0)[0], "fini")
+
     def test_le_wav_contient_le_debut(self):
         avant = np.full(J.TRAME * 3, 7, np.int16)
         ph = J.Phrase(self.PARLE, avant=avant)
@@ -1475,6 +1488,346 @@ class OreilleSansMicro(unittest.TestCase):
         for _ in range(60):
             self.o.trame(trame())
         self.assertEqual(self.sorties[0].get("erreur"), "rien entendu")
+
+
+# ======================================================================
+#  COMMENT IL ECOUTE UNE PHRASE (la fin, la suite, le fond, par-dessus lui)
+# ======================================================================
+
+def trame_vad(rms, p, marque=None):
+    """Une trame de niveau `rms`, dont le VAD scripte lira la probabilite `p`."""
+    x = (np.sin(np.arange(J.TRAME) * 0.3) * rms * np.sqrt(2)).astype(np.int16)
+    x[1] = int(round(p * 1000))
+    if marque is not None:
+        x[5] = marque
+    return x
+
+
+class VadScripte:
+    """Le VAD lit la probabilite que le test a mise dans la trame."""
+    def trame(self, x):
+        return int(x[1]) / 1000.0
+
+
+class SansMot:
+    """Aucun mot d'eveil (pas de « hey », pas de gabarit)."""
+    hey_m = None
+
+    def trame(self, x):
+        return 0.0, np.zeros(96, np.float32)
+
+
+def parle_marque(marque):
+    x = trame(parole=True)
+    x[5] = marque
+    return x
+
+
+def compte(wav64, marque):
+    with wave.open(io.BytesIO(base64.b64decode(wav64))) as w:
+        s = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+    return int(np.sum(s == marque))
+
+
+def duree(wav64):
+    with wave.open(io.BytesIO(base64.b64decode(wav64))) as w:
+        return w.getnframes() / 16000.0
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
+class LEcoute(unittest.TestCase):
+    def setUp(self):
+        self.sorties, self.sons = [], []
+        self.o = J.Oreille(FaussesEmpreintes(), self.sorties.append, self.sons.append)
+        self.o.niveau_vu = float("inf")
+        for _ in range(20):                      # le calme de la piece : le plancher s'y cale
+            self.o.trame(trame())
+
+    def evts(self):
+        return [e["evt"] for e in self.sorties if e["evt"] not in ("voix_niveau", "essai")]
+
+    def phrases(self):
+        return [e for e in self.sorties if e["evt"] == "phrase"]
+
+    def _premiere_partie(self):
+        """« Mets la musique de... » : une phrase qui se ferme sur la pause."""
+        self.o.commande({"cmd": "ecouter", "attente": 5.0})
+        for _ in range(12):
+            self.o.trame(trame(parole=True))
+        for _ in range(40):
+            if "phrase" in self.evts():
+                break
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["phrase"])
+
+    def test_la_suite_d_une_phrase_en_suspens_n_est_plus_perdue(self):
+        """« ... Daft Punk », dit pendant qu'il transcrivait la premiere moitie :
+        il n'ecoutait plus, ces mots tombaient dans le vide. Maintenant la
+        suite repart de la fin de la phrase -- et la phrase entiere est devant."""
+        self._premiere_partie()
+        for _ in range(3):
+            self.o.trame(trame())
+        for _ in range(3):                       # la personne reprend PENDANT la transcription
+            self.o.trame(parle_marque(7003))
+        self.o.commande({"cmd": "ecouter", "attente": 3.0, "reprise": True, "ignorer": 0.0})
+        for _ in range(10):
+            self.o.trame(parle_marque(7003))
+        for _ in range(30):
+            self.o.trame(trame())
+        self.assertEqual(self.evts(), ["phrase", "phrase"])
+        suite = self.phrases()[-1]
+        self.assertEqual(compte(suite["wav"], 7003), 13, "le trou n'est plus perdu")
+        self.assertTrue(suite.get("avec_debut"), "la premiere moitie est devant")
+        self.assertGreater(duree(suite["wav"]), duree(self.phrases()[0]["wav"]) + 13 * J.TRAME_S)
+
+    def test_une_suite_deja_finie_quand_il_rouvre(self):
+        # toute la suite dite dans le trou : elle n'attend pas trois secondes pour finir « vide »
+        self._premiere_partie()
+        for _ in range(2):
+            self.o.trame(trame())
+        for _ in range(6):
+            self.o.trame(parle_marque(7004))
+        for _ in range(8):
+            self.o.trame(trame())
+        self.o.commande({"cmd": "ecouter", "attente": 3.0, "reprise": True, "ignorer": 0.0})
+        n = 0
+        while len(self.evts()) < 2 and n < 60:
+            self.o.trame(trame())
+            n += 1
+        self.assertEqual(self.evts(), ["phrase", "phrase"])
+        self.assertLessEqual(n, 8, "la pause etait deja en cours")
+        self.assertEqual(compte(self.phrases()[-1]["wav"], 7004), 6)
+
+    def test_apres_une_coupure_la_suite_sans_le_debut(self):
+        # « attends... » par-dessus lui : sa voix est dans la phrase d'avant, on ne la remet pas
+        self._premiere_partie()
+        self.o.commande({"cmd": "ecouter", "attente": 3.0, "reprise": True, "debut": False})
+        for _ in range(6):
+            self.o.trame(parle_marque(7005))
+        for _ in range(20):
+            self.o.trame(trame())
+        suite = self.phrases()[-1]
+        self.assertFalse(suite.get("avec_debut"))
+        self.assertLess(duree(suite["wav"]), 3.0)
+
+    def test_le_psychologue_laisse_des_silences(self):
+        """« Je me sens... [1,2 s] ...completement vide » : une seule phrase."""
+        seq = [True] * 30 + [False] * 15 + [True] * 20 + [False] * 30
+        self.o.commande({"cmd": "ecouter", "attente": 10.0, "pause": J.PHRASE_PSY_PAUSE_S})
+        for p in seq:
+            self.o.trame(trame(parole=p))
+        self.assertEqual(self.evts(), ["phrase"])
+        self.assertGreater(duree(self.phrases()[0]["wav"]), 5.0, "la pensee entiere")
+        # chez le majordome, rien ne change : la pause de 0,75 s ferme
+        self.sorties.clear()
+        self.o.commande({"cmd": "ecouter", "attente": 10.0})
+        for p in seq:
+            self.o.trame(trame(parole=p))
+        self.assertLess(duree(self.phrases()[0]["wav"]), 3.5)
+
+    def test_ecouter_n_ecrase_pas_la_coupure(self):
+        """« Voulez-vous que je le lance ? » -- « Oui ! » : la coupure et la fin
+        de sa voix se croisent ; l'« ecouter » qui arrive ne jette plus le debut."""
+        o = self.o
+        o.phrase = o._nouvelle_phrase(avant=np.zeros(int(0.6 * J.FREQ), np.int16), attente=1.5, ignorer=0.0)
+        o.etat, o.apres_coupure = "phrase", True
+        o.trame(trame(parole=True))
+        o.commande({"cmd": "ecouter", "attente": 5.0})
+        for _ in range(10):
+            o.trame(trame(parole=True))
+        for _ in range(20):
+            o.trame(trame())
+        self.assertEqual(self.evts(), ["phrase"])
+        self.assertTrue(self.phrases()[0].get("apres_coupure"), "toujours la reponse a sa coupure")
+        self.assertGreater(duree(self.phrases()[0]["wav"]), 0.6 + 11 * J.TRAME_S)
+
+    # ---------------- la tele, la musique ----------------
+
+    def _oreille_tele(self):
+        sorties = []
+        o = J.Oreille(SansMot(), sorties.append, lambda g: None)
+        o.niveau_vu = float("inf")
+        o.det.vad = VadScripte()
+        o.commande({"cmd": "config", "niveau_voix": 2500.0})
+        rng = np.random.default_rng(5)
+
+        def tele():
+            if rng.random() < 0.85:
+                return trame_vad(rng.uniform(250, 600), rng.uniform(0.5, 0.95))
+            return trame_vad(80, 0.1)
+        return o, sorties, tele
+
+    @staticmethod
+    def _quand(sorties, trames, oreille, evt=("phrase", "vide")):
+        for i, x in enumerate(trames):
+            oreille.trame(x)
+            fins = [e["evt"] for e in sorties if e["evt"] in evt]
+            if fins:
+                return fins[0], i + 1
+        return None, None
+
+    def test_la_tele_ne_tient_plus_la_phrase_ouverte(self):
+        """« Jarvis, baisse le son » avec la tele allumee : la phrase ne se
+        fermait qu'a 30 s (la tele parlait encore), et la tele entrait dans
+        ta demande."""
+        o, sorties, tele = self._oreille_tele()
+        for _ in range(150):
+            o.trame(tele())                       # il dort, la tele parle
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        toi = [trame_vad(2500, 0.95) for _ in range(20)]
+        fin, i = self._quand(sorties, toi + [tele() for _ in range(400)], o)
+        self.assertEqual(fin, "phrase")
+        self.assertLessEqual((i - 20) * J.TRAME_S, 1.2, "fermee %.2f s apres toi" % ((i - 20) * J.TRAME_S))
+
+    def test_la_tele_seule_n_est_pas_une_reponse(self):
+        o, sorties, tele = self._oreille_tele()
+        for _ in range(150):
+            o.trame(tele())
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        fin, i = self._quand(sorties, [tele() for _ in range(400)], o)
+        self.assertEqual(fin, "vide", "personne ne lui a repondu")
+        self.assertAlmostEqual(i * J.TRAME_S, 4.0, delta=0.2)
+
+    def test_ta_voix_plus_basse_ne_ferme_pas_la_phrase(self):
+        # 10 dB sous ton « Jarvis », pendant une seconde, la tele derriere
+        o, sorties, tele = self._oreille_tele()
+        for _ in range(150):
+            o.trame(tele())
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        toi = [trame_vad(2500, 0.95) for _ in range(10)] + [trame_vad(800, 0.9) for _ in range(12)]
+        fin, i = self._quand(sorties, toi + [tele() for _ in range(400)], o)
+        self.assertEqual(fin, "phrase")
+        self.assertGreater(i, 22, "pas fermee pendant que tu parlais plus bas")
+        self.assertLessEqual((i - 22) * J.TRAME_S, 1.2)
+
+    def test_dans_le_calme_rien_ne_change(self):
+        o, sorties, _ = self._oreille_tele()
+        for _ in range(150):
+            o.trame(trame_vad(20, 0.02))
+        o.commande({"cmd": "ecouter", "attente": 4.0})
+        fin, i = self._quand(sorties, [trame_vad(2500, 0.95)] * 20 + [trame_vad(20, 0.02)] * 60, o)
+        self.assertEqual(fin, "phrase")
+        self.assertEqual(i, 20 + 13, "la pause de 1 s, comme avant")
+        self.assertEqual(o.phrase, None)
+
+    # ---------------- pendant qu'il parle ----------------
+
+    class CoupureStub:
+        def __init__(s, coupe=False):
+            s.coupe, s.appels = coupe, []
+
+        def armer(s, t):
+            pass
+
+        def desarmer(s, garder=True):
+            s.appels.append("desarmer")
+
+        def reference(s, x, t):
+            pass
+
+        def micro(s, x, t):
+            return s.coupe
+
+        def pret(s):
+            return True
+
+    def _pendant_qu_il_parle(self, nom, coupe=False, erreur=None):
+        sorties, horloge = [], {"t": 100.0}
+        lb = FauxLoopback()
+        lb.erreur = erreur
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, lb, horloge=lambda: horloge["t"])
+        o.niveau_vu = float("inf")
+        o.coupure = self.CoupureStub(coupe)
+        for _ in range(20):
+            o.trame(trame())
+        o.commande({"cmd": "parole", "actif": True, "nom": nom})
+
+        def jouer(x):
+            horloge["t"] += J.TRAME_S
+            lb.blocs.append((horloge["t"], np.zeros(J.TRAME, np.float32)))
+            o.trame(x)
+        return o, sorties, jouer, horloge, lb
+
+    def test_jarvis_par_dessus_sa_voix_le_coupe(self):
+        """Sur un portable, personne ne parle plus fort que son echo : la
+        coupure ne l'entendait pas, et le mot d'eveil ne cherchait plus."""
+        o, sorties, jouer, _, _ = self._pendant_qu_il_parle(nom=False)
+        for _ in range(10):
+            jouer(trame())
+        jouer(trame(parole=True, marque=True))
+        self.assertIn("reveil", [e["evt"] for e in sorties])
+        self.assertFalse(o.parole, "il se tait")
+
+    def test_son_propre_nom_ne_le_reveille_pas(self):
+        o, sorties, jouer, _, _ = self._pendant_qu_il_parle(nom=True)
+        for _ in range(10):
+            jouer(trame())
+        jouer(trame(parole=True, marque=True))
+        self.assertEqual([e["evt"] for e in sorties], [])
+        self.assertTrue(o.parole)
+
+    def test_un_appel_pas_net_pendant_qu_il_parle_n_est_pas_verifie(self):
+        sorties = []
+        o = J.Oreille(FaussesEmpreintes(), sorties.append, lambda g: None, None)
+        o.niveau_vu = float("inf")
+        for _ in range(20):
+            o.trame(trame())
+        o.det.seuil_hey = 1.5                    # 0,95 : pas net
+        o.commande({"cmd": "parole", "actif": True, "nom": False})
+        for _ in range(5):
+            o.trame(trame(parole=True))
+        o.trame(trame(parole=True, marque=True))
+        for _ in range(10):
+            o.trame(trame())
+        self.assertNotIn("verifier", [e["evt"] for e in sorties], "sa propre voix : rien a verifier")
+        o.commande({"cmd": "parole", "actif": False})
+        o.det.repos_jusqua = 0
+        for _ in range(5):
+            o.trame(trame(parole=True))
+        o.trame(trame(parole=True, marque=True))
+        for _ in range(10):
+            o.trame(trame())
+        self.assertIn("verifier", [e["evt"] for e in sorties], "il s'est tu : on verifie comme avant")
+
+    def test_sans_reference_vivante_il_ne_se_coupe_pas(self):
+        """Une sortie son changee, un loopback tombe : l'echo predit valait
+        zero et il se coupait sur sa propre voix, au bout d'une seconde et demie."""
+        o, sorties, jouer, horloge, lb = self._pendant_qu_il_parle(nom=True, coupe=True, erreur="OSError : x")
+        for _ in range(5):
+            jouer(trame(parole=True))
+        self.assertNotIn("coupure", [e["evt"] for e in sorties])
+        lb.erreur = None                          # rouvert : la coupure revient
+        jouer(trame(parole=True))
+        self.assertIn("coupure", [e["evt"] for e in sorties])
+        # une reference qui n'envoie plus rien depuis plus de 0,3 s
+        o, sorties, _, horloge, lb = self._pendant_qu_il_parle(nom=True, coupe=True)
+        horloge["t"] += 0.6
+        for _ in range(5):
+            horloge["t"] += J.TRAME_S
+            o.trame(trame(parole=True))
+        self.assertNotIn("coupure", [e["evt"] for e in sorties])
+
+    def test_le_loopback_rouvert_oublie_son_erreur(self):
+        class Rec:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                return False
+
+            def record(s, numframes):
+                time.sleep(0.002)
+                return np.zeros((numframes, 1), np.float32)
+        lb = J.Loopback(ouvrir=Rec)
+        lb.erreur = "OSError : ancienne"
+        lb.demarrer()
+        for _ in range(200):
+            if lb.blocs:
+                break
+            time.sleep(0.01)
+        lb.arreter()
+        lb.fil.join(2)
+        self.assertIsNone(lb.erreur)
 
 
 class EmpreintesEcrites:
@@ -1966,7 +2319,8 @@ class DansMachiTool(unittest.TestCase):
                         attente_code=None, acces_jusqua=0.0, verrou_jusqua=0.0, suite_active=False,
                         entendu="", calme_jusqua=0.0, reveil_verifie=False, souci=None, fait_jusqua=0.0,
                         erreur_jusqua=0.0, propose_psy_phrase="", psy_raison=None,
-                        transcription_absente_dite=False, suspens=None)
+                        transcription_absente_dite=False, suspens=None, coupe_contexte="", ecoute_avant=0.0,
+                        muet_depuis=None)
         m.ONGLETS.update(file=[], resultats={}, vu=0.0)      # pas d'extension d'un test a l'autre
         self.dit, self.envoye = [], []
         m.JARVIS_CROCHETS.clear()
@@ -3495,6 +3849,201 @@ class DansMachiTool(unittest.TestCase):
         self.assertIsNone(m.VOIX.reprise)
         self.assertEqual(voix[-1]["texte"], "Yes?")
 
+    # ---------------- CE QU'ON DIT PAR-DESSUS SA VOIX ----------------
+
+    def test_sa_propre_voix_au_debut_de_la_phrase_coupee(self):
+        """La phrase d'apres une coupure commence avant la decision : sa voix
+        y est, et la transcription l'ecrit."""
+        ctx = "All systems are operational. Your calendar is clear."
+        self.assertEqual(J.sans_sa_voix("operational. Stop.", ctx), "Stop.")
+        self.assertEqual(J.sans_sa_voix("systems are operational", ctx), "")
+        self.assertEqual(J.sans_sa_voix("What time is it?", ctx), "What time is it?")
+        self.assertEqual(J.sans_sa_voix("Clear the calendar", ctx), "Clear the calendar", "tes mots a toi restent")
+        self.assertEqual(J.sans_sa_voix("clear. Jarvis, stop.", ctx), "Jarvis, stop.")
+
+    def test_une_toux_pendant_qu_il_parle_il_reprend(self):
+        # la transcription n'est pas vide (sa voix y est), mais personne n'a parle
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        vus = self.espions()
+        m.transcrire = lambda octets: "systems are operational"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, breve=True, apres_coupure=True)
+        self.assertEqual(vus["jarvis"], [], "il ne repond pas a sa propre phrase")
+        self.assertIn({"cmd": "fausse_coupure"}, oreille)
+        self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.")
+
+    def test_stop_par_dessus_sa_voix(self):
+        m = self.m
+        voix, oreille = self._jarvis_parle()
+        vus = self.espions()
+        m.transcrire = lambda octets: "operational. Stop."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, breve=True, apres_coupure=True)
+        self.assertEqual(vus["jarvis"], [], "« stop », pas une question")
+        self.assertIn({"cmd": "annuler"}, oreille)
+        self.assertEqual(m.JARVIS["etat"], "attente")
+
+    def test_un_mm_hmm_par_dessus_lui_il_continue(self):
+        """« Mm-hmm », « d'accord » dits par-dessus lui : continue -- pas une
+        nouvelle question, pas la fin de la conversation."""
+        m = self.m
+        for dit in ("Mm-hmm.", "D'accord.", "Oui."):
+            voix, oreille = self._jarvis_parle()
+            vus = self.espions()
+            m.transcrire = lambda octets, d=dit: d
+            m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+            self.assertEqual(vus["jarvis"], [], dit)
+            self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.", dit)
+            self.assertNotIn({"cmd": "fausse_coupure"}, oreille, "c'etait toi, pas de l'echo")
+            self.assertNotIn({"cmd": "annuler"}, oreille, dit)
+        self.assertIsNone(J.nature_coupure("oui oui oui"), "repete, ca veut dire « ca suffit »")
+        self.assertIsNone(J.nature_coupure("Attends, mets plutôt Lyon"))
+
+    def test_attends_par_dessus_lui(self):
+        """« Attends... » : il se tait et ecoute la suite sans repondre ; si
+        rien ne suit, il reprend sa phrase."""
+        m = self.m
+        vrai = m.oreille_vivante
+        self.addCleanup(lambda: setattr(m, "oreille_vivante", vrai))
+        m.oreille_vivante = lambda: True
+        voix, oreille = self._jarvis_parle()
+        vus = self.espions()
+        m.transcrire = lambda octets: "Attends..."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        self.assertEqual(vus["jarvis"], [])
+        self.assertEqual(oreille[-1]["cmd"], "ecouter")
+        self.assertEqual(oreille[-1]["attente"], J.SUSPENS_ECOUTE_S)
+        self.assertEqual((oreille[-1]["reprise"], oreille[-1]["debut"]), (True, False))
+        self.assertIsNotNone(m.VOIX.reprise, "sa reponse est gardee")
+        m.traiter_evenement({"evt": "vide"})
+        self.assertEqual(voix[-1]["texte"], "All systems are operational. Your calendar is clear.")
+        # ... ou la suite vient : elle part, avec le debut, et il ne reprend pas
+        voix, oreille = self._jarvis_parle()
+        m.transcrire = lambda octets: "Wait,"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, True)
+        m.transcrire = lambda octets: "what's the weather tomorrow?"
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(vus["jarvis"], ["Wait, what's the weather tomorrow?"])
+        self.assertIsNone(m.VOIX.reprise)
+
+    # ---------------- LA PHRASE EN SUSPENS ----------------
+
+    def test_la_suite_en_suspens_repart_de_la_fin_de_la_phrase(self):
+        m = self.m
+        dits, ecoutes = self._voix_et_bd(lambda *a, **k: {"texte": "Bien.", "mode": "jarvis"})
+        vus = self.espions()
+        self.phrase("Jarvis, raconte-moi l'histoire de")
+        e = ecoutes()[-1]
+        self.assertTrue(e["reprise"], "l'oreille reprend depuis la fin de la phrase")
+        self.assertEqual(e["ignorer"], 0.0, "pas de carillon : rien a ignorer")
+        # l'oreille a mis la phrase entiere devant : on la lit telle quelle
+        m.transcrire = lambda octets: "Jarvis, raconte-moi l'histoire de la tour Eiffel."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG, avec_debut=True)
+        self.assertEqual(vus["jarvis"], ["raconte-moi l'histoire de la tour Eiffel."])
+        # sans elle, deux textes recolles -- et redire tout, guide par le « toc », ne double rien
+        self.phrase("Jarvis, mets la musique de")
+        m.transcrire = lambda octets: "Mets la musique de Daft Punk."
+        m.traiter_phrase(base64.b64encode(b"RIFF....").decode(), m.CFG)
+        self.assertEqual(J.joindre_suspens("mets la musique de", "Mets la musique de Daft Punk."),
+                         "Mets la musique de Daft Punk.")
+
+    def test_le_petit_mot_mal_ecrit(self):
+        # la transcription ecrit « de » ou « a » suivi d'un silence en un autre mot
+        for t in ("Baisse le sonde.", "Allume la lumière dent.", "Ouvre le dossier d'e.",
+                  "Ouvre le dossier d'eux.", "Envoie un message A.", "Mets la musique dent"):
+            self.assertTrue(J.phrase_suspendue(t), t)
+        for t in ("Il y en a.", "il a", "Je me brosse les dents.", "Rappelle-moi donc.", "Cherche des vidéos sûres.",
+                  "Baisse le son de Discord.", "Allume la lumière.", "Il y en a plus d'un.", "Va voir la sonde."):
+            self.assertFalse(J.phrase_suspendue(t), t)
+
+    def test_chez_le_psychologue_il_laisse_des_silences(self):
+        m = self.m
+        ordres = []
+        vrai = m.oreille_vivante
+        self.addCleanup(lambda: setattr(m, "oreille_vivante", vrai))
+        m.oreille_vivante = lambda: True
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        m.dire("Je vous entends.", suite=True)
+        self.assertNotIn("pause", ordres[-1], "chez le majordome, la pause d'avant")
+        m.JARVIS["mode"] = "psy"
+        m.dire("Je vous entends.", suite=True)
+        self.assertEqual(ordres[-1]["pause"], J.PHRASE_PSY_PAUSE_S)
+        self.assertEqual(ordres[-1]["duree_max"], J.PHRASE_PSY_MAX_S)
+        m._suspendre("je me sens un peu comme", m.CFG, m.JARVIS.get("tour"), None, True, False, "fr")
+        self.assertEqual(ordres[-1]["pause"], J.PHRASE_PSY_PAUSE_S)
+
+    # ---------------- LA FENETRE DE SUITE ----------------
+
+    def _fenetre(self, reponse):
+        m = self.m
+        ordres = []
+        vrai = m.oreille_vivante
+        self.addCleanup(lambda: setattr(m, "oreille_vivante", vrai))
+        m.oreille_vivante = lambda: True
+        m.envoyer_oreille = lambda o: ordres.append(o) or True
+        m.dire(reponse, suite=True)
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        del m._JARVIS_TRAVAIL[:]
+        m.traiter_evenement({"evt": "phrase", "wav": base64.b64encode(b"RIFF....").decode()})
+        return ordres, m._JARVIS_TRAVAIL.pop()
+
+    def test_la_fin_de_sa_voix_n_est_pas_ta_reponse(self):
+        """« Je vous ecoute encore un instant » -- la fenetre entendait la fin de
+        SA phrase (« sir. »), l'envoyait comme ta reponse, ou se refermait."""
+        m = self.m
+        vus = self.espions()
+        ordres, item = self._fenetre("Very good, sir.")
+        m.transcrire = lambda octets: "sir."
+        m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+        self.assertEqual(vus["jarvis"], [])
+        self.assertEqual(m.JARVIS["etat"], "ecoute", "il ecoute encore")
+        self.assertEqual(ordres[-1]["cmd"], "ecouter")
+        self.assertEqual(ordres[-1]["ignorer"], 0.0)
+        self.assertLessEqual(ordres[-1]["attente"], ordres[0]["attente"])
+        # un bruit sans mots dans la fenetre : pareil, tant qu'il reste du temps
+        ordres, item = self._fenetre("Voila qui est fait.")
+        m.transcrire = lambda octets: ""
+        m.traiter_phrase(item["wav"], m.CFG, tour=item["tour"])
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        self.assertEqual(ordres[-1]["cmd"], "ecouter")
+        # apres une question, « du cafe » est bien ta reponse
+        self.assertFalse(J.queue_de_sa_voix("du café", "Du thé ou du café ?"))
+
+    # ---------------- LE MICRO MUET ----------------
+
+    def test_le_micro_qui_ne_rend_que_du_silence_est_signale(self):
+        """Micro refuse par Windows, touche « micro coupe » : il n'entendait
+        plus rien, et rien ne disait pourquoi."""
+        m = self.m
+        horloge = {"t": 1000.0}
+
+        class Horloge:
+            def __getattr__(s, n):
+                return getattr(time, n)
+
+            def time(s):
+                return horloge["t"]
+        vrai = m.time
+        self.addCleanup(lambda: setattr(m, "time", vrai))
+        m.time = Horloge()
+        m.envoyer_oreille = lambda o: True
+        for _ in range(int(m.MICRO_MUET_S) + 2):
+            horloge["t"] += 1.0
+            m.traiter_evenement({"evt": "niveau", "db": -90.3})
+        self.assertEqual(m.JARVIS["souci"][0], m.MICRO_MUET_MESSAGE)
+        m.traiter_evenement({"evt": "pret", "vad": True})     # l'oreille rouvre le micro
+        self.assertEqual(m.JARVIS["souci"][0], m.MICRO_MUET_MESSAGE, "rouvrir ne l'efface pas")
+        m.traiter_evenement({"evt": "niveau", "db": -60.0})
+        self.assertIsNone(m.JARVIS["souci"], "un vrai son l'efface")
+
+    def test_son_nom_dans_ce_qu_il_dit(self):
+        m = self.m
+        m.SOUS_TITRES[991] = {"phrases": ["Ouvrez les Réglages, Jarvis."], "k": -1}
+        m.SOUS_TITRES[992] = {"phrases": ["Il pleut."], "k": -1}
+        self.addCleanup(lambda: (m.SOUS_TITRES.pop(991, None), m.SOUS_TITRES.pop(992, None)))
+        self.assertTrue(m.nom_dans_sa_voix(991))
+        self.assertFalse(m.nom_dans_sa_voix(992))
+        self.assertTrue(m.nom_dans_sa_voix(12345), "inconnu : l'oreille ne cherche pas")
+
     def test_le_micro_qui_se_rouvre_ne_coupe_pas_la_conversation(self):
         m = self.m
         m.JARVIS["etat"] = "ecoute"
@@ -4434,6 +4983,27 @@ class LeMicroChoisi(unittest.TestCase):
         etat["defaut"] = self.Micro("{B}", "Webcam")      # Windows a change de micro
         self.assertEqual(list(flux), [], "il s'arrete pour rouvrir le nouveau")
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_pret_seulement_une_fois_le_micro_ouvert(self):
+        """Un micro refuse (confidentialite de Windows) : « pret » partait avant
+        l'ouverture, et effacait l'erreur qui suivait, toutes les 3 s."""
+        import types
+
+        def refuse(self, **k):
+            raise OSError("acces refuse")
+        test = self
+        test.Micro.recorder = refuse
+        self.addCleanup(lambda: delattr(test.Micro, "recorder"))
+        m = self.Micro("{A}", "Casque")
+        faux = types.SimpleNamespace(all_microphones=lambda: [m], default_microphone=lambda: m)
+        vrai = sys.modules.get("soundcard")
+        sys.modules["soundcard"] = faux
+        self.addCleanup(lambda: sys.modules.__setitem__("soundcard", vrai) if vrai else sys.modules.pop("soundcard"))
+        annonces = []
+        with self.assertRaises(OSError):
+            next(J.micro_windows("", lambda n, ok: annonces.append(n)))
+        self.assertEqual(annonces, [])
+
     def test_par_identifiant_puis_par_nom_sinon_celui_de_windows(self):
         a, b, c = self.Micro("{A}", "Micro casque"), self.Micro("{B}", "Webcam"), self.Micro("{C}", "Webcam")
         tous = lambda: [a, b, c]
@@ -5116,6 +5686,20 @@ class DoubleTransmission(unittest.TestCase):
         for _ in range(int(1.0 / J.TRAME_S)):
             o.trame(silence)
         self.assertEqual(sorties[-1], {"evt": "vide"}, "une ecoute ordinaire n'est pas une coupure")
+
+    def test_sans_reference_il_ne_se_coupe_pas_lui_meme(self):
+        """Le loopback tombe apres que la piece a ete apprise : l'echo predit
+        vaut zero, et sa voix passait pour quelqu'un au bout de 1,6 s."""
+        for graine, lat, rt, db in self.PIECES:
+            p, c = PieceSimulee(graine, lat, rt, db), J.Coupure()
+            p.passage(c, self.jarvis[0])
+            p.passage(c, self.jarvis[1])
+            _, mic, _, _ = p.signaux(self.jarvis[2])
+            p.t += 30.0
+            c.armer(p.t)
+            for i in range(0, len(mic) - J.TRAME, J.TRAME):
+                self.assertFalse(c.micro(mic[i:i + J.TRAME].astype(np.float32), p.t + (i + J.TRAME) / 16000.0),
+                                 "piece %d : coupe a %.2f s sans reference" % (graine, i / 16000.0))
 
     def test_sans_reference_seul_le_mot_d_eveil_le_coupe(self):
         sorties = []

@@ -5172,6 +5172,21 @@ atexit.register(arreter_voix)
 SOUS_TITRES = {}
 
 
+def nom_dans_sa_voix(ident=None, texte=None):
+    """Son propre nom est-il dans ce qu'il dit ? Pendant qu'il parle,
+    l'oreille cherche « Jarvis » -- sauf si sa propre voix le prononce. Dans
+    le doute (texte inconnu), oui : elle ne cherche pas."""
+    if texte is None:
+        st = SOUS_TITRES.get(ident)
+        texte = " ".join(st.get("phrases") or []) if st else ""
+    if not texte:
+        return True
+    try:
+        return bool(_jv.contient_nom(texte, noms_appris()))
+    except Exception:
+        return True
+
+
 def sous_titre_courant(maintenant=None):
     """Ce que Jarvis a deja prononce, a l'instant."""
     st = JARVIS.get("sous_titre")
@@ -5203,7 +5218,7 @@ def _lire_voix(sock):
                 JARVIS["sous_titre"] = st
         elif quoi == "debut":
             # IL PARLE : l'oreille guette qu'on lui coupe la parole
-            envoyer_oreille({"cmd": "parole", "actif": True})
+            envoyer_oreille({"cmd": "parole", "actif": True, "nom": nom_dans_sa_voix(ev.get("id"))})
             if ev.get("id") in SOUS_TITRES:
                 JARVIS["sous_titre"] = SOUS_TITRES[ev.get("id")]
         elif quoi == "pret":
@@ -5428,7 +5443,7 @@ class Voix:
                 self.couper.clear()
                 self.parle = True
                 dit = True
-                envoyer_oreille({"cmd": "parole", "actif": True})
+                envoyer_oreille({"cmd": "parole", "actif": True, "nom": nom_dans_sa_voix(texte=texte)})
                 try:
                     dit = self._sapi(texte, langue)
                 except Exception as e:
@@ -5638,7 +5653,9 @@ def traiter_evenement(ev):
     if quoi == "pret":
         _OREILLE["echecs"] = 0
         JARVIS["niveau_t"] = time.time()             # le chien de garde repart d'ici
-        JARVIS["souci"] = None
+        # (un micro muet le reste quand il se rouvre : seul un vrai son l'efface)
+        if not micro_muet_signale():
+            JARVIS["souci"] = None
         JARVIS["vad"] = bool(ev.get("vad"))
         # le micro qui se rouvre en pleine conversation ne la coupe pas
         if JARVIS.get("etat") in _ETATS_HORS_CONVERSATION:
@@ -5672,6 +5689,7 @@ def traiter_evenement(ev):
         JARVIS["niveau_t"] = time.time()
         JARVIS["db"] = ev.get("db")
         JARVIS["coupure"] = ev.get("coupure")
+        suivre_micro_muet(ev.get("db"), JARVIS["niveau_t"])
     elif quoi == "vad":
         JARVIS["vad"] = bool(ev.get("ok"))
     elif quoi == "coupure":
@@ -5679,6 +5697,9 @@ def traiter_evenement(ev):
         # suite -- elle fera une phrase comme une autre.
         print("Jarvis : on lui coupe la parole")
         VOIX.taire(garder=True)
+        # ce qu'il disait a cet instant : sa voix est au debut de la phrase
+        # captee, la transcription l'ecrit (voir `_jv.sans_sa_voix`)
+        JARVIS["coupe_contexte"] = contexte_de_coupure()
         poser_led("ecoute")
         JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=0.0, parole_vue=time.time())
         threading.Thread(target=prechauffer_dictee, daemon=True).start()
@@ -5714,6 +5735,12 @@ def traiter_evenement(ev):
         # reprend sa phrase -- l'oreille, elle, a deja appris que c'etait de l'echo.
         if ev.get("apres_coupure") and reprendre_apres_coupure():
             return
+        if (JARVIS.get("suspens") or {}).get("coupe") and JARVIS["etat"] == "ecoute":
+            # « Attends... » dit par-dessus lui, et rien n'a suivi : il reprend
+            JARVIS["suspens"] = None
+            if reprendre_apres_coupure():
+                return
+            return fin_de_l_ecoute()
         if JARVIS.get("suspens") and JARVIS["etat"] == "ecoute":
             # sa phrase en suspens, et rien n'a suivi : elle part telle quelle
             JARVIS["ecoute_fin"] = 0.0
@@ -5726,13 +5753,17 @@ def traiter_evenement(ev):
             fin_de_l_ecoute()
     elif quoi == "phrase":
         # IL N'ECOUTE PLUS : ca se voit tout de suite (l'oreille a joue son petit son)
+        # (la fin prevue de la fenetre de suite est gardee : si ce n'etait que
+        # la queue de sa voix, il ecoute encore le temps qui restait)
+        JARVIS["ecoute_avant"] = (float(JARVIS.get("ecoute_fin") or 0.0)
+                                  if JARVIS.get("etat") == "ecoute" and JARVIS.get("suite_active") else 0.0)
         JARVIS["ecoute_fin"] = 0.0
         if JARVIS.get("etat") in ("ecoute", "attente"):
             poser_led("comprend")
             JARVIS.update(etat="comprend", message="Je transcris...")
         _JARVIS_TRAVAIL.append({"wav": ev.get("wav") or "", "apres_coupure": bool(ev.get("apres_coupure")),
                                 "deja_dit": bool(ev.get("deja_dit")), "breve": bool(ev.get("breve")),
-                                "tour": JARVIS.get("tour")})
+                                "avec_debut": bool(ev.get("avec_debut")), "tour": JARVIS.get("tour")})
         _JARVIS_TRAVAIL_SIGNAL.set()
     elif quoi == "gabarit":
         _GABARIT_RECU["evt"] = ev
@@ -5765,6 +5796,79 @@ def fin_de_l_ecoute():
         poser_mode("jarvis")
         JARVIS.update(psy_echange=[], psy_grave=False)
     JARVIS.update(etat="attente", message=message_attente())
+
+
+def consigne_ecouter(attente, mode=None, **plus):
+    """L'ordre « ecouter » pour l'oreille, selon le mode : le psychologue
+    laisse des phrases plus longues ET plus de silence avant de conclure."""
+    psy = (mode or JARVIS.get("mode")) == "psy"
+    c = {"cmd": "ecouter", "attente": attente, "duree_max": _jv.PHRASE_PSY_MAX_S if psy else _jv.PHRASE_MAX_S}
+    if psy:
+        c["pause"] = _jv.PHRASE_PSY_PAUSE_S
+    c.update(plus)
+    return c
+
+
+def reecouter_la_suite():
+    """« JE VOUS ECOUTE ENCORE UN INSTANT » -- et il se rendormait 1,5 s plus
+    tard : la fin de sa voix (une enceinte en retard, l'echo), pas un mot de
+    toi, avait ferme l'ecoute. Tant qu'il reste du temps a la fenetre de
+    suite, il ecoute encore ce temps-la, sans carillon."""
+    jusqua = float(JARVIS.get("ecoute_avant") or 0.0)
+    reste = jusqua - time.time()
+    if reste < 1.0 or not oreille_vivante():
+        return False
+    JARVIS["ecoute_avant"] = 0.0
+    print("Jarvis : rien de toi dans ce qu'il a entendu, il ecoute encore %.1f s" % reste)
+    poser_led("ecoute")
+    JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.", suite_active=True,
+                  ecoute_fin=jusqua, ecoute_duree=reste, parole_vue=0.0)
+    envoyer_oreille(consigne_ecouter(round(reste, 2), ignorer=0.0))
+    return True
+
+
+def contexte_de_coupure():
+    """La phrase qu'il disait quand on l'a coupe, et celle d'avant."""
+    r = VOIX.reprise
+    if not r:
+        return ""
+    st = SOUS_TITRES.get(r.get("id"))
+    if not st:
+        return str(r.get("texte") or "")[:400]
+    phrases, k = list(st.get("phrases") or []), int(st.get("k", -1))
+    return " ".join(phrases[max(0, k - 1):k + 1] if k >= 0 else phrases[:2])
+
+
+# « IL NE M'ENTEND PLUS » : la confidentialite de Windows qui refuse le micro
+# aux applications, une touche « micro coupe » -- le micro ne rend que des
+# zeros. La page montrait « -90 dB » sans rien dire. Un indice, pas une erreur :
+# certains pilotes antibruit rendent aussi des zeros dans une piece calme.
+MICRO_MUET_DB = -90.0
+MICRO_MUET_S = 30.0
+MICRO_MUET_MESSAGE = ("Le micro ne rend que du silence : coupe, ou acces refuse "
+                      "(Parametres > Confidentialite > Microphone).")
+
+
+def micro_muet_signale():
+    return (JARVIS.get("souci") or ("",))[0] == MICRO_MUET_MESSAGE
+
+
+def suivre_micro_muet(db, maintenant):
+    """Chaque niveau du micro : trente secondes de zeros exacts, on le dit ;
+    le premier vrai son l'efface."""
+    try:
+        db = float(db)
+    except (TypeError, ValueError):
+        return
+    if db <= MICRO_MUET_DB:
+        debut = JARVIS.get("muet_depuis") or maintenant
+        JARVIS["muet_depuis"] = debut
+        if maintenant - debut >= MICRO_MUET_S and not micro_muet_signale():
+            souci(MICRO_MUET_MESSAGE)
+    else:
+        JARVIS["muet_depuis"] = None
+        if micro_muet_signale():
+            JARVIS["souci"] = None
 
 
 def verifier_appel(wav64, n=None):
@@ -5964,7 +6068,8 @@ def fil_jarvis_travail(cfg):
             item = _JARVIS_TRAVAIL.pop(0)
             try:
                 traiter_phrase(item["wav"], cfg, item.get("apres_coupure", False), deja_dit=item.get("deja_dit", False),
-                               breve=item.get("breve", False), tour=item.get("tour"))
+                               breve=item.get("breve", False), tour=item.get("tour"),
+                               avec_debut=item.get("avec_debut", False))
             except Annule:
                 pass                         # congedie ou rappele pendant qu'il y pensait
             except Exception as e:
@@ -6318,8 +6423,7 @@ def dire(texte, suite=False, langue=None, apres=None, tour=None, notifier=True, 
             poser_led("ecoute")
             JARVIS.update(etat="ecoute", message="Je vous ecoute encore un instant.", suite_active=True,
                           ecoute_fin=time.time() + attente, ecoute_duree=attente, parole_vue=0.0)
-            envoyer_oreille({"cmd": "ecouter", "attente": attente,
-                             "duree_max": _jv.PHRASE_PSY_MAX_S if mode == "psy" else _jv.PHRASE_MAX_S})
+            envoyer_oreille(consigne_ecouter(attente, mode))
         else:
             poser_led(None)
             JARVIS.update(etat="attente", message=message_attente())
@@ -6462,7 +6566,9 @@ def retirer_nom_ecorche(texte, noms=()):
     return str(texte or "").strip()
 
 
-def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False, tour=None):
+def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False, tour=None, avec_debut=False):
+    """`avec_debut` : l'oreille a mis la phrase en suspens DEVANT sa suite --
+    la transcription lit la phrase entiere, on ne recolle pas deux textes."""
     tour = JARVIS.get("tour") if tour is None else tour
     if JARVIS.get("tour") != tour:
         return                                     # congedie avant qu'on la lise
@@ -6476,6 +6582,9 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
         # la phrase en suspens, et personne n'a rien ajoute : elle part telle quelle
         if not suspens:
             return fin_de_l_ecoute()
+        if suspens.get("coupe"):
+            # « Attends... » par-dessus lui, et rien apres : il reprend sa phrase
+            return reprendre_apres_coupure() or fin_de_l_ecoute()
         return _traiter_texte(suspens["brut"], cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
                               sans_suspens=True)
     try:
@@ -6501,20 +6610,30 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
     if JARVIS.get("tour") != tour:
         return
     texte = str(texte or "")
+    if suspens and suspens.get("coupe"):
+        if not texte.strip():
+            return reprendre_apres_coupure() or fin_de_l_ecoute()
+        VOIX.oublier_reprise()                   # on lui a vraiment parle
     if suspens:
-        texte = (suspens["brut"] + " " + texte).strip()
+        if avec_debut and texte.strip() and not suspens.get("coupe"):
+            print("Jarvis : la phrase en suspens relue en entier, avec sa suite")
+        else:
+            texte = _jv.joindre_suspens(suspens["brut"], texte)
     return _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L)
 
 
-def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L):
+def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=False):
     """« Mets la musique de... » -- la phrase n'est pas finie : il ne repond
-    pas a la moitie, il ecoute la suite (sans carillon : on parlait deja)."""
+    pas a la moitie, il ecoute la suite (sans carillon : on parlait deja).
+    L'oreille reprend depuis la FIN de la phrase (`reprise`) : ce qui a ete dit
+    pendant qu'on transcrivait n'est plus perdu. `coupe` : « attends... » dit
+    par-dessus lui -- sa reponse est gardee, il la reprend si rien ne suit."""
     n = int((suspens or {}).get("n") or 0)
     if n >= _jv.SUSPENS_MAX or not oreille_vivante():
         return False
     print("Jarvis : phrase en suspens, il attend la suite")
     JARVIS["suspens"] = {"brut": brut, "tour": tour, "n": n + 1, "deja_dit": deja_dit,
-                         "suite": (suspens or {}).get("suite", suite)}
+                         "suite": True if coupe else (suspens or {}).get("suite", suite), "coupe": bool(coupe)}
     attente = _jv.SUSPENS_ECOUTE_S
     poser_led("ecoute")
     try:
@@ -6523,14 +6642,22 @@ def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L):
         vu = brut
     JARVIS.update(etat="ecoute", message="Je vous ecoute.", entendu=vu.strip() + "\u2026", suite_active=True,
                   ecoute_fin=time.time() + attente, ecoute_duree=attente, parole_vue=0.0)
-    envoyer_oreille({"cmd": "ecouter", "attente": attente,
-                     "duree_max": _jv.PHRASE_PSY_MAX_S if JARVIS.get("mode") == "psy" else _jv.PHRASE_MAX_S})
+    # pas de carillon, donc rien a ignorer ; et apres une coupure, pas la
+    # phrase d'avant devant (sa voix y est)
+    envoyer_oreille(consigne_ecouter(attente, ignorer=0.0, reprise=True, debut=not coupe))
     return True
 
 
 def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L, sans_suspens=False):
     brut = texte = str(texte or "")
     noms = noms_appris()
+    if (apres_coupure or breve) and not suspens:
+        # LE DEBUT DE LA PHRASE D'APRES UNE COUPURE, C'EST SA VOIX : « operational.
+        # Stop. » -> « Stop. » ; « systems are operational » -> rien (une toux)
+        net = _jv.sans_sa_voix(brut, JARVIS.get("coupe_contexte") or "")
+        if net != brut.strip():
+            print("Jarvis : sa propre voix retiree de ce qu'on lui a dit")
+        brut = texte = net
     # une reponse, sans le nom (la phrase en suspens garde ce qu'elle etait)
     suite = bool(suspens["suite"]) if suspens else bool(JARVIS.get("suite_active"))
     JARVIS["suite_active"] = False
@@ -6550,6 +6677,14 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
         JARVIS["auto_en_attente"] = []
         poser_led(None)
         JARVIS.update(etat="attente", message=message_attente())
+
+    # LA FIN DE SA PROPRE PHRASE, revenue des haut-parleurs dans la fenetre de
+    # suite (« sir. ») : ce n'est pas ta reponse -- il ecoute encore
+    if (suite and not code and not suspens and not apres_coupure and not breve
+            and _jv.queue_de_sa_voix(brut, JARVIS.get("reponse_affichee"))):
+        if reecouter_la_suite():
+            return
+        return se_rendormir("la fin de sa propre voix")
 
     # « SURTOUT QU'IL N'APPARAISSE PAS POUR RIEN » : juste apres un reveil que
     # personne n'a lu, il faut son nom dans ce qui a ete dit (meme ecorche) ;
@@ -6591,6 +6726,14 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
             if reprendre_apres_coupure():
                 return
             return se_rendormir("coupe pour rien")
+        # « MM-HMM », « OUI » par-dessus lui : continue (c'etait bien toi, pas
+        # l'echo -- rien a apprendre). « ATTENDS... » : il se tait, et ecoute la
+        # suite sans repondre ; si rien ne suit, il reprend.
+        nature = _jv.nature_coupure(brut) if VOIX.reprise else None
+        if nature == "relance" and reprendre_apres_coupure():
+            return
+        if nature == "attente" and _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=True):
+            return
         # on lui a vraiment parle -- son nom compris (« Jarvis ? » pour le couper)
         VOIX.oublier_reprise()
     # CHEZ LE PSYCHOLOGUE, la phrase brute d'abord : son nom, « reviens »,
@@ -6635,8 +6778,10 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
         changement, texte = None, ""
     if not texte:
         if not premiere:
-            # la suite d'une conversation, mais pas un mot (une toux, un clavier) :
-            # il n'insiste pas
+            # la suite d'une conversation, mais pas un mot (une toux, un clavier,
+            # la fin de sa voix) : il ecoute le temps qui restait, sans insister
+            if not apres_coupure and not breve and reecouter_la_suite():
+                return
             return se_rendormir("rien de dit")
         # « Jarvis. » tout court : il attend la suite -- et, UNE fois, s'il
         # a ete reveille par « Hey Jarvis » sans connaitre la voix, il dit
