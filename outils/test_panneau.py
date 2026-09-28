@@ -179,6 +179,61 @@ class AL_Ecran(unittest.TestCase):
             M.CFG.update(vieux)
             M.JARVIS["etat"] = etat
 
+    def test_la_boule_seule_et_sa_legende(self):
+        """« Jarvis ne devrait afficher que la petite bulle, plus la grande
+        fenetre, le texte peut s'afficher en minuscule a cote (ecran 4K) » : pas
+        de panneau, la boule dans chaque etat, et a cote d'elle, en petit, ce
+        qu'il dit -- du cote de l'ecran ou il y a la place."""
+        p = self.p
+        cles = ("jarvis_actif", "jarvis_boule", "jarvis_panneau", "jarvis_legende", "jarvis_boule_x")
+        vieux = {k: M.CFG.get(k) for k in cles}
+        garde = {k: M.JARVIS.get(k) for k in ("etat", "sous_titre", "regard", "entendu", "fait_jusqua")}
+        try:
+            M.CFG.update(jarvis_actif=True, jarvis_boule=True, jarvis_panneau=M.CONFIG_DEFAUT["jarvis_panneau"],
+                         jarvis_legende=True, jarvis_boule_x=0.97)
+            M.JARVIS.update(regard=None, entendu="mets du jazz", sous_titre=None, fait_jusqua=0.0)
+            self.assertEqual(p._panneau_tic(), 500, "le grand panneau ne s'ouvre plus")
+            M.JARVIS["etat"] = "pense"
+            self.assertEqual(p._boule_tic(), 40, "la boule seule sort aussi quand il reflechit")
+            p.root.update()
+            self.assertEqual(p.legende.state(), "normal")
+            self.assertEqual(p.legende_texte.cget("text"), "\u00ab mets du jazz \u00bb")
+            # il parle : la legende suit sa voix, a GAUCHE d'une boule rangee a droite
+            M.JARVIS["etat"] = "parle"
+            t0 = time.time() - 30
+            M.JARVIS["sous_titre"] = {"phrases": ["Voici du jazz, Monsieur."], "k": 0, "t0": t0, "duree": 1.0}
+            p._boule_tic()
+            p.root.update()
+            self.assertEqual(p.legende_texte.cget("text"), "Voici du jazz, Monsieur.")
+            self.assertLessEqual(p.legende.winfo_x() + p.legende.winfo_width(), p.boule.winfo_x(),
+                                 "a gauche de la boule")
+            # une boule rangee a gauche : la legende passe a droite
+            M.CFG["jarvis_boule_x"] = 0.02
+            for _ in range(40):
+                p._boule_tic()
+            p.root.update()
+            self.assertGreaterEqual(p.legende.winfo_x(), p.boule.winfo_x() + p.boule.winfo_width())
+            # une commande faite : la boule le montre un instant, puis s'efface avec sa legende
+            M.JARVIS.update(etat="attente", sous_titre=None, entendu="", fait_jusqua=time.time() + 5)
+            p._boule_tic()
+            p.root.update()
+            self.assertEqual(p.legende_texte.cget("text"), M._jv.MOTS_LEGENDE[M.langue_jarvis(M.CFG)]["fait"])
+            M.JARVIS["fait_jusqua"] = 0.0
+            for _ in range(12):
+                p._boule_tic()
+            p.root.update()
+            self.assertEqual(p.boule.state(), "withdrawn")
+            self.assertEqual(p.legende.state(), "withdrawn", "la legende part avec elle")
+            # decochee : la boule, sans texte
+            M.CFG["jarvis_legende"] = False
+            M.JARVIS["etat"] = "pense"
+            p._boule_tic()
+            p.root.update()
+            self.assertEqual(p.legende.state(), "withdrawn")
+        finally:
+            M.CFG.update(vieux)
+            M.JARVIS.update(garde)
+
     def test_la_boule_joue_avec_sa_voix_meme_avec_le_panneau(self):
         """« Un petit peu de jazz » : avec son panneau, elle ne sortait plus que
         pour regarder un ecran. Elle sort quand il parle et quand il ecoute, et
