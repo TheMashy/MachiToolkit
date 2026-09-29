@@ -183,7 +183,8 @@ class AL_Ecran(unittest.TestCase):
         """Revue : un journal d'activite coupe par Jarvis se rallumait au premier
         « Enregistrer », la fenetre reecrivant ses vieilles cases."""
         p = self.p
-        garde = {k: M.CFG.get(k) for k in ("collecte_active", "jarvis_panneau", "mode", "jarvis_appellation")}
+        garde = {k: M.CFG.get(k) for k in ("collecte_active", "collecte_envoi", "jarvis_panneau", "mode",
+                                           "jarvis_appellation", "ecran_source")}
         try:
             p.var_act.set(1)
             M.CFG.update(collecte_active=False, jarvis_panneau=True, mode="son", jarvis_appellation="Capitaine")
@@ -192,6 +193,11 @@ class AL_Ecran(unittest.TestCase):
             self.assertEqual(p.vars_jarvis["jarvis_panneau"].get(), 1)
             self.assertEqual(p.var_mode.get(), "son")
             self.assertEqual(p.champ_appellation.get(), "Capitaine")
+            # une source d'ecran qui n'est ni « actif » ni un numero ne fait pas
+            # planter « Enregistrer »
+            p.var_source.set("n'importe quoi")
+            p.enregistrer()
+            self.assertEqual(M.CFG["ecran_source"], "actif")
         finally:
             M.CFG.update(garde)
 

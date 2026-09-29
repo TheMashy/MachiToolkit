@@ -6049,6 +6049,59 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue(m.annoncer_maj("disponible", "9.9.9"), "et plus tard, elle est dite")
         self.assertEqual(len(dits), 1)
 
+    def test_le_journal_et_son_envoi_un_seul_interrupteur(self):
+        # Contre-revue : « J'active le journal d'activite ? » allumait aussi l'envoi
+        # au site sans le nommer ; couper l'envoi seul decochait la case unique.
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("demarrer_activite",)}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        faits = []
+        m.demarrer_activite = lambda cfg: faits.append(cfg.get("collecte_active"))
+        envoyes, _ = self.mains([self.outil("reglages_machi", {"action": "changer", "cle": "collecte_active",
+                                                               "valeur": "oui"}),
+                                 {"texte": "C'est fait.", "mode": "jarvis"}], code_actif=False)
+        m.CFG.update(collecte_active=False, collecte_envoi=False)
+        self.phrase("Jarvis, active le journal d'activité")
+        self.assertIn("envoi", self.dit[-1], "la question nomme l'envoi")
+        self.phrase("oui")
+        self.assertEqual((m.CFG["collecte_active"], m.CFG["collecte_envoi"]), (True, True))
+        self.assertEqual(faits, [True])
+        # l'envoi seul : c'est le meme interrupteur, le journal suit
+        m.outil_application("reglages_machi", {"action": "changer", "cle": "collecte_envoi", "valeur": "non"}, m.CFG)
+        self.assertEqual((m.CFG["collecte_active"], m.CFG["collecte_envoi"]), (False, False))
+        self.assertEqual(faits, [True, False])
+        m.REGLAGES_A_RELIRE.clear()
+
+    def test_la_source_d_ecran_se_valide(self):
+        # Contre-revue : « écran 2 » en toutes lettres faisait planter « Enregistrer ».
+        D = {"ecran_source": "actif"}
+        self.assertEqual(J.valeur_reglage("ecran_source", D, "écran 2"), 2)
+        self.assertEqual(J.valeur_reglage("ecran_source", D, "2"), 2)
+        self.assertEqual(J.valeur_reglage("ecran_source", D, "actif"), "actif")
+        self.assertRaises(ValueError, J.valeur_reglage, "ecran_source", D, "deux")
+        self.assertRaises(ValueError, J.valeur_reglage, "ecran_source", D, "0")
+
+    def test_la_pose_ne_coupe_pas_une_seance(self):
+        # Contre-revue : chez le psychologue, la pose partait sans un mot.
+        m = self.m
+        garde = {k: m.JARVIS.get(k) for k in ("mode", "etat")}
+        self.addCleanup(lambda: m.JARVIS.update(garde))
+        m.JARVIS.update(mode="psy", etat="ecoute")
+        t0 = time.monotonic()
+        m.attendre_jarvis_libre(borne=0.3, pas=0.01)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.3, "en seance : la pose attend")
+        # et une fois posee, elle se dit (seule « disponible » se tait en seance)
+        vrai = m.annoncer
+        self.addCleanup(lambda: setattr(m, "annoncer", vrai))
+        dits = []
+        m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
+        m.MAJ_ANNONCEES.clear()
+        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True)
+        self.assertTrue(m.annoncer_maj("pose", "9.9.9"))
+        self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
+        self.assertEqual(len(dits), 1)
+        m.MAJ_ANNONCEES.clear()
+
     def test_je_reviens_attend_qu_il_ait_fini(self):
         m = self.m
         m.JARVIS["etat"] = "attente"

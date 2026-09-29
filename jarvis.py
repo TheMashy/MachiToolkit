@@ -5910,8 +5910,11 @@ NOMS_REGLAGES = {
     "jarvis_initiatives": ("mes petites initiatives", "my small initiatives"),
     "jarvis_journal": ("nos échanges dans le journal", "our talks in the journal"),
     "jarvis_actif": ("mon écoute", "my listening"),
-    "collecte_active": ("le journal d'activité", "the activity log"),
-    "collecte_envoi": ("l'envoi de l'activité au site", "sending the activity to the site"),
+    # un seul interrupteur, comme dans la fenetre : la question nomme l'envoi
+    "collecte_active": ("le journal d'activité et son envoi à BrainDebugger",
+                        "the activity log and sending it to BrainDebugger"),
+    "collecte_envoi": ("le journal d'activité et son envoi à BrainDebugger",
+                       "the activity log and sending it to BrainDebugger"),
     "collecte_titres_complets": ("les titres d'onglets complets", "full tab titles"),
     "api_active": ("le serveur local", "the local server"),
     "maj_installation_auto": ("l'installation automatique des mises à jour", "automatic update installs"),
@@ -6636,6 +6639,16 @@ def reglage_modifiable(cle, defaut):
 def valeur_reglage(cle, defaut, valeur):
     """La valeur convertie au type du reglage, ou ValueError."""
     modele = defaut[cle]
+    if cle == "ecran_source":
+        # « actif » (la fenetre active) ou le numero d'un ecran -- jamais une
+        # phrase libre, que la fenetre ne saurait pas relire
+        v = normaliser(str(valeur)).strip()
+        if v in ("actif", "active", "fenetre active", "l'ecran actif", "ecran actif"):
+            return "actif"
+        chiffres = "".join(c for c in v if c.isdigit())
+        if chiffres and int(chiffres) >= 1:
+            return int(chiffres)
+        raise ValueError("ecran_source : actif | 1 | 2 | ...")
     if cle in REGLAGES_CHOIX:
         v = normaliser(str(valeur)).replace(" ", "_")
         if v not in REGLAGES_CHOIX[cle]:

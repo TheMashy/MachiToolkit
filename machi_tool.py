@@ -9344,10 +9344,12 @@ def outil_application(nom, e, cfg):
             if cle == "mode":
                 executer_commande({"action": "mode", "mode": v}, cfg)
             else:
+                if cle in ("collecte_active", "collecte_envoi"):
+                    # un seul interrupteur, comme dans la fenetre (et la question le nomme)
+                    cle = "collecte_active"
+                    cfg["collecte_envoi"] = v
                 avant = cfg.get(cle)
                 cfg[cle] = v
-                if cle == "collecte_active":
-                    cfg["collecte_envoi"] = v        # un seul interrupteur, comme dans la fenetre
                 sauver_config(cfg)
                 appliquer_reglage(cle, avant, v, cfg)
             if cle.startswith("jarvis_"):
@@ -9401,11 +9403,12 @@ MAJ_JARVIS_LIBRE_S = 60       # au plus, avant de poser malgre tout
 
 def attendre_jarvis_libre(borne=MAJ_JARVIS_LIBRE_S, pas=0.5):
     """Attend (dans le fil des mises a jour) qu'il ne soit plus en train de
-    comprendre, reflechir ou parler -- ni d'attendre une reponse -- pour que
-    la pose ne le coupe pas au milieu d'une phrase."""
+    comprendre, reflechir ou parler -- ni d'attendre une reponse, ni en
+    seance avec le psychologue -- pour que la pose ne le coupe pas."""
     fin = time.time() + borne
     while time.time() < fin and ETAT.get("en_marche", True) and (
-            JARVIS.get("etat") in ("comprend", "pense", "parle")
+            JARVIS.get("mode") == "psy"                  # une seance : on ne la coupe pas
+            or JARVIS.get("etat") in ("comprend", "pense", "parle")
             or (JARVIS.get("etat") == "ecoute" and (JARVIS.get("parole_vue") or JARVIS.get("attente_oui")
                                                    or JARVIS.get("attente_code")))):
         time.sleep(pas)
@@ -9464,11 +9467,13 @@ def annoncer_maj(quoi, version, cfg=None):
     texte = _jv.annonce_maj(quoi, version, L)
     if not texte:
         return False
-    if quoi != "posee" and (JARVIS.get("mode") == "psy" or JARVIS.get("attente_oui") or JARVIS.get("attente_code")
-                            or time.time() < float(JARVIS.get("calme_jusqua") or 0) - CALME_S + 60):
+    if quoi == "disponible" and (JARVIS.get("mode") == "psy" or JARVIS.get("attente_oui")
+                                 or JARVIS.get("attente_code")
+                                 or time.time() < float(JARVIS.get("calme_jusqua") or 0) - CALME_S + 60):
         # pas chez le psychologue, pas pendant une question, pas juste apres
         # un conge : la notification suffit, la verification suivante
-        # redira « disponible »
+        # redira « disponible ». (La pose, elle, attend qu'il soit libre et
+        # la seance finie -- attendre_jarvis_libre -- puis se dit toujours.)
         MAJ_ANNONCEES.discard((quoi, version))
         return False
     if quoi == "posee":
@@ -15741,8 +15746,8 @@ class Panneau:
         if self.cfg["collecte_active"] != avant_act:
             demarrer_activite(self.cfg)
         self.cfg["mode"] = self.var_mode.get()
-        source = self.var_source.get()
-        self.cfg["ecran_source"] = source if source == "actif" else int(source)
+        source = str(self.var_source.get())
+        self.cfg["ecran_source"] = int(source) if source.isdigit() and int(source) >= 1 else "actif"
         self.cfg["ecran_saturation"] = round(self.var_sat.get(), 2)
         self.cfg["douceur_ecran"] = round(self.var_douceur_ecran.get(), 2)
         self.cfg["ecran_finesse"] = int(self.var_finesse.get())
