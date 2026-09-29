@@ -87,6 +87,22 @@ class Demarrage(unittest.TestCase):
         veille = src[src.index("    def veille_activite():"):src.index("threading.Thread(target=veille_activite")]
         self.assertNotIn("relever_demande_panneau()", veille)
 
+    def test_le_carre_de_jarvis_a_un_clic_depuis_l_icone(self):
+        """« Tu peux mettre un toggle pour remettre le carre de Jarvis » : une
+        case cochee dans le menu de l'icone, qui suit jarvis_panneau ; la case
+        des options est remise d'accord par la boucle de la fenetre."""
+        src = open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8").read()
+        menu = src[src.index("    def construire_menu():"):src.index("    TRAY[\"icone\"].menu = construire_menu()")]
+        self.assertIn('pystray.MenuItem("Le carre de Jarvis", basculer_carre_jarvis', menu)
+        self.assertIn('checked=lambda i: bool(CFG.get("jarvis_panneau", False))', menu)
+        corps = src[src.index("    def basculer_carre_jarvis(*_):"):src.index("    def travail_maj(quoi):")]
+        self.assertIn('CFG["jarvis_panneau"] = not CFG.get("jarvis_panneau", False)', corps)
+        self.assertIn("sauver_config(CFG)", corps)
+        # la case des options suit, relue dans la boucle de la fenetre : jamais
+        # de Tk depuis le fil de l'icone
+        self.assertIn('REGLAGES_A_RELIRE.add("jarvis_panneau")', corps)
+        self.assertNotIn(".set(", corps)
+
     # ---------------- la configuration ----------------
 
     def test_config_absente(self):

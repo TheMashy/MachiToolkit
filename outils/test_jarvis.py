@@ -2570,10 +2570,37 @@ class SesNouveauxPouvoirs(unittest.TestCase):
         self.assertIsNone(C(dict(s, activite_continue_s=3 * 3600), {"pause": t - 3600}), "une fois")
         self.assertIn("break", C(dict(s, activite_continue_s=3 * 3600, langue="en"), {})["texte"])
 
-    def test_ses_droits_ne_se_donnent_pas(self):
-        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
-                    "jarvis_annoncer_taches"):
-            self.assertIn(cle, J.REGLAGES_INTERDITS, cle)
+    def test_tous_les_reglages_mais_ses_droits_se_confirment(self):
+        # « Fait en sorte que Jarvis puisse changer n'importe quel setting de l'application »
+        D = {"jarvis_fichiers": False, "jarvis_windows": False, "jarvis_initiatives": False, "veille_minutes": 5,
+             "jarvis_repliques_spontanees": False, "jarvis_code_actif": False, "maj_installation_auto": True,
+             "pont_cle": "", "pont_site": "", "jarvis_code_empreinte": "", "regles": []}
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_code_actif",
+                    "maj_installation_auto", "veille_minutes", "jarvis_repliques_spontanees"):
+            self.assertTrue(J.reglage_modifiable(cle, D), cle)
+        # jamais : les cles, les codes, l'adresse ou part le journal, les listes
+        for cle in ("pont_cle", "pont_site", "jarvis_code_empreinte", "regles"):
+            self.assertFalse(J.reglage_modifiable(cle, D), cle)
+        # ses droits : la personne confirme a chaque fois ; le reste, directement
+        P = lambda cle: J.palier_application("reglages_machi", {"action": "changer", "cle": cle, "valeur": "oui"})
+        for cle in ("jarvis_pc", "jarvis_fichiers", "jarvis_windows", "jarvis_ecran", "jarvis_code_actif",
+                    "jarvis_initiatives", "jarvis_journal", "collecte_envoi"):
+            self.assertEqual(P(cle), J.PALIER_POUVOIR, cle)
+        self.assertIsNone(P("veille_minutes"))
+        self.assertIsNone(J.palier_application("reglages_machi", {"action": "lire", "cle": "jarvis_pc"}))
+        # une mise a jour : l'application redemarre, « oui ? » avant
+        self.assertEqual(J.palier_application("mise_a_jour", {"action": "installer"}), J.PALIER_OUI)
+        self.assertIsNone(J.palier_application("mise_a_jour", {"action": "verifier"}))
+        self.assertEqual(J.question_oui([("reglage", J.libelle_reglage("jarvis_fichiers", True))]),
+                         "J'active l'accès aux fichiers ?")
+        self.assertEqual(J.question_oui([("reglage", J.libelle_reglage("jarvis_code_actif", False, "en"))], "en"),
+                         "Shall I turn off the access code?")
+        self.assertEqual(J.question_oui([("maj_machi", "1.68.0")]),
+                         "J'installe Machi Tool 1.68.0 (il redémarre un instant) ?")
+        self.assertIn("1.68.0", J.annonce_maj("disponible", "1.68.0"))
+        self.assertIn("installer", J.annonce_maj("disponible", "1.68.0"))
+        self.assertIn("reviens", J.annonce_maj("pose", "1.68.0"))
+        self.assertIn("version 1.68.0", J.annonce_maj("posee", "1.68.0", "en"))
 
 
 # ======================================================================
@@ -3483,8 +3510,8 @@ class DansMachiTool(unittest.TestCase):
             raise m.urllib.error.HTTPError(chemin, 404, "Not Found", {}, None)
         m._requete_bd = ancien
         self.assertTrue(m.verser_au_journal("x", "y", m.CFG))
-        # il ne peut pas se le cocher ni se le decocher
-        self.assertIn("jarvis_journal", J.REGLAGES_INTERDITS)
+        # il peut le changer, mais la personne confirme
+        self.assertIn("jarvis_journal", J.REGLAGES_POUVOIRS)
 
     def test_il_se_souvient_de_vos_conversations(self):
         # « Il faut que Jarvis se souvienne des anciennes discussions, mais simplement. »
@@ -5310,7 +5337,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("reaction_processeur = False", ex("reglages_machi", {"action": "changer",
                                                                            "cle": "reaction_processeur",
                                                                            "valeur": "non"})["texte"])
-        for interdit in ("pont_cle", "jarvis_pc", "jarvis_ecran", "api_origines", "maj_installation_auto"):
+        for interdit in ("pont_cle", "pont_site", "jarvis_code_empreinte", "api_origines", "adresse"):
             self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": interdit, "valeur": "1"}), interdit)
         self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": "son_bande", "valeur": "fort"}))
         r = ex("reglages_machi", {"action": "couleur_appli", "nom": "Discord", "couleur": "vert"})
@@ -5633,11 +5660,23 @@ class DansMachiTool(unittest.TestCase):
         m.CFG["jarvis_pc"] = False
         c = m.capacites_jarvis(m.CFG)
         self.assertEqual((c["fichiers"], c["windows"]), (False, False), "sans ses mains, rien")
-        # ...et il ne peut pas se les donner
+        # ...il peut se les donner, mais la personne confirme : le code s'il est
+        # demande, sinon « oui ? » (voir test_il_se_donne_un_droit_si_tu_dis_oui)
         ex = lambda nom, e: m.executer_outil({"id": "x", "nom": nom, "entree": e}, m.CFG)
-        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives", "jarvis_repliques_spontanees",
-                    "jarvis_annoncer_taches"):
-            self.assertIn("erreur", ex("reglages_machi", {"action": "changer", "cle": cle, "valeur": "oui"}), cle)
+        pal = lambda cle: m._palier({"nom": "reglages_machi",
+                                     "entree": {"action": "changer", "cle": cle, "valeur": "oui"}}, m.CFG)
+        for cle in ("jarvis_fichiers", "jarvis_windows", "jarvis_initiatives"):
+            m.CFG["jarvis_code_actif"] = False
+            self.assertEqual(pal(cle), J.PALIER_OUI, cle)
+            m.CFG["jarvis_code_actif"] = True
+            self.assertEqual(pal(cle), J.PALIER_CODE, cle)
+        self.assertEqual(pal("jarvis_repliques_spontanees"), J.PALIER_DIRECT)
+        # une session de code ouverte ne le couvre jamais : la question, nommee
+        m.CFG["jarvis_code_actif"] = True
+        m.JARVIS["acces_jusqua"] = time.time() + 300
+        self.assertEqual(pal("jarvis_fichiers"), J.PALIER_OUI)
+        m.JARVIS["acces_jusqua"] = 0.0
+        m.CFG["jarvis_code_actif"] = False
         m.CFG["jarvis_pc"] = True
         m.CFG["jarvis_fichiers"] = m.CFG["jarvis_windows"] = False
         self.assertIn("pas permis", ex("corbeille", {"chemin": "Documents\\a.txt"})["erreur"])
@@ -5816,6 +5855,296 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("Ferme de force", envoyes[1]["resultats"][0]["texte"])
         self.assertEqual(self.dit[-1], "Discord est fermé.")
         self.assertIsNone(m.JARVIS["attente_oui"])
+
+    def test_il_se_donne_un_droit_si_tu_dis_oui(self):
+        # « Fait en sorte que Jarvis puisse changer n'importe quel setting de l'application »
+        m = self.m
+        envoyes, _ = self.mains([self.outil("reglages_machi", {"action": "changer", "cle": "jarvis_fichiers",
+                                                               "valeur": "oui"}),
+                                 {"texte": "C'est fait : je range vos fichiers.", "mode": "jarvis"},
+                                 self.outil("reglages_machi", {"action": "changer", "cle": "jarvis_windows",
+                                                               "valeur": "oui"}),
+                                 {"texte": "Bien, je n'y touche pas.", "mode": "jarvis"},
+                                 self.outil("reglages_machi", {"action": "changer", "cle": "veille_minutes",
+                                                               "valeur": "12"}),
+                                 {"texte": "Douze minutes.", "mode": "jarvis"}], code_actif=False)
+        m.CFG.update(jarvis_fichiers=False, jarvis_windows=False)
+        self.phrase("Jarvis, donne-toi l'accès aux fichiers")
+        self.assertEqual(self.dit[-1], "J'active l'accès aux fichiers ?")
+        self.assertFalse(m.CFG["jarvis_fichiers"], "rien avant le oui")
+        self.phrase("oui")
+        self.assertTrue(m.CFG["jarvis_fichiers"])
+        self.assertEqual(self.dit[-1], "C'est fait : je range vos fichiers.")
+        self.phrase("Jarvis, prends aussi Windows")
+        self.phrase("non")
+        self.assertFalse(m.CFG["jarvis_windows"])
+        self.assertEqual(envoyes[3]["resultats"][0]["erreur"], m.REFUS_OUI)
+        # un reglage ordinaire : directement
+        self.phrase("Jarvis, mets la veille à 12 minutes")
+        self.assertEqual(m.CFG["veille_minutes"], 12)
+        self.assertEqual(self.dit[-1], "Douze minutes.")
+
+    def test_il_annonce_et_lance_une_mise_a_jour(self):
+        # « Ainsi qu'annoncer une mise a jour (il peut la lancer) »
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("FIGE", "verifier_maj", "annoncer")}
+        garde_maj = dict(m.MAJ)
+        self.addCleanup(lambda: ([setattr(m, k, v) for k, v in vrais.items()], m.MAJ.update(garde_maj),
+                                 m.DECLENCHER_MAJ.__setitem__(0, None), m.MAJ_ANNONCEES.clear()))
+        m.MAJ_ANNONCEES.clear()
+        dits = []
+        m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
+        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True)
+        # l'annonce : une fois par version
+        self.assertTrue(m.annoncer_maj("disponible", "9.9.9"))
+        self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
+        self.assertEqual(len(dits), 1)
+        self.assertIn("9.9.9", dits[0])
+        m.CFG["jarvis_annoncer_maj"] = False
+        self.assertFalse(m.annoncer_maj("disponible", "9.9.10"), "decoche : il se tait")
+        m.CFG["jarvis_annoncer_maj"] = True
+        # « Me revoila » attend que sa voix soit prete
+        n = len(m.ANNONCES)
+        m.annoncer_maj("posee", "9.9.9")
+        self.assertEqual(len(m.ANNONCES), n + 1)
+        del m.ANNONCES[n:]
+        # verifier : GitHub, et ce qu'il en dit
+        def verifier(cfg):
+            m.MAJ.update(etat="disponible", version="9.9.9", notes="La boule seule.",
+                         message="Version 9.9.9 disponible (installee : %s)." % m.VERSION)
+            return {"version": "9.9.9"}
+        m.verifier_maj = verifier
+        r = m.outil_mise_a_jour("verifier", m.CFG)
+        self.assertIn("Nouvelle version : 9.9.9", r)
+        self.assertIn("La boule seule.", r)
+        # installer : « oui ? », puis le meme chemin que le bouton
+        lances = []
+        m.DECLENCHER_MAJ[0] = lances.append
+        m.FIGE = True
+        envoyes, _ = self.mains([self.outil("mise_a_jour", {"action": "installer"}),
+                                 {"texte": "Je lance la mise à jour.", "mode": "jarvis"}], code_actif=False)
+        self.phrase("Jarvis, installe la mise à jour")
+        self.assertEqual(self.dit[-1], "J'installe Machi Tool 9.9.9 (il redémarre un instant) ?")
+        self.assertEqual(lances, [], "rien avant le oui")
+        self.phrase("oui")
+        self.assertEqual(lances, ["installer"])
+        self.assertIn("Mise a jour lancee", envoyes[1]["resultats"][0]["texte"])
+        # en mode script : il le dit, sans rien demander
+        m.FIGE = False
+        self.assertRaises(RuntimeError, m.outil_mise_a_jour, "installer", m.CFG)
+        self.assertTrue(m.capacites_jarvis(m.CFG)["mise_a_jour"])
+
+    def test_une_session_de_code_ne_couvre_jamais_ses_droits(self):
+        # Revue : le code donne pour lister un dossier ouvrait dix minutes pendant
+        # lesquelles un texte lu pouvait lui faire couper le code, sans question.
+        m = self.m
+        envoyes, _ = self.mains([self.outil("reglages_machi", {"action": "changer", "cle": "jarvis_code_actif",
+                                                               "valeur": "non"}),
+                                 {"texte": "Voila.", "mode": "jarvis"},
+                                 self.outil("reglages_machi", {"action": "changer", "cle": "jarvis_ecran",
+                                                               "valeur": "oui"}),
+                                 {"texte": "C'est fait.", "mode": "jarvis"}], code_actif=True)
+        m.JARVIS["acces_jusqua"] = time.time() + 300          # une session ouverte pour autre chose
+        self.phrase("Jarvis, résume-moi cet article")
+        self.assertEqual(self.dit[-1], "Je coupe le code d'accès ?", "une question qui nomme le reglage")
+        self.assertTrue(m.CFG["jarvis_code_actif"], "rien avant le oui")
+        self.phrase("non")
+        self.assertTrue(m.CFG["jarvis_code_actif"])
+        self.assertEqual(envoyes[1]["resultats"][0]["erreur"], m.REFUS_OUI)
+        # session fermee, code actif : le code d'abord, PUIS la question nommee
+        m.JARVIS["acces_jusqua"] = 0.0
+        self.phrase("Jarvis, regarde mon écran")
+        self.assertEqual(self.dit[-1], "Code d'accès ?")
+        self.phrase("4 8 1 5")
+        self.assertEqual(self.dit[-1], "J'active mes yeux sur l'écran ?")
+        self.assertFalse(m.CFG["jarvis_ecran"])
+        self.phrase("oui")
+        self.assertTrue(m.CFG["jarvis_ecran"])
+
+    def test_un_droit_donne_n_ouvre_pas_le_reste_du_meme_tour(self):
+        # Revue : [jarvis_windows=oui, forcer_fermeture Discord] -- un seul « oui »
+        # pour le reglage, et Discord etait ferme de force sans sa propre question.
+        m = self.m
+        envoyes, tues, _ = self.fermer_discord([
+            {"texte": "", "mode": "jarvis", "outils": [
+                {"id": "a", "nom": "reglages_machi", "entree": {"action": "changer", "cle": "jarvis_windows",
+                                                                 "valeur": "oui"}},
+                {"id": "b", "nom": "forcer_fermeture", "entree": {"cible": "Discord"}}], "suite": []},
+            {"texte": "Windows est a moi ; je redemande pour Discord.", "mode": "jarvis"}], code_actif=False)
+        m.CFG["jarvis_windows"] = False
+        self.phrase("Jarvis, prends Windows et ferme Discord")
+        self.assertEqual(self.dit[-1], "J'active les réglages de Windows ?")
+        self.phrase("oui")
+        self.assertTrue(m.CFG["jarvis_windows"])
+        self.assertEqual(tues, [], "pas de fermeture de force sans SA question")
+        self.assertEqual(envoyes[1]["resultats"][1]["erreur"], m.REFUS_MEME_LOT)
+
+    def test_un_reglage_change_par_jarvis_prend_effet(self):
+        # Revue : « coupe le journal d'activite » etait note, mais le journal
+        # continuait, et la fenetre le rallumait a « Enregistrer ».
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("demarrer_activite", "demarrer_api", "_en_fond")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        faits = []
+        m.demarrer_activite = lambda cfg: faits.append(("activite", cfg.get("collecte_active")))
+        m.demarrer_api = lambda cfg: faits.append(("api", cfg.get("api_active")))
+        m._en_fond = lambda f: f()
+        m.envoyer_oreille = lambda o: True
+        m.REGLAGES_A_RELIRE.clear()
+        m.CFG.update(collecte_active=True, collecte_envoi=True, api_active=True)
+        m.outil_application("reglages_machi", {"action": "changer", "cle": "collecte_active", "valeur": "non"}, m.CFG)
+        m.outil_application("reglages_machi", {"action": "changer", "cle": "api_active", "valeur": "non"}, m.CFG)
+        self.assertEqual(faits, [("activite", False), ("api", False)])
+        self.assertFalse(m.CFG["collecte_envoi"], "un seul interrupteur, comme dans la fenetre")
+        self.assertTrue({"collecte_active", "collecte_envoi", "api_active"} <= m.REGLAGES_A_RELIRE)
+        # rien ne bouge : rien a relancer
+        faits.clear()
+        m.outil_application("reglages_machi", {"action": "changer", "cle": "api_active", "valeur": "non"}, m.CFG)
+        self.assertEqual(faits, [])
+        m.JARVIS["acces_jusqua"] = time.time() + 300
+        m.CFG["jarvis_pc"] = True
+        m.outil_application("reglages_machi", {"action": "changer", "cle": "jarvis_pc", "valeur": "non"}, m.CFG)
+        self.assertEqual(m.JARVIS["acces_jusqua"], 0.0, "ses mains fermees : la session aussi")
+        m.REGLAGES_A_RELIRE.clear()
+
+    def test_les_mises_a_jour_gardees(self):
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("FIGE", "verifier_maj", "annoncer")}
+        garde_maj = dict(m.MAJ)
+        self.addCleanup(lambda: ([setattr(m, k, v) for k, v in vrais.items()], m.MAJ.update(garde_maj),
+                                 m.DECLENCHER_MAJ.__setitem__(0, None), m.MAJ_ANNONCEES.clear()))
+        # une version qui attend d'etre posee ne redevient pas « disponible »
+        verifs = []
+        m.verifier_maj = lambda cfg: verifs.append(1)
+        for etat in ("a_poser", "prete"):
+            m.MAJ.update(etat=etat, version="9.9.9")
+            m.outil_mise_a_jour("verifier", m.CFG)
+            self.assertEqual(m.MAJ["etat"], etat)
+        self.assertEqual(verifs, [])
+        # la case decochee : ni proposee, ni lancee
+        m.CFG["jarvis_annoncer_maj"] = False
+        m.FIGE = True
+        m.DECLENCHER_MAJ[0] = lambda q: self.fail("lancee malgre la case decochee")
+        m.MAJ.update(etat="disponible")
+        self.assertFalse(m.capacites_jarvis(m.CFG)["mise_a_jour"])
+        self.assertRaises(RuntimeError, m.outil_mise_a_jour, "installer", m.CFG)
+        self.assertRaises(RuntimeError, m.geste_oui, {"nom": "mise_a_jour", "entree": {"action": "installer"}})
+        # et la recocher se confirme
+        self.assertEqual(m._palier({"nom": "reglages_machi", "entree": {"action": "changer",
+                                    "cle": "jarvis_annoncer_maj", "valeur": "oui"}}, m.CFG), J.PALIER_OUI)
+        for cle in ("maj_installation_auto", "maj_verifier", "maj_prereleases"):
+            self.assertEqual(J.palier_application("reglages_machi", {"action": "changer", "cle": cle}),
+                             J.PALIER_POUVOIR, cle)
+        # une annonce ne tombe ni chez le psychologue, ni pendant une question
+        m.CFG.update(jarvis_annoncer_maj=True, jarvis_actif=True)
+        dits = []
+        m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
+        m.MAJ_ANNONCEES.clear()
+        m.JARVIS["mode"] = "psy"
+        self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
+        m.JARVIS["mode"] = "jarvis"
+        m.JARVIS["attente_oui"] = {"tour_oui": 0}
+        self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
+        m.JARVIS["attente_oui"] = None
+        self.assertTrue(m.annoncer_maj("disponible", "9.9.9"), "et plus tard, elle est dite")
+        self.assertEqual(len(dits), 1)
+
+    def test_le_journal_et_son_envoi_un_seul_interrupteur(self):
+        # Contre-revue : « J'active le journal d'activite ? » allumait aussi l'envoi
+        # au site sans le nommer ; couper l'envoi seul decochait la case unique.
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("demarrer_activite",)}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        faits = []
+        m.demarrer_activite = lambda cfg: faits.append(cfg.get("collecte_active"))
+        envoyes, _ = self.mains([self.outil("reglages_machi", {"action": "changer", "cle": "collecte_active",
+                                                               "valeur": "oui"}),
+                                 {"texte": "C'est fait.", "mode": "jarvis"}], code_actif=False)
+        m.CFG.update(collecte_active=False, collecte_envoi=False)
+        self.phrase("Jarvis, active le journal d'activité")
+        self.assertIn("envoi", self.dit[-1], "la question nomme l'envoi")
+        self.phrase("oui")
+        self.assertEqual((m.CFG["collecte_active"], m.CFG["collecte_envoi"]), (True, True))
+        self.assertEqual(faits, [True])
+        # l'envoi seul : c'est le meme interrupteur, le journal suit
+        m.outil_application("reglages_machi", {"action": "changer", "cle": "collecte_envoi", "valeur": "non"}, m.CFG)
+        self.assertEqual((m.CFG["collecte_active"], m.CFG["collecte_envoi"]), (False, False))
+        self.assertEqual(faits, [True, False])
+        m.REGLAGES_A_RELIRE.clear()
+
+    def test_la_source_d_ecran_se_valide(self):
+        # Contre-revue : « écran 2 » en toutes lettres faisait planter « Enregistrer ».
+        D = {"ecran_source": "actif"}
+        self.assertEqual(J.valeur_reglage("ecran_source", D, "écran 2"), 2)
+        self.assertEqual(J.valeur_reglage("ecran_source", D, "2"), 2)
+        self.assertEqual(J.valeur_reglage("ecran_source", D, "actif"), "actif")
+        self.assertRaises(ValueError, J.valeur_reglage, "ecran_source", D, "deux")
+        self.assertRaises(ValueError, J.valeur_reglage, "ecran_source", D, "0")
+
+    def test_la_pose_ne_coupe_pas_une_seance(self):
+        # Contre-revue : chez le psychologue, la pose partait sans un mot.
+        m = self.m
+        garde = {k: m.JARVIS.get(k) for k in ("mode", "etat")}
+        self.addCleanup(lambda: m.JARVIS.update(garde))
+        m.JARVIS.update(mode="psy", etat="ecoute")
+        t0 = time.monotonic()
+        m.attendre_jarvis_libre(borne=0.3, pas=0.01)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.3, "en seance : la pose attend")
+        # et une fois posee, elle se dit (seule « disponible » se tait en seance)
+        vrai = m.annoncer
+        self.addCleanup(lambda: setattr(m, "annoncer", vrai))
+        dits = []
+        m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
+        m.MAJ_ANNONCEES.clear()
+        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True)
+        self.assertTrue(m.annoncer_maj("pose", "9.9.9"))
+        self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
+        self.assertEqual(len(dits), 1)
+        m.MAJ_ANNONCEES.clear()
+
+    def test_je_reviens_attend_qu_il_ait_fini(self):
+        m = self.m
+        m.JARVIS["etat"] = "attente"
+        t0 = time.monotonic()
+        m.attendre_jarvis_libre(borne=5, pas=0.01)
+        self.assertLess(time.monotonic() - t0, 0.5, "libre : pas d'attente")
+        m.JARVIS["etat"] = "parle"
+        t0 = time.monotonic()
+        m.attendre_jarvis_libre(borne=0.3, pas=0.01)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.3, "il parle : on attend (borne)")
+        m.JARVIS["etat"] = "attente"
+
+    def test_les_annonces_attendent_sa_vraie_voix(self):
+        # Revue : sous Windows, peut_parler() est toujours vrai -- « Me revoila »
+        # partait dans la voix de Windows avant que la sienne soit chargee.
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("charges_voix", "voix_prete")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        vraie_peut = m.VOIX.peut_parler
+        self.addCleanup(lambda: setattr(m.VOIX, "peut_parler", vraie_peut))
+        dits = []
+        vrai_dire = m.VOIX.dire
+        self.addCleanup(lambda: setattr(m.VOIX, "dire", vrai_dire))
+        m.VOIX.dire = lambda texte, fin=None, langue="fr", **k: dits.append(texte)
+        m.VOIX.peut_parler = lambda: True
+        m.charges_voix = lambda cfg: [{"cle": "fr"}]
+        prete = {"v": False}
+        m.voix_prete = lambda cle=None: prete["v"]
+        m.CFG["jarvis_voix"] = True
+        m.JARVIS["etat"] = "attente"
+        del m.ANNONCES[:]
+        m.ANNONCES.append(("Me revoilà, en version 9.9.9.", "fr", time.time()))
+        m.dire_les_annonces()
+        self.assertEqual(dits, [], "sa voix se charge : ca attend")
+        prete["v"] = True
+        m.dire_les_annonces()
+        self.assertEqual(dits, ["Me revoilà, en version 9.9.9."])
+        # jamais chargee : la voix de Windows la dit apres le delai
+        prete["v"] = False
+        m.ANNONCES.append(("Bonjour.", "fr", time.time() - m.ANNONCE_VOIX_ATTENTE_S - 1))
+        m.dire_les_annonces()
+        self.assertEqual(dits[-1], "Bonjour.")
+        del m.ANNONCES[:]
 
     def test_le_oui_refuse_ou_autre_chose(self):
         m = self.m
