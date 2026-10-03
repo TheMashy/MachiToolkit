@@ -1166,6 +1166,30 @@ class Kokoro(unittest.TestCase):
         # une voix inconnue : celle de Jarvis
         self.assertAlmostEqual(float(J.style_kokoro(pack, "nimporte")[0, 0, 0]), 1.3, places=5)
 
+    @unittest.skipUnless(NUMPY, "numpy")
+    def test_timbre_et_intonation_a_part(self):
+        """« Le ton est encore trop britannique » : les 128 premieres valeurs
+        (le timbre) d'un melange, les 128 dernieres (l'intonation) d'un autre."""
+        pack = {"ff_siwis": np.full((510, 1, 256), 10.0, np.float32),
+                "bm_lewis": np.zeros((510, 1, 256), np.float32)}
+        s = J.style_kokoro(pack, "fr_jarvis")
+        e = J.VOIX_KOKORO_FR["fr_jarvis"]
+        self.assertAlmostEqual(float(s[0, 0, 0]), 10 * e["timbre"]["ff_siwis"], places=4)
+        self.assertAlmostEqual(float(s[0, 0, 127]), 10 * e["timbre"]["ff_siwis"], places=4)
+        self.assertAlmostEqual(float(s[0, 0, 128]), 10 * e["prosodie"]["ff_siwis"], places=4)
+        self.assertGreater(e["prosodie"]["ff_siwis"], e["timbre"]["ff_siwis"],
+                           "plus d'intonation francaise que de timbre")
+        self.assertEqual(J.voix_de_kokoro(e), {"ff_siwis", "bm_lewis"})
+
+    def test_la_carte_graphique_d_abord(self):
+        dispo = ["DmlExecutionProvider", "CPUExecutionProvider"]
+        self.assertEqual(J.accelerateurs_kokoro(dispo, ""), ["DmlExecutionProvider", "CPUExecutionProvider"])
+        self.assertEqual(J.accelerateurs_kokoro(["CPUExecutionProvider"], ""), ["CPUExecutionProvider"],
+                         "sans carte graphique, le processeur")
+        self.assertEqual(J.accelerateurs_kokoro(dispo, "cpu"), ["CPUExecutionProvider"], "on peut s'en passer")
+        self.assertEqual(J.accelerateurs_kokoro(dispo, "cuda"), ["CPUExecutionProvider"],
+                         "un moteur force mais absent : le processeur")
+
 
 class MotEveil(unittest.TestCase):
     def test_on_coupe_jusqu_au_mot(self):
@@ -8110,7 +8134,7 @@ class VoixFrancaise(unittest.TestCase):
     def test_les_melanges_existent(self):
         with np.load(self.voix) as pack:
             for cle, entree in J.VOIX_KOKORO_FR.items():
-                for nom in entree["melange"]:
+                for nom in J.voix_de_kokoro(entree):
                     self.assertIn(nom, pack.files, cle)
 
     def test_les_phonemes_francais(self):
