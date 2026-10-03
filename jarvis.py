@@ -2287,19 +2287,39 @@ KOKORO_DEFAUT = "jarvis"
 # SA VOIX FRANCAISE, PAR KOKORO AUSSI. « Can you have a french voice for
 # jarvis ? » -- Piper lisait juste, mais il lisait. Kokoro-82M parle francais
 # (espeak-ng « fr » pour les phonemes) ; sa seule voix francaise, Siwis, est
-# une voix de femme. Melangee aux voix d'hommes britanniques du Jarvis anglais,
-# elle garde l'accent et prend leur timbre. MESURE (six phrases de Jarvis,
-# relues par Whisper small ; hauteur mediane) : Siwis seule 218 Hz, 14 % de
-# mots rates ; Lewis seul 103 Hz mais 42 % -- un Anglais qui lit du francais ;
-# Siwis 0,3 + Lewis 0,7 : 141 Hz, 17 %. Un homme, qu'on comprend.
+# une voix de femme. MESURE (six phrases de Jarvis, relues par Whisper small ;
+# hauteur mediane) : Siwis seule 218 Hz, 14 % de mots rates ; Lewis seul 103 Hz
+# mais 42 % -- un Anglais qui lit du francais ; Siwis 0,3 + Lewis 0,7 : 141 Hz,
+# 17 %. Un homme, qu'on comprend -- mais avec l'accent anglais.
+#
+# « LE TON EST ENCORE TROP BRITANNIQUE. » Le style d'une voix a DEUX MOITIES
+# (kokoro/model.py) : les 128 premieres valeurs vont au DECODEUR -- le timbre,
+# le grain -- et les 128 dernieres au PREDICTEUR -- les durees et la courbe de
+# hauteur, c'est-a-dire l'intonation, la ou l'accent s'entend. Les melanger
+# separement donne un timbre d'homme et une intonation plus francaise.
+#
+# MAIS LA HAUTEUR VIENT AVEC L'INTONATION : toute l'intonation de Siwis, et la
+# voix remonte a ~200 Hz (mesure), un timbre d'homme qui parle comme une femme.
+# MESURE (test_un_homme_et_le_meme_modele) : la moitie de l'intonation de
+# Siwis donne deja 171 Hz. D'ou 35 % par defaut -- une voix d'homme, un peu
+# plus francaise qu'avant -- et « plus francais » a 70 % pour qui prefere moins
+# d'accent quitte a monter. A choisir a l'oreille.
 KOKORO_ESPEAK_FR = "fr"       # espeak-ng : lang/roa/fr, le francais de France
 VOIX_KOKORO_FR = {
-    "fr_jarvis": {"nom": "Jarvis -- homme, grave, pose (Siwis et Lewis)",
-                  "melange": {"ff_siwis": 0.3, "bm_lewis": 0.7}},
+    "fr_jarvis": {"nom": "Jarvis -- homme, grave, intonation plus francaise",
+                  "timbre": {"ff_siwis": 0.3, "bm_lewis": 0.7},
+                  "prosodie": {"ff_siwis": 0.35, "bm_lewis": 0.65}},
+    "fr_jarvis_francais": {"nom": "Jarvis plus francais -- moins d'accent, un peu plus haut",
+                           "timbre": {"ff_siwis": 0.3, "bm_lewis": 0.7},
+                           "prosodie": {"ff_siwis": 0.7, "bm_lewis": 0.3}},
     "fr_jarvis_clair": {"nom": "Jarvis clair -- homme, plus leger (Siwis, Fable et Lewis)",
-                        "melange": {"ff_siwis": 0.3, "bm_fable": 0.35, "bm_lewis": 0.35}},
+                        "timbre": {"ff_siwis": 0.3, "bm_fable": 0.35, "bm_lewis": 0.35},
+                        "prosodie": {"ff_siwis": 0.35, "bm_fable": 0.325, "bm_lewis": 0.325}},
     "fr_daniel": {"nom": "Daniel -- homme, net (Siwis et Daniel)",
-                  "melange": {"ff_siwis": 0.2, "bm_daniel": 0.8}},
+                  "timbre": {"ff_siwis": 0.2, "bm_daniel": 0.8},
+                  "prosodie": {"ff_siwis": 0.35, "bm_daniel": 0.65}},
+    "fr_jarvis_anglais": {"nom": "Jarvis d'avant -- le plus grave, accent anglais",
+                          "melange": {"ff_siwis": 0.3, "bm_lewis": 0.7}},
     "fr_siwis": {"nom": "Siwis -- femme, la plus naturelle", "melange": {"ff_siwis": 1.0}},
 }
 KOKORO_FR_DEFAUT = "fr_jarvis"
@@ -2318,16 +2338,31 @@ _KOKORO_IDS = (1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 
 KOKORO_VOCAB = dict(zip(_KOKORO_SYMBOLES, _KOKORO_IDS))
 
 
+def voix_de_kokoro(entree):
+    """Toutes les voix du modele qu'une entree du catalogue utilise."""
+    return set(entree.get("melange", {})) | set(entree.get("timbre", {})) | set(entree.get("prosodie", {}))
+
+
 def style_kokoro(pack, voix):
     """La table des styles d'une voix du catalogue : (510, 1, 256), un vecteur
-    par longueur de phrase. Un melange est la moyenne ponderee des tables."""
+    par longueur de phrase. Un melange est la moyenne ponderee des tables ;
+    `timbre` et `prosodie` melangent separement les 128 premieres valeurs (le
+    decodeur) et les 128 dernieres (le predicteur, l'intonation)."""
     entree = VOIX_KOKORO.get(voix) or VOIX_KOKORO_FR.get(voix) or VOIX_KOKORO[KOKORO_DEFAUT]
-    total = sum(entree["melange"].values())
-    style = None
-    for nom, poids in entree["melange"].items():
-        s = pack[nom].astype("float32") * (poids / total)
-        style = s if style is None else style + s
-    return style
+
+    def moyenne(melange):
+        total = sum(melange.values())
+        style = None
+        for nom, poids in melange.items():
+            s = pack[nom].astype("float32") * (poids / total)
+            style = s if style is None else style + s
+        return style
+
+    if "melange" in entree:
+        return moyenne(entree["melange"])
+    timbre, prosodie = moyenne(entree["timbre"]), moyenne(entree["prosodie"])
+    timbre[..., 128:] = prosodie[..., 128:]
+    return timbre
 
 
 def phonemes_kokoro(liste):
@@ -2357,6 +2392,55 @@ def morceaux_kokoro(phonemes, plafond=KOKORO_MAX):
     return sortie
 
 
+# LA CARTE GRAPHIQUE D'ABORD. « Exploite plus le GPU, pour la voix la plus
+# reactive possible. » Kokoro est petit : sur processeur, ~0,3 s de calcul par
+# seconde de parole ; sur une carte graphique, quelques centiemes -- la phrase
+# suivante est prete avant que la premiere soit dite. Sous Windows, le paquet
+# onnxruntime-directml (requirements.txt) apporte DirectML : toute carte
+# DirectX 12, sans CUDA a installer. On prend le premier accelerateur
+# disponible qui accepte le modele, sinon le processeur. JARVIS_KOKORO_GPU=cpu
+# force le processeur ; =dml / =cuda en force un.
+KOKORO_ACCELERATEURS = ("DmlExecutionProvider", "CUDAExecutionProvider", "CoreMLExecutionProvider")
+
+
+def accelerateurs_kokoro(disponibles, force=None):
+    """Les moteurs a essayer, dans l'ordre, le processeur toujours en dernier."""
+    force = (force if force is not None else os.environ.get("JARVIS_KOKORO_GPU", "")).strip().lower()
+    if force == "cpu":
+        return ["CPUExecutionProvider"]
+    voulus = {"dml": "DmlExecutionProvider", "cuda": "CUDAExecutionProvider",
+              "coreml": "CoreMLExecutionProvider"}.get(force)
+    ordre = [voulus] if voulus else list(KOKORO_ACCELERATEURS)
+    return [p for p in ordre if p in disponibles] + ["CPUExecutionProvider"]
+
+
+def session_kokoro(rt, modele, fils=4):
+    """La session Kokoro sur le meilleur moteur qui l'accepte. Un tour a vide
+    au chargement : la carte graphique compile ses noyaux a la premiere
+    passe, autant que ce ne soit pas sur la premiere phrase qu'on attend."""
+    import numpy as np
+    for moteur in accelerateurs_kokoro(rt.get_available_providers()):
+        o = rt.SessionOptions()
+        o.intra_op_num_threads = max(1, int(fils))
+        o.inter_op_num_threads = 1
+        if moteur == "DmlExecutionProvider":
+            # DirectML refuse la reutilisation de memoire et le parallelisme.
+            o.enable_mem_pattern = False
+            o.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
+        try:
+            session = rt.InferenceSession(modele, o, providers=[moteur, "CPUExecutionProvider"]
+                                          if moteur != "CPUExecutionProvider" else [moteur])
+            noms = {i.name for i in session.get_inputs()}
+            session.run(None, {("input_ids" if "input_ids" in noms else "tokens"): np.array([[0, 50, 0]], np.int64),
+                               "style": np.zeros((1, 256), np.float32),
+                               "speed": np.array([1.0], np.float32)})
+            print("[jarvis] Kokoro sur %s" % session.get_providers()[0], flush=True)
+            return session
+        except Exception as e:
+            print("[jarvis] Kokoro : %s refuse (%s)" % (moteur, str(e).splitlines()[0][:160]), flush=True)
+    raise RuntimeError("Kokoro : aucun moteur n'a accepte le modele")
+
+
 class SyntheseKokoro:
     """Kokoro-82M, charge UNE fois. Meme interface que `Synthese` : la Bouche
     ne sait pas laquelle elle fait parler."""
@@ -2375,10 +2459,7 @@ class SyntheseKokoro:
             cle = os.path.abspath(modele)
             self.session = SyntheseKokoro._SESSIONS.get(cle)
             if self.session is None:
-                o = rt.SessionOptions()
-                o.intra_op_num_threads = max(1, int(fils))
-                o.inter_op_num_threads = 1
-                self.session = rt.InferenceSession(modele, o, providers=["CPUExecutionProvider"])
+                self.session = session_kokoro(rt, modele, fils)
                 SyntheseKokoro._SESSIONS[cle] = self.session
         noms = {i.name for i in self.session.get_inputs()}
         # « tokens » dans l'export v1.0, « input_ids » dans les suivants
