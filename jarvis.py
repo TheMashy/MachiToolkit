@@ -2414,6 +2414,19 @@ def accelerateurs_kokoro(disponibles, force=None):
     return [p for p in ordre if p in disponibles] + ["CPUExecutionProvider"]
 
 
+# Ce que session_kokoro a essaye avant de retenir un moteur : rendu au
+# panneau, parce que l'exe n'a pas de console -- un print ne se lit nulle part.
+KOKORO_REFUS = []
+
+
+def nom_moteur_kokoro(fournisseur):
+    """« DmlExecutionProvider » -> ce que la personne comprend."""
+    return {"DmlExecutionProvider": "la carte graphique (DirectML)",
+            "CUDAExecutionProvider": "la carte graphique (CUDA)",
+            "CoreMLExecutionProvider": "la puce graphique (CoreML)",
+            "CPUExecutionProvider": "le processeur"}.get(fournisseur, fournisseur or "?")
+
+
 def session_kokoro(rt, modele, fils=4):
     """La session Kokoro sur le meilleur moteur qui l'accepte. Un tour a vide
     au chargement : la carte graphique compile ses noyaux a la premiere
@@ -2437,7 +2450,9 @@ def session_kokoro(rt, modele, fils=4):
             print("[jarvis] Kokoro sur %s" % session.get_providers()[0], flush=True)
             return session
         except Exception as e:
-            print("[jarvis] Kokoro : %s refuse (%s)" % (moteur, str(e).splitlines()[0][:160]), flush=True)
+            raison = (str(e).splitlines() or [""])[0][:160]
+            KOKORO_REFUS.append("%s : %s" % (moteur, raison))
+            print("[jarvis] Kokoro : %s refuse (%s)" % (moteur, raison), flush=True)
     raise RuntimeError("Kokoro : aucun moteur n'a accepte le modele")
 
 
@@ -2472,6 +2487,23 @@ class SyntheseKokoro:
 
     def jetons(self, phonemes):
         return [KOKORO_VOCAB[c] for c in phonemes if c in KOKORO_VOCAB]
+
+    def moteur(self):
+        """Ce qui calcule vraiment la voix : le premier fournisseur de la session."""
+        try:
+            return self.session.get_providers()[0]
+        except Exception:
+            return None
+
+    def mesurer(self, texte=None):
+        """Le temps de calcul par seconde de parole, sur une phrase de Jarvis
+        -- ce qui dit, mieux qu'un nom de moteur, si la voix suit la parole."""
+        texte = texte or ("Bonjour, je vous ecoute." if self.langue == "fr" else "Good evening, I'm listening.")
+        t0 = time.perf_counter()
+        sons = list(self.phrases(texte, 1.0))
+        calcul = time.perf_counter() - t0
+        duree = sum(len(x) for x in sons) / float(self.frequence)
+        return calcul / duree if duree > 0 else None
 
     def phrase(self, phonemes, lenteur=1.0):
         """Le son d'une phrase : int16, crete normalisee comme Piper. `lenteur`
@@ -4146,7 +4178,16 @@ def voix_enfant(port, secret, lecteur=None):
                     etat["bouche"] = Bouche({cle: syn}, sortie, lecteur, float(c.get("silence", 0.2)))
                 else:
                     etat["bouche"].syns[cle] = syn
-                sortie({"evt": "pret", "cle": cle, "frequence": syn.frequence})
+                pret = {"evt": "pret", "cle": cle, "frequence": syn.frequence}
+                if c.get("moteur") == "kokoro":
+                    # Ce qui calcule, et a quelle vitesse : affiche dans le panneau.
+                    pret["moteur"] = syn.moteur()
+                    pret["refus"] = list(KOKORO_REFUS)
+                    try:
+                        pret["rtf"] = syn.mesurer()
+                    except Exception:
+                        pass
+                sortie(pret)
             elif c.get("cmd") == "dire" and etat["bouche"] is not None:
                 etat["bouche"].dire(c.get("id"), c.get("texte", ""), float(c.get("lenteur", 1.0)),
                                     c.get("cle"), travail=c.get("travail"), garder=True)

@@ -5224,7 +5224,23 @@ def preparer_piper(cfg, ouvrir=None):
 
 # ---------- la voix anglaise de Jarvis : Kokoro ----------
 
-KOKORO = {"etat": "absent", "progres": 0.0, "message": ""}
+KOKORO = {"etat": "absent", "progres": 0.0, "message": "", "calcul": {}}
+
+
+def texte_calcul_kokoro(cle):
+    """Ce qui calcule la voix Kokoro de cette langue, et a quelle vitesse --
+    rapporte par le processus de la voix au chargement (l'exe n'a pas de
+    console : sans ca, rien ne dirait si la carte graphique travaille)."""
+    c = KOKORO.get("calcul", {}).get(cle)
+    if not c or not c.get("moteur"):
+        return ""
+    t = " Calculee par %s" % _jv.nom_moteur_kokoro(c["moteur"])
+    if c.get("rtf"):
+        t += ", %.2f s par seconde de parole" % c["rtf"]
+    t += "."
+    if c["moteur"] == "CPUExecutionProvider" and c.get("refus"):
+        t += " (Carte graphique refusee : %s)" % c["refus"][0][:120]
+    return t
 _KOKORO_VERROU = threading.Lock()
 _ESPEAK_VERROU = threading.Lock()     # les deux preparations peuvent vouloir l'archive en meme temps
 
@@ -5481,6 +5497,9 @@ def _lire_voix(sock):
                 JARVIS["sous_titre"] = SOUS_TITRES[ev.get("id")]
         elif quoi == "pret":
             _VOIX_ENFANT["pretes"].add(str(ev.get("cle") or "fr"))
+            if ev.get("moteur"):
+                KOKORO.setdefault("calcul", {})[str(ev.get("cle") or "fr")] = {
+                    "moteur": ev.get("moteur"), "rtf": ev.get("rtf"), "refus": ev.get("refus") or []}
             _VOIX_ENFANT.update(pret=True, echecs=0)
             if ev.get("cle") == "en" or (ev.get("cle") == "fr" and kokoro_fr_pret(CFG)):
                 KOKORO.update(etat="pret", message="")
@@ -15193,7 +15212,7 @@ class Panneau:
         elif PIPER["etat"] == "preparation":
             piper = "Telechargement de la voix : %d %%" % (PIPER["progres"] * 100)
         elif voix_prete("fr"):
-            piper = PIPER.get("message") or "Voix chargee : elle repond tout de suite."
+            piper = (PIPER.get("message") or "Voix chargee : elle repond tout de suite.") + texte_calcul_kokoro("fr")
         elif piper_pret(self.cfg):
             piper = "Voix telechargee ; elle se charge quand Jarvis ecoute."
         else:
@@ -15206,7 +15225,7 @@ class Panneau:
         elif KOKORO["etat"] == "erreur":
             kokoro = KOKORO.get("message") or "La voix anglaise n'a pas pu venir."
         elif voix_prete("en"):
-            kokoro = "Voix anglaise chargee : elle repond tout de suite."
+            kokoro = "Voix anglaise chargee : elle repond tout de suite." + texte_calcul_kokoro("en")
         elif kokoro_present():
             kokoro = "Voix anglaise telechargee ; elle se charge quand Jarvis ecoute."
         else:
