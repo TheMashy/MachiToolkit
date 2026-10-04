@@ -3154,6 +3154,21 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(r["erreur"], "Spotify refuse (403 : Restriction violated).", "sans « ErreurSpotify : »")
         self.assertIn("Restriction violated", m.JARVIS["spotify_message"], "et on le voit sous « Spotify »")
 
+    def test_on_voit_ce_qui_calcule_la_voix(self):
+        """L'exe n'a pas de console : le moteur de Kokoro se lit dans le panneau."""
+        m = self.m
+        self.addCleanup(lambda: m.KOKORO.__setitem__("calcul", {}))
+        self.assertEqual(m.texte_calcul_kokoro("fr"), "", "rien de rapporte, rien d'affiche")
+        m.KOKORO["calcul"] = {"fr": {"moteur": "DmlExecutionProvider", "rtf": 0.04, "refus": []}}
+        t = m.texte_calcul_kokoro("fr")
+        self.assertIn("carte graphique (DirectML)", t)
+        self.assertIn("0.04 s par seconde de parole", t)
+        m.KOKORO["calcul"] = {"en": {"moteur": "CPUExecutionProvider", "rtf": 0.3,
+                                     "refus": ["DmlExecutionProvider : pas de carte"]}}
+        t = m.texte_calcul_kokoro("en")
+        self.assertIn("le processeur", t)
+        self.assertIn("pas de carte", t, "et pourquoi la carte graphique n'a pas servi")
+
     def test_les_noms_pollues_sont_ecartes_a_la_lecture(self):
         m = self.m
         m.sauver_gabarits([[[0.1] * 96] * 8] * 3, noms=["travis", "lumiere", "musique", "jarvi"])
@@ -8182,6 +8197,12 @@ class VoixAnglaise(unittest.TestCase):
             self.assertGreater(float(np.sqrt(np.mean(s.astype(np.float64) ** 2))), 1500, "il parle, il ne souffle pas")
         self.assertAlmostEqual(int(np.max(np.abs(sons[0]))), int(J.VOIX_CRETE * 32767), delta=2,
                                msg="crete normalisee (80 % : pas d'ecretage au reechantillonnage)")
+
+    def test_il_dit_ce_qui_le_calcule_et_a_quelle_vitesse(self):
+        self.assertIn(self.syn.moteur(), ("CPUExecutionProvider", "DmlExecutionProvider",
+                                          "CUDAExecutionProvider", "CoreMLExecutionProvider"))
+        rtf = self.syn.mesurer()
+        self.assertTrue(rtf is not None and 0 < rtf < 10, rtf)
 
     def test_deux_langues_dans_un_processus(self):
         """espeak-ng n'a qu'une voix par processus : le francais du mode psy
