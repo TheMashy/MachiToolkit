@@ -5239,7 +5239,7 @@ def texte_calcul_kokoro(cle):
         t += ", %.2f s par seconde de parole" % c["rtf"]
     t += "."
     if c["moteur"] == "CPUExecutionProvider" and c.get("refus"):
-        t += " (Carte graphique refusee : %s)" % c["refus"][0][:120]
+        t += " (Carte graphique refusee : %s)" % c["refus"][0][:300]
     return t
 _KOKORO_VERROU = threading.Lock()
 _ESPEAK_VERROU = threading.Lock()     # les deux preparations peuvent vouloir l'archive en meme temps

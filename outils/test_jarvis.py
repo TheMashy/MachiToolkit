@@ -1181,6 +1181,24 @@ class Kokoro(unittest.TestCase):
                            "plus d'intonation francaise que de timbre")
         self.assertEqual(J.voix_de_kokoro(e), {"ff_siwis", "bm_lewis"})
 
+    def test_une_erreur_windows_en_francais_se_lit(self):
+        """« 'utf-8' codec can't decode byte 0xe8 » : Windows repond dans sa
+        langue et son encodage ; on relit les octets au lieu de perdre la cause."""
+        brut = "Erreur DML : La procédure spécifiée est introuvable. Accès système.".encode("cp1252")
+        try:
+            brut.decode("utf-8")
+        except UnicodeDecodeError as e:
+            r = J.raison_erreur(e)
+        if os.name != "nt":
+            self.assertIn("procédure spécifiée est introuvable", r)
+            self.assertIn("Accès système", r)
+        self.assertNotIn("codec can't decode", r)
+        self.assertEqual(J.raison_erreur(RuntimeError("une\n  ligne")), "une ligne")
+
+    def test_directml_ne_se_precharge_que_sous_windows(self):
+        if os.name != "nt":
+            self.assertIsNone(J.precharger_directml(object()))
+
     def test_la_carte_graphique_d_abord(self):
         dispo = ["DmlExecutionProvider", "CPUExecutionProvider"]
         self.assertEqual(J.accelerateurs_kokoro(dispo, ""), ["DmlExecutionProvider", "CPUExecutionProvider"])

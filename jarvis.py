@@ -2427,12 +2427,74 @@ def nom_moteur_kokoro(fournisseur):
             "CPUExecutionProvider": "le processeur"}.get(fournisseur, fournisseur or "?")
 
 
+def raison_erreur(e):
+    """Le message d'une erreur, LISIBLE. Une erreur native de Windows arrive
+    dans la langue du systeme et son encodage (cp1252 en francais) ;
+    onnxruntime la lit en UTF-8 et ne rend que « 'utf-8' codec can't decode
+    byte 0xe8 » -- le « e » accentue d'un mot francais, et la vraie cause
+    perdue. L'erreur de decodage porte pourtant les octets d'origine : on les
+    relit dans le bon encodage."""
+    if isinstance(e, UnicodeDecodeError) and isinstance(getattr(e, "object", None), (bytes, bytearray)):
+        codage = "mbcs" if os.name == "nt" else "cp1252"
+        texte = bytes(e.object).decode(codage, "replace")
+    else:
+        texte = str(e)
+    texte = " ".join(texte.split())
+    return texte[:240]
+
+
+def directml_embarquee(rt):
+    """La DirectML.dll livree avec onnxruntime-directml, ou None."""
+    try:
+        chemin = os.path.join(os.path.dirname(os.path.abspath(rt.__file__)), "capi", "DirectML.dll")
+    except Exception:
+        return None
+    return chemin if os.path.isfile(chemin) else None
+
+
+def precharger_directml(rt):
+    """Charge LA BONNE DirectML.dll avant la session.
+
+    Windows en garde une ancienne copie dans System32. Dans l'exe, onnxruntime
+    demande « DirectML.dll » par son nom seul et Windows sert celle de
+    System32, trop vieille : DirectML refuse, et la voix retombe sur le
+    processeur. Une DLL deja chargee sous ce nom est celle que Windows rend
+    ensuite a tout le monde : on charge donc d'abord, par son chemin complet,
+    celle qu'onnxruntime-directml a apportee. Rend le chemin de la DirectML
+    effectivement chargee, ou un message d'erreur."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    embarquee = directml_embarquee(rt)
+    try:
+        if embarquee:
+            try:
+                os.add_dll_directory(os.path.dirname(embarquee))
+            except Exception:
+                pass
+            ctypes.WinDLL(embarquee)
+        noyau = ctypes.WinDLL("kernel32", use_last_error=True)
+        noyau.GetModuleHandleW.restype = ctypes.c_void_p
+        noyau.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        h = noyau.GetModuleHandleW("DirectML.dll")
+        if not h:
+            return "DirectML.dll introuvable"
+        tampon = ctypes.create_unicode_buffer(520)
+        noyau.GetModuleFileNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint]
+        noyau.GetModuleFileNameW(ctypes.c_void_p(h), tampon, 520)
+        return tampon.value
+    except Exception as e:
+        return "DirectML.dll : %s" % raison_erreur(e)
+
+
 def session_kokoro(rt, modele, fils=4):
     """La session Kokoro sur le meilleur moteur qui l'accepte. Un tour a vide
     au chargement : la carte graphique compile ses noyaux a la premiere
     passe, autant que ce ne soit pas sur la premiere phrase qu'on attend."""
     import numpy as np
-    for moteur in accelerateurs_kokoro(rt.get_available_providers()):
+    moteurs = accelerateurs_kokoro(rt.get_available_providers())
+    dml = precharger_directml(rt) if "DmlExecutionProvider" in moteurs else None
+    for moteur in moteurs:
         o = rt.SessionOptions()
         o.intra_op_num_threads = max(1, int(fils))
         o.inter_op_num_threads = 1
@@ -2450,7 +2512,10 @@ def session_kokoro(rt, modele, fils=4):
             print("[jarvis] Kokoro sur %s" % session.get_providers()[0], flush=True)
             return session
         except Exception as e:
-            raison = (str(e).splitlines() or [""])[0][:160]
+            raison = raison_erreur(e)
+            if moteur == "DmlExecutionProvider" and dml:
+                # quelle DirectML.dll Windows a servie : System32, c'est la vieille
+                raison += " [DirectML.dll : %s]" % dml
             KOKORO_REFUS.append("%s : %s" % (moteur, raison))
             print("[jarvis] Kokoro : %s refuse (%s)" % (moteur, raison), flush=True)
     raise RuntimeError("Kokoro : aucun moteur n'a accepte le modele")
