@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.70.0"
+VERSION = "1.71.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -5239,7 +5239,7 @@ def texte_calcul_kokoro(cle):
         t += ", %.2f s par seconde de parole" % c["rtf"]
     t += "."
     if c["moteur"] == "CPUExecutionProvider" and c.get("refus"):
-        t += " (Carte graphique refusee : %s)" % c["refus"][0][:120]
+        t += " (Carte graphique refusee : %s)" % c["refus"][0][:300]
     return t
 _KOKORO_VERROU = threading.Lock()
 _ESPEAK_VERROU = threading.Lock()     # les deux preparations peuvent vouloir l'archive en meme temps
