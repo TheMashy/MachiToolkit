@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.74.0"
+VERSION = "1.75.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -6214,6 +6214,52 @@ def consigne_ecouter(attente, mode=None, **plus):
         c["pause"] = _jv.PHRASE_PSY_PAUSE_S
     c.update(plus)
     return c
+
+
+REVEIL_CLAVIER_ATTENTE_S = 6.0
+
+
+def reveil_au_clavier(cfg=None, attendre_oreille_s=10.0):
+    """« Ctrl+J n'allume rien, j'entends juste le bruit de notif » : le
+    raccourci basculait la case « Jarvis ecoute ». Il fait maintenant ce que
+    fait son nom dit a voix haute : Jarvis se reveille et t'ecoute -- et s'il
+    est deja en train d'ecouter, de reflechir ou de parler, il se tait (un
+    second appui congedie). Eteint, il s'allume d'abord. Rend ce qu'il a fait."""
+    cfg = CFG if cfg is None else cfg
+    # en pleine conversation (pas pendant qu'il ouvre le micro : la, on l'attend)
+    if JARVIS.get("etat") in ("ecoute", "comprend", "pense", "parle") or JARVIS.get("mode") == "psy":
+        print("Jarvis : raccourci clavier -- il se tait")
+        terminer_conversation()
+        return "congedie"
+    if not cfg.get("jarvis_actif"):
+        cfg["jarvis_actif"] = True
+        sauver_config(cfg)
+        REGLAGES_A_RELIRE.add("jarvis_actif")
+    # l'oreille demarre avec la veille de Jarvis : on lui laisse un instant
+    fin = time.time() + attendre_oreille_s
+    while not oreille_vivante() and time.time() < fin:
+        time.sleep(0.2)
+    if not oreille_vivante():
+        print("Jarvis : raccourci clavier -- l'oreille ne repond pas")
+        return "sans_oreille"
+    if etat_dictee()["etat"] != "pret":
+        return dire_transcription_indisponible(langue_du_mode()) or "sans_dictee"
+    print("Jarvis : eveil (clavier)")
+    JARVIS["tour"] = int(JARVIS.get("tour") or 0) + 1
+    VOIX.taire()
+    mode_courant()
+    poser_mode("jarvis")
+    # pas de nom a reconnaitre dans ce qui suit : c'est toi qui l'as appele
+    JARVIS.update(reveil_par="clavier", reveil_verifie=True, suite_active=True, attente_code=None,
+                  entendu="", fait_jusqua=0.0)
+    poser_led("ecoute")
+    JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=time.time() + REVEIL_CLAVIER_ATTENTE_S,
+                  ecoute_duree=REVEIL_CLAVIER_ATTENTE_S, parole_vue=0.0)
+    jouer_son("eveil")
+    envoyer_oreille(consigne_ecouter(REVEIL_CLAVIER_ATTENTE_S))
+    declencher_routines("evenement", "reveil", cfg)
+    threading.Thread(target=prechauffer_dictee, daemon=True).start()
+    return "reveille"
 
 
 def reecouter_la_suite():
@@ -16443,6 +16489,7 @@ def installer_raccourci():
 
 
 CTRL_J_ID = 0x4A4A
+CTRL_MAJ_ESPACE_ID = 0x4A4B
 
 
 def ecouter_ctrl_j(basculer):
@@ -16458,14 +16505,20 @@ def ecouter_ctrl_j(basculer):
 
     def fil():
         u = ctypes.WinDLL("user32")
-        MOD_CONTROL, MOD_NOREPEAT, VK_J, WM_HOTKEY = 0x0002, 0x4000, 0x4A, 0x0312
-        if not u.RegisterHotKey(None, CTRL_J_ID, MOD_CONTROL | MOD_NOREPEAT, VK_J):
-            print("Ctrl+J deja pris par une autre application : le raccourci de Jarvis est inactif.")
+        MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT, WM_HOTKEY = 0x0002, 0x0004, 0x4000, 0x0312
+        pris = 0
+        for ident, mods, vk, nom in ((CTRL_J_ID, MOD_CONTROL, 0x4A, "Ctrl+J"),
+                                     (CTRL_MAJ_ESPACE_ID, MOD_CONTROL | MOD_SHIFT, 0x20, "Ctrl+Maj+Espace")):
+            if u.RegisterHotKey(None, ident, mods | MOD_NOREPEAT, vk):
+                pris += 1
+                print("%s : reveille Jarvis" % nom)
+            else:
+                print("%s deja pris par une autre application : inactif pour Jarvis." % nom)
+        if not pris:
             return
-        print("Ctrl+J : bascule Jarvis")
         msg = wintypes.MSG()
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY and msg.wParam == CTRL_J_ID:
+            if msg.message == WM_HOTKEY and msg.wParam in (CTRL_J_ID, CTRL_MAJ_ESPACE_ID):
                 basculer()
     threading.Thread(target=fil, daemon=True, name="ctrl-j").start()
     return True
@@ -16931,7 +16984,10 @@ def lancer():
     # l'installation, et une mise a jour ne repasse pas par la)
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
-    sans_faute("Ctrl+J de Jarvis", ecouter_ctrl_j, lambda: REGLAGES_A_RELIRE.add("__bascule__"))
+    # Ctrl+J et Ctrl+Maj+Espace : il se reveille et t'ecoute (hors du fil de Tk)
+    sans_faute("Ctrl+J de Jarvis", ecouter_ctrl_j,
+               lambda: threading.Thread(target=sans_faute, args=("Reveil clavier", reveil_au_clavier),
+                                        daemon=True).start())
 
     def basculer_jarvis(*_):
         CFG["jarvis_actif"] = not CFG.get("jarvis_actif", False)
@@ -17212,9 +17268,8 @@ def lancer():
         # boucle de la fenetre -- l'effacer prouve a l'autre copie que la
         # fenetre vit (voir reveiller_ou_remplacer)
         # le raccourci de Windows (--basculer-jarvis) a laisse son mot
-        if relever_bascule_jarvis() or "__bascule__" in REGLAGES_A_RELIRE:
-            REGLAGES_A_RELIRE.discard("__bascule__")
-            sans_faute("Bascule de Jarvis", basculer_jarvis)
+        if relever_bascule_jarvis():
+            threading.Thread(target=sans_faute, args=("Reveil clavier", reveil_au_clavier), daemon=True).start()
         if relever_demande_panneau():
             demande_ouverture.set()
         # des reglages changes par Jarvis ou le menu de l'icone : la fenetre les relit

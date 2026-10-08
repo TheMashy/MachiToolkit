@@ -2803,6 +2803,34 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.diagnostic_spotify(m.CFG), "OK. Jeton : OK.")
         self.assertIs(m._jv.CONTEXTE_SSL, m._contexte_ssl, "Spotify passe par le magasin de Machi Tool")
 
+    def test_ctrl_j_le_reveille_et_un_second_appui_le_congedie(self):
+        # « Ctrl+J n'allume rien, j'entends juste le bruit de notif »
+        m = self.m
+        vrais = (m.oreille_vivante, m.poser_led, m.declencher_routines, m.terminer_conversation)
+        self.addCleanup(lambda: (setattr(m, "oreille_vivante", vrais[0]), setattr(m, "poser_led", vrais[1]),
+                                 setattr(m, "declencher_routines", vrais[2]),
+                                 setattr(m, "terminer_conversation", vrais[3])))
+        congedies = []
+        m.oreille_vivante, m.poser_led = (lambda: True), (lambda *a, **k: None)
+        m.declencher_routines = lambda *a, **k: None
+        m.terminer_conversation = lambda: congedies.append(1)
+        m.prechauffer_dictee = lambda: None
+        m.envoyer_oreille = lambda o: self.envoye.append(o) or True
+        m.CFG["jarvis_actif"] = False
+        m.JARVIS.update(etat="eteint", mode="jarvis", suite_active=False)
+        self.assertEqual(m.reveil_au_clavier(m.CFG, attendre_oreille_s=0), "reveille")
+        self.assertTrue(m.CFG["jarvis_actif"], "eteint, il s'allume d'abord")
+        self.assertEqual(m.JARVIS["etat"], "ecoute")
+        self.assertTrue(m.JARVIS["suite_active"], "pas besoin de dire son nom : on l'a appele au clavier")
+        self.assertEqual([o["cmd"] for o in self.envoye], ["ecouter"])
+        self.assertEqual(m.reveil_au_clavier(m.CFG, attendre_oreille_s=0), "congedie")
+        self.assertEqual(congedies, [1])
+        # pendant qu'il ouvre le micro, un appui ne le congedie pas : il l'attend
+        m.JARVIS.update(etat="demarrage")
+        m.oreille_vivante = lambda: False
+        self.assertEqual(m.reveil_au_clavier(m.CFG, attendre_oreille_s=0), "sans_oreille")
+        self.assertEqual(congedies, [1])
+
     def test_un_appel_pas_net_est_verifie_par_transcription(self):
         m = self.m
         envoye = []
