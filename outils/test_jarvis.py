@@ -2803,6 +2803,18 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.diagnostic_spotify(m.CFG), "OK. Jeton : OK.")
         self.assertIs(m._jv.CONTEXTE_SSL, m._contexte_ssl, "Spotify passe par le magasin de Machi Tool")
 
+    def test_un_raccourci_pris_par_une_autre_appli_est_retente(self):
+        # « Handy avait pris control shift espace, je l'ai eteint, retente »
+        m = self.m
+        tenu = {m.CTRL_MAJ_ESPACE_ID}
+        combos = [(m.CTRL_J_ID, 2, 0x4A, "Ctrl+J"), (m.CTRL_MAJ_ESPACE_ID, 6, 0x20, "Ctrl+Maj+Espace")]
+        enregistrer = lambda i, mods, vk: i not in tenu
+        restent = m.prendre_raccourcis(combos, enregistrer)
+        self.assertEqual([c[3] for c in restent], ["Ctrl+Maj+Espace"])
+        self.assertEqual(m.prendre_raccourcis(restent, enregistrer, bavard=False), restent, "Handy le tient encore")
+        tenu.clear()
+        self.assertEqual(m.prendre_raccourcis(restent, enregistrer, bavard=False), [], "libere : Jarvis le prend")
+
     def test_ctrl_j_le_reveille_et_un_second_appui_le_congedie(self):
         # « Ctrl+J n'allume rien, j'entends juste le bruit de notif »
         m = self.m
