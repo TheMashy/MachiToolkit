@@ -103,6 +103,22 @@ class Demarrage(unittest.TestCase):
         self.assertIn('REGLAGES_A_RELIRE.add("jarvis_panneau")', corps)
         self.assertNotIn(".set(", corps)
 
+    def test_ctrl_shift_espace_bascule_jarvis_par_windows(self):
+        """« Control shift espace toggle Jarvis » : le raccourci est celui de
+        Windows (une entree du menu Demarrer), qui lance --basculer-jarvis ;
+        l'instance qui tourne lit le mot et bascule. Machi Tool ne lit jamais
+        le clavier."""
+        mt = self.mt
+        self.assertEqual(mt.CONFIG_DEFAUT["jarvis_raccourci_clavier"], "Ctrl+Shift+Space")
+        self.assertFalse(mt.relever_bascule_jarvis())
+        self.assertTrue(mt.demander_bascule_jarvis())
+        self.assertTrue(mt.relever_bascule_jarvis())
+        self.assertFalse(mt.relever_bascule_jarvis(), "une seule fois par appui")
+        src = open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8").read()
+        surveiller = src[src.index("    def surveiller():"):]
+        surveiller = surveiller[:surveiller.index("panneau.root.after(150, surveiller)")]
+        self.assertIn("relever_bascule_jarvis()", surveiller)
+
     # ---------------- la configuration ----------------
 
     def test_config_absente(self):
