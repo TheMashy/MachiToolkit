@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.72.0"
+VERSION = "1.73.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -420,7 +420,9 @@ CONFIG_DEFAUT = {
     # « Un raccourci clavier pour basculer Jarvis » : tenu par WINDOWS (la
     # touche de raccourci d'une entree du menu Demarrer), jamais par Machi
     # Tool -- qui ne lit pas le clavier. Vide : pas de raccourci.
-    "jarvis_raccourci_clavier": "Ctrl+Shift+Space",
+    # Windows n'accepte pas Espace (ni une touche avec Ctrl seul) pour la
+    # touche d'un raccourci : Ctrl+Maj+J.
+    "jarvis_raccourci_clavier": "Ctrl+Shift+J",
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -697,6 +699,9 @@ def charger_config():
     au retour, ne disait qu'il ne s'en etait pas produit un. Une ligne suffit a
     lever le doute, et elle se lit au premier coup d'oeil sur le panneau.
     """
+    # 1.72 posait Ctrl+Maj+Espace, que Windows refuse pour un raccourci
+    if cfg.get("jarvis_raccourci_clavier") == "Ctrl+Shift+Space":
+        cfg["jarvis_raccourci_clavier"] = "Ctrl+Shift+J"
     vue = str(enregistre.get("derniere_version", "") or "")
     cfg["derniere_version"] = VERSION
     if vue and vue != VERSION:
@@ -16435,6 +16440,17 @@ def installer_raccourci():
         print("Raccourci menu Demarrer non cree :", e)
 
 
+def poser_raccourci_jarvis(cfg=None):
+    """L'entree « Jarvis - basculer » du menu Demarrer, a jour de la config."""
+    if os.name != "nt" or not FIGE:
+        return
+    import win32com.client
+    dossier = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs")
+    os.makedirs(dossier, exist_ok=True)
+    installer_raccourci_jarvis(win32com.client.Dispatch("WScript.Shell"), dossier,
+                               os.path.join(DOSSIER, "icone.ico"), cfg)
+
+
 def installer_raccourci_jarvis(shell, dossier, ico, cfg=None):
     """« Control shift espace toggle Jarvis » : une entree du menu Demarrer
     qui lance --basculer-jarvis, avec sa touche de raccourci. C'est WINDOWS
@@ -16880,6 +16896,9 @@ def lancer():
     JARVIS_CROCHETS["ouvrir_panneau"] = lambda: demande_ouverture.set()
     sans_faute("Jarvis", demarrer_jarvis, CFG)
     sans_faute("Taches de Jarvis", reprendre_taches, CFG)
+    # le raccourci Ctrl+Maj+J : pose a chaque lancement (il n'etait pose qu'a
+    # l'installation, et une mise a jour ne repasse pas par la)
+    sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
 
     def basculer_jarvis(*_):
         CFG["jarvis_actif"] = not CFG.get("jarvis_actif", False)

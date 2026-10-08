@@ -109,7 +109,9 @@ class Demarrage(unittest.TestCase):
         l'instance qui tourne lit le mot et bascule. Machi Tool ne lit jamais
         le clavier."""
         mt = self.mt
-        self.assertEqual(mt.CONFIG_DEFAUT["jarvis_raccourci_clavier"], "Ctrl+Shift+Space")
+        self.assertEqual(mt.CONFIG_DEFAUT["jarvis_raccourci_clavier"], "Ctrl+Shift+J")
+        src0 = open(os.path.join(RACINE, "machi_tool.py"), encoding="utf-8").read()
+        self.assertIn('sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)', src0, "pose a chaque lancement")
         self.assertFalse(mt.relever_bascule_jarvis())
         self.assertTrue(mt.demander_bascule_jarvis())
         self.assertTrue(mt.relever_bascule_jarvis())
