@@ -2657,9 +2657,13 @@ class CeQuiNeSeFaitPas(unittest.TestCase):
     def test_aucun_crochet_clavier(self):
         for nom in ("jarvis.py", "machi_tool.py"):
             src = self.lire(nom).lower()
+            # « il y a un Ctrl+J maintenant » : un raccourci global (RegisterHotKey)
+            # est permis -- il ne voit que sa combinaison. Lire le clavier, non :
+            # rien de tout ca n'en a besoin.
             for interdit in ("setwindowshookex", "pynput", "import keyboard", "wh_keyboard",
-                             "getasynckeystate", "registerhotkey"):
+                             "getasynckeystate"):
                 self.assertNotIn(interdit, src, "%s : %s" % (nom, interdit))
+        self.assertNotIn("registerhotkey", self.lire("jarvis.py").lower())
 
     def test_l_oreille_n_ecrit_rien_sur_le_disque(self):
         src = self.lire("jarvis.py")

@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.73.0"
+VERSION = "1.74.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -423,6 +423,8 @@ CONFIG_DEFAUT = {
     # Windows n'accepte pas Espace (ni une touche avec Ctrl seul) pour la
     # touche d'un raccourci : Ctrl+Maj+J.
     "jarvis_raccourci_clavier": "Ctrl+Shift+J",
+    # Ctrl+J bascule Jarvis, partout (raccourci global, tenu par Machi Tool)
+    "jarvis_ctrl_j": True,
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -16440,6 +16442,35 @@ def installer_raccourci():
         print("Raccourci menu Demarrer non cree :", e)
 
 
+CTRL_J_ID = 0x4A4A
+
+
+def ecouter_ctrl_j(basculer):
+    """« Il y a un Ctrl+J maintenant » : Windows previent Machi Tool quand
+    Ctrl+J est presse (RegisterHotKey), et rien d'autre -- le reste du clavier
+    ne passe jamais par ici. Un fil a sa propre boucle de messages ; la
+    bascule, elle, se fait dans la boucle de la fenetre (`basculer` y laisse
+    un mot)."""
+    if os.name != "nt" or not CFG.get("jarvis_ctrl_j", True):
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    def fil():
+        u = ctypes.WinDLL("user32")
+        MOD_CONTROL, MOD_NOREPEAT, VK_J, WM_HOTKEY = 0x0002, 0x4000, 0x4A, 0x0312
+        if not u.RegisterHotKey(None, CTRL_J_ID, MOD_CONTROL | MOD_NOREPEAT, VK_J):
+            print("Ctrl+J deja pris par une autre application : le raccourci de Jarvis est inactif.")
+            return
+        print("Ctrl+J : bascule Jarvis")
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_HOTKEY and msg.wParam == CTRL_J_ID:
+                basculer()
+    threading.Thread(target=fil, daemon=True, name="ctrl-j").start()
+    return True
+
+
 def poser_raccourci_jarvis(cfg=None):
     """L'entree « Jarvis - basculer » du menu Demarrer, a jour de la config."""
     if os.name != "nt" or not FIGE:
@@ -16899,6 +16930,8 @@ def lancer():
     # le raccourci Ctrl+Maj+J : pose a chaque lancement (il n'etait pose qu'a
     # l'installation, et une mise a jour ne repasse pas par la)
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
+    # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
+    sans_faute("Ctrl+J de Jarvis", ecouter_ctrl_j, lambda: REGLAGES_A_RELIRE.add("__bascule__"))
 
     def basculer_jarvis(*_):
         CFG["jarvis_actif"] = not CFG.get("jarvis_actif", False)
@@ -17179,7 +17212,8 @@ def lancer():
         # boucle de la fenetre -- l'effacer prouve a l'autre copie que la
         # fenetre vit (voir reveiller_ou_remplacer)
         # le raccourci de Windows (--basculer-jarvis) a laisse son mot
-        if relever_bascule_jarvis():
+        if relever_bascule_jarvis() or "__bascule__" in REGLAGES_A_RELIRE:
+            REGLAGES_A_RELIRE.discard("__bascule__")
             sans_faute("Bascule de Jarvis", basculer_jarvis)
         if relever_demande_panneau():
             demande_ouverture.set()
