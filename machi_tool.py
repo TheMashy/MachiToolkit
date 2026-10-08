@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.75.0"
+VERSION = "1.76.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -16490,6 +16490,22 @@ def installer_raccourci():
 
 CTRL_J_ID = 0x4A4A
 CTRL_MAJ_ESPACE_ID = 0x4A4B
+RACCOURCI_RETENTE_S = 30
+
+
+def prendre_raccourcis(manquants, enregistrer, bavard=True):
+    """Tente chaque combinaison ; rend celles qu'une autre application tient
+    encore. `bavard` : ne pas redire l'echec a chaque nouvel essai."""
+    restent = []
+    for ident, mods, vk, nom in manquants:
+        if enregistrer(ident, mods, vk):
+            print("%s : reveille Jarvis" % nom)
+        else:
+            if bavard:
+                print("%s deja pris par une autre application : retente toutes les %d s."
+                      % (nom, RACCOURCI_RETENTE_S))
+            restent.append((ident, mods, vk, nom))
+    return restent
 
 
 def ecouter_ctrl_j(basculer):
@@ -16505,21 +16521,24 @@ def ecouter_ctrl_j(basculer):
 
     def fil():
         u = ctypes.WinDLL("user32")
-        MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT, WM_HOTKEY = 0x0002, 0x0004, 0x4000, 0x0312
-        pris = 0
-        for ident, mods, vk, nom in ((CTRL_J_ID, MOD_CONTROL, 0x4A, "Ctrl+J"),
-                                     (CTRL_MAJ_ESPACE_ID, MOD_CONTROL | MOD_SHIFT, 0x20, "Ctrl+Maj+Espace")):
-            if u.RegisterHotKey(None, ident, mods | MOD_NOREPEAT, vk):
-                pris += 1
-                print("%s : reveille Jarvis" % nom)
-            else:
-                print("%s deja pris par une autre application : inactif pour Jarvis." % nom)
-        if not pris:
-            return
+        MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT, WM_HOTKEY, WM_TIMER = 0x0002, 0x0004, 0x4000, 0x0312, 0x0113
+        manquants = [(CTRL_J_ID, MOD_CONTROL, 0x4A, "Ctrl+J"),
+                     (CTRL_MAJ_ESPACE_ID, MOD_CONTROL | MOD_SHIFT, 0x20, "Ctrl+Maj+Espace")]
+        manquants = prendre_raccourcis(manquants, lambda i, m, vk: u.RegisterHotKey(None, i, m | MOD_NOREPEAT, vk))
+        # « Handy avait pris Ctrl+Maj+Espace, je l'ai eteint » : une combinaison
+        # prise par une autre application est retentee toutes les 30 s -- liberee,
+        # elle sert a Jarvis sans redemarrer Machi Tool
+        minuterie = u.SetTimer(None, 0, RACCOURCI_RETENTE_S * 1000, None) if manquants else 0
         msg = wintypes.MSG()
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY and msg.wParam in (CTRL_J_ID, CTRL_MAJ_ESPACE_ID):
                 basculer()
+            elif msg.message == WM_TIMER and manquants:
+                manquants = prendre_raccourcis(manquants,
+                                               lambda i, m, vk: u.RegisterHotKey(None, i, m | MOD_NOREPEAT, vk),
+                                               bavard=False)
+                if not manquants:
+                    u.KillTimer(None, minuterie)
     threading.Thread(target=fil, daemon=True, name="ctrl-j").start()
     return True
 
