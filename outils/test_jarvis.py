@@ -2815,6 +2815,48 @@ class DansMachiTool(unittest.TestCase):
         tenu.clear()
         self.assertEqual(m.prendre_raccourcis(restent, enregistrer, bavard=False), [], "libere : Jarvis le prend")
 
+    def test_ctrl_maj_espace_prend_une_note_pour_le_carnet(self):
+        # « il faut que control shift espace remplisse un systeme de notes, pour
+        # inscrire on the fly des infos sur brain debugger » -- et « bon, j'y
+        # vais » dit dans la note ne le congedie pas
+        m = self.m
+        noms = ("oreille_vivante", "poser_led", "declencher_routines", "_requete_bd", "dire", "_cle_presente")
+        vrais = {k: getattr(m, k) for k in noms}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        self.addCleanup(lambda: m.NOTES_EN_ATTENTE.clear())
+        poses, dits, panne = [], [], []
+
+        def bd(chemin, corps, cfg, delai, **k):
+            if panne:
+                raise OSError("hors ligne")
+            poses.append((chemin, corps["texte"]))
+            return {"ok": True}
+        m.oreille_vivante, m.poser_led = (lambda: True), (lambda *a, **k: None)
+        m.declencher_routines = lambda *a, **k: None
+        m.prechauffer_dictee = lambda: None
+        m.envoyer_oreille = lambda o: self.envoye.append(o) or True
+        m._requete_bd, m._cle_presente = bd, (lambda cfg: True)
+        m.dire = lambda texte, **k: dits.append(texte)
+        m.CFG["jarvis_actif"] = True
+        m.JARVIS.update(etat="attente", mode="jarvis")
+        self.assertEqual(m.reveil_au_clavier(m.CFG, attendre_oreille_s=0, note=True), "reveille")
+        self.assertEqual(m.JARVIS["message"], "Je note.")
+        self.assertIn("pause", self.envoye[-1], "il laisse le temps de dicter")
+        tour = m.JARVIS["tour"]
+        m._traiter_texte("Rappeler le garage-témoin demain, bon j'y vais, au revoir.", m.CFG, tour,
+                         None, False, False, False, "fr")
+        self.assertEqual(poses, [("/api/machitool/note", "Rappeler le garage-témoin demain, bon j'y vais, au revoir.")])
+        self.assertEqual(dits, ["Noté."])
+        self.assertIsNone(m.JARVIS.get("note_tour"), "une seule phrase est une note")
+        # BrainDebugger injoignable : la note est gardee, et part avec la suivante
+        panne.append(1)
+        m.reveil_au_clavier(m.CFG, attendre_oreille_s=0, note=True)
+        self.assertEqual(m.noter_au_carnet("note-témoin une", m.CFG, m.JARVIS["tour"], "fr"), "gardee")
+        panne.clear()
+        self.assertEqual(m.noter_au_carnet("note-témoin deux", m.CFG, m.JARVIS["tour"], "fr"), "notee")
+        self.assertEqual([t for _, t in poses[1:]], ["note-témoin une", "note-témoin deux"])
+        self.assertEqual(m.NOTES_EN_ATTENTE, [])
+
     def test_ctrl_j_le_reveille_et_un_second_appui_le_congedie(self):
         # « Ctrl+J n'allume rien, j'entends juste le bruit de notif »
         m = self.m
