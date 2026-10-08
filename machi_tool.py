@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.76.0"
+VERSION = "1.77.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -6219,12 +6219,19 @@ def consigne_ecouter(attente, mode=None, **plus):
 REVEIL_CLAVIER_ATTENTE_S = 6.0
 
 
-def reveil_au_clavier(cfg=None, attendre_oreille_s=10.0):
+def reveil_au_clavier(cfg=None, attendre_oreille_s=10.0, note=False):
     """« Ctrl+J n'allume rien, j'entends juste le bruit de notif » : le
     raccourci basculait la case « Jarvis ecoute ». Il fait maintenant ce que
     fait son nom dit a voix haute : Jarvis se reveille et t'ecoute -- et s'il
     est deja en train d'ecouter, de reflechir ou de parler, il se tait (un
-    second appui congedie). Eteint, il s'allume d'abord. Rend ce qu'il a fait."""
+    second appui congedie). Eteint, il s'allume d'abord. Rend ce qu'il a fait.
+
+    `note` (Ctrl+Maj+Espace) : « il faut que control shift espace remplisse un
+    systeme de notes, pour inscrire on the fly des infos sur BrainDebugger ».
+    Ce qui est dit ensuite n'est pas une demande : c'est une note, qui part au
+    carnet telle quelle -- meme « bon, j'y vais » ne le congedie pas (voir
+    `noter_au_carnet`). Il ecoute comme le psychologue : plus long, plus de
+    silence avant de conclure."""
     cfg = CFG if cfg is None else cfg
     # en pleine conversation (pas pendant qu'il ouvre le micro : la, on l'attend)
     if JARVIS.get("etat") in ("ecoute", "comprend", "pense", "parle") or JARVIS.get("mode") == "psy":
@@ -6251,12 +6258,13 @@ def reveil_au_clavier(cfg=None, attendre_oreille_s=10.0):
     poser_mode("jarvis")
     # pas de nom a reconnaitre dans ce qui suit : c'est toi qui l'as appele
     JARVIS.update(reveil_par="clavier", reveil_verifie=True, suite_active=True, attente_code=None,
-                  entendu="", fait_jusqua=0.0)
+                  entendu="", fait_jusqua=0.0, note_tour=JARVIS["tour"] if note else None)
     poser_led("ecoute")
-    JARVIS.update(etat="ecoute", message="Je vous ecoute.", ecoute_fin=time.time() + REVEIL_CLAVIER_ATTENTE_S,
+    JARVIS.update(etat="ecoute", message="Je note." if note else "Je vous ecoute.",
+                  ecoute_fin=time.time() + REVEIL_CLAVIER_ATTENTE_S,
                   ecoute_duree=REVEIL_CLAVIER_ATTENTE_S, parole_vue=0.0)
     jouer_son("eveil")
-    envoyer_oreille(consigne_ecouter(REVEIL_CLAVIER_ATTENTE_S))
+    envoyer_oreille(consigne_ecouter(REVEIL_CLAVIER_ATTENTE_S, mode="psy" if note else "jarvis"))
     declencher_routines("evenement", "reveil", cfg)
     threading.Thread(target=prechauffer_dictee, daemon=True).start()
     return "reveille"
@@ -6807,6 +6815,13 @@ _PHRASES = {
     "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page de l'assistant, dans Machi Tool.",
                               "Transcription isn't ready yet. Have a look at the assistant page in Machi Tool."),
     "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
+    "note_posee": ("Noté.", "Noted."),
+    "note_gardee": ("Je n'ai pas pu la noter dans BrainDebugger. Je la garde, elle partira avec la prochaine.",
+                    "I couldn't note it in BrainDebugger. I'm keeping it; it will go with the next one."),
+    "note_sans_bd": ("BrainDebugger ne connaît pas encore les notes : il faut le redéployer. Je la garde.",
+                     "BrainDebugger doesn't know about notes yet: it needs redeploying. I'm keeping it."),
+    "note_sans_cle": ("Je ne peux rien noter : la passerelle BrainDebugger n'est pas réglée.",
+                      "I can't note anything: the BrainDebugger bridge isn't set up."),
     "transcription_telecharge": ("Ma transcription se télécharge encore : %d pour cent.",
                                  "My transcription is still downloading: %d percent."),
     "transcription_reessaie": ("Ma transcription n'a pas pu se préparer. Je réessaie.",
@@ -7613,6 +7628,44 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
     return _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L)
 
 
+NOTES_EN_ATTENTE = []      # notes que BrainDebugger n'a pas prises : en memoire, jamais sur le disque
+
+
+def noter_au_carnet(texte, cfg, tour, L):
+    """La phrase dite apres Ctrl+Maj+Espace part au carnet de BrainDebugger
+    telle quelle (POST /api/machitool/note). « Fait qu'il note ce qui a ete
+    dit plutot que se refermer s'il detecte qu'on lui dit de partir » : ni
+    au revoir, ni code, ni outil -- seulement la note. Celles qui n'ont pas pu
+    partir restent en memoire et partent avec la suivante. Rend ce qui a ete fait."""
+    texte = " ".join(str(texte or "").split())
+    if not texte:
+        fin_de_l_ecoute()
+        return "vide"
+    if not _cle_presente(cfg):
+        dire(phrase("note_sans_cle", L), tour=tour)
+        return "sans_cle"
+    poser_led("comprend")
+    JARVIS.update(etat="pense", message="Je note...")
+    a_poser = NOTES_EN_ATTENTE[:] + [texte]
+    del NOTES_EN_ATTENTE[:]
+    for i, t in enumerate(a_poser):
+        try:
+            _requete_bd("/api/machitool/note", {"texte": t}, cfg, 20)
+        except urllib.error.HTTPError as e:
+            NOTES_EN_ATTENTE.extend(a_poser[i:])
+            print("Jarvis : note pas posee au carnet (HTTP %d)" % e.code)
+            dire(phrase("note_sans_bd" if e.code == 404 else "note_gardee", L), tour=tour)
+            return "gardee"
+        except Exception as e:
+            NOTES_EN_ATTENTE.extend(a_poser[i:])
+            print("Jarvis : note pas posee au carnet (%s)" % type(e).__name__)
+            dire(phrase("note_gardee", L), tour=tour)
+            return "gardee"
+    print("Jarvis : %d note(s) au carnet" % len(a_poser))
+    dire(phrase("note_posee", L), tour=tour)
+    return "notee"
+
+
 def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=False):
     """« Mets la musique de... » -- la phrase n'est pas finie : il ne repond
     pas a la moitie, il ecoute la suite (sans carillon : on parlait deja).
@@ -7659,6 +7712,10 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
             and _jv.phrase_suspendue(brut, L)
             and _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L)):
         return
+    if JARVIS.get("note_tour") == tour:
+        # Ctrl+Maj+Espace : une note, pas une demande -- rien n'est interprete
+        JARVIS["note_tour"] = None
+        return noter_au_carnet(brut, cfg, tour, L)
     premiere = not suite and not code              # la phrase qui suit un reveil (ou qui le coupe)
     coupe = apres_coupure or breve
 
@@ -16532,7 +16589,7 @@ def ecouter_ctrl_j(basculer):
         msg = wintypes.MSG()
         while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_HOTKEY and msg.wParam in (CTRL_J_ID, CTRL_MAJ_ESPACE_ID):
-                basculer()
+                basculer(msg.wParam == CTRL_MAJ_ESPACE_ID)
             elif msg.message == WM_TIMER and manquants:
                 manquants = prendre_raccourcis(manquants,
                                                lambda i, m, vk: u.RegisterHotKey(None, i, m | MOD_NOREPEAT, vk),
@@ -17003,10 +17060,11 @@ def lancer():
     # l'installation, et une mise a jour ne repasse pas par la)
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
-    # Ctrl+J et Ctrl+Maj+Espace : il se reveille et t'ecoute (hors du fil de Tk)
+    # Ctrl+J : il se reveille et t'ecoute ; Ctrl+Maj+Espace : il prend une
+    # note pour le carnet (hors du fil de Tk). Un second appui le congedie.
     sans_faute("Ctrl+J de Jarvis", ecouter_ctrl_j,
-               lambda: threading.Thread(target=sans_faute, args=("Reveil clavier", reveil_au_clavier),
-                                        daemon=True).start())
+               lambda note: threading.Thread(target=sans_faute, args=("Reveil clavier", reveil_au_clavier),
+                                             kwargs={"note": note}, daemon=True).start())
 
     def basculer_jarvis(*_):
         CFG["jarvis_actif"] = not CFG.get("jarvis_actif", False)
