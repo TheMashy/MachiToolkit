@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.71.0"
+VERSION = "1.72.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -417,6 +417,10 @@ CONFIG_DEFAUT = {
     # « Ainsi qu'annoncer une mise a jour (il peut la lancer) » : il dit qu'une
     # version attend, qu'il s'en va l'installer, puis qu'il est revenu
     "jarvis_annoncer_maj": True,
+    # « Un raccourci clavier pour basculer Jarvis » : tenu par WINDOWS (la
+    # touche de raccourci d'une entree du menu Demarrer), jamais par Machi
+    # Tool -- qui ne lit pas le clavier. Vide : pas de raccourci.
+    "jarvis_raccourci_clavier": "Ctrl+Shift+Space",
     # « Une discussion a double transmission, comme ChatGPT, pour pouvoir
     # couper la parole » : on parle par-dessus, il se tait et ecoute -- et si
     # personne ne parlait (un clavier, une porte), il reprend sa phrase.
@@ -920,6 +924,29 @@ FICHIER_DEMANDE = os.path.join(DOSSIER, "synchro_demandee")
 # alors que l'application tourne deja se fait renvoyer par le mutex, et l'ecran
 # ne bouge pas. Il laisse donc un mot avant de partir.
 FICHIER_PANNEAU = os.path.join(DOSSIER, "panneau_demande")
+# Le meme mot laisse, pour basculer Jarvis (voir --basculer-jarvis)
+FICHIER_BASCULE_JARVIS = os.path.join(DOSSIER, "jarvis_bascule")
+BASCULER_JARVIS_ARG = "--basculer-jarvis"
+
+
+def demander_bascule_jarvis():
+    try:
+        with open(FICHIER_BASCULE_JARVIS, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+        return True
+    except Exception as e:
+        print("Bascule de Jarvis non deposee :", e)
+        return False
+
+
+def relever_bascule_jarvis():
+    try:
+        if not os.path.exists(FICHIER_BASCULE_JARVIS):
+            return False
+        os.remove(FICHIER_BASCULE_JARVIS)
+        return True
+    except Exception:
+        return False
 
 
 def deposer_demande_synchro(origine="site"):
@@ -16403,8 +16430,38 @@ def installer_raccourci():
             raccourci.IconLocation = ico
         raccourci.Description = NOM_APP
         raccourci.Save()
+        installer_raccourci_jarvis(shell, dossier, ico)
     except Exception as e:
         print("Raccourci menu Demarrer non cree :", e)
+
+
+def installer_raccourci_jarvis(shell, dossier, ico, cfg=None):
+    """« Control shift espace toggle Jarvis » : une entree du menu Demarrer
+    qui lance --basculer-jarvis, avec sa touche de raccourci. C'est WINDOWS
+    qui ecoute la combinaison (comme pour n'importe quel raccourci) : Machi
+    Tool ne lit jamais le clavier. Vide dans la config : l'entree est retiree."""
+    cfg = CFG if cfg is None else cfg
+    lien = os.path.join(dossier, "Jarvis - basculer.lnk")
+    touches = str(cfg.get("jarvis_raccourci_clavier", "") or "").strip()
+    if not touches:
+        try:
+            os.remove(lien)
+        except OSError:
+            pass
+        return
+    raccourci = shell.CreateShortcut(lien)
+    raccourci.TargetPath = CIBLE_EXE
+    raccourci.Arguments = BASCULER_JARVIS_ARG
+    raccourci.WorkingDirectory = DOSSIER
+    raccourci.WindowStyle = 7                 # reduit : rien ne s'ouvre a l'ecran
+    if os.path.exists(ico):
+        raccourci.IconLocation = ico
+    raccourci.Description = "Allumer ou eteindre Jarvis"
+    try:
+        raccourci.Hotkey = touches
+    except Exception as e:
+        print("Touche de raccourci refusee par Windows (%s) : %s" % (touches, e))
+    raccourci.Save()
 
 
 def installer_protocole():
@@ -17102,6 +17159,9 @@ def lancer():
         # « montre-toi », laisse par un second lancement : relu ICI, dans la
         # boucle de la fenetre -- l'effacer prouve a l'autre copie que la
         # fenetre vit (voir reveiller_ou_remplacer)
+        # le raccourci de Windows (--basculer-jarvis) a laisse son mot
+        if relever_bascule_jarvis():
+            sans_faute("Bascule de Jarvis", basculer_jarvis)
         if relever_demande_panneau():
             demande_ouverture.set()
         # des reglages changes par Jarvis ou le menu de l'icone : la fenetre les relit
@@ -17197,6 +17257,12 @@ def main():
     lien = next((a for a in sys.argv[1:] if a.startswith("machitool://")), None)
     if lien:
         deposer_demande_synchro("lien")
+    if BASCULER_JARVIS_ARG in sys.argv:
+        # lance par le raccourci de Windows : un mot pour l'instance qui tourne,
+        # et on s'en va ; sans instance, le mot est perime, on demarre normalement
+        if deja_lance():
+            demander_bascule_jarvis()
+            return
     if FIGE:
         if installer_ou_mettre_a_jour():
             return
