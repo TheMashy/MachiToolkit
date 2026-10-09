@@ -2815,16 +2815,17 @@ class DansMachiTool(unittest.TestCase):
         tenu.clear()
         self.assertEqual(m.prendre_raccourcis(restent, enregistrer, bavard=False), [], "libere : Jarvis le prend")
 
-    def test_ctrl_maj_espace_prend_une_note_pour_le_carnet(self):
-        # « il faut que control shift espace remplisse un systeme de notes, pour
-        # inscrire on the fly des infos sur brain debugger » -- et « bon, j'y
-        # vais » dit dans la note ne le congedie pas
+    def test_ctrl_maj_espace_note_au_carnet_et_jarvis_repond(self):
+        # « il faut que control shift espace remplisse un systeme de notes » puis
+        # « je veux que jarvis puisse repondre au lieu de dire note, aussi que
+        # ca note dans brain debugger » -- et « bon, j'y vais » ne le congedie pas
         m = self.m
-        noms = ("oreille_vivante", "poser_led", "declencher_routines", "_requete_bd", "dire", "_cle_presente")
+        noms = ("oreille_vivante", "poser_led", "declencher_routines", "_requete_bd", "_cle_presente",
+                "_en_fond", "parler_a_jarvis", "souci")
         vrais = {k: getattr(m, k) for k in noms}
         self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
         self.addCleanup(lambda: m.NOTES_EN_ATTENTE.clear())
-        poses, dits, panne = [], [], []
+        poses, questions, soucis, panne = [], [], [], []
 
         def bd(chemin, corps, cfg, delai, **k):
             if panne:
@@ -2835,25 +2836,27 @@ class DansMachiTool(unittest.TestCase):
         m.declencher_routines = lambda *a, **k: None
         m.prechauffer_dictee = lambda: None
         m.envoyer_oreille = lambda o: self.envoye.append(o) or True
-        m._requete_bd, m._cle_presente = bd, (lambda cfg: True)
-        m.dire = lambda texte, **k: dits.append(texte)
+        m._requete_bd, m._cle_presente, m._en_fond = bd, (lambda cfg: True), (lambda f: f())
+        m.parler_a_jarvis = lambda texte, cfg, conv=None, notee=False: questions.append((texte, notee))
+        m.souci = soucis.append
         m.CFG["jarvis_actif"] = True
         m.JARVIS.update(etat="attente", mode="jarvis")
         self.assertEqual(m.reveil_au_clavier(m.CFG, attendre_oreille_s=0, note=True), "reveille")
-        self.assertEqual(m.JARVIS["message"], "Je note.")
         self.assertIn("pause", self.envoye[-1], "il laisse le temps de dicter")
-        tour = m.JARVIS["tour"]
-        m._traiter_texte("Rappeler le garage-témoin demain, bon j'y vais, au revoir.", m.CFG, tour,
-                         None, False, False, False, "fr")
-        self.assertEqual(poses, [("/api/machitool/note", "Rappeler le garage-témoin demain, bon j'y vais, au revoir.")])
-        self.assertEqual(dits, ["Noté."])
+        dit = "Le garage-témoin rappelle demain, bon j'y vais, au revoir."
+        m._traiter_texte(dit, m.CFG, m.JARVIS["tour"], None, False, False, False, "fr")
+        self.assertEqual(poses, [("/api/machitool/note", dit)], "au carnet, telle quelle")
+        self.assertEqual(questions, [(dit, True)], "et Jarvis y repond, en sachant qu'elle y est")
         self.assertIsNone(m.JARVIS.get("note_tour"), "une seule phrase est une note")
-        # BrainDebugger injoignable : la note est gardee, et part avec la suivante
+        # la suite de la conversation n'est plus une note
+        m._traiter_texte("Et quelle heure est-il ?", m.CFG, m.JARVIS["tour"], None, False, False, False, "fr")
+        self.assertEqual(len(poses), 1)
+        # BrainDebugger injoignable : la note est gardee (dit sur sa page), et part avec la suivante
         panne.append(1)
-        m.reveil_au_clavier(m.CFG, attendre_oreille_s=0, note=True)
-        self.assertEqual(m.noter_au_carnet("note-témoin une", m.CFG, m.JARVIS["tour"], "fr"), "gardee")
+        self.assertEqual(m.poser_notes("note-témoin une", m.CFG), 0)
+        self.assertTrue(soucis and "1 gardee" in soucis[-1])
         panne.clear()
-        self.assertEqual(m.noter_au_carnet("note-témoin deux", m.CFG, m.JARVIS["tour"], "fr"), "notee")
+        self.assertEqual(m.poser_notes("note-témoin deux", m.CFG), 2)
         self.assertEqual([t for _, t in poses[1:]], ["note-témoin une", "note-témoin deux"])
         self.assertEqual(m.NOTES_EN_ATTENTE, [])
 
