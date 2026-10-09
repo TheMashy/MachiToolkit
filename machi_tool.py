@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.77.0"
+VERSION = "1.78.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -6228,9 +6228,8 @@ def reveil_au_clavier(cfg=None, attendre_oreille_s=10.0, note=False):
 
     `note` (Ctrl+Maj+Espace) : « il faut que control shift espace remplisse un
     systeme de notes, pour inscrire on the fly des infos sur BrainDebugger ».
-    Ce qui est dit ensuite n'est pas une demande : c'est une note, qui part au
-    carnet telle quelle -- meme « bon, j'y vais » ne le congedie pas (voir
-    `noter_au_carnet`). Il ecoute comme le psychologue : plus long, plus de
+    Ce qui est dit ensuite part au carnet tel quel, et Jarvis y repond (voir
+    `noter_et_repondre`). Il ecoute comme le psychologue : plus long, plus de
     silence avant de conclure."""
     cfg = CFG if cfg is None else cfg
     # en pleine conversation (pas pendant qu'il ouvre le micro : la, on l'attend)
@@ -6815,13 +6814,6 @@ _PHRASES = {
     "transcription_absente": ("La transcription n'est pas encore prête. Jetez un œil à la page de l'assistant, dans Machi Tool.",
                               "Transcription isn't ready yet. Have a look at the assistant page in Machi Tool."),
     "transcription_ratee": ("Je vous demande pardon, je n'ai pas saisi.", "Sorry, I couldn't make that out."),
-    "note_posee": ("Noté.", "Noted."),
-    "note_gardee": ("Je n'ai pas pu la noter dans BrainDebugger. Je la garde, elle partira avec la prochaine.",
-                    "I couldn't note it in BrainDebugger. I'm keeping it; it will go with the next one."),
-    "note_sans_bd": ("BrainDebugger ne connaît pas encore les notes : il faut le redéployer. Je la garde.",
-                     "BrainDebugger doesn't know about notes yet: it needs redeploying. I'm keeping it."),
-    "note_sans_cle": ("Je ne peux rien noter : la passerelle BrainDebugger n'est pas réglée.",
-                      "I can't note anything: the BrainDebugger bridge isn't set up."),
     "transcription_telecharge": ("Ma transcription se télécharge encore : %d pour cent.",
                                  "My transcription is still downloading: %d percent."),
     "transcription_reessaie": ("Ma transcription n'a pas pu se préparer. Je réessaie.",
@@ -7629,41 +7621,46 @@ def traiter_phrase(wav64, cfg, apres_coupure=False, deja_dit=False, breve=False,
 
 
 NOTES_EN_ATTENTE = []      # notes que BrainDebugger n'a pas prises : en memoire, jamais sur le disque
+_NOTES_VERROU = threading.Lock()
 
 
-def noter_au_carnet(texte, cfg, tour, L):
-    """La phrase dite apres Ctrl+Maj+Espace part au carnet de BrainDebugger
-    telle quelle (POST /api/machitool/note). « Fait qu'il note ce qui a ete
-    dit plutot que se refermer s'il detecte qu'on lui dit de partir » : ni
-    au revoir, ni code, ni outil -- seulement la note. Celles qui n'ont pas pu
-    partir restent en memoire et partent avec la suivante. Rend ce qui a ete fait."""
+def noter_et_repondre(texte, cfg, tour):
+    """« Quand je fais Ctrl+Maj+Espace, je veux que Jarvis puisse repondre au
+    lieu de dire note, aussi que ca note dans BrainDebugger. » La phrase part
+    au carnet telle quelle (en arriere-plan, voir `poser_notes`), puis au
+    majordome, qui sait qu'elle y est deja (`notee`) : il y repond. Rien
+    n'est interprete en route -- « bon, j'y vais » ne le congedie pas."""
     texte = " ".join(str(texte or "").split())
     if not texte:
-        fin_de_l_ecoute()
-        return "vide"
-    if not _cle_presente(cfg):
-        dire(phrase("note_sans_cle", L), tour=tour)
-        return "sans_cle"
-    poser_led("comprend")
-    JARVIS.update(etat="pense", message="Je note...")
-    a_poser = NOTES_EN_ATTENTE[:] + [texte]
-    del NOTES_EN_ATTENTE[:]
-    for i, t in enumerate(a_poser):
-        try:
-            _requete_bd("/api/machitool/note", {"texte": t}, cfg, 20)
-        except urllib.error.HTTPError as e:
-            NOTES_EN_ATTENTE.extend(a_poser[i:])
-            print("Jarvis : note pas posee au carnet (HTTP %d)" % e.code)
-            dire(phrase("note_sans_bd" if e.code == 404 else "note_gardee", L), tour=tour)
-            return "gardee"
-        except Exception as e:
-            NOTES_EN_ATTENTE.extend(a_poser[i:])
-            print("Jarvis : note pas posee au carnet (%s)" % type(e).__name__)
-            dire(phrase("note_gardee", L), tour=tour)
-            return "gardee"
-    print("Jarvis : %d note(s) au carnet" % len(a_poser))
-    dire(phrase("note_posee", L), tour=tour)
-    return "notee"
+        return fin_de_l_ecoute()
+    JARVIS["entendu"] = texte
+    if _cle_presente(cfg):
+        _en_fond(lambda: poser_notes(texte, cfg))
+    return parler_a_jarvis(texte, cfg, tour, notee=True)
+
+
+def poser_notes(texte, cfg):
+    """POST /api/machitool/note : celle-ci, et celles d'avant que BrainDebugger
+    n'a pas prises -- gardees en memoire, jamais sur le disque. Un echec se dit
+    sur sa page, pas a voix haute (il est en train de te repondre). Rend
+    le nombre de notes posees."""
+    with _NOTES_VERROU:
+        a_poser = NOTES_EN_ATTENTE[:] + [texte]
+        del NOTES_EN_ATTENTE[:]
+        for i, t in enumerate(a_poser):
+            try:
+                _requete_bd("/api/machitool/note", {"texte": t}, cfg, 20)
+            except Exception as e:
+                NOTES_EN_ATTENTE.extend(a_poser[i:])
+                if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                    souci("BrainDebugger ne connait pas encore les notes : il faut le redeployer "
+                          "(%d note(s) gardee(s))" % len(NOTES_EN_ATTENTE))
+                else:
+                    souci("Note pas posee au carnet (%s) : %d gardee(s), elles partiront avec la prochaine"
+                          % (getattr(e, "code", None) or type(e).__name__, len(NOTES_EN_ATTENTE)))
+                return i
+        print("Jarvis : %d note(s) au carnet" % len(a_poser))
+        return len(a_poser)
 
 
 def _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L, coupe=False):
@@ -7713,9 +7710,9 @@ def _traiter_texte(texte, cfg, tour, suspens, apres_coupure, deja_dit, breve, L,
             and _suspendre(brut, cfg, tour, suspens, suite, deja_dit, L)):
         return
     if JARVIS.get("note_tour") == tour:
-        # Ctrl+Maj+Espace : une note, pas une demande -- rien n'est interprete
+        # Ctrl+Maj+Espace : au carnet telle quelle, puis il y repond
         JARVIS["note_tour"] = None
-        return noter_au_carnet(brut, cfg, tour, L)
+        return noter_et_repondre(brut, cfg, tour)
     premiere = not suite and not code              # la phrase qui suit un reveil (ou qui le coupe)
     coupe = apres_coupure or breve
 
@@ -10707,7 +10704,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
     dire(reponse, suite=True, langue=L, tour=conv, deja=avance)
 
 
-def parler_a_jarvis(texte, cfg, conv=None):
+def parler_a_jarvis(texte, cfg, conv=None, notee=False):
     """Le mode Jarvis : le majordome du PC, par BrainDebugger (qui tient la cle
     Claude) -- Sonnet, effort bas. Chaque echange va au journal une fois dit
     (verser_au_journal, si « jarvis_journal ») ; un message grave, lui, part
@@ -10724,7 +10721,9 @@ def parler_a_jarvis(texte, cfg, conv=None):
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
                                         dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
-                                              "onglets_ouverts": onglets_attendus(cfg)},
+                                              "onglets_ouverts": onglets_attendus(cfg),
+                                              # Ctrl+Maj+Espace : deja au carnet, il y repond
+                                              **({"notee": True} if notee else {})},
                                              **capacites_jarvis(cfg)), cfg, 180, conv,
                                         sur_debut=lambda t: dire_en_avance(t, L, conv, avance), avance=avance)
     except Interrompu:
