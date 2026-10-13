@@ -2029,6 +2029,78 @@ class EtalonnageAuFilDeLEau(unittest.TestCase):
 
 
 @unittest.skipUnless(NUMPY, "numpy absent")
+class SeulementMaVoix(unittest.TestCase):
+    """« Jarvis s'active parfois, fait qu'il n'ecoute que mon micro avec mon
+    son, avec le bon volume. » Ta voix apprise : ton « Jarvis » a ton volume le
+    reveille ; le meme mot plus bas (la tele, une video plus loin) non, et le
+    modele anglais, qui ne connait personne, se tait."""
+
+    NIVEAU = 2000.0
+
+    def setUp(self):
+        self.g = J.normer(np.random.default_rng(7).normal(size=(9, 96)))
+        self.e = EmpreintesEcrites()
+        self.sorties = []
+        self.o = J.Oreille(self.e, self.sorties.append)
+        self.o.niveau_vu = float("inf")
+        self.config(True)
+
+    def config(self, ma_voix, gabarits=True):
+        self.o.commande({"cmd": "config", "gabarits": [self.g.tolist()] if gabarits else [], "son": False,
+                         "tolerant": False, "niveau_voix": self.NIVEAU, "ma_voix": ma_voix})
+
+    def dire(self, vecteurs, amplitude):
+        for v in vecteurs:
+            self.e.a_venir.append(np.asarray(v, dtype=np.float32))
+            self.o.trame((np.sin(np.arange(J.TRAME) * 0.3) * amplitude).astype(np.int16))
+
+    def silence(self, n):
+        self.dire([np.random.default_rng(n).normal(size=96) for _ in range(n)], 20)
+
+    def reveils(self):
+        return [e for e in self.sorties if e["evt"] == "reveil"]
+
+    def test_ton_jarvis_a_ton_volume_le_reveille(self):
+        self.silence(20)
+        self.dire(self.g, 2900)                  # ~2050 de niveau : toi, au micro
+        self.assertEqual(len(self.reveils()), 1)
+
+    def test_le_meme_mot_trop_bas_ne_le_reveille_pas(self):
+        self.silence(20)
+        self.dire(self.g, 700)                   # ~500 : la tele, plus loin
+        self.silence(20)
+        self.assertEqual(self.reveils(), [])
+        self.assertGreater(self.o.det.trop_loin, 0)
+        # l'option decochee : le meme son passe, comme avant
+        self.config(False)
+        self.silence(30)
+        self.dire(self.g, 700)
+        self.assertEqual(len(self.reveils()), 1)
+
+    def test_sans_voix_apprise_rien_ne_change(self):
+        self.config(True, gabarits=False)
+        self.assertFalse(self.o.det.seule_ta_voix(), "sans voix apprise, il resterait sourd")
+
+    def test_le_modele_anglais_se_tait(self):
+        sorties = []
+        o = J.Oreille(FaussesEmpreintes(), sorties.append)
+        o.niveau_vu = float("inf")
+        o.commande({"cmd": "config", "gabarits": [self.g.tolist()], "son": False, "niveau_voix": 2000.0,
+                    "ma_voix": True})
+        for _ in range(15):
+            o.trame(trame())
+        o.trame(trame(parole=True, marque=True))      # « Hey Jarvis » de la tele
+        for _ in range(10):
+            o.trame(trame())
+        self.assertNotIn("reveil", [e["evt"] for e in sorties])
+        o.commande({"cmd": "config", "ma_voix": False})
+        for _ in range(30):
+            o.trame(trame())
+        o.trame(trame(parole=True, marque=True))
+        self.assertIn("reveil", [e["evt"] for e in sorties])
+
+
+@unittest.skipUnless(NUMPY, "numpy absent")
 class TresTolerant(EtalonnageAuFilDeLEau):
     """« Il ne se declenche pas assez : il faudrait qu'il soit tres tolerant
     au mot Jarvis. » Un appel pas net : ecoute en silence, verifie par
