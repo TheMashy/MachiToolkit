@@ -138,6 +138,13 @@ TOLERANCE_HEY = 0.5
 TOLERANCE_ATTENTE = 4           # trames : un « presque » attend de voir s'il devient net
 PAROLE_DOUCE_FACTEUR = 1.8      # un « jarvis » dit bas compte aussi comme de la parole
 PAROLE_DOUCE_MIN = 150.0
+# « Jarvis s'active parfois, fait qu'il n'ecoute que mon micro avec mon son,
+# avec le bon volume » : SEULEMENT TA VOIX, DE PRES. Ta voix apprise, un appel
+# ne compte que s'il ressemble a un « Jarvis » que TU lui as appris (pas le
+# modele anglais, qui ne connait personne ; pas ce qu'il a appris seul), et
+# s'il est dit au moins a ce niveau-la de ta voix apprise : la tele, une video,
+# quelqu'un plus loin dans la piece arrivent bien plus bas que toi au micro.
+MA_VOIX_VOLUME = 0.5
 
 
 # « JARVIS GALERE VRAIMENT A RECONNAITRE MA VOIX. » Les seuils ci-dessus ont
@@ -440,6 +447,8 @@ class Detecteur:
         self.derniere_parole_douce = -999
         self.long_proche = 12         # la longueur (en trames) du gabarit le plus proche
         self.queue_proche = 0         # reconnu avant sa fin : combien de trames du mot restent a venir
+        self.ma_voix = False          # seulement ta voix, de pres (voir MA_VOIX_VOLUME)
+        self.trop_loin = 0            # les appels ecartes parce que trop bas (l'indicateur)
 
     def longueur_mot(self):
         """La longueur d'un « Jarvis », en trames : celle du gabarit le plus
@@ -490,6 +499,29 @@ class Detecteur:
         if self.p_voix is None:
             return self.parle_doucement(rms)
         return self.p_voix >= VAD_SEUIL_SUITE and rms > max(1.2 * (self.plancher or 0.0), 40.0)
+
+    def seule_ta_voix(self):
+        """Le mode « seulement ma voix » s'applique-t-il ? Il faut une voix
+        apprise (des gabarits faits a la main, et son niveau) : sans elle, on ne
+        sait pas qui tu es, et Jarvis resterait sourd."""
+        return bool(self.ma_voix and self.niveau_appris and self.gabarits
+                    and (self.n_manuels is None or self.n_manuels > 0))
+
+    def niveau_du_mot(self, k):
+        """Le niveau du mot qui vient d'etre dit, mesure comme a l'apprentissage :
+        la mediane des trames de voix sur ses `k` dernieres trames."""
+        niv, pv = list(self.niveaux)[-k:], list(self.voix)[-k:]
+        voix = sorted(r for r, q in zip(niv, pv) if q >= VAD_SEUIL_SUITE and self.parle_doucement(r))
+        return voix[len(voix) // 2] if voix else 0.0
+
+    def assez_pres(self, k):
+        """Dit a ton volume (et pas la tele au fond de la piece) ?"""
+        if not self.seule_ta_voix():
+            return True
+        if self.niveau_du_mot(k) >= MA_VOIX_VOLUME * self.niveau_appris:
+            return True
+        self.trop_loin += 1
+        return False
 
     def parle(self, rms):
         # le plancher absolu se cale sur TON micro : un micro faible ne passait jamais 300
@@ -560,14 +592,16 @@ class Detecteur:
         # pas un mot -- il faut qu'on vienne de PARLER, et, ta voix apprise, il
         # se verifie par transcription (la tele, un film, un jeu en anglais)
         recente = self.n - self.derniere_parole_douce <= GABARIT_FIN + 3
-        if self.e.hey_m is not None and score >= self.seuil_hey and recente:
+        # seulement ta voix : le modele anglais ne te connait pas, il se tait
+        hey = self.e.hey_m is not None and not self.seule_ta_voix()
+        if hey and score >= self.seuil_hey and recente:
             if self.verifier_tout and self.gabarits:
                 self._doute("hey", score, meilleur_si_plus_petit=False)
             else:
                 self.repos_jusqua = self.n + 25
                 self.en_doute = None
                 return ("hey", score)
-        elif self.e.hey_m is not None and self.tolerance and recente and score >= self.seuil_hey * TOLERANCE_HEY:
+        elif hey and self.tolerance and recente and score >= self.seuil_hey * TOLERANCE_HEY:
             self._doute("hey", score, meilleur_si_plus_petit=False)
         if not self.gabarits:
             return self._rendre_doute()
@@ -579,7 +613,9 @@ class Detecteur:
         x_ = np.array(self.emps)
         meilleur = 9.0
         self.plus_proche = None
-        for i, g in enumerate(self.gabarits):
+        # seulement ta voix : ce qu'il a appris seul ne compte plus, que les tiens
+        apprises = self.gabarits[:self.n_manuels] if self.seule_ta_voix() and self.n_manuels else self.gabarits
+        for i, g in enumerate(apprises):
             fen = x_[-(int(FENETRE_FACTEUR * len(g)) + 1):]
             if len(fen) < len(g) // 2:
                 continue
@@ -595,6 +631,8 @@ class Detecteur:
         voise = sum(1 for r, q in zip(niv, pv) if q >= VAD_SEUIL and self.parle(r)) >= TRAMES_VOISEES_MIN
         voise_doux = sum(1 for r, q in zip(niv, pv)
                          if q >= VAD_SEUIL and self.parle_doucement(r)) >= TRAMES_VOISEES_MIN
+        if (meilleur <= self.seuil_verifie if self.tolerance else meilleur <= self.seuil) and not self.assez_pres(k):
+            return self._rendre_doute()       # ta facon de le dire, mais trop loin, trop bas : pas toi au micro
         if meilleur <= self.seuil and voise:
             # un « Jarvis » que TU as appris : il se reveille ; une facon apprise
             # seul se verifie d'abord (quand la transcription est prete)
@@ -3281,6 +3319,7 @@ class Oreille:
         self.det.n_manuels = len(manuels) if "gabarits_auto" in self.reglages else None
         self.det.verifier_tout = bool(self.reglages.get("verifier_tout", False))
         tolerant = self.reglages.get("tolerant", True)
+        self.det.ma_voix = bool(self.reglages.get("ma_voix", False))
         self.det.seuil, self.det.seuil_verifie = seuils_detection(
             self.reglages.get("sensibilite", 0.5), self.reglages.get("seuil_perso"), tolerant)
         self.det.seuil_hey = seuil_hey(self.reglages.get("sensibilite", 0.5), self.reglages.get("hey", True))

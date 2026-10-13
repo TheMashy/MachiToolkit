@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.79.0"
+VERSION = "1.80.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -336,6 +336,7 @@ CONFIG_DEFAUT = {
     "jarvis_actif": False,
     "jarvis_sensibilite": 0.5,        # 0 strict .. 1 permissif (le mot appris)
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
+    "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
     "jarvis_tolerant": True,          # un « Jarvis » pas net : verifie par transcription (voir TOLERANCE_FACTEUR)
     "jarvis_auto_purge": 0,           # version de la derniere purge des facons apprises seul
@@ -5868,6 +5869,7 @@ def config_oreille(cfg):
             "tolerant": bool(cfg.get("jarvis_tolerant", True)),
             "sensibilite": float(cfg.get("jarvis_sensibilite", 0.5)),
             "hey": bool(cfg.get("jarvis_hey", True)),
+            "ma_voix": bool(cfg.get("jarvis_ma_voix", True)),
             "son": bool(cfg.get("jarvis_son", True)),
             "couper": bool(cfg.get("jarvis_couper", True)),
             "micro": str(cfg.get("jarvis_micro", "") or "")}
@@ -14781,6 +14783,8 @@ class Panneau:
                                    "« Jarvis »)"),
                 ("jarvis_annoncer_maj", "Il annonce les mises a jour de Machi Tool (et peut les lancer)"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
+                ("jarvis_ma_voix", "Seulement ma voix, a mon volume : la tele, une video, quelqu'un plus loin "
+                                   "ne le reveillent pas (une fois ta voix apprise)"),
                 ("jarvis_hey", "Reconnaitre aussi « Hey Jarvis » (modele anglais)"),
                 ("jarvis_tolerant", "Tres tolerant : un « Jarvis » pas net est verifie en le transcrivant"),
                 ("jarvis_auto_etalonnage", "S'etalonner seul sur les appels rates de peu"),
@@ -14919,7 +14923,8 @@ class Panneau:
     def regler_jarvis(self, cle):
         self.cfg[cle] = bool(self.vars_jarvis[cle].get())
         sauver_config(self.cfg)
-        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper", "jarvis_auto_etalonnage", "jarvis_tolerant"):
+        if cle in ("jarvis_son", "jarvis_hey", "jarvis_couper", "jarvis_auto_etalonnage", "jarvis_tolerant",
+                   "jarvis_ma_voix"):
             envoyer_oreille(config_oreille(self.cfg))
         if cle == "jarvis_leds" and not self.cfg[cle]:
             poser_led(None)
