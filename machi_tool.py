@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.78.0"
+VERSION = "1.79.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -6779,7 +6779,7 @@ def dire_transcription_indisponible(langue, tour=None, maintenant=None):
 
 
 PSY_DUREE_S = 180            # le mode psy se referme apres trois minutes sans un mot
-CONVERSATION_S = 300         # au-dela, le majordome oublie la conversation d'avant
+CONVERSATION_S = 15 * 60     # au-dela, la conversation se referme (resumee ; BrainDebugger garde le fil)
 # UN OUI FRANC a « Voulez-vous que je passe en mode psychologue ? » -- pas
 # « allez », « go », « why not », qui disent aussi autre chose.
 _OUI = {"oui", "ouais", "oui vas y", "vas y", "d'accord", "ok", "okay", "volontiers",
@@ -6882,8 +6882,14 @@ def phrase(cle, langue, *args):
     return t % args if args else t
 
 
-SOUVENIRS_MAX = 30          # gardes sur le PC
-SOUVENIRS_ENVOYES = 15      # envoyes avec chaque question
+SOUVENIRS_MAX = 40          # gardes sur le PC
+SOUVENIRS_ENVOYES = 20      # envoyes avec chaque question
+SOUVENIR_SIGNES = 700       # un souvenir garde les details : quelques phrases
+# « Fais en sorte que Jarvis se souvienne beaucoup mieux des conversations
+# passees » : la conversation en cours part en entier (40 repliques), et
+# BrainDebugger y joint le fil des dernieres heures -- eteint, relance ou
+# interrompu, il reprend ou vous en etiez.
+HISTORIQUE_JARVIS = 40
 
 
 def _en_fond(f):
@@ -6897,11 +6903,11 @@ def resumer_conversation(historique, cfg):
     if not _cle_presente(cfg) or not any(h.get("role") == "user" for h in historique):
         return None
     try:
-        donnees = _requete_bd("/api/machitool/jarvis", {"transition": "resume", "historique": historique[-12:],
+        donnees = _requete_bd("/api/machitool/jarvis", {"transition": "resume", "historique": historique[-HISTORIQUE_JARVIS:],
                                                         "langue": langue_jarvis(cfg)}, cfg, 60)
     except Exception:
         return None
-    texte = " ".join(str((donnees or {}).get("texte") or "").split())[:200]
+    texte = " ".join(str((donnees or {}).get("texte") or "").split())[:SOUVENIR_SIGNES]
     if not texte:
         return None
     souvenir = {"date": time.strftime("%Y-%m-%d"), "texte": texte}
@@ -7051,7 +7057,9 @@ def quitter_psy(cfg):
     VOIX.taire()
     envoyer_oreille({"cmd": "annuler"})
     poser_mode("jarvis")
-    JARVIS["historique"] = []
+    # congedie : la conversation se referme, mais elle est resumee (avant, elle
+    # etait jetee -- « on parlait de quoi ? » n'avait plus de reponse)
+    clore_historique()
     JARVIS.update(psy_echange=[], psy_grave=False, suite_active=False, ecoute_fin=0.0, attente_code=None)
     poser_led(None)
     JARVIS.update(etat="attente", message=message_attente())
@@ -8085,7 +8093,7 @@ def parler_au_compagnon(texte, cfg, tour=None):
         return                      # revenu au majordome entre-temps : la seance est close
     JARVIS["mode_vu"] = time.time()
     JARVIS["psy_echange"] = (list(JARVIS.get("psy_echange") or []) + [
-        {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+        {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-HISTORIQUE_JARVIS:]
     dire(reponse, suite=True, langue="fr", tour=tour)
 
 
@@ -10668,7 +10676,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         # disait « je m'efface » et restait a l'ecoute.
         print("Jarvis : congedie")
         JARVIS["historique"] = (JARVIS["historique"] + [
-            {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+            {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-HISTORIQUE_JARVIS:]
         verser_au_journal(texte, reponse, cfg)
         clore_historique(cfg)
         JARVIS["attente_code"] = None
@@ -10690,7 +10698,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         JARVIS["vu"] = time.time()
         return dire(reponse, suite=True, langue="fr", tour=conv)
     JARVIS["historique"] = (JARVIS["historique"] + [
-        {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-12:]
+        {"role": "user", "texte": texte}, {"role": "assistant", "texte": reponse}])[-HISTORIQUE_JARVIS:]
     verser_au_journal(texte, reponse, cfg)
     # « IL EST RENTRE EN MODE PSYCHOLOGUE » : il ne le propose plus en passant.
     # Seule une VRAIE proposition (BrainDebugger la signale ; sinon la question
@@ -10719,7 +10727,7 @@ def parler_a_jarvis(texte, cfg, conv=None, notee=False):
     t0 = time.monotonic()
     try:
         donnees = _requete_bd_annulable("/api/machitool/jarvis",
-                                        dict({"texte": texte, "historique": JARVIS["historique"][-12:], "langue": L,
+                                        dict({"texte": texte, "historique": JARVIS["historique"][-HISTORIQUE_JARVIS:], "langue": L,
                                               "appellation": str(cfg.get("jarvis_appellation", "") or "")[:40],
                                               "onglets_ouverts": onglets_attendus(cfg),
                                               # Ctrl+Maj+Espace : deja au carnet, il y repond
@@ -10741,7 +10749,7 @@ def reponse_interrompue(texte, avance):
     print("Jarvis : interrompu pendant sa premiere phrase, il t'ecoute")
     JARVIS["historique"] = (JARVIS["historique"] + [
         {"role": "user", "texte": texte},
-        {"role": "assistant", "texte": (str(avance.get("texte") or "") + " [interrompu]").strip()}])[-12:]
+        {"role": "assistant", "texte": (str(avance.get("texte") or "") + " [interrompu]").strip()}])[-HISTORIQUE_JARVIS:]
     # au journal aussi : ta question, et ce qu'il a eu le temps de dire
     verser_au_journal(texte, avance.get("texte"), CFG)
 

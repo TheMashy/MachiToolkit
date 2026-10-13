@@ -2860,6 +2860,35 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual([t for _, t in poses[1:]], ["note-témoin une", "note-témoin deux"])
         self.assertEqual(m.NOTES_EN_ATTENTE, [])
 
+    def test_jarvis_se_souvient_de_la_conversation_meme_congedie(self):
+        # « fais en sorte que jarvis se souvienne beaucoup mieux des conversations
+        # passees [...] pouvant reprendre un fil de discussion s'il est eteint ou
+        # interrompu » -- congedie, la conversation est resumee, plus jetee
+        m = self.m
+        vrais = (m._en_fond, m._requete_bd, m._cle_presente, m.poser_led)
+        self.addCleanup(lambda: (setattr(m, "_en_fond", vrais[0]), setattr(m, "_requete_bd", vrais[1]),
+                                 setattr(m, "_cle_presente", vrais[2]), setattr(m, "poser_led", vrais[3])))
+        envoyes = []
+
+        def bd(chemin, corps, cfg, delai, **k):
+            envoyes.append((chemin, corps))
+            return {"texte": "A cherche un garage-témoin ouvert le samedi : le garage Martin-témoin, "
+                             "rue des Lilas-témoin, 9 h-12 h. Reste a appeler pour le devis. " * 3}
+        m._en_fond, m._requete_bd, m._cle_presente = (lambda f: f()), bd, (lambda cfg: True)
+        m.poser_led = lambda *a, **k: None
+        m.CFG["jarvis_souvenirs"] = []
+        m.JARVIS.update(mode="jarvis", psy_echange=[], historique=[
+            {"role": "user" if i % 2 == 0 else "assistant", "texte": "replique %d" % i} for i in range(50)])
+        m.terminer_conversation()
+        self.assertEqual(m.JARVIS["historique"], [])
+        resume = [c for ch, c in envoyes if c.get("transition") == "resume"]
+        self.assertEqual(len(resume), 1, "la conversation congediee est resumee")
+        self.assertEqual(len(resume[0]["historique"]), m.HISTORIQUE_JARVIS)
+        self.assertEqual(resume[0]["historique"][-1]["texte"], "replique 49")
+        souvenir = m.CFG["jarvis_souvenirs"][-1]["texte"]
+        self.assertGreater(len(souvenir), 200, "le souvenir garde les details")
+        self.assertLessEqual(len(souvenir), m.SOUVENIR_SIGNES)
+
     def test_ctrl_j_le_reveille_et_un_second_appui_le_congedie(self):
         # « Ctrl+J n'allume rien, j'entends juste le bruit de notif »
         m = self.m
@@ -3699,17 +3728,19 @@ class DansMachiTool(unittest.TestCase):
         m.JARVIS["historique"] = [{"role": "user", "texte": "x"}]
         m.clore_historique()
         self.assertEqual(len(envoyes), n + 1)
-        # 30 au plus, 15 envoyes
-        m.CFG["jarvis_souvenirs"] = [{"date": "2026-09-%02d" % (1 + i % 28), "texte": "s%d" % i} for i in range(30)]
+        # SOUVENIRS_MAX au plus (40), SOUVENIRS_ENVOYES envoyes (20)
+        n_max = m.SOUVENIRS_MAX
+        m.CFG["jarvis_souvenirs"] = [{"date": "2026-09-%02d" % (1 + i % 28), "texte": "s%d" % i}
+                                     for i in range(n_max)]
         m.JARVIS["mode"] = "jarvis"
         m.JARVIS["historique"] = [{"role": "user", "texte": "y"}]
         reponses += [{"texte": "Nouveau."}]
         m.clore_historique()
-        self.assertEqual(len(m.CFG["jarvis_souvenirs"]), 30)
+        self.assertEqual(len(m.CFG["jarvis_souvenirs"]), n_max)
         self.assertEqual(m.CFG["jarvis_souvenirs"][-1]["texte"], "Nouveau.")
-        self.assertEqual(len(m.capacites_jarvis(m.CFG)["souvenirs"]), 15)
+        self.assertEqual(len(m.capacites_jarvis(m.CFG)["souvenirs"]), m.SOUVENIRS_ENVOYES)
         r = m.executer_outil({"id": "x", "nom": "oublier", "entree": {"conversations": True}}, m.CFG)
-        self.assertIn("30 souvenirs", r["texte"])
+        self.assertIn("%d souvenirs" % n_max, r["texte"])
         self.assertEqual(m.CFG["jarvis_souvenirs"], [])
 
     def test_les_onglets_par_l_extension(self):
