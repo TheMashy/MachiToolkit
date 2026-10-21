@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.85.0"
+VERSION = "1.86.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -340,8 +340,13 @@ CONFIG_DEFAUT = {
     "panneau_actif": True,
     "panneau_contenu": "horloge",     # horloge | ambiance | eteint
     "panneau_luminosite": 64,         # 0-255, la valeur du croquis (qui la plafonne)
-    "panneau_jarvis": True,           # quand Jarvis parle de lui-meme : sa boule et sa phrase
+    "panneau_jarvis": True,           # le panneau de Jarvis s'affiche ici, plus a l'ecran
     "panneau_rotation": 0,            # 0 | 90 | 180 | 270, sens horaire : la carte posee de travers
+    # la balance (en %, sur la lumiere) : sur l'USB-C seul, le bleu et le vert
+    # faiblissent -- le rouge baisse d'autant (voir balance_panneau)
+    "panneau_rouge": 70,
+    "panneau_vert": 85,
+    "panneau_bleu": 100,
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -11369,12 +11374,12 @@ def restaurer_chronos(cfg=None):
 # « Tu peux faire passer ca dans Machi Tool automatiquement ? » Un panneau
 # 64 x 64 sur une MatrixPortal S3 branchee en USB, avec le croquis du guide
 # (machi_panneau.ino) : "MF" + 8 192 octets (RGB565, poids fort d'abord) est
-# une image, "MB" + 1 octet la luminosite. Machi Tool trouve la carte seul,
-# regarde 30 fois par seconde (« possible que machitool envoie du 30 fps ? »)
-# et n'envoie une image que quand elle change -- 8 Ko a 30 i/s, 250 Ko/s :
-# l'USB de l'ESP32-S3 suit sans peine. Rien de personnel n'y passe : l'heure,
-# la date, la couleur de la guirlande, un minuteur -- sans son nom. Seule
-# exception, qu'on peut decocher : ce que Jarvis dit de lui-meme, tel quel.
+# une image, "MB" + 1 octet la luminosite. Machi Tool trouve la carte seul et
+# lui envoie 30 images par seconde (« possible que machitool envoie du 30
+# fps ? ») -- 8 Ko a 30 i/s, 250 Ko/s : l'USB de l'ESP32-S3 suit sans peine.
+# Rien de personnel n'y passe : l'heure, la date, la couleur de la guirlande,
+# un minuteur -- sans son nom. Seule exception, qu'on peut decocher : le
+# panneau de Jarvis, et ce qu'il dit.
 
 PANNEAU_L = PANNEAU_H = 64
 PANNEAU_VIDS = (0x239A, 0x303A)        # Adafruit ; Espressif (l'USB de l'ESP32-S3)
@@ -11383,9 +11388,9 @@ PANNEAU_IPS = 30                       # images par seconde
 PANNEAU_PAS_S = 1.0 / PANNEAU_IPS
 PANNEAU_CONTENUS = ("horloge", "ambiance", "eteint")
 PANNEAU_BLANC_CHAUD = (255, 176, 80)   # la guirlande debranchee : rien a suivre
-PANNEAU_DEFILE_PX_S = 30               # ce que dit Jarvis : un pixel par image
+PANNEAU_JARVIS_TRAINE_S = 2.0          # sa voix tue, le temps de lire la fin
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
-           "teinte": None, "jarvis": None}
+           "teinte": None, "jarvis": None, "mire_jusqua": 0.0, "ips": 0.0, "perdues": 0}
 
 _CHIFFRES_5X7 = {
     "0": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
@@ -11424,56 +11429,6 @@ _PETITE_3X5 = {
 }
 _JOURS_PANNEAU = ("LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM")
 _MOIS_PANNEAU = ("JAN", "FEV", "MAR", "AVR", "MAI", "JUIN", "JUIL", "AOUT", "SEPT", "OCT", "NOV", "DEC")
-
-# Ce que dit Jarvis, en 5 x 7 (les capitales d'un afficheur) : la ponctuation
-# est etroite, pour que la phrase tienne mieux.
-_LETTRES_5X7 = dict(_CHIFFRES_5X7, **{
-    "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
-    "C": (".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."),
-    "D": ("###..", "#..#.", "#...#", "#...#", "#...#", "#..#.", "###.."),
-    "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
-    "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
-    "G": (".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".####"),
-    "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
-    "I": (".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###."),
-    "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
-    "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
-    "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
-    "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
-    "N": ("#...#", "#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#"),
-    "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
-    "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
-    "R": ("####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"),
-    "S": (".####", "#....", "#....", ".###.", "....#", "....#", "####."),
-    "T": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."),
-    "U": ("#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
-    "V": ("#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.."),
-    "W": ("#...#", "#...#", "#...#", "#.#.#", "#.#.#", "#.#.#", ".#.#."),
-    "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
-    "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
-    "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
-    " ": ("...", "...", "...", "...", "...", "...", "..."),
-    ".": (".", ".", ".", ".", ".", ".", "#"),
-    ",": ("..", "..", "..", "..", "..", ".#", "#."),
-    "!": ("#", "#", "#", "#", "#", ".", "#"),
-    "?": (".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."),
-    "'": ("#", "#", ".", ".", ".", ".", "."),
-    '"': ("#.#", "#.#", "...", "...", "...", "...", "..."),
-    ":": (".", ".", "#", ".", ".", "#", "."),
-    ";": ("..", "..", ".#", "..", "..", ".#", "#."),
-    "-": ("...", "...", "...", "###", "...", "...", "..."),
-    "(": (".#", "#.", "#.", "#.", "#.", "#.", ".#"),
-    ")": ("#.", ".#", ".#", ".#", ".#", ".#", "#."),
-    "/": (".....", "....#", "...#.", "..#..", ".#...", "#....", "....."),
-    "+": (".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."),
-    "%": ("##...", "##..#", "...#.", "..#..", ".#...", "#..##", "...##"),
-})
-_REMPLACE_5X7 = {"’": "'", "‘": "'", "«": '"', "»": '"', "“": '"', "”": '"',
-                 "…": "...", "—": "-", "–": "-", "œ": "oe", "Œ": "OE",
-                 "æ": "ae", "Æ": "AE", "ß": "ss", "€": " EUR", "°": " DEG"}
-_BANDES_5X7 = {}
 
 
 def _motif(img, motif, x, y, couleur, echelle=1):
@@ -11524,92 +11479,97 @@ def accent_panneau():
     return teinte
 
 
-def _texte_5x7(texte):
-    # « bientot » -> "BIENTOT" : 64 pixels de large, les espaces des guillemets coutent
-    t = re.sub(r"«\s*", "«", re.sub(r"\s*»", "»", str(texte or "")))
-    t = "".join(_REMPLACE_5X7.get(c, c) for c in t)
-    t = " ".join(_jv.sans_accents(t).upper().split())
-    return "".join(c for c in t if c in _LETTRES_5X7)
+def couleur_guirlande_vue():
+    """Ce que la guirlande emet en ce moment, telle que l'ecran la montre (le
+    graphe), SANS la pousser a pleine valeur : l'ambiance suit sa lumiere --
+    sa respiration, ses fondus -- au lieu d'une teinte figee."""
+    if not ETAT.get("connecte"):
+        return PANNEAU_BLANC_CHAUD
+    return vu_a_l_oeil(ETAT.get("couleur") or (0, 0, 0))
 
 
-def bande_texte(texte):
-    """La phrase en 5 x 7, sur une seule bande (7 lignes de booleens) : le
-    panneau la fait defiler. Gardee : elle se redessine 30 fois par seconde."""
-    import numpy as np
-    t = _texte_5x7(texte)
-    b = _BANDES_5X7.get(t)
-    if b is not None:
-        return b
-    motifs = [_LETTRES_5X7[c] for c in t]
-    b = np.zeros((7, max(1, sum(len(m[0]) + 1 for m in motifs))), bool)
-    x = 0
-    for m in motifs:
-        for j, ligne in enumerate(m):
-            for i, c in enumerate(ligne):
-                if c == "#":
-                    b[j, x + i] = True
-        x += len(m[0]) + 1
-    if len(_BANDES_5X7) > 8:
-        _BANDES_5X7.clear()
-    _BANDES_5X7[t] = b
-    return b
-
-
-def vitesse_defile(largeur):
-    """Un pixel par image (30 px/s) ; une longue phrase, deux : 1,5 pixel ferait trembler."""
-    return PANNEAU_DEFILE_PX_S if largeur < 480 else 2 * PANNEAU_DEFILE_PX_S
-
-
-def duree_jarvis(texte):
-    """Le temps que la phrase traverse le panneau, de bord a bord."""
-    w = bande_texte(texte).shape[1]
-    return (PANNEAU_L + w) / float(vitesse_defile(w)) + 0.5
-
+# LE PANNEAU DE JARVIS, SUR LE PANNEAU LED. « Lorsque Jarvis parle, il faut
+# montrer l'interface du petit panneau de Jarvis sur le panneau plutot que la
+# montrer sur l'ecran. » Son panneau a l'ecran EST deja une image 64 x 64
+# (_jv.image_jarvis) : la meme part sur le panneau LED, et la fenetre a
+# l'ecran s'efface tant que le panneau la montre. Quand il parle de lui-meme
+# (minuteur, rappel, routine, initiative), il n'est pas « actif » : on montre
+# son etat « parle », le temps de sa voix et un peu apres pour lire la fin.
 
 def montrer_au_panneau(texte):
-    """« Lorsque Jarvis parle automatiquement, montre-le sur le panneau. » Un
-    minuteur, un rappel, une initiative, une routine : sa boule, aux couleurs
-    de la guirlande, qui enfle avec sa voix, et sa phrase qui defile dessous."""
     texte = " ".join(str(texte or "").split())
     if texte:
         PANNEAU["jarvis"] = {"texte": texte, "debut": time.time()}
 
 
-def niveau_pour_panneau(maintenant=None):
-    """Le niveau de sa voix (0 a 1), comme sa boule a l'ecran. La voix de
-    Windows ne dit rien de son son : on balance tant qu'elle parle."""
-    try:
-        n = niveau_de_sa_voix(maintenant)
-    except Exception:
-        n = 0.0
-    if n is None:
-        t = time.time() if maintenant is None else maintenant
-        n = 0.45 + 0.35 * math.sin(t * 9.0) if VOIX.parle else 0.0
-    return max(0.0, min(1.0, float(n)))
+def image_jarvis_du_moment(etat, maintenant, cfg, croix=True):
+    """L'image de son panneau pour cet etat : ce qu'il dit au fil de sa voix,
+    ta voix quand il ecoute (la sienne quand il parle), le temps qu'il t'attend."""
+    texte = sous_titre_courant(maintenant) if etat == "parle" else ""
+    niveau = (niveau_de_la_voix(maintenant) if etat == "ecoute" else
+              niveau_de_sa_voix(maintenant) if etat == "parle" else None)
+    reste = None
+    if etat == "ecoute" and JARVIS.get("ecoute_fin") and not JARVIS.get("parole_vue"):
+        reste = (float(JARVIS["ecoute_fin"]) - maintenant) / max(0.5, float(JARVIS.get("ecoute_duree") or 5.0))
+    entendu = (JARVIS.get("entendu") or "") if etat in ("pense", "fait") else ""
+    return _jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis"), texte, niveau=niveau,
+                            langue=langue_jarvis(cfg), reste=reste, entendu=entendu, croix=croix)
 
 
-_DISTANCES_BOULE = []
+def etat_jarvis_pour_le_panneau(cfg, maintenant):
+    """L'etat de Jarvis que le panneau LED montre, ou None (son contenu a lui)."""
+    if not cfg.get("panneau_jarvis", True):
+        PANNEAU["jarvis"] = None
+        return None
+    etat = _jv.etat_panneau(JARVIS.get("etat"), maintenant, JARVIS.get("fait_jusqua"),
+                            JARVIS.get("erreur_jusqua"))
+    if etat is not None:
+        return etat
+    seul = PANNEAU.get("jarvis")
+    if not seul:
+        return None
+    if VOIX.parle:
+        seul["vu"] = maintenant
+    fin = max(seul["debut"] + len(seul["texte"]) / _jv.LETTRES_PAR_S, float(seul.get("vu") or 0))
+    if maintenant < min(fin + PANNEAU_JARVIS_TRAINE_S, seul["debut"] + 120):
+        return "parle"
+    PANNEAU["jarvis"] = None
+    return None
 
 
-def dessiner_jarvis(img, jarvis, t, accent, niveau):
+def jarvis_sur_le_panneau_led(cfg):
+    """Le panneau LED montre-t-il Jarvis ? Alors sa fenetre a l'ecran s'efface."""
+    return bool(cfg.get("panneau_actif", True) and cfg.get("panneau_jarvis", True)
+                and cfg.get("panneau_contenu", "horloge") != "eteint" and PANNEAU.get("etat") == "connecte")
+
+
+# LA BALANCE DES COULEURS. « J'utilise maintenant le panneau uniquement en
+# USB-C : fais en sorte que les couleurs matchent ce qui est affiche a
+# l'ecran. » Sur l'USB seul, la tension baisse sous la charge ; le bleu et le
+# vert (pres de 3 V de seuil) faiblissent bien avant le rouge (2 V) : le gris
+# de la date sortait orange, le rose orange, le jaune rouge. On baisse donc le
+# rouge (et un peu le vert), en lumiere lineaire, jusqu'a ce que le blanc de
+# la mire soit blanc. Avec une alimentation 5 V sur le panneau : tout a 100.
+
+def balance_panneau(cfg):
+    return tuple(max(0.0, min(1.0, entier(cfg.get(cle, CONFIG_DEFAUT[cle]), CONFIG_DEFAUT[cle]) / 100.0))
+                 for cle in ("panneau_rouge", "panneau_vert", "panneau_bleu"))
+
+
+def image_mire(accent=None):
+    """La mire de reglage, a comparer a l'apercu de l'ecran : du blanc, les
+    trois couleurs, six gris, et la couleur de la guirlande."""
     import numpy as np
-    if not _DISTANCES_BOULE:
-        y, x = np.mgrid[0:PANNEAU_H, 0:PANNEAU_L]
-        _DISTANCES_BOULE.append(np.hypot(x - 31.5, y - 21.5))
-    d = _DISTANCES_BOULE[0]
-    # sa boule : pleine, un peu plus sombre au bord, et un halo qui s'eteint
-    r = 7.0 + 6.0 * niveau
-    coeur = np.where(d <= r, 1.0 - 0.35 * (d / r) ** 2, 0.0)
-    halo = np.where(d > r, 0.55 * np.exp(-(d - r) / 2.5), 0.0)
-    k = np.maximum(coeur, halo)[..., None]
-    img[:] = (np.array(accent, float)[None, None, :] * k).astype(np.uint8)
-    # sa phrase, qui entre par la droite
-    b = bande_texte(jarvis["texte"])
-    w = b.shape[1]
-    x0 = PANNEAU_L - int((t - jarvis["debut"]) * vitesse_defile(w))
-    a, z = max(0, -x0), min(w, PANNEAU_L - x0)
-    if a < z:
-        img[46:53, x0 + a:x0 + z][b[:, a:z]] = (240, 240, 248)
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    img[4:16, 2:62] = (255, 255, 255)
+    img[19:31, 2:20] = (255, 0, 0)
+    img[19:31, 23:41] = (0, 255, 0)
+    img[19:31, 44:62] = (0, 0, 255)
+    for k in range(6):
+        v = int(round(255 * (k + 1) / 6.0))
+        img[34:46, 2 + 10 * k:11 + 10 * k] = (v, v, v)
+    img[49:61, 2:62] = accent or accent_panneau()
+    return img
 
 
 def _prochain_chrono(minuteurs, t):
@@ -11628,7 +11588,7 @@ def _prochain_chrono(minuteurs, t):
     return None
 
 
-def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None, jarvis=None, niveau=0.0):
+def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None):
     """L'image de 64 x 64 (numpy, RGB) que le panneau doit montrer : ce que
     l'ecran en montre (voir `rgb565` pour ce que la carte en recoit)."""
     import numpy as np
@@ -11636,15 +11596,12 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
     t = time.time() if maintenant is None else maintenant
     if contenu == "eteint":
         return img
-    accent = accent or accent_panneau()
-    if jarvis:
-        dessiner_jarvis(img, jarvis, t, accent, niveau)
-        return img
     if contenu == "ambiance":
-        # la couleur de la guirlande, qui s'assombrit doucement vers le bas
+        # la lumiere de la guirlande, qui s'assombrit doucement vers le bas
         k = np.linspace(1.0, 0.4, PANNEAU_H)[:, None, None]
-        img[:] = (np.array(accent, float)[None, None, :] * k).astype(np.uint8)
+        img[:] = (np.array(accent or couleur_guirlande_vue(), float)[None, None, :] * k).astype(np.uint8)
         return img
+    accent = accent or accent_panneau()
     lt = time.localtime(t)
     # l'heure : quatre chiffres 5 x 7 doubles (10 x 14), les deux points
     hh, mm = "%02d" % lt.tm_hour, "%02d" % lt.tm_min
@@ -11706,10 +11663,18 @@ def lut_panneau():
     return _LUT_PANNEAU[0]
 
 
-def rgb565(img):
-    """L'image en RGB565, poids fort d'abord : ce que lit le croquis."""
+def rgb565(img, balance=None):
+    """L'image en RGB565, poids fort d'abord : ce que lit le croquis.
+    `balance` : (rouge, vert, bleu) de 0 a 1, appliques a la lumiere."""
     import numpy as np
-    a = lut_panneau()[np.asarray(img, np.uint8)].astype(np.uint16)
+    a = np.asarray(img, np.uint8)
+    if balance is None or all(b >= 1.0 for b in balance):
+        a = lut_panneau()[a].astype(np.uint16)
+    else:
+        x = a / 255.0
+        lin = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4) * np.asarray(balance, float)
+        clarte = np.where(lin > 0.008856, 116.0 * np.cbrt(lin) - 16.0, 903.3 * lin)
+        a = np.clip(np.round(clarte * 2.55), 0, 255).astype(np.uint16)
     v = ((a[..., 0] & 0xF8) << 8) | ((a[..., 1] & 0xFC) << 3) | (a[..., 2] >> 3)
     return v.astype(">u2").tobytes()
 
@@ -11729,28 +11694,39 @@ def trouver_panneau():
 
 def ouvrir_panneau(port):
     import serial
-    return serial.Serial(port, 115200, timeout=1, write_timeout=2)
+    return serial.Serial(port, 115200, timeout=1, write_timeout=1)
+
+
+def image_du_panneau(cfg, contenu, t):
+    """Ce que le panneau montre a l'instant t : la mire pendant un reglage,
+    Jarvis quand il est la, sinon son contenu."""
+    if contenu == "eteint":
+        return image_panneau("eteint", t)
+    if t < float(PANNEAU.get("mire_jusqua") or 0):
+        return image_mire()
+    etat = etat_jarvis_pour_le_panneau(cfg, t)
+    if etat is not None:
+        return image_jarvis_du_moment(etat, t, cfg, croix=False)
+    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"))
 
 
 def piloter_panneau(cfg=None, tours=None):
     """Le fil du panneau : l'image du moment (l'apercu la montre, branche ou
-    non), et, une carte trouvee, la luminosite puis chaque image qui change.
-    Une liaison perdue (debranchee, reprise par Arduino) se recherche seule.
-    `tours` : pour les tests, un nombre de passages."""
+    non), et, une carte trouvee, la luminosite puis une image toutes les
+    1/30 s -- toutes, meme identiques : « j'ai l'impression que c'est pas a
+    30 fps » ; le debit tenu s'affiche. Une liaison perdue (debranchee,
+    reprise par Arduino) se recherche seule ; une image qui ne passe pas a
+    temps (la carte deborde), elle, ne coupe rien. `tours` : pour les tests."""
     cfg = CFG if cfg is None else cfg
-    lien, envoye, lum, recherche = None, None, None, 0.0
-    n, prochaine, niveau = 0, time.monotonic(), 0.0
+    lien, lum, recherche = None, None, 0.0
+    n, prochaine, envois = 0, time.monotonic(), deque(maxlen=PANNEAU_IPS * 3)
     while ETAT["en_marche"] and (tours is None or n < tours):
         n += 1
         contenu = cfg.get("panneau_contenu", "horloge")
         contenu = contenu if contenu in PANNEAU_CONTENUS else "horloge"
         try:
-            # Jarvis parle de lui-meme : sa boule et sa phrase, le temps qu'elle passe
-            jarvis, t = PANNEAU.get("jarvis"), time.time()
-            if jarvis and (not cfg.get("panneau_jarvis", True) or t > jarvis["debut"] + duree_jarvis(jarvis["texte"])):
-                PANNEAU["jarvis"] = jarvis = None
-            niveau = 0.5 * niveau + 0.5 * (niveau_pour_panneau(t) if jarvis else 0.0)
-            img = image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), jarvis=jarvis, niveau=niveau)
+            t = time.time()
+            img = image_du_panneau(cfg, contenu, t)
             PANNEAU["image"] = img
             if not cfg.get("panneau_actif", True):
                 if lien is not None:
@@ -11763,8 +11739,9 @@ def piloter_panneau(cfg=None, tours=None):
                 if port:
                     try:
                         lien = ouvrir_panneau(port)
-                        envoye, lum = None, None
-                        PANNEAU.update(etat="connecte", port=port, envoyees=0)
+                        lum = None
+                        envois.clear()
+                        PANNEAU.update(etat="connecte", port=port, envoyees=0, ips=0.0)
                         print("Panneau LED : connecte sur %s" % port)
                     except Exception:
                         PANNEAU.update(etat="occupe", port=port)
@@ -11775,11 +11752,19 @@ def piloter_panneau(cfg=None, tours=None):
                 if voulue != lum:
                     lien.write(b"MB" + bytes([voulue]))
                     lum = voulue
-                donnees = rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)))
-                if donnees != envoye:
+                donnees = rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)), balance_panneau(cfg))
+                try:
                     lien.write(b"MF" + donnees)
-                    envoye = donnees
                     PANNEAU["envoyees"] += 1
+                    envois.append(time.monotonic())
+                except Exception as e:
+                    if type(e).__name__ != "SerialTimeoutException":
+                        raise
+                    PANNEAU["perdues"] = PANNEAU.get("perdues", 0) + 1   # la carte suit moins vite
+                if len(envois) >= 2 and envois[-1] > envois[0]:
+                    recentes = [x for x in envois if x > time.monotonic() - 2.0]
+                    PANNEAU["ips"] = (len(recentes) - 1) / max(1e-3, recentes[-1] - recentes[0]) \
+                        if len(recentes) >= 2 else 0.0
         except Exception as e:
             print("Panneau LED : liaison perdue (%s)" % type(e).__name__)
             try:
@@ -11812,9 +11797,9 @@ def etat_panneau_lisible():
     if not PANNEAU.get("pyserial", True):
         return "Il manque pyserial a cette version de Machi Tool.", ALERTE
     if e == "connecte":
-        return "Branche sur %s  ·  %d image%s envoyee%s" % (
-            port, PANNEAU["envoyees"], "s" if PANNEAU["envoyees"] > 1 else "",
-            "s" if PANNEAU["envoyees"] > 1 else ""), VIF
+        ips = float(PANNEAU.get("ips") or 0.0)
+        return ("Branche sur %s  ·  %.0f im/s (reglee %d)" % (port, ips, PANNEAU_IPS) if ips
+                else "Branche sur %s" % port), VIF
     if e == "occupe":
         return ("%s est pris par un autre programme (le Serial Monitor d'Arduino, ou test_panneau.py) : "
                 "ferme-le, je reessaie toutes les 5 s." % port), ALERTE
@@ -14586,6 +14571,11 @@ class Panneau:
             return 500
         maintenant = time.time()
         st = self.__dict__.setdefault("panneau_etat", {"alpha": 0.0, "dernier": None})
+        if jarvis_sur_le_panneau_led(self.cfg):
+            # le panneau LED le montre : « plutot que le montrer sur l'ecran »
+            cache()
+            st["alpha"] = 0.0
+            return 120
         # ce qu'il montre : ou il en est, ou FAIT / ERREUR le temps de les lire --
         # et en s'effacant, sa derniere image (il ecrivait « DONE » a chaque fois)
         etat = _jv.etat_panneau(JARVIS.get("etat"), maintenant, JARVIS.get("fait_jusqua"),
@@ -14614,18 +14604,8 @@ class Panneau:
             cache()
             return 120
         from PIL import Image, ImageTk
-        # ce qu'il dit s'ecrit au fil de sa voix, DANS le panneau
-        texte = sous_titre_courant(maintenant) if etat == "parle" else ""
-        # ta voix quand il ecoute, la sienne quand il parle (None : le sinus)
-        niveau = (niveau_de_la_voix(maintenant) if etat == "ecoute" else
-                  niveau_de_sa_voix(maintenant) if etat == "parle" else None)
-        reste = None
-        if etat == "ecoute" and JARVIS.get("ecoute_fin") and not JARVIS.get("parole_vue"):
-            reste = (float(JARVIS["ecoute_fin"]) - maintenant) / max(0.5, float(JARVIS.get("ecoute_duree") or 5.0))
-        entendu = (JARVIS.get("entendu") or "") if etat in ("pense", "fait") else ""
-        img = _jv.dalle_led(_jv.image_jarvis(etat, maintenant, "", JARVIS.get("mode", "jarvis"), texte,
-                                             niveau=niveau, langue=langue_jarvis(self.cfg), reste=reste,
-                                             entendu=entendu), pas)
+        # la meme image que le panneau LED (voir image_jarvis_du_moment)
+        img = _jv.dalle_led(image_jarvis_du_moment(etat, maintenant, self.cfg), pas)
         photo = ImageTk.PhotoImage(Image.fromarray(img))
         self.fen_led_image.configure(image=photo)
         self.fen_led_image.image = photo
@@ -15473,7 +15453,7 @@ class Panneau:
         Tout s'applique tout de suite (le fil du panneau relit la config)."""
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
-                    "panneau_rotation"):
+                    "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -15508,8 +15488,8 @@ class Panneau:
                         justify="left")
             r.pack(fill="x")
         self.var_panneau_jarvis = tk.IntVar(value=1 if self.cfg.get("panneau_jarvis", True) else 0)
-        c = self.case(col, "Quand Jarvis parle de lui-meme (un minuteur, un rappel, une initiative) : sa boule "
-                           "et sa phrase, qui defile", self.var_panneau_jarvis,
+        c = self.case(col, "Le panneau de Jarvis s'affiche ici, plus a l'ecran : quand il t'ecoute, reflechit, "
+                           "parle -- et quand il parle de lui-meme (un minuteur, un rappel)", self.var_panneau_jarvis,
                       lambda: self.regler_panneau("panneau_jarvis"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
@@ -15530,8 +15510,20 @@ class Panneau:
             "De 0 a 255. Le croquis de la carte la plafonne (PLAFOND) : sur l'USB seul, 96 au plus.", entier=True)
         self.var_panneau_luminosite.trace_add("write", lambda *_: self._panneau_luminosite_bientot())
 
+        self.titre(col, "Couleurs").pack(fill="x", pady=(14, 4))
+        self.texte(col, "Sur l'USB-C seul, le bleu et le vert manquent de tension et le panneau tire vers l'orange. "
+                        "Baisse le rouge (et un peu le vert) jusqu'a ce que le blanc de la mire soit blanc, comme "
+                        "a l'ecran. Bouger une reglette montre la mire 20 s. Avec une alimentation 5 V branchee "
+                        "sur le panneau : tout a 100.", BRUME, 8, largeur=380).pack(fill="x", pady=(0, 8))
+        for cle, nom in (("panneau_rouge", "Rouge"), ("panneau_vert", "Vert"), ("panneau_bleu", "Bleu")):
+            v = self.reglette(col, cle, nom, 0, 100, 1, "", entier=True)
+            v.trace_add("write", lambda *_, cle=cle, v=v: self._panneau_balance_bientot(cle, v))
+            setattr(self, "var_" + cle, v)
+        self.bouton(col, "Montrer la mire", lambda: PANNEAU.update(mire_jusqua=time.time() + 30),
+                    compact=True).pack(anchor="w", pady=(4, 0))
+
         self.texte(f, "Ni journal, ni humeur, ni messages n'y passent. Seule exception, si la case est cochee : "
-                      "ce que Jarvis dit de lui-meme, tel qu'il le dit (le nom d'un rappel compris). "
+                      "le panneau de Jarvis, avec ce qu'il dit (le nom d'un rappel compris). "
                       "Pour televerser un croquis avec Arduino, decoche d'abord « Machi Tool pilote le panneau » : "
                       "un seul programme a la fois peut tenir le port USB de la carte.",
                    BRUME, 8, largeur=560).pack(fill="x", pady=(18, 0))
@@ -15547,6 +15539,15 @@ class Panneau:
             self.cfg[cle] = self.var_panneau_contenu.get()
         sauver_config(self.cfg)
         self._peindre_panneau()
+
+    def _panneau_balance_bientot(self, cle, v):
+        """La balance s'applique a l'image suivante, la mire a l'appui ; la config
+        s'ecrit une fois le geste fini."""
+        self.cfg[cle] = int(v.get())
+        PANNEAU["mire_jusqua"] = time.time() + 20
+        if getattr(self, "_panneau_sauve", None):
+            self.root.after_cancel(self._panneau_sauve)
+        self._panneau_sauve = self.root.after(500, lambda: sauver_config(self.cfg))
 
     def _panneau_luminosite_bientot(self):
         """Le fil suit la reglette en direct ; la config s'ecrit une fois le geste fini."""
