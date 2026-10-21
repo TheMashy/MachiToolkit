@@ -3051,6 +3051,44 @@ class DansMachiTool(unittest.TestCase):
         src = open(m.__file__, encoding="utf-8").read()
         self.assertEqual(src.count("eteindre_panneau()\n                eteindre_guirlande()"), 2)
 
+    def test_le_panneau_dit_qui_ralentit_et_reconnait_son_croquis(self):
+        # « ca tombe a 5 fps parfois, tu pourrais fixer ca ? »
+        m = self.m
+        avant = dict(m.PANNEAU)
+        self.addCleanup(lambda: (m.PANNEAU.clear(), m.PANNEAU.update(avant)))
+
+        class Carte:
+            def __init__(self, reponse):
+                self.reponse, self.attente = reponse, b""
+
+            def reset_input_buffer(self):
+                self.attente = b""
+
+            def write(self, octets):
+                if octets == b"MV":
+                    self.attente += self.reponse
+
+            @property
+            def in_waiting(self):
+                return len(self.attente)
+
+            def read(self, n):
+                lu, self.attente = self.attente[:n], self.attente[n:]
+                return lu
+        self.assertEqual(m.version_croquis(Carte(b"MACHI 2\r\n")), 2)
+        self.assertEqual(m.version_croquis(Carte(b""), attente=0.05), 1, "la v1 ne repond rien")
+        self.assertEqual(m.version_croquis(object()), 1)
+        self.assertTrue(os.path.exists(os.path.join(os.path.dirname(m.__file__), "carte", "machi_panneau",
+                                                    "machi_panneau.ino")), "le croquis v2 est dans le depot")
+        m.PANNEAU.update(etat="connecte", port="COM4", ips=29.0, croquis=1)
+        self.assertIn("ancien croquis", m.etat_panneau_lisible()[0])
+        m.PANNEAU.update(croquis=2, ips=5.0, calcul_ms=3.0, envoi_ms=180.0)
+        self.assertIn("la carte qui suit mal", m.etat_panneau_lisible()[0])
+        m.PANNEAU.update(calcul_ms=190.0, envoi_ms=4.0)
+        self.assertIn("le PC qui ralentit", m.etat_panneau_lisible()[0])
+        m.PANNEAU.update(ips=30.0)
+        self.assertEqual(m.etat_panneau_lisible()[0], "Branche sur COM4  ·  30 im/s (reglee 30)")
+
     def test_jarvis_pose_minuteurs_alarmes_et_chronos_sans_permission(self):
         # « verifie bien que Jarvis puisse declencher un minuteur de lui-meme : qu'il
         # ait les droits, pareil pour les alarmes et les chronometres »
