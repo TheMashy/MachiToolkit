@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.82.0"
+VERSION = "1.83.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -336,6 +336,10 @@ CONFIG_DEFAUT = {
     "jarvis_actif": False,
     "jarvis_sensibilite": 0.5,        # 0 strict .. 1 permissif (le mot appris)
     "jarvis_chronos": [],             # minuteurs, alarmes, chronometres en cours (voir restaurer_chronos)
+    # Le panneau LED (Machi LED Wall) : Machi Tool le pilote des qu'il est branche
+    "panneau_actif": True,
+    "panneau_contenu": "horloge",     # horloge | ambiance | eteint
+    "panneau_luminosite": 64,         # 0-255, la valeur du croquis (qui la plafonne)
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -11352,6 +11356,256 @@ def restaurer_chronos(cfg=None):
     return len(rates)
 
 
+# ---------- le panneau LED (Machi LED Wall) ----------
+# « Tu peux faire passer ca dans Machi Tool automatiquement ? » Un panneau
+# 64 x 64 sur une MatrixPortal S3 branchee en USB, avec le croquis du guide
+# (machi_panneau.ino) : "MF" + 8 192 octets (RGB565, poids fort d'abord) est
+# une image, "MB" + 1 octet la luminosite. Machi Tool trouve la carte seul,
+# n'envoie une image que quand elle change (l'horloge : une par seconde), et
+# rien de personnel n'y passe : l'heure, la date, la couleur de la guirlande,
+# un minuteur -- sans son nom.
+
+PANNEAU_L = PANNEAU_H = 64
+PANNEAU_VIDS = (0x239A, 0x303A)        # Adafruit ; Espressif (l'USB de l'ESP32-S3)
+PANNEAU_CHERCHE_S = 5.0
+PANNEAU_PAS_S = 0.25
+PANNEAU_CONTENUS = ("horloge", "ambiance", "eteint")
+PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True}
+
+_CHIFFRES_5X7 = {
+    "0": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
+    "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
+    "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
+    "3": ("#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###."),
+    "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
+    "5": ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
+    "6": ("..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."),
+    "7": ("#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."),
+    "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
+    "9": (".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."),
+}
+
+_PETITE_3X5 = {
+    "A": (".#.", "#.#", "###", "#.#", "#.#"), "B": ("##.", "#.#", "##.", "#.#", "##."),
+    "C": (".##", "#..", "#..", "#..", ".##"), "D": ("##.", "#.#", "#.#", "#.#", "##."),
+    "E": ("###", "#..", "##.", "#..", "###"), "F": ("###", "#..", "##.", "#..", "#.."),
+    "G": (".##", "#..", "#.#", "#.#", ".##"), "H": ("#.#", "#.#", "###", "#.#", "#.#"),
+    "I": ("###", ".#.", ".#.", ".#.", "###"), "J": ("..#", "..#", "..#", "#.#", ".#."),
+    "K": ("#.#", "#.#", "##.", "#.#", "#.#"), "L": ("#..", "#..", "#..", "#..", "###"),
+    "M": ("#.#", "###", "###", "#.#", "#.#"), "N": ("##.", "#.#", "#.#", "#.#", "#.#"),
+    "O": (".#.", "#.#", "#.#", "#.#", ".#."), "P": ("##.", "#.#", "##.", "#..", "#.."),
+    "Q": (".#.", "#.#", "#.#", "##.", ".##"), "R": ("##.", "#.#", "##.", "#.#", "#.#"),
+    "S": (".##", "#..", ".#.", "..#", "##."), "T": ("###", ".#.", ".#.", ".#.", ".#."),
+    "U": ("#.#", "#.#", "#.#", "#.#", "###"), "V": ("#.#", "#.#", "#.#", "#.#", ".#."),
+    "W": ("#.#", "#.#", "###", "###", "#.#"), "X": ("#.#", "#.#", ".#.", "#.#", "#.#"),
+    "Y": ("#.#", "#.#", ".#.", ".#.", ".#."), "Z": ("###", "..#", ".#.", "#..", "###"),
+    "0": ("###", "#.#", "#.#", "#.#", "###"), "1": (".#.", "##.", ".#.", ".#.", "###"),
+    "2": ("##.", "..#", ".#.", "#..", "###"), "3": ("##.", "..#", ".#.", "..#", "##."),
+    "4": ("#.#", "#.#", "###", "..#", "..#"), "5": ("###", "#..", "##.", "..#", "##."),
+    "6": (".##", "#..", "###", "#.#", "###"), "7": ("###", "..#", ".#.", ".#.", ".#."),
+    "8": ("###", "#.#", "###", "#.#", "###"), "9": ("###", "#.#", "###", "..#", "##."),
+    ":": (".", "#", ".", "#", "."), ".": (".", ".", ".", ".", "#"), "-": ("...", "...", "###", "...", "..."),
+    " ": ("..", "..", "..", "..", ".."),
+}
+_JOURS_PANNEAU = ("LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM")
+_MOIS_PANNEAU = ("JAN", "FEV", "MAR", "AVR", "MAI", "JUIN", "JUIL", "AOUT", "SEPT", "OCT", "NOV", "DEC")
+
+
+def _motif(img, motif, x, y, couleur, echelle=1):
+    for j, ligne in enumerate(motif):
+        for i, c in enumerate(ligne):
+            if c == "#":
+                x0, y0 = x + i * echelle, y + j * echelle
+                if 0 <= x0 < PANNEAU_L and 0 <= y0 < PANNEAU_H:
+                    img[y0:y0 + echelle, x0:x0 + echelle] = couleur
+
+
+def _texte_petit(texte):
+    return [_PETITE_3X5.get(c, _PETITE_3X5[" "]) for c in _jv.sans_accents(str(texte)).upper()]
+
+
+def largeur_petit(texte):
+    motifs = _texte_petit(texte)
+    return sum(len(m[0]) for m in motifs) + max(0, len(motifs) - 1)
+
+
+def ecrire_petit(img, texte, x, y, couleur):
+    """Du texte en police 3 x 5 ; `x` None : centre."""
+    if x is None:
+        x = (PANNEAU_L - largeur_petit(texte)) // 2
+    for m in _texte_petit(texte):
+        _motif(img, m, x, y, couleur)
+        x += len(m[0]) + 1
+
+
+def accent_panneau():
+    """La couleur de la guirlande, poussee a pleine valeur (un panneau dit sa
+    couleur, pas sa luminosite) ; un blanc chaud si elle est eteinte."""
+    r, g, b = ETAT.get("couleur") or (0, 0, 0)
+    m = max(r, g, b)
+    if not ETAT.get("connecte") or m < 40:
+        return (255, 176, 80)
+    return tuple(int(c * 255.0 / m) for c in (r, g, b))
+
+
+def _prochain_chrono(minuteurs, t):
+    """Le minuteur (ou l'alarme, ou le chrono) a montrer : celui qui sonne en
+    premier. (genre, texte) ou None."""
+    tous = [m for m in minuteurs or [] if isinstance(m, dict)]
+    a_rebours = sorted((m for m in tous if m.get("genre") in ("minuteur", "alarme")), key=lambda m: m["fin"])
+    if a_rebours:
+        m = a_rebours[0]
+        if m["genre"] == "alarme":
+            return "alarme", "REVEIL " + time.strftime("%H:%M", time.localtime(m["fin"]))
+        return "minuteur", temps_ecoule(m["fin"] - t)
+    chronos = [m for m in tous if m.get("genre") == "chrono"]
+    if chronos:
+        return "chrono", temps_ecoule(t - chronos[0]["debut"])
+    return None
+
+
+def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None):
+    """L'image de 64 x 64 (numpy, RGB) que le panneau doit montrer."""
+    import numpy as np
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    t = time.time() if maintenant is None else maintenant
+    if contenu == "eteint":
+        return img
+    accent = accent or accent_panneau()
+    if contenu == "ambiance":
+        # la couleur de la guirlande, qui s'assombrit doucement vers le bas
+        k = np.linspace(1.0, 0.4, PANNEAU_H)[:, None, None]
+        img[:] = (np.array(accent, float)[None, None, :] * k).astype(np.uint8)
+        return img
+    lt = time.localtime(t)
+    # l'heure : quatre chiffres 5 x 7 doubles (10 x 14), les deux points
+    hh, mm = "%02d" % lt.tm_hour, "%02d" % lt.tm_min
+    y = 10
+    for x, c in ((6, hh[0]), (18, hh[1]), (36, mm[0]), (48, mm[1])):
+        _motif(img, _CHIFFRES_5X7[c], x, y, accent, 2)
+    img[y + 3:y + 5, 31:33] = accent
+    img[y + 9:y + 11, 31:33] = accent
+    # la date
+    date = "%s %d %s" % (_JOURS_PANNEAU[lt.tm_wday], lt.tm_mday, _MOIS_PANNEAU[lt.tm_mon - 1])
+    ecrire_petit(img, date, None, 32, (150, 150, 165))
+    # le minuteur de Jarvis, s'il y en a un
+    suivant = _prochain_chrono(minuteurs, t)
+    if suivant:
+        genre, texte = suivant
+        couleur = {"minuteur": (255, 150, 40), "alarme": (255, 90, 70), "chrono": (110, 170, 255)}[genre]
+        ecrire_petit(img, texte, None, 44, couleur)
+    # les secondes : une ligne qui se remplit en bas
+    plein = int(round(60 * (lt.tm_sec + 1) / 60.0))
+    img[60, 2:62] = tuple(int(c * 0.15) for c in accent)
+    img[60, 2:2 + plein] = tuple(int(c * 0.6) for c in accent)
+    return img
+
+
+def rgb565(img):
+    """L'image en RGB565, poids fort d'abord : ce que lit le croquis."""
+    import numpy as np
+    a = np.asarray(img).astype(np.uint16)
+    v = ((a[..., 0] & 0xF8) << 8) | ((a[..., 1] & 0xFC) << 3) | (a[..., 2] >> 3)
+    return v.astype(">u2").tobytes()
+
+
+def trouver_panneau():
+    """Le port de la MatrixPortal, ou None. Sans pyserial : None (et on le dit)."""
+    try:
+        from serial.tools import list_ports
+    except ImportError:
+        PANNEAU["pyserial"] = False
+        return None
+    for p in list_ports.comports():
+        if getattr(p, "vid", None) in PANNEAU_VIDS:
+            return p.device
+    return None
+
+
+def ouvrir_panneau(port):
+    import serial
+    return serial.Serial(port, 115200, timeout=1, write_timeout=2)
+
+
+def piloter_panneau(cfg=None, tours=None):
+    """Le fil du panneau : l'image du moment (l'apercu la montre, branche ou
+    non), et, une carte trouvee, la luminosite puis chaque image qui change.
+    Une liaison perdue (debranchee, reprise par Arduino) se recherche seule.
+    `tours` : pour les tests, un nombre de passages."""
+    cfg = CFG if cfg is None else cfg
+    lien, envoye, lum, recherche = None, None, None, 0.0
+    n = 0
+    while ETAT["en_marche"] and (tours is None or n < tours):
+        n += 1
+        contenu = cfg.get("panneau_contenu", "horloge")
+        contenu = contenu if contenu in PANNEAU_CONTENUS else "horloge"
+        try:
+            img = image_panneau(contenu, minuteurs=JARVIS.get("minuteurs"))
+            PANNEAU["image"] = img
+            if not cfg.get("panneau_actif", True):
+                if lien is not None:
+                    lien.close()
+                    lien = None
+                PANNEAU.update(etat="coupe", port=None)
+            elif lien is None and time.time() >= recherche:
+                recherche = time.time() + PANNEAU_CHERCHE_S
+                port = trouver_panneau()
+                if port:
+                    try:
+                        lien = ouvrir_panneau(port)
+                        envoye, lum = None, None
+                        PANNEAU.update(etat="connecte", port=port, envoyees=0)
+                        print("Panneau LED : connecte sur %s" % port)
+                    except Exception:
+                        PANNEAU.update(etat="occupe", port=port)
+                else:
+                    PANNEAU.update(etat="absent", port=None)
+            if lien is not None:
+                voulue = 0 if contenu == "eteint" else int(max(0, min(255, cfg.get("panneau_luminosite", 64))))
+                if voulue != lum:
+                    lien.write(b"MB" + bytes([voulue]))
+                    lum = voulue
+                donnees = rgb565(img)
+                if donnees != envoye:
+                    lien.write(b"MF" + donnees)
+                    envoye = donnees
+                    PANNEAU["envoyees"] += 1
+        except Exception as e:
+            print("Panneau LED : liaison perdue (%s)" % type(e).__name__)
+            try:
+                if lien is not None:
+                    lien.close()
+            except Exception:
+                pass
+            lien = None
+            PANNEAU.update(etat="absent", port=None)
+            recherche = time.time() + 1.0
+        if tours is None:
+            time.sleep(PANNEAU_PAS_S)
+    if lien is not None:
+        try:
+            lien.close()
+        except Exception:
+            pass
+
+
+def etat_panneau_lisible():
+    e, port = PANNEAU.get("etat"), PANNEAU.get("port")
+    if not PANNEAU.get("pyserial", True):
+        return "Il manque pyserial a cette version de Machi Tool.", ALERTE
+    if e == "connecte":
+        return "Branche sur %s  ·  %d image%s envoyee%s" % (
+            port, PANNEAU["envoyees"], "s" if PANNEAU["envoyees"] > 1 else "",
+            "s" if PANNEAU["envoyees"] > 1 else ""), VIF
+    if e == "occupe":
+        return ("%s est pris par un autre programme (le Serial Monitor d'Arduino, ou test_panneau.py) : "
+                "ferme-le, je reessaie toutes les 5 s." % port), ALERTE
+    if e == "coupe":
+        return "Machi Tool laisse le panneau tranquille (Arduino peut s'en servir).", BRUME
+    return ("Pas de panneau branche : la MatrixPortal en USB-C, avec le croquis du guide. "
+            "Je la cherche toutes les 5 s."), BRUME
+
+
 # ---------- apprendre la voix ----------
 
 def apprendre_a_voix_haute(cfg):
@@ -12697,6 +12951,7 @@ MENU = [
     ("ecran",      "Ecran",           "\u25ad", "lampe"),
     ("son",        "Son",             "\u266a", "lampe"),
     ("appairage",  "Appairage",       "\u21c4", "lampe"),
+    ("panneau",    "Panneau LED",     "\u25a6", "panneau"),
     ("jarvis",     "Jarvis",          "\u25ce", "jarvis"),
     ("passerelle", "BrainDebugger",   "\u25c8", "pont"),
     ("activite",   "Quantified Self", "\u25a4", "pont"),
@@ -12842,6 +13097,7 @@ class Panneau:
         self.page_activite()
         self.page_appairage()
         self.page_jarvis()
+        self.page_panneau()
         self.aller(self.section if self.section in self.pages else "accueil")
 
         self.animer()
@@ -14873,7 +15129,7 @@ class Panneau:
         grille.grid_columnconfigure(1, weight=1, uniform="tuile")
 
         self.tuile_lumiere(grille).grid(row=0, column=0, sticky="nsew", padx=(0, 9))
-        self.tuile_a_venir(grille).grid(row=0, column=1, sticky="nsew", padx=(9, 0))
+        self.tuile_panneau(grille).grid(row=0, column=1, sticky="nsew", padx=(9, 0))
 
         self.texte(f, "Version %s — %s" % (VERSION, DOSSIER), BRUME, 8).pack(
             fill="x", side="bottom", pady=(18, 0))
@@ -14961,6 +15217,147 @@ class Panneau:
                           fill=melange((178, 188, 206), arriere, 0.5), width=e(3))
         c.create_arc(e(39), e(92), e(57), e(102), start=180, extent=180,
                      outline="", fill=melange((178, 188, 206), arriere, 0.4))
+
+    def tuile_panneau(self, parent):
+        """Le panneau LED, sur l'accueil : son image du moment, en petit."""
+        tk = self.tk
+        carte = tk.Frame(parent, bg=VELOURS, cursor="hand2", highlightthickness=1, highlightbackground=VELOURS)
+        dedans = tk.Frame(carte, bg=VELOURS, padx=22, pady=24)
+        dedans.pack(fill="both", expand=True)
+        cote = PANNEAU_L * max(1, round(self.px(112) / float(PANNEAU_L)))     # un pixel = un carre entier
+        self.apercu_tuile = tk.Canvas(dedans, width=cote, height=cote, bg="#000000", highlightthickness=0)
+        self.apercu_tuile.pack()
+        titre = tk.Label(dedans, text="Panneau LED", bg=VELOURS, fg=CRAIE, font=(self.f_titre, 18))
+        titre.pack(pady=(14, 4))
+        detail = tk.Label(dedans, text="Machi LED Wall\nL'heure et la couleur de la guirlande\nsur 64 × 64 LED",
+                          bg=VELOURS, fg=BRUME, font=(self.f_ui, 9), justify="center")
+        detail.pack()
+        self.etat_tuile_panneau = tk.Label(dedans, text="", bg=VELOURS, fg=BRUME, font=(self.f_mono, 8))
+        self.etat_tuile_panneau.pack(pady=(12, 0))
+        cibles = [carte, dedans, titre, detail, self.etat_tuile_panneau, self.apercu_tuile]
+
+        def survol(entre):
+            fond = ENCRE if entre else VELOURS
+            carte.configure(bg=fond, highlightbackground=self.accent if entre else VELOURS)
+            for w in (dedans, titre, detail, self.etat_tuile_panneau):
+                w.configure(bg=fond)
+        for w in cibles:
+            w.bind("<Button-1>", lambda e: self.aller("panneau"))
+            w.bind("<Enter>", lambda e: survol(True))
+            w.bind("<Leave>", lambda e: survol(False))
+        self._apercus_panneau = {}
+        self._peindre_panneau()
+        return carte
+
+    def page_panneau(self):
+        """« Tu peux faire passer ca dans Machi Tool automatiquement ? » La page
+        du panneau LED : ce qu'il montre en ce moment, et de quoi le regler.
+        Tout s'applique tout de suite (le fil du panneau relit la config)."""
+        tk = self.tk
+        for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite"):
+            self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
+        f = self.nouvelle_page("panneau", defilante=True)
+        self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
+        tk.Label(f, text="Panneau LED", bg=NUIT, fg=CRAIE, font=(self.f_titre, 22), anchor="w").pack(fill="x")
+        self.txt_panneau_etat = tk.Label(f, text="", bg=NUIT, fg=BRUME, font=(self.f_ui, 9), anchor="w",
+                                         justify="left", wraplength=self.px(560))
+        self.txt_panneau_etat.pack(fill="x", pady=(2, 14))
+
+        ligne = tk.Frame(f, bg=NUIT)
+        ligne.pack(fill="x")
+        cote = PANNEAU_L * max(2, round(self.px(224) / float(PANNEAU_L)))
+        cadre = tk.Frame(ligne, bg=ENCRE, padx=self.px(8), pady=self.px(8))
+        cadre.pack(side="left", anchor="n")
+        self.apercu_page_panneau = tk.Canvas(cadre, width=cote, height=cote, bg="#000000", highlightthickness=0)
+        self.apercu_page_panneau.pack()
+        tk.Label(cadre, text="ce que montre le panneau", bg=ENCRE, fg=BRUME, font=(self.f_mono, 7)).pack(
+            pady=(6, 0))
+
+        col = tk.Frame(ligne, bg=NUIT)
+        col.pack(side="left", fill="both", expand=True, padx=(self.px(22), 0))
+        self.var_panneau_actif = tk.IntVar(value=1 if self.cfg.get("panneau_actif", True) else 0)
+        self.case(col, "Machi Tool pilote le panneau", self.var_panneau_actif,
+                  lambda: self.regler_panneau("panneau_actif")).pack(fill="x")
+        self.titre(col, "Ce qu'il affiche").pack(fill="x", pady=(14, 4))
+        self.var_panneau_contenu = tk.StringVar(value=self.cfg.get("panneau_contenu", "horloge"))
+        for valeur, nom in (("horloge", "L'heure et la date, aux couleurs de la guirlande (et le minuteur de "
+                                        "Jarvis quand il y en a un)"),
+                            ("ambiance", "La couleur de la guirlande, en grand"),
+                            ("eteint", "Rien : le panneau reste noir")):
+            r = self.radio(col, nom, self.var_panneau_contenu, valeur)
+            r.configure(command=lambda: self.regler_panneau("panneau_contenu"), wraplength=self.px(380),
+                        justify="left")
+            r.pack(fill="x")
+        tk.Frame(col, bg=NUIT, height=self.px(12)).pack()
+        self.var_panneau_luminosite = self.reglette(
+            col, "panneau_luminosite", "Luminosite", 0, 255, 1,
+            "De 0 a 255. Le croquis de la carte la plafonne (PLAFOND) : sur l'USB seul, 96 au plus.", entier=True)
+        self.var_panneau_luminosite.trace_add("write", lambda *_: self._panneau_luminosite_bientot())
+
+        self.texte(f, "Rien de personnel n'y passe : ni journal, ni humeur, ni messages, ni le nom d'un minuteur. "
+                      "Pour televerser un croquis avec Arduino, decoche d'abord « Machi Tool pilote le panneau » : "
+                      "un seul programme a la fois peut tenir le port USB de la carte.",
+                   BRUME, 8, largeur=560).pack(fill="x", pady=(18, 0))
+
+    def regler_panneau(self, cle):
+        if cle == "panneau_actif":
+            self.cfg[cle] = bool(self.var_panneau_actif.get())
+        elif cle == "panneau_contenu":
+            self.cfg[cle] = self.var_panneau_contenu.get()
+        sauver_config(self.cfg)
+        self._peindre_panneau()
+
+    def _panneau_luminosite_bientot(self):
+        """Le fil suit la reglette en direct ; la config s'ecrit une fois le geste fini."""
+        self.cfg["panneau_luminosite"] = int(self.var_panneau_luminosite.get())
+        if getattr(self, "_panneau_sauve", None):
+            self.root.after_cancel(self._panneau_sauve)
+        self._panneau_sauve = self.root.after(500, lambda: sauver_config(self.cfg))
+
+    def _peindre_panneau(self):
+        """Les apercus (la tuile, la page) : l'image du fil, ou celle qu'il montrerait."""
+        img = PANNEAU.get("image")
+        if img is None:
+            try:
+                img = image_panneau(self.cfg.get("panneau_contenu", "horloge"), minuteurs=JARVIS.get("minuteurs"))
+            except Exception:
+                return
+        cle = img.tobytes()
+        memo = self.__dict__.setdefault("_apercus_panneau", {})
+        for nom in ("apercu_tuile", "apercu_page_panneau"):
+            c = getattr(self, nom, None)
+            if c is None:
+                continue
+            try:
+                if not c.winfo_exists():
+                    continue
+            except Exception:
+                continue
+            if memo.get(nom, (None,))[0] == cle:
+                continue
+            zoom = max(1, int(c.cget("width")) // PANNEAU_L)
+            # master=c : l'image vit dans la fenetre de la toile, pas dans la
+            # premiere fenetre Tk ouverte (refaire l'interface en cree une autre).
+            photo = self.tk.PhotoImage(master=c, width=PANNEAU_L, height=PANNEAU_H)
+            lignes = " ".join("{" + " ".join("#%02x%02x%02x" % tuple(px) for px in rang) + "}" for rang in img)
+            photo.put(lignes, to=(0, 0))
+            grande = photo.zoom(zoom, zoom)
+            c.delete("all")
+            c.create_image(0, 0, image=grande, anchor="nw")
+            memo[nom] = (cle, grande)
+        texte, couleur = etat_panneau_lisible()
+        if getattr(self, "txt_panneau_etat", None) is not None:
+            try:
+                self.txt_panneau_etat.configure(text=texte, fg=couleur)
+            except Exception:
+                pass
+        if getattr(self, "etat_tuile_panneau", None) is not None:
+            court = {"connecte": "branche \u2014 %s" % PANNEAU.get("port"), "occupe": "port occupe",
+                     "coupe": "laisse tranquille"}.get(PANNEAU.get("etat"), "non branche")
+            try:
+                self.etat_tuile_panneau.configure(text=court, fg=VIF if PANNEAU.get("etat") == "connecte" else BRUME)
+            except Exception:
+                pass
 
     def tuile_a_venir(self, parent):
         """Place tenue pour le prochain outil. Une grille a une seule tuile
@@ -17003,6 +17400,8 @@ class Panneau:
                       "et la couleur reviendra toute seule.") if suspendue else "",
                 fg=ALERTE if suspendue else BRUME)
 
+        if self.section in ("accueil", "panneau"):
+            self._peindre_panneau()
         if self.section == "accueil":
             # Repeindre hors de l'accueil ne servirait a rien : la tuile
             # n'est pas a l'ecran.
@@ -17976,6 +18375,9 @@ def lancer():
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
     # ce qui tournait avant (minuteurs, alarmes, chronometres) reprend
     sans_faute("Minuteurs de Jarvis", restaurer_chronos, CFG)
+    # le panneau LED : trouve seul, des qu'il est branche
+    threading.Thread(target=sans_faute, args=("Panneau LED", piloter_panneau, CFG), daemon=True,
+                     name="panneau").start()
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
     # Ctrl+J : il se reveille et t'ecoute ; Ctrl+Maj+Espace : il prend une
     # note pour le carnet (hors du fil de Tk). Un second appui le congedie.

@@ -38,6 +38,9 @@ hiddenimports += ['jarvis', 'winsound', 'pythoncom', 'win32com.client']
 # Le son de chaque appli (« baisse Discord ») : pycaw, sur comtypes. Et
 # win32con pour les fenetres de Jarvis.
 hiddenimports += ['win32con']
+# Le panneau LED : pyserial, importe dans des fonctions (trouver_panneau).
+hiddenimports += ['serial', 'serial.tools.list_ports',
+                  'serial.tools.list_ports_windows']
 for paquet in ('bleak', 'winrt', 'mss', 'soundcard', 'cffi', 'numpy',
                'onnxruntime', 'onnx_asr', 'pycaw', 'comtypes'):
     try:

@@ -2974,6 +2974,93 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual([t for _, t in poses[1:]], ["note-témoin une", "note-témoin deux"])
         self.assertEqual(m.NOTES_EN_ATTENTE, [])
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_panneau_led_dessine_l_heure_et_rien_de_personnel(self):
+        # « tu peux faire passer ca dans machitool automatiquement ? »
+        m = self.m
+        t = time.mktime((2026, 10, 21, 21, 47, 30, 0, 0, -1))
+        bleu = (40, 120, 255)
+        img = m.image_panneau("horloge", t, accent=bleu)
+        self.assertEqual(img.shape, (64, 64, 3))
+        heure = img[10:24]
+        self.assertGreater(int((heure == bleu).all(axis=2).sum()), 150, "l'heure, aux couleurs de la guirlande")
+        self.assertTrue((img[0:9] == 0).all() and (img[61:] == 0).all(), "les bords restent noirs")
+        self.assertGreater(int((img[32:37] == (150, 150, 165)).all(axis=2).sum()), 20, "la date")
+        self.assertFalse((img[44:49] != 0).any(), "pas de minuteur : rien a cette ligne")
+        minuteur = [{"genre": "minuteur", "fin": t + 523, "quoi": "nom-temoin", "duree": 600}]
+        avec = m.image_panneau("horloge", t, accent=bleu, minuteurs=minuteur)
+        self.assertGreater(int((avec[44:49] == (255, 150, 40)).all(axis=2).sum()), 15, "le minuteur, sans son nom")
+        self.assertEqual(m._prochain_chrono(minuteur, t), ("minuteur", "08:43"))
+        self.assertTrue((m.image_panneau("eteint", t) == 0).all())
+        ambiance = m.image_panneau("ambiance", t, accent=(255, 0, 0))
+        self.assertEqual(tuple(ambiance[0, 0]), (255, 0, 0))
+        self.assertLess(int(ambiance[63, 0, 0]), 120, "elle s'assombrit vers le bas")
+        # RGB565, poids fort d'abord : ce que lit le croquis
+        donnees = m.rgb565(ambiance)
+        self.assertEqual(len(donnees), 8192)
+        self.assertEqual(donnees[:2], b"\xf8\x00")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_panneau_led_se_branche_seul_et_n_envoie_que_ce_qui_change(self):
+        m = self.m
+        vrais = (m.trouver_panneau, m.ouvrir_panneau, m.image_panneau)
+        self.addCleanup(lambda: (setattr(m, "trouver_panneau", vrais[0]), setattr(m, "ouvrir_panneau", vrais[1]),
+                                 setattr(m, "image_panneau", vrais[2])))
+        import numpy as np
+
+        class Carte:
+            def __init__(self):
+                self.ecrit, self.ferme, self.panne = [], False, False
+
+            def write(self, octets):
+                if self.panne:
+                    raise OSError("debranchee")
+                self.ecrit.append(bytes(octets))
+
+            def close(self):
+                self.ferme = True
+        cartes, port = [], ["COM7"]
+        m.trouver_panneau = lambda: port[0]
+        m.ouvrir_panneau = lambda p: cartes.append(Carte()) or cartes[-1]
+        image = [np.zeros((64, 64, 3), np.uint8)]
+        m.image_panneau = lambda *a, **k: image[0]
+        cfg = {"panneau_actif": True, "panneau_contenu": "horloge", "panneau_luminosite": 80}
+        m.PANNEAU.update(etat="absent", port=None, envoyees=0)
+        m.piloter_panneau(cfg, tours=3)
+        self.assertEqual(m.PANNEAU["etat"], "connecte")
+        self.assertEqual(m.PANNEAU["port"], "COM7")
+        genres = [o[:2] for o in cartes[0].ecrit]
+        self.assertEqual(genres, [b"MB", b"MF"], "la luminosite, puis UNE image : elle n'a pas change")
+        self.assertEqual(cartes[0].ecrit[0], b"MB" + bytes([80]))
+        self.assertEqual(len(cartes[0].ecrit[1]), 2 + 8192)
+        # debranchee en cours de route : la liaison se ferme, l'etat le dit
+        images = iter([np.zeros((64, 64, 3), np.uint8), np.full((64, 64, 3), 9, np.uint8)] * 4)
+        m.image_panneau = lambda *a, **k: next(images)
+        ecrire_vrai = Carte.write
+
+        def ecrire(self_, octets):
+            if len(self_.ecrit) >= 2:
+                raise OSError("debranchee")
+            ecrire_vrai(self_, octets)
+        Carte.write = ecrire
+        self.addCleanup(lambda: setattr(Carte, "write", ecrire_vrai))
+        m.piloter_panneau(cfg, tours=3)
+        self.assertTrue(cartes[-1].ferme)
+        self.assertEqual(m.PANNEAU["etat"], "absent")
+        Carte.write = ecrire_vrai
+        # rebranchee : il la retrouve seul
+        m.piloter_panneau(cfg, tours=1)
+        self.assertEqual(m.PANNEAU["etat"], "connecte")
+        # « Machi Tool pilote le panneau » decoche : le port est rendu (Arduino peut televerser)
+        cfg["panneau_actif"] = False
+        m.piloter_panneau(cfg, tours=1)
+        self.assertEqual(m.PANNEAU["etat"], "coupe")
+        # rien de branche
+        cfg["panneau_actif"], port[0] = True, None
+        m.piloter_panneau(cfg, tours=1)
+        self.assertEqual(m.PANNEAU["etat"], "absent")
+        self.assertIn("Je la cherche", m.etat_panneau_lisible()[0])
+
     def test_l_agenda_synchro_meme_hors_ligne(self):
         # « fait en sorte que l'agenda soit synchro sur brain debugger »
         m = self.m

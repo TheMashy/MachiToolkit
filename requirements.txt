@@ -17,3 +17,5 @@ pycaw; sys_platform == "win32"
 onnxruntime; sys_platform != "win32"
 onnxruntime-directml; sys_platform == "win32"
 onnx-asr
+# Le panneau LED (MatrixPortal S3) : le port serie USB.
+pyserial
