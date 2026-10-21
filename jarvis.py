@@ -6974,6 +6974,7 @@ REGLAGES_CHOIX = {
     "son_cible": ("luminosite", "saturation", "les_deux"),
     "ecran_cible": ("luminosite", "saturation", "les_deux", "rien"),
     "jarvis_langue": ("fr", "en"),
+    "panneau_contenu": ("horloge", "ambiance", "eteint"),
 }
 
 
