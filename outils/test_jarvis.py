@@ -2987,6 +2987,13 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue((img[0:9] == 0).all() and (img[61:] == 0).all(), "les bords restent noirs")
         self.assertGreater(int((img[32:37] == (150, 150, 165)).all(axis=2).sum()), 20, "la date")
         self.assertFalse((img[44:49] != 0).any(), "pas de minuteur : rien a cette ligne")
+        # « possible que machitool envoie du 30 fps ? » : la barre des secondes
+        # glisse -- a 30 s et demie, le 31e pixel est a moitie allume
+        demi = m.image_panneau("horloge", t + 0.5, accent=bleu)
+        self.assertEqual(tuple(img[60, 31]), tuple(int(c * 0.6) for c in bleu), "30 secondes pleines")
+        self.assertEqual(tuple(img[60, 32]), tuple(int(c * 0.15) for c in bleu))
+        self.assertTrue(img[60, 32, 2] < demi[60, 32, 2] < int(bleu[2] * 0.6), "le bout s'allume en cours de seconde")
+        self.assertEqual(m.PANNEAU_IPS, 30)
         minuteur = [{"genre": "minuteur", "fin": t + 523, "quoi": "nom-temoin", "duree": 600}]
         avec = m.image_panneau("horloge", t, accent=bleu, minuteurs=minuteur)
         self.assertGreater(int((avec[44:49] == (255, 150, 40)).all(axis=2).sum()), 15, "le minuteur, sans son nom")
@@ -2999,6 +3006,80 @@ class DansMachiTool(unittest.TestCase):
         donnees = m.rgb565(ambiance)
         self.assertEqual(len(donnees), 8192)
         self.assertEqual(donnees[:2], b"\xf8\x00")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_panneau_led_a_la_couleur_de_la_guirlande(self):
+        # « Cheque bien que la couleur actuelle de la guirlande matche la couleur du panneau »
+        m = self.m
+        avant = {k: m.ETAT.get(k) for k in ("connecte", "couleur")}
+        self.addCleanup(lambda: (m.ETAT.update(avant), m.PANNEAU.update(teinte=None)))
+        m.PANNEAU["teinte"] = None
+        # la guirlande recoit de la lumiere lineaire : l'ecran la montre par vu_a_l_oeil (le graphe)
+        m.ETAT.update(connecte=True, couleur=(255, 120, 0))
+        jaune = m.accent_panneau()
+        self.assertEqual(jaune, m.vu_a_l_oeil((255, 120, 0)), "la couleur du graphe, pas la valeur brute")
+        self.assertGreater(jaune[1], 170, "un jaune reste jaune (120 tel quel le faisait orange)")
+        # tamisee (la veille, la nuit) : la meme teinte -- plus le blanc chaud sous 40
+        m.ETAT["couleur"] = (34, 16, 0)
+        self.assertEqual(m.accent_panneau(), jaune)
+        m.ETAT["couleur"] = (6, 0, 8)
+        violet = m.accent_panneau()
+        self.assertEqual(violet[1], 0)
+        self.assertGreater(violet[2], violet[0])
+        # noire : la derniere teinte ; debranchee : le blanc chaud
+        m.ETAT["couleur"] = (0, 0, 0)
+        self.assertEqual(m.accent_panneau(), violet)
+        m.ETAT["connecte"] = False
+        self.assertEqual(m.accent_panneau(), m.PANNEAU_BLANC_CHAUD)
+
+        # et la carte eclaire comme la guirlande : la bibliotheque HUB75 applique
+        # CIE 1931 (lumConvTab) a ce qu'elle recoit -- les memes proportions de lumiere
+        def lumiere(v):
+            clarte = v * 100.0 / 255
+            return ((clarte + 16) / 116) ** 3 if clarte > 8 else clarte / 903.3
+        mot = int.from_bytes(m.rgb565(m.image_panneau("ambiance", 0, accent=jaune))[:2], "big")
+        r5, v6 = mot >> 11, (mot >> 5) & 0x3F
+        r8, v8 = (r5 << 3) | (r5 >> 2), (v6 << 2) | (v6 >> 4)
+        self.assertAlmostEqual(lumiere(v8) / lumiere(r8), 120 / 255.0, delta=0.02)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_quand_jarvis_parle_de_lui_meme_le_panneau_le_montre(self):
+        # « Lorsque Jarvis parle automatiquement, montre-le sur le panneau »
+        m = self.m
+        vrai = m.trouver_panneau
+        self.addCleanup(lambda: (setattr(m, "trouver_panneau", vrai), m.PANNEAU.update(jarvis=None)))
+        m.trouver_panneau = lambda: None
+        m.montrer_au_panneau("Votre  minuteur est terminé.")
+        jv = m.PANNEAU["jarvis"]
+        self.assertEqual(jv["texte"], "Votre minuteur est terminé.")
+        bleu = (40, 120, 255)
+        img = m.image_panneau("horloge", jv["debut"] + 1.0, accent=bleu, jarvis=jv, niveau=0.0)
+        self.assertGreater(int(img[21, 31, 2]), 240, "sa boule, aux couleurs de la guirlande")
+        self.assertAlmostEqual(int(img[21, 31, 0]), int(img[21, 31, 2]) * 40 / 255.0, delta=1)
+        texte = (img[46:53] == (240, 240, 248)).all(axis=2)
+        self.assertGreater(int(texte.sum()), 10, "sa phrase entre par la droite")
+        self.assertFalse(texte[:, :34].any(), "une seconde : 30 pixels, pas plus")
+        # sa voix fait enfler la boule
+        fort = m.image_panneau("horloge", jv["debut"] + 1.0, accent=bleu, jarvis=jv, niveau=1.0)
+        self.assertGreater(int((fort[..., 2] > 128).sum()), int((img[..., 2] > 128).sum()) + 100)
+        # « Rien : le panneau reste noir » le reste
+        self.assertTrue((m.image_panneau("eteint", jv["debut"] + 1.0, jarvis=jv) == 0).all())
+        # la police : capitales sans accents, guillemets et tirets a plat
+        self.assertEqual(m._texte_5x7("Ça s’arrête à 7 h — « bientôt » !"), "CA S'ARRETE A 7 H - \"BIENTOT\" !")
+        w = m.bande_texte(jv["texte"]).shape[1]
+        self.assertAlmostEqual(m.duree_jarvis(jv["texte"]), (64 + w) / 30.0 + 0.5)
+        # le fil la garde le temps qu'elle passe, puis l'horloge revient
+        cfg = {"panneau_actif": True, "panneau_contenu": "horloge", "panneau_luminosite": 64}
+        m.piloter_panneau(cfg, tours=1)
+        self.assertIs(m.PANNEAU["jarvis"], jv)
+        jv["debut"] -= m.duree_jarvis(jv["texte"]) + 1
+        m.piloter_panneau(cfg, tours=1)
+        self.assertIsNone(m.PANNEAU["jarvis"])
+        # decoche : rien ne s'affiche
+        m.montrer_au_panneau("Bonne nuit.")
+        cfg["panneau_jarvis"] = False
+        m.piloter_panneau(cfg, tours=1)
+        self.assertIsNone(m.PANNEAU["jarvis"])
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_le_panneau_led_se_branche_seul_et_n_envoie_que_ce_qui_change(self):
@@ -5461,13 +5542,17 @@ class DansMachiTool(unittest.TestCase):
         oreille = []
         m.envoyer_oreille = lambda o: oreille.append(o) or True
         m.JARVIS.update(etat="pense")
+        self.addCleanup(lambda: m.PANNEAU.update(jarvis=None))
+        m.PANNEAU["jarvis"] = None
         self.assertFalse(m.annoncer("Votre minuteur est terminé.", "fr"))
         self.assertEqual(dits(), [], "il reflechit a ta question : pas maintenant")
+        self.assertIsNone(m.PANNEAU["jarvis"], "le panneau non plus")
         m.dire_les_annonces()
         self.assertEqual(dits(), [])
         m.JARVIS.update(etat="attente")
         m.dire_les_annonces()
         self.assertEqual([d["texte"] for d in dits()], ["Votre minuteur est terminé."])
+        self.assertEqual(m.PANNEAU["jarvis"]["texte"], "Votre minuteur est terminé.", "dit de lui-meme : le panneau le montre")
         # une fenetre d'ecoute d'apres, ou personne ne parle : il la ferme, et le dit
         m.JARVIS.update(etat="ecoute", suite_active=True, parole_vue=0.0)
         self.assertTrue(m.annoncer("Votre rappel.", "fr"))
