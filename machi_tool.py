@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.84.0"
+VERSION = "1.85.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -341,6 +341,7 @@ CONFIG_DEFAUT = {
     "panneau_contenu": "horloge",     # horloge | ambiance | eteint
     "panneau_luminosite": 64,         # 0-255, la valeur du croquis (qui la plafonne)
     "panneau_jarvis": True,           # quand Jarvis parle de lui-meme : sa boule et sa phrase
+    "panneau_rotation": 0,            # 0 | 90 | 180 | 270, sens horaire : la carte posee de travers
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -11672,6 +11673,22 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
     return img
 
 
+PANNEAU_ROTATIONS = (0, 90, 180, 270)
+
+
+def tourner_panneau(img, degres):
+    """« Ajoute une facon de tourner l'affichage de 90° (j'ai installe la carte
+    a 90°, c'est plus simple). » L'image tourne juste avant d'etre envoyee,
+    dans le sens des aiguilles d'une montre ; l'apercu, lui, reste droit :
+    c'est ce qu'on doit voir sur le panneau."""
+    import numpy as np
+    try:
+        quarts = (int(degres) // 90) % 4
+    except (TypeError, ValueError):
+        quarts = 0
+    return np.rot90(img, -quarts) if quarts else img
+
+
 _LUT_PANNEAU = []
 
 
@@ -11758,7 +11775,7 @@ def piloter_panneau(cfg=None, tours=None):
                 if voulue != lum:
                     lien.write(b"MB" + bytes([voulue]))
                     lum = voulue
-                donnees = rgb565(img)
+                donnees = rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)))
                 if donnees != envoye:
                     lien.write(b"MF" + donnees)
                     envoye = donnees
@@ -15455,7 +15472,8 @@ class Panneau:
         du panneau LED : ce qu'il montre en ce moment, et de quoi le regler.
         Tout s'applique tout de suite (le fil du panneau relit la config)."""
         tk = self.tk
-        for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis"):
+        for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
+                    "panneau_rotation"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -15495,6 +15513,17 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_jarvis"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        self.titre(col, "Sens du panneau").pack(fill="x", pady=(14, 4))
+        rangee = tk.Frame(col, bg=NUIT)
+        rangee.pack(fill="x")
+        self.var_panneau_rotation = tk.IntVar(value=entier(self.cfg.get("panneau_rotation", 0), 0) % 360)
+        for degres in PANNEAU_ROTATIONS:
+            r = self.radio(rangee, "%d°" % degres, self.var_panneau_rotation, degres)
+            r.configure(command=lambda: self.regler_panneau("panneau_rotation"))
+            r.pack(side="left", padx=(0, self.px(14)))
+        self.texte(col, "La carte posee de travers : l'image tourne d'autant, dans le sens des aiguilles d'une "
+                        "montre. Choisis celui qui la remet droite ; l'apercu, lui, reste toujours droit.",
+                   BRUME, 8, largeur=380).pack(fill="x", pady=(4, 0))
         tk.Frame(col, bg=NUIT, height=self.px(12)).pack()
         self.var_panneau_luminosite = self.reglette(
             col, "panneau_luminosite", "Luminosite", 0, 255, 1,
@@ -15512,6 +15541,8 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_actif.get())
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
+        elif cle == "panneau_rotation":
+            self.cfg[cle] = int(self.var_panneau_rotation.get())
         elif cle == "panneau_contenu":
             self.cfg[cle] = self.var_panneau_contenu.get()
         sauver_config(self.cfg)

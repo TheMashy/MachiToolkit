@@ -3008,6 +3008,41 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(donnees[:2], b"\xf8\x00")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_panneau_led_tourne_pour_une_carte_posee_de_travers(self):
+        # « add a way to rotate the display by 90° (I have installed the board at a 90° angle) »
+        m = self.m
+        import numpy as np
+        vrais = (m.trouver_panneau, m.ouvrir_panneau, m.image_panneau)
+        self.addCleanup(lambda: (setattr(m, "trouver_panneau", vrais[0]), setattr(m, "ouvrir_panneau", vrais[1]),
+                                 setattr(m, "image_panneau", vrais[2])))
+        ecrit = []
+
+        class Carte:
+            def write(self, octets):
+                ecrit.append(bytes(octets))
+
+            def close(self):
+                pass
+        m.trouver_panneau = lambda: "COM7"
+        m.ouvrir_panneau = lambda p: Carte()
+        img = np.zeros((64, 64, 3), np.uint8)
+        img[0, 0] = (255, 0, 0)
+        m.image_panneau = lambda *a, **k: img
+
+        def ou_est_le_rouge(cfg):
+            del ecrit[:]
+            m.piloter_panneau(cfg, tours=1)
+            mots = np.frombuffer([o for o in ecrit if o[:2] == b"MF"][-1][2:], ">u2").reshape(64, 64)
+            return tuple(int(v) for v in np.argwhere(mots == 0xF800)[0])
+        cfg = {"panneau_actif": True, "panneau_contenu": "horloge", "panneau_luminosite": 64}
+        self.assertEqual(ou_est_le_rouge(cfg), (0, 0), "sans rotation : tel quel")
+        for degres, attendu in ((90, (0, 63)), (180, (63, 63)), (270, (63, 0))):
+            cfg["panneau_rotation"] = degres
+            self.assertEqual(ou_est_le_rouge(cfg), attendu, "%d° dans le sens horaire" % degres)
+        self.assertIs(m.tourner_panneau(img, "n'importe quoi"), img, "une valeur abimee : pas de rotation")
+        self.assertEqual(m.CONFIG_DEFAUT["panneau_rotation"], 0)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
     def test_le_panneau_led_a_la_couleur_de_la_guirlande(self):
         # « Cheque bien que la couleur actuelle de la guirlande matche la couleur du panneau »
         m = self.m
