@@ -675,6 +675,24 @@ class SesMains(unittest.TestCase):
         self.assertEqual([x[1] for x in jours[1][1]], ["Dentiste", "Anniversaire de Paul"])
         self.assertEqual(J.agenda_par_jour([], "2026-10-01"), [])
 
+    def test_la_liste_plus_belle_de_l_agenda(self):
+        # « rends l'agenda plus beau » : les jours avec leur date, et ce qui reste
+        rdv = [{"date": "2026-10-02", "heure": "", "label": "Anniversaire de Paul"},
+               {"date": "2026-10-01", "heure": "18:00", "label": "Appeler maman"},
+               {"date": "2026-10-01", "heure": "09:00", "label": "Reunion"},
+               {"date": "2026-09-28", "fin": "2026-10-04", "label": "Vacances"}, {"label": "sans date"}]
+        jours = J.agenda_jours(rdv, "2026-10-01")
+        self.assertEqual([j for j, _, _ in jours], ["2026-10-01", "2026-10-02"])
+        self.assertEqual([r["label"] for r in jours[0][2]], ["Reunion", "Appeler maman", "Vacances"])
+        self.assertEqual(jours[0][2][2]["date"], "2026-09-28", "la periode garde sa vraie date")
+        quatorze_h = 14 * 60
+        self.assertEqual(J.relatif_aujourdhui("18:00", quatorze_h), "dans 4 h")
+        self.assertEqual(J.relatif_aujourdhui("15:10", quatorze_h), "dans 1 h 10")
+        self.assertEqual(J.relatif_aujourdhui("14:25", quatorze_h), "dans 25 min")
+        self.assertEqual(J.relatif_aujourdhui("13:50", quatorze_h), "maintenant")
+        self.assertEqual(J.relatif_aujourdhui("09:00", quatorze_h), "passé")
+        self.assertIsNone(J.relatif_aujourdhui("", quatorze_h))
+
     def test_la_frise_de_l_agenda(self):
         # « un mode frise », « des rappels pouvant durer plusieurs jours »
         rdv = [{"date": "2026-09-20", "fin": "2026-09-27", "label": "Vacances"},
@@ -2931,6 +2949,73 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.poser_notes("note-témoin deux", m.CFG), 2)
         self.assertEqual([t for _, t in poses[1:]], ["note-témoin une", "note-témoin deux"])
         self.assertEqual(m.NOTES_EN_ATTENTE, [])
+
+    def test_minuteurs_alarmes_et_chronos_tournent_en_fond(self):
+        # « fait en sorte que je puisse demander a jarvis de mettre un minuteur,
+        # un chronometre ou une alarme qui tourne en fond »
+        m = self.m
+        self.addCleanup(lambda: m.annuler_chronos())
+        vrais = (m.annoncer, m.poser_led, m._cle_presente)
+        self.addCleanup(lambda: (setattr(m, "annoncer", vrais[0]), setattr(m, "poser_led", vrais[1]),
+                                 setattr(m, "_cle_presente", vrais[2])))
+        dits = []
+        m.annoncer = lambda texte, langue="fr": dits.append(texte)
+        m.poser_led = lambda *a, **k: None
+        m._cle_presente = lambda cfg: False
+        m.annuler_chronos()
+        o = lambda **e: m.outil_minuteurs(e, m.CFG)
+        self.assertIn("« pates »", o(action="minuteur", secondes=600, nom="pates"))
+        self.assertIn("Alarme", o(action="alarme", heure="7:00", nom="se lever"))
+        self.assertEqual(o(action="chrono_lancer", nom="course"), "Chronomètre lancé.")
+        genres = sorted(x["genre"] for x in m.JARVIS["minuteurs"])
+        self.assertEqual(genres, ["alarme", "chrono", "minuteur"])
+        liste = o(action="lister")
+        self.assertRegex(liste, r"minuteur « pates » : reste 09:5\d|minuteur « pates » : reste 10:00")
+        self.assertIn("chronometre « course »", liste)
+        # garde dans la config : un redemarrage ne les perd pas
+        self.assertEqual(len(m.CFG["jarvis_chronos"]), 3)
+        self.assertNotIn("minuteur", m.CFG["jarvis_chronos"][0], "l'objet Timer ne va pas dans la config")
+        # « annule les minuteurs » : pas l'alarme de demain matin
+        m.executer_commande({"action": "minuteurs_annuler"}, m.CFG)
+        self.assertEqual(sorted(x["genre"] for x in m.JARVIS["minuteurs"]), ["alarme", "chrono"])
+        # le chrono s'arrete et dit le temps ecoule
+        m.JARVIS["minuteurs"][-1]["debut"] -= 125
+        self.assertIn("2 minutes et 5 secondes", o(action="chrono_arreter", nom="course"))
+        # l'alarme sonne : son nom, a voix haute
+        alarme = m.JARVIS["minuteurs"][0]
+        alarme["minuteur"].cancel()
+        alarme["minuteur"].function()
+        self.assertRegex(dits[-1], r"^Il est \d+ h(?: \d\d)? : se lever\.$")
+        self.assertEqual(m.JARVIS["minuteurs"], [])
+        self.assertEqual(m.CFG["jarvis_chronos"], [])
+        with self.assertRaises(LookupError):
+            o(action="annuler", nom="rien")
+
+    def test_l_heure_d_une_alarme(self):
+        m = self.m
+        base = time.mktime((2026, 10, 21, 22, 0, 0, 0, 0, -1))
+        self.assertEqual(time.localtime(m.fin_d_alarme("23:30", maintenant=base))[2:5], (21, 23, 30))
+        self.assertEqual(time.localtime(m.fin_d_alarme("7h", maintenant=base))[2:5], (22, 7, 0), "demain matin")
+        self.assertEqual(time.localtime(m.fin_d_alarme("7:15", "2026-10-25", maintenant=base))[1:5], (10, 25, 7, 15))
+        for faux in ("25:00", "midi", "7:75"):
+            with self.assertRaises(ValueError):
+                m.fin_d_alarme(faux, maintenant=base)
+
+    def test_au_redemarrage_ce_qui_tournait_reprend(self):
+        m = self.m
+        self.addCleanup(lambda: m.annuler_chronos())
+        notifs = []
+        m.JARVIS_CROCHETS["notifier"] = lambda t, x: notifs.append(x)
+        m.annuler_chronos()
+        t = time.time()
+        m.CFG["jarvis_chronos"] = [
+            {"id": 1, "genre": "minuteur", "fin": t + 300, "duree": 600, "quoi": "pates"},
+            {"id": 2, "genre": "chrono", "debut": t - 60, "quoi": ""},
+            {"id": 3, "genre": "alarme", "fin": t - 120, "duree": 3600, "quoi": "reunion"}]
+        self.assertEqual(m.restaurer_chronos(m.CFG), 1, "l'alarme a sonne pendant que c'etait ferme")
+        self.assertEqual(sorted(x["id"] for x in m.JARVIS["minuteurs"]), [1, 2])
+        self.assertIn("« reunion » a sonne", notifs[-1])
+        self.assertEqual(len(m.CFG["jarvis_chronos"]), 2)
 
     def test_jarvis_se_souvient_de_la_conversation_meme_congedie(self):
         # « fais en sorte que jarvis se souvienne beaucoup mieux des conversations
