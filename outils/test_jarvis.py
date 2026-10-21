@@ -3007,6 +3007,50 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(len(donnees), 8192)
         self.assertEqual(donnees[:2], b"\xf8\x00")
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_machi_tool_qui_s_eteint_eteint_le_panneau(self):
+        # « quand Machi Tool s'eteint, eteins automatiquement le panneau (comme la guirlande) »
+        m = self.m
+        vrais = (m.trouver_panneau, m.ouvrir_panneau)
+        self.addCleanup(lambda: (setattr(m, "trouver_panneau", vrais[0]), setattr(m, "ouvrir_panneau", vrais[1]),
+                                 m.PANNEAU.update(fini=False, lien=None)))
+        m.PANNEAU.update(fini=False, lien=None)
+        self.assertFalse(m.eteindre_panneau(), "rien de branche : rien a eteindre")
+        m.PANNEAU["fini"] = False
+
+        class Carte:
+            def __init__(self):
+                self.ecrit = []
+
+            def write(self, octets):
+                self.ecrit.append(bytes(octets))
+                self.vu_lien = m.PANNEAU.get("lien")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+        carte = Carte()
+        m.trouver_panneau = lambda: "COM7"
+        m.ouvrir_panneau = lambda p: carte
+        cfg = {"panneau_actif": True, "panneau_contenu": "horloge", "panneau_luminosite": 64}
+        m.piloter_panneau(cfg, tours=1)
+        self.assertIs(carte.vu_lien, carte, "le fil laisse sa liaison a l'extinction")
+        self.assertIsNone(m.PANNEAU["lien"], "fil arrete : plus de liaison")
+        m.PANNEAU["lien"] = carte                 # le fil tourne encore
+        del carte.ecrit[:]
+        self.assertTrue(m.eteindre_panneau())
+        self.assertEqual(carte.ecrit, [b"MB\x00", b"MF" + bytes(8192)], "luminosite 0, image noire")
+        # et le fil n'ecrit plus rien par-dessus
+        m.PANNEAU["lien"] = carte
+        del carte.ecrit[:]
+        m.piloter_panneau(cfg, tours=2)
+        self.assertEqual(carte.ecrit, [])
+        # les deux sorties : quitter Machi Tool et l'arret de Windows
+        src = open(m.__file__, encoding="utf-8").read()
+        self.assertEqual(src.count("eteindre_panneau()\n                eteindre_guirlande()"), 2)
+
     def test_jarvis_pose_minuteurs_alarmes_et_chronos_sans_permission(self):
         # « verifie bien que Jarvis puisse declencher un minuteur de lui-meme : qu'il
         # ait les droits, pareil pour les alarmes et les chronometres »
