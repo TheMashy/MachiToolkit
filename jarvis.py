@@ -5869,6 +5869,88 @@ def relatif_aujourdhui(heure, maintenant_min):
     return "dans %d h %02d" % (h, mn) if mn else "dans %d h" % h
 
 
+# « Sur l'agenda de Machi Tool rajoute une vue a la semaine, au mois et a
+# l'annee » : les bornes, la navigation et les grilles, calculees ici.
+
+VUES_AGENDA = ("liste", "semaine", "mois", "annee", "frise")
+
+
+def lundi_de(iso):
+    d = _jour_iso(iso)
+    return plus_jours(d.isoformat(), -d.weekday())
+
+
+def bornes_vue(mode, curseur):
+    """(debut, fin) iso de la vue `mode` qui contient `curseur`. Le mois couvre
+    ses semaines entieres (du lundi d'avant au dimanche d'apres)."""
+    d = _jour_iso(curseur)
+    if mode == "semaine":
+        debut = lundi_de(curseur)
+        return debut, plus_jours(debut, 6)
+    if mode == "mois":
+        premier = d.replace(day=1).isoformat()
+        suivant = (d.replace(day=28) + __import__("datetime").timedelta(days=4)).replace(day=1)
+        dernier = plus_jours(suivant.isoformat(), -1)
+        debut = lundi_de(premier)
+        fin = plus_jours(lundi_de(dernier), 6)
+        return debut, fin
+    if mode == "annee":
+        return "%04d-01-01" % d.year, "%04d-12-31" % d.year
+    return None
+
+
+def deplacer_vue(mode, curseur, sens):
+    """La semaine, le mois, l'annee d'avant (sens -1) ou d'apres (+1)."""
+    d = _jour_iso(curseur)
+    if mode == "semaine":
+        return plus_jours(curseur, 7 * sens)
+    if mode == "mois":
+        m = d.month - 1 + sens
+        an, mois = d.year + m // 12, m % 12 + 1
+        return "%04d-%02d-01" % (an, mois)
+    if mode == "annee":
+        return "%04d-01-01" % (d.year + sens)
+    return curseur
+
+
+def titre_vue(mode, curseur):
+    d = _jour_iso(curseur)
+    if mode == "semaine":
+        debut, fin = bornes_vue("semaine", curseur)
+        a, b = _jour_iso(debut), _jour_iso(fin)
+        num = a.isocalendar()[1]
+        if a.month == b.month:
+            return "Semaine %d  ·  %d - %d %s %d" % (num, a.day, b.day, _MOIS_AG[a.month - 1], b.year)
+        return "Semaine %d  ·  %d %s - %d %s %d" % (num, a.day, _MOIS_COURTS[a.month - 1], b.day,
+                                                    _MOIS_COURTS[b.month - 1], b.year)
+    if mode == "mois":
+        nom = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre",
+               "octobre", "novembre", "décembre")[d.month - 1]
+        return "%s %d" % (nom[0].upper() + nom[1:], d.year)
+    if mode == "annee":
+        return str(d.year)
+    return ""
+
+
+def grille_mois(curseur):
+    """Les semaines (listes de 7 jours iso) qui couvrent le mois de `curseur`."""
+    debut, fin = bornes_vue("mois", curseur)
+    semaines, j = [], debut
+    while j <= fin:
+        semaines.append([plus_jours(j, k) for k in range(7)])
+        j = plus_jours(j, 7)
+    return semaines
+
+
+def rdv_du_jour(rendez_vous, jour):
+    """Les rendez-vous qui touchent `jour` (une periode le couvre) : les
+    periodes d'abord, puis par heure."""
+    out = [r for r in rendez_vous or [] if isinstance(r, dict) and r.get("date")
+           and str(r["date"]) <= jour <= str(r.get("fin") or r["date"])]
+    return sorted(out, key=lambda r: (not r.get("fin"), not r.get("heure"), str(r.get("heure") or ""),
+                                      str(r.get("label") or "")))
+
+
 # --- la fenetre Agenda : frise, bilan, saisie --------------------------------
 #
 # « Rends l'interface des rappels beaucoup plus belle, avec un mode frise ;
