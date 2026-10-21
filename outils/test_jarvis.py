@@ -3170,6 +3170,50 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.CONFIG_DEFAUT["panneau_rotation"], 0)
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_l_heure_suit_la_luminosite_de_la_guirlande(self):
+        # « peux-tu faire varier la luminosite de l'heure et de la date en fonction de la guirlande aussi ? »
+        m = self.m
+        avant = {k: m.ETAT.get(k) for k in ("connecte", "couleur")}
+        self.addCleanup(lambda: (m.ETAT.update(avant), m.PANNEAU.update(teinte=None, mire=False, jarvis=None)))
+        m.PANNEAU.update(teinte=None, mire=False, jarvis=None)
+        avant_j = m.JARVIS.get("etat")
+        self.addCleanup(lambda: m.JARVIS.update(etat=avant_j))
+        m.JARVIS["etat"] = "attente"
+
+        def lumiere(v):                               # ce que l'ecran montre -> la lumiere
+            x = v / 255.0
+            return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+        t = time.mktime((2026, 10, 22, 0, 25, 30, 0, 0, -1))
+        cfg = {"panneau_contenu": "horloge"}
+        chiffre = (12, 6)                             # un pixel allume du premier « 0 » (y, x)
+        m.ETAT.update(connecte=True, couleur=(255, 120, 0))
+        plein = m.image_du_panneau(cfg, "horloge", t)
+        self.assertEqual(m.eclat_guirlande(), 1.0)
+        self.assertEqual(tuple(plein[chiffre]), m.accent_panneau(), "guirlande a fond : l'heure aussi")
+        # la guirlande a un quart de sa lumiere (la meme teinte) : l'heure et la date aussi
+        m.ETAT["couleur"] = (64, 30, 0)
+        quart = m.image_du_panneau(cfg, "horloge", t)
+        self.assertAlmostEqual(m.eclat_guirlande(), 64 / 255.0)
+        for i in range(3):
+            self.assertAlmostEqual(lumiere(quart[chiffre][i]), lumiere(plein[chiffre][i]) * 64 / 255.0, delta=0.01)
+        self.assertTrue((plein[32:37] > 0).any() and (quart[32:37] < plein[32:37]).any(), "la date aussi")
+        self.assertGreater(int(quart[chiffre][0]), 0)
+        self.assertEqual(sorted(range(3), key=lambda i: quart[chiffre][i]),
+                         sorted(range(3), key=lambda i: plein[chiffre][i]), "la teinte ne bouge pas")
+        # eteinte ou presque : le plancher, l'heure reste lisible
+        m.ETAT["couleur"] = (0, 0, 0)
+        nuit = m.image_du_panneau(cfg, "horloge", t)
+        self.assertAlmostEqual(lumiere(nuit[chiffre][0]), lumiere(plein[chiffre][0]) * m.PANNEAU_ECLAT_MIN, delta=0.01)
+        self.assertGreater(int(nuit[chiffre][0]), 40, "lisible")
+        # debranchee, ou case decochee : pleine lumiere
+        m.ETAT["couleur"] = (64, 30, 0)
+        self.assertTrue((m.image_du_panneau(dict(cfg, panneau_suit_eclat=False), "horloge", t) == plein).all())
+        m.ETAT["connecte"] = False
+        self.assertEqual(m.eclat_guirlande(), 1.0)
+        self.assertTrue((m.assombrir(plein, 1.0) is plein))
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_suit_eclat"])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
     def test_le_panneau_led_a_la_couleur_de_la_guirlande(self):
         # « Cheque bien que la couleur actuelle de la guirlande matche la couleur du panneau »
         m = self.m

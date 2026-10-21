@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.90.0"
+VERSION = "1.91.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -347,6 +347,8 @@ CONFIG_DEFAUT = {
     "panneau_rouge": 70,
     "panneau_vert": 85,
     "panneau_bleu": 100,
+    # l'horloge suit la lumiere de la guirlande (sa respiration, la veille, le soir)
+    "panneau_suit_eclat": True,
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -11488,6 +11490,31 @@ def accent_panneau():
     return teinte
 
 
+PANNEAU_ECLAT_MIN = 0.08               # en lumiere : l'heure reste lisible, guirlande tamisee ou eteinte
+
+
+def eclat_guirlande():
+    """« Fais varier la luminosite de l'heure et de la date en fonction de la
+    guirlande. » Sa lumiere, de 0 a 1 : son canal le plus fort (sa valeur est
+    une lumiere lineaire) -- la respiration, le processeur, la veille y sont
+    deja. Debranchee : 1, rien a suivre."""
+    if not ETAT.get("connecte"):
+        return 1.0
+    return max(0.0, min(1.0, max(ETAT.get("couleur") or (0, 0, 0)) / 255.0))
+
+
+def assombrir(img, k):
+    """L'image dont la LUMIERE est multipliee par k (0 a 1), reencodee pour
+    l'ecran : la teinte ne bouge pas, seul l'eclat baisse."""
+    import numpy as np
+    if k >= 1.0:
+        return img
+    x = np.arange(256) / 255.0
+    lin = np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4) * max(0.0, k)
+    srgb = np.where(lin <= 0.0031308, 12.92 * lin, 1.055 * np.power(lin, 1 / 2.4) - 0.055)
+    return np.clip(np.round(srgb * 255), 0, 255).astype(np.uint8)[np.asarray(img, np.uint8)]
+
+
 def couleur_guirlande_vue():
     """Ce que la guirlande emet en ce moment, telle que l'ecran la montre (le
     graphe), SANS la pousser a pleine valeur : l'ambiance suit sa lumiere --
@@ -11597,9 +11624,11 @@ def _prochain_chrono(minuteurs, t):
     return None
 
 
-def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None):
+def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None, eclat=None):
     """L'image de 64 x 64 (numpy, RGB) que le panneau doit montrer : ce que
-    l'ecran en montre (voir `rgb565` pour ce que la carte en recoit)."""
+    l'ecran en montre (voir `rgb565` pour ce que la carte en recoit).
+    `eclat` (0 a 1) : l'horloge suit la lumiere de la guirlande, jamais sous
+    PANNEAU_ECLAT_MIN ; None : pleine lumiere."""
     import numpy as np
     img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
     t = time.time() if maintenant is None else maintenant
@@ -11636,6 +11665,8 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
     img[60, 2:2 + plein] = tuple(int(c * 0.6) for c in accent)
     if plein < 60:
         img[60, 2 + plein] = tuple(int(c * (0.15 + 0.45 * bout)) for c in accent)
+    if eclat is not None:
+        img = assombrir(img, max(PANNEAU_ECLAT_MIN, float(eclat)))
     return img
 
 
@@ -11716,7 +11747,8 @@ def image_du_panneau(cfg, contenu, t):
     etat = etat_jarvis_pour_le_panneau(cfg, t)
     if etat is not None:
         return image_jarvis_du_moment(etat, t, cfg, croix=False)
-    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"))
+    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"),
+                         eclat=eclat_guirlande() if cfg.get("panneau_suit_eclat", True) else None)
 
 
 def fletcher16(donnees):
@@ -15574,7 +15606,7 @@ class Panneau:
         Tout s'applique tout de suite (le fil du panneau relit la config)."""
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
-                    "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu"):
+                    "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -15608,6 +15640,12 @@ class Panneau:
             r.configure(command=lambda: self.regler_panneau("panneau_contenu"), wraplength=self.px(380),
                         justify="left")
             r.pack(fill="x")
+        self.var_panneau_suit_eclat = tk.IntVar(value=1 if self.cfg.get("panneau_suit_eclat", True) else 0)
+        c = self.case(col, "L'heure et la date suivent la luminosite de la guirlande (sa respiration, la veille "
+                           "du soir) -- sans jamais devenir illisibles", self.var_panneau_suit_eclat,
+                      lambda: self.regler_panneau("panneau_suit_eclat"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
         self.var_panneau_jarvis = tk.IntVar(value=1 if self.cfg.get("panneau_jarvis", True) else 0)
         c = self.case(col, "Le panneau de Jarvis s'affiche ici, plus a l'ecran : quand il t'ecoute, reflechit, "
                            "parle -- et quand il parle de lui-meme (un minuteur, un rappel)", self.var_panneau_jarvis,
@@ -15655,6 +15693,8 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_actif.get())
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
+        elif cle == "panneau_suit_eclat":
+            self.cfg[cle] = bool(self.var_panneau_suit_eclat.get())
         elif cle == "panneau_rotation":
             self.cfg[cle] = int(self.var_panneau_rotation.get())
         elif cle == "panneau_contenu":
