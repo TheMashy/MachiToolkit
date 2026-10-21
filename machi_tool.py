@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.88.0"
+VERSION = "1.89.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11396,7 +11396,7 @@ PANNEAU_BLANC_CHAUD = (255, 176, 80)   # la guirlande debranchee : rien a suivre
 PANNEAU_JARVIS_TRAINE_S = 2.0          # sa voix tue, le temps de lire la fin
 PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la meme liaison
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
-           "teinte": None, "jarvis": None, "mire_jusqua": 0.0, "ips": 0.0, "perdues": 0,
+           "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0}
 PANNEAU_CROQUIS = 2                    # carte/machi_panneau/machi_panneau.ino
 
@@ -11710,7 +11710,7 @@ def image_du_panneau(cfg, contenu, t):
     Jarvis quand il est la, sinon son contenu."""
     if contenu == "eteint":
         return image_panneau("eteint", t)
-    if t < float(PANNEAU.get("mire_jusqua") or 0):
+    if PANNEAU.get("mire"):
         return image_mire()
     etat = etat_jarvis_pour_le_panneau(cfg, t)
     if etat is not None:
@@ -15583,14 +15583,15 @@ class Panneau:
         self.titre(col, "Couleurs").pack(fill="x", pady=(14, 4))
         self.texte(col, "Sur l'USB-C seul, le bleu et le vert manquent de tension et le panneau tire vers l'orange. "
                         "Baisse le rouge (et un peu le vert) jusqu'a ce que le blanc de la mire soit blanc, comme "
-                        "a l'ecran. Bouger une reglette montre la mire 20 s. Avec une alimentation 5 V branchee "
+                        "a l'ecran (« Montrer la mire » l'allume, un second clic l'eteint). Avec une alimentation 5 V branchee "
                         "sur le panneau : tout a 100.", BRUME, 8, largeur=380).pack(fill="x", pady=(0, 8))
         for cle, nom in (("panneau_rouge", "Rouge"), ("panneau_vert", "Vert"), ("panneau_bleu", "Bleu")):
             v = self.reglette(col, cle, nom, 0, 100, 1, "", entier=True)
             v.trace_add("write", lambda *_, cle=cle, v=v: self._panneau_balance_bientot(cle, v))
             setattr(self, "var_" + cle, v)
-        self.bouton(col, "Montrer la mire", lambda: PANNEAU.update(mire_jusqua=time.time() + 30),
-                    compact=True).pack(anchor="w", pady=(4, 0))
+        # « montre la mire uniquement si je clique ; un toggle, qu'on peut re-desactiver »
+        self.bouton_mire = self.bouton(col, self._texte_mire(), self.basculer_mire, compact=True)
+        self.bouton_mire.pack(anchor="w", pady=(4, 0))
 
         self.texte(f, "Ni journal, ni humeur, ni messages n'y passent. Seule exception, si la case est cochee : "
                       "le panneau de Jarvis, avec ce qu'il dit (le nom d'un rappel compris). "
@@ -15610,11 +15611,24 @@ class Panneau:
         sauver_config(self.cfg)
         self._peindre_panneau()
 
+    @staticmethod
+    def _texte_mire():
+        return "Cacher la mire" if PANNEAU.get("mire") else "Montrer la mire"
+
+    def basculer_mire(self):
+        """La mire sur le panneau : un clic l'allume, le suivant l'eteint."""
+        PANNEAU["mire"] = not PANNEAU.get("mire")
+        if getattr(self, "bouton_mire", None) is not None:
+            try:
+                self.bouton_mire.configure(text=self._texte_mire())
+            except Exception:
+                pass
+        self._peindre_panneau()
+
     def _panneau_balance_bientot(self, cle, v):
-        """La balance s'applique a l'image suivante, la mire a l'appui ; la config
-        s'ecrit une fois le geste fini."""
+        """La balance s'applique a l'image suivante ; la config s'ecrit une fois
+        le geste fini. La mire, elle, ne s'allume qu'au bouton."""
         self.cfg[cle] = int(v.get())
-        PANNEAU["mire_jusqua"] = time.time() + 20
         if getattr(self, "_panneau_sauve", None):
             self.root.after_cancel(self._panneau_sauve)
         self._panneau_sauve = self.root.after(500, lambda: sauver_config(self.cfg))

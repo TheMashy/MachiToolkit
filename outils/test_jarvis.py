@@ -3237,7 +3237,7 @@ class DansMachiTool(unittest.TestCase):
         # « j'utilise maintenant le panneau uniquement en USB-C, fais en sorte que les
         # couleurs matchent ce qui est affiche a l'ecran ; c'est un peu rouge »
         m = self.m
-        self.addCleanup(lambda: m.PANNEAU.update(mire_jusqua=0.0))
+        self.addCleanup(lambda: m.PANNEAU.update(mire=False))
         cfg = {"panneau_contenu": "horloge"}
         self.assertEqual(m.balance_panneau(cfg), (0.70, 0.85, 1.0), "sur l'USB-C : moins de rouge, un peu moins de vert")
         self.assertEqual(m.balance_panneau({"panneau_rouge": 250, "panneau_vert": "abime", "panneau_bleu": -3}),
@@ -3260,10 +3260,30 @@ class DansMachiTool(unittest.TestCase):
                          ((255, 0, 0), (0, 255, 0), (0, 0, 255)))
         self.assertEqual(tuple(mire[55, 30]), (10, 20, 30))
         t = time.time()
-        m.PANNEAU["mire_jusqua"] = t + 20
-        self.assertEqual(tuple(m.image_du_panneau(cfg, "horloge", t)[8, 30]), (255, 255, 255))
-        m.PANNEAU["mire_jusqua"] = t - 1
+        # « montre la mire uniquement si je clique ; un toggle, qu'on peut re-desactiver »
+        m.PANNEAU["mire"] = False
         self.assertNotEqual(tuple(m.image_du_panneau(cfg, "horloge", t)[8, 30]), (255, 255, 255))
+
+        class Faux:
+            bouton_mire = None
+            _texte_mire = staticmethod(m.Panneau._texte_mire)
+
+            def _peindre_panneau(self):
+                pass
+        faux = Faux()
+        self.assertEqual(faux._texte_mire(), "Montrer la mire")
+        m.Panneau.basculer_mire(faux)
+        self.assertTrue(m.PANNEAU["mire"])
+        self.assertEqual(faux._texte_mire(), "Cacher la mire")
+        self.assertEqual(tuple(m.image_du_panneau(cfg, "horloge", t + 3600)[8, 30]), (255, 255, 255),
+                         "elle reste tant qu'on ne la cache pas")
+        m.Panneau.basculer_mire(faux)
+        self.assertFalse(m.PANNEAU["mire"])
+        self.assertNotEqual(tuple(m.image_du_panneau(cfg, "horloge", t)[8, 30]), (255, 255, 255))
+        # bouger une reglette de balance ne l'allume plus
+        src = open(m.__file__, encoding="utf-8").read()
+        i = src.index("    def _panneau_balance_bientot")
+        self.assertNotIn('PANNEAU["mire"]', src[i:i + 600])
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_le_panneau_led_se_branche_seul_et_envoie_un_flux(self):
