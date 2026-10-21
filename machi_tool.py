@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.80.0"
+VERSION = "1.81.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -335,6 +335,7 @@ CONFIG_DEFAUT = {
     # reste (tout, sauf ce qui est pour le compagnon).
     "jarvis_actif": False,
     "jarvis_sensibilite": 0.5,        # 0 strict .. 1 permissif (le mot appris)
+    "jarvis_chronos": [],             # minuteurs, alarmes, chronometres en cours (voir restaurer_chronos)
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -6859,6 +6860,12 @@ _PHRASES = {
     "rappel_pose": ("Entendu. Je vous le rappelle dans %s.", "Very well. I'll remind you in %s."),
     "rappel": ("Je vous rappelle : %s.", "A reminder: %s."),
     "minuteur_fini": ("Le minuteur de %s est terminé.", "Your timer for %s is up."),
+    "minuteur_nomme_fini": ("Le minuteur « %s » est terminé.", "Your « %s » timer is up."),
+    "alarme": ("Alarme réglée pour %s.", "Alarm set for %s."),
+    "alarme_sonne": ("Il est %s : votre alarme.", "It's %s: your alarm."),
+    "alarme_nommee_sonne": ("Il est %s : %s.", "It's %s: %s."),
+    "chrono": ("Chronomètre lancé.", "Stopwatch started."),
+    "chrono_arrete": ("Chronomètre arrêté : %s.", "Stopwatch stopped: %s."),
     "apprendre": ("Très bien. Chaque fois que la guirlande s'allume, dites mon nom, comme vous "
                   "m'appellerez. Huit fois : cinq normalement, puis comme une question, plus fort, "
                   "et plus bas. L'écran vous guide.",
@@ -9198,6 +9205,8 @@ def executer_outil(outil, cfg):
         # sans les mains sur le PC (« il a tous les droits au niveau de l'application »)
         if nom in ("lumiere", "routine_lumiere", "reglages_machi", "mise_a_jour"):
             return {"id": ident, "texte": outil_application(nom, e, cfg)}
+        if nom == "minuteurs":
+            return {"id": ident, "texte": outil_minuteurs(e, cfg, langue_jarvis(cfg))}
         # SES TACHES DE FOND ET TES PROJETS : a lui aussi, sans les mains sur le PC
         if nom == "lancer_tache":
             return {"id": ident, "texte": lancer_tache_de_fond(e, cfg)}
@@ -10850,10 +10859,8 @@ def executer_commande(a, cfg, maintenant=None):
     if quoi == "minuteur":
         return poser_minuteur(a["secondes"], a.get("quoi") or "", L)
     if quoi == "minuteurs_annuler":
-        n = len(JARVIS["minuteurs"])
-        for m in JARVIS["minuteurs"]:
-            m["minuteur"].cancel()
-        JARVIS["minuteurs"] = []
+        # « annule les minuteurs » : les minuteurs -- pas l'alarme de demain matin
+        n = annuler_chronos(genre="minuteur")
         return phrase("annule" if n else "aucun_minuteur", L)
     if quoi == "ouvrir_site":
         import webbrowser
@@ -10947,34 +10954,259 @@ def rappel_dans_l_agenda(quoi, fin, cfg):
     return True
 
 
-def poser_minuteur(secondes, quoi="", langue="fr"):
-    secondes = max(1.0, min(24 * 3600.0, float(secondes)))
-    entree = {"fin": time.time() + secondes, "quoi": quoi, "duree": secondes}
+# ---------- minuteurs, alarmes, chronometres ----------
+# « Fais en sorte que je puisse demander a Jarvis de mettre un minuteur, un
+# chronometre ou une alarme qui tourne en fond. » Tous dans JARVIS["minuteurs"]
+# (genre : minuteur, alarme, chrono), gardes dans la config : un redemarrage de
+# Machi Tool ne les perd plus. Ils se voient dans la fenetre Agenda (« En cours »).
+
+CHRONOS_MAX = 20
+
+
+class _SansSonnerie:
+    """Un chronometre ne sonne pas : rien a annuler."""
+
+    def cancel(self):
+        pass
+
+
+def _nouvel_id():
+    pris = {m.get("id") for m in JARVIS["minuteurs"]}
+    n = 1
+    while n in pris:
+        n += 1
+    return n
+
+
+def sauver_chronos(cfg=None):
+    cfg = CFG if cfg is None else cfg
+    cfg["jarvis_chronos"] = [{k: m[k] for k in ("id", "genre", "fin", "debut", "duree", "quoi") if k in m}
+                             for m in JARVIS["minuteurs"]]
+    sauver_config(cfg)
+
+
+def _heure_dite(t, langue="fr"):
+    lt = time.localtime(t)
+    if langue == "en":
+        return time.strftime("%H:%M", lt)
+    return "%d h %02d" % (lt.tm_hour, lt.tm_min) if lt.tm_min else "%d h" % lt.tm_hour
+
+
+def _armer(entree, langue="fr"):
+    """La sonnerie d'un minuteur ou d'une alarme, a sa fin."""
+    if entree.get("genre") == "chrono":
+        entree["minuteur"] = _SansSonnerie()
+        return
 
     def sonner():
-        if entree in JARVIS["minuteurs"]:
-            JARVIS["minuteurs"].remove(entree)
+        if entree not in JARVIS["minuteurs"]:
+            return
+        JARVIS["minuteurs"].remove(entree)
+        try:
+            sauver_chronos()
+        except Exception:
+            pass
+        quoi = entree.get("quoi") or ""
         jouer_son("minuteur")
-        poser_led("minuteur", 5)
-        texte = (phrase("rappel", langue, quoi) if quoi
-                 else phrase("minuteur_fini", langue, _jv.dire_duree(secondes, langue)))
+        poser_led("minuteur", 8 if entree.get("genre") == "alarme" else 5)
+        if entree.get("genre") == "alarme":
+            heure = _heure_dite(entree["fin"], langue)
+            texte = (phrase("alarme_nommee_sonne", langue, heure, quoi) if quoi
+                     else phrase("alarme_sonne", langue, heure))
+        elif entree.get("rappel"):
+            texte = phrase("rappel", langue, quoi)
+        elif quoi:
+            texte = phrase("minuteur_nomme_fini", langue, quoi)
+        else:
+            texte = phrase("minuteur_fini", langue, _jv.dire_duree(entree["duree"], langue))
         notifier = JARVIS_CROCHETS.get("notifier")
         if notifier:
             notifier("Jarvis", texte)
         annoncer(texte, langue)
 
-    entree["minuteur"] = threading.Timer(secondes, sonner)
+    entree["minuteur"] = threading.Timer(max(0.0, entree["fin"] - time.time()), sonner)
     entree["minuteur"].daemon = True
     entree["minuteur"].start()
+
+
+def _ajouter(entree, langue="fr"):
+    if len(JARVIS["minuteurs"]) >= CHRONOS_MAX:
+        raise ValueError("Deja %d minuteurs, alarmes et chronometres en cours : annules-en un d'abord."
+                         % CHRONOS_MAX)
+    entree.setdefault("id", _nouvel_id())
+    _armer(entree, langue)
     JARVIS["minuteurs"].append(entree)
-    if quoi and _cle_presente(CFG):
+    sauver_chronos()
+    return entree
+
+
+def poser_minuteur(secondes, quoi="", langue="fr", rappel=None):
+    """Un minuteur de `secondes`. Une phrase de rappel (« rappelle-moi dans 2 h
+    d'appeler maman ») va aussi dans l'agenda ; `rappel=False` : un minuteur
+    nomme (« les pates »), qui n'encombre pas l'agenda."""
+    secondes = max(1.0, min(24 * 3600.0, float(secondes)))
+    rappel = bool(quoi) if rappel is None else bool(rappel and quoi)
+    entree = _ajouter({"genre": "minuteur", "fin": time.time() + secondes, "quoi": quoi, "duree": secondes,
+                       "rappel": rappel}, langue)
+    if rappel and _cle_presente(CFG):
         # « Assure-toi que rajouter un rappel rajoute un element a l'agenda
         # aussi » : il sonne ici, ET il est dans l'agenda de BrainDebugger
         # (la fenetre Agenda, la frise) -- meme apres un redemarrage.
         _en_fond(lambda: rappel_dans_l_agenda(quoi, entree["fin"], CFG))
-    if quoi:
+    if rappel:
         return phrase("rappel_pose", langue, _jv.dire_duree(secondes, langue))
     return phrase("minuteur", langue, _jv.dire_duree(secondes, langue))
+
+
+def fin_d_alarme(heure, jour=None, maintenant=None):
+    """L'instant d'une alarme a HH:MM : aujourd'hui si c'est encore a venir,
+    sinon demain -- ou le `jour` donne (AAAA-MM-JJ)."""
+    m = re.match(r"^\s*(\d{1,2})\s*(?:[:hH]\s*(\d{2})?)?\s*$", str(heure or ""))
+    if not m or int(m.group(1)) > 23 or int(m.group(2) or 0) > 59:
+        raise ValueError("Heure illisible : %s (HH:MM)" % heure)
+    h, mn = int(m.group(1)), int(m.group(2) or 0)
+    t = time.time() if maintenant is None else maintenant
+    base = time.localtime(t)
+    if jour:
+        try:
+            a, mo, j = (int(x) for x in str(jour).split("-"))
+        except Exception:
+            raise ValueError("Jour illisible : %s (AAAA-MM-JJ)" % jour)
+        fin = time.mktime((a, mo, j, h, mn, 0, 0, 0, -1))
+        if fin <= t:
+            raise ValueError("Cette heure-la est deja passee.")
+        return fin
+    fin = time.mktime((base.tm_year, base.tm_mon, base.tm_mday, h, mn, 0, 0, 0, -1))
+    if fin <= t:
+        fin = time.mktime((base.tm_year, base.tm_mon, base.tm_mday + 1, h, mn, 0, 0, 0, -1))
+    return fin
+
+
+def poser_alarme(heure, jour=None, quoi="", langue="fr"):
+    fin = fin_d_alarme(heure, jour)
+    _ajouter({"genre": "alarme", "fin": fin, "quoi": quoi, "duree": fin - time.time()}, langue)
+    quand = _heure_dite(fin, langue)
+    if time.strftime("%Y-%m-%d", time.localtime(fin)) != time.strftime("%Y-%m-%d"):
+        demain = time.strftime("%Y-%m-%d", time.localtime(time.time() + 86400))
+        jour_fin = time.strftime("%Y-%m-%d", time.localtime(fin))
+        quand = ("demain " if langue != "en" else "tomorrow ") + quand if jour_fin == demain else \
+            "%s %s" % (_jv.jour_court(jour_fin), quand)
+    return phrase("alarme", langue, quand)
+
+
+def lancer_chrono(quoi="", langue="fr"):
+    _ajouter({"genre": "chrono", "debut": time.time(), "quoi": quoi}, langue)
+    return phrase("chrono", langue)
+
+
+def temps_ecoule(secondes):
+    """« 1:02:05 », « 12:30 » : pour l'ecran."""
+    s = int(max(0, secondes))
+    h, reste = divmod(s, 3600)
+    return "%d:%02d:%02d" % (h, reste // 60, reste % 60) if h else "%02d:%02d" % (reste // 60, reste % 60)
+
+
+def _choisir(designation=None, genre=None):
+    """Ceux que designe un numero, un nom (« les pates »), ou un genre."""
+    tous = [m for m in JARVIS["minuteurs"] if genre is None or m.get("genre") == genre]
+    d = str(designation if designation is not None else "").strip().lower()
+    if not d:
+        return tous
+    if d.isdigit():
+        return [m for m in tous if m.get("id") == int(d)]
+    return [m for m in tous if d in str(m.get("quoi") or "").lower()]
+
+
+def arreter_chrono(designation=None, langue="fr"):
+    chronos = _choisir(designation, "chrono")
+    if not chronos:
+        raise LookupError("Aucun chronometre en cours%s." % (" pour « %s »" % designation if designation else ""))
+    c = chronos[-1]
+    JARVIS["minuteurs"].remove(c)
+    sauver_chronos()
+    return phrase("chrono_arrete", langue, _jv.dire_duree(time.time() - c["debut"], langue))
+
+
+def annuler_chronos(designation=None, genre=None, langue="fr"):
+    choisis = _choisir(designation, genre)
+    for m in choisis:
+        m["minuteur"].cancel()
+        JARVIS["minuteurs"].remove(m)
+    if choisis:
+        sauver_chronos()
+    return len(choisis)
+
+
+def decrire_chronos(maintenant=None, langue="fr"):
+    """Ce qui tourne, une ligne chacun : pour Jarvis, et pour l'ecran."""
+    t = time.time() if maintenant is None else maintenant
+    lignes = []
+    for m in sorted(JARVIS["minuteurs"], key=lambda m: m.get("fin") or 9e12):
+        nom = (" « %s »" % m["quoi"]) if m.get("quoi") else ""
+        if m.get("genre") == "chrono":
+            lignes.append("#%d chronometre%s : %s ecoulees" % (m["id"], nom, temps_ecoule(t - m["debut"])))
+        elif m.get("genre") == "alarme":
+            lignes.append("#%d alarme%s : %s (dans %s)" % (m["id"], nom, time.strftime("%d/%m %H:%M",
+                          time.localtime(m["fin"])), _jv.dire_duree(m["fin"] - t, langue)))
+        else:
+            lignes.append("#%d minuteur%s : reste %s" % (m["id"], nom, temps_ecoule(m["fin"] - t)))
+    return lignes
+
+
+def outil_minuteurs(e, cfg, langue="fr"):
+    """L'outil « minuteurs » de Jarvis. Rend le texte du resultat."""
+    a = e.get("action")
+    quoi = str(e.get("nom") or "").strip()[:80]
+    if a == "minuteur":
+        secondes = e.get("secondes")
+        if not isinstance(secondes, (int, float)) or secondes <= 0:
+            raise ValueError("Il faut une duree en secondes.")
+        poser_minuteur(secondes, quoi, langue, rappel=False)
+        return "Minuteur%s lance : %s." % (" « %s »" % quoi if quoi else "", _jv.dire_duree(secondes, langue))
+    if a == "alarme":
+        return poser_alarme(e.get("heure"), e.get("jour") or None, quoi, langue)
+    if a == "chrono_lancer":
+        return lancer_chrono(quoi, langue)
+    if a == "chrono_arreter":
+        return arreter_chrono(e.get("id") or quoi or None, langue)
+    if a == "annuler":
+        n = annuler_chronos(None if e.get("tout") else (e.get("id") or quoi or None),
+                            e.get("genre") if e.get("genre") in ("minuteur", "alarme", "chrono") else None, langue)
+        if not n:
+            raise LookupError("Rien de tel en cours.")
+        return "Annule : %d." % n
+    if a == "lister":
+        return "\n".join(decrire_chronos(langue=langue)) or "Rien en cours."
+    raise ValueError("Action inconnue : %s" % a)
+
+
+def restaurer_chronos(cfg=None):
+    """Au demarrage : ce qui tournait avant reprend ; ce qui a sonne pendant que
+    Machi Tool etait ferme se dit en notification (sans voix : c'est passe)."""
+    cfg = CFG if cfg is None else cfg
+    t = time.time()
+    rates = []
+    for m in cfg.get("jarvis_chronos") or []:
+        if not isinstance(m, dict) or m.get("genre") not in ("minuteur", "alarme", "chrono"):
+            continue
+        if any(x.get("id") == m.get("id") for x in JARVIS["minuteurs"]):
+            continue
+        if m["genre"] != "chrono" and float(m.get("fin") or 0) <= t:
+            rates.append(m)
+            continue
+        entree = dict(m)
+        _armer(entree)
+        JARVIS["minuteurs"].append(entree)
+    sauver_chronos(cfg)
+    notifier = JARVIS_CROCHETS.get("notifier")
+    for m in rates:
+        texte = "Pendant que Machi Tool etait ferme : %s %s a sonne a %s." % (
+            "l'alarme" if m["genre"] == "alarme" else "le minuteur",
+            ("« %s »" % m["quoi"]) if m.get("quoi") else "", time.strftime("%H:%M", time.localtime(m["fin"])))
+        print("Jarvis : " + texte)
+        if notifier:
+            notifier("Jarvis", texte)
+    return len(rates)
 
 
 # ---------- apprendre la voix ----------
@@ -12749,14 +12981,17 @@ class Panneau:
 
         self.agenda_tuiles = tk.Canvas(f, bg=NUIT, highlightthickness=0, bd=0, height=self.px(118))
         self.agenda_tuiles.pack(fill="x", padx=marge)
+        # CE QUI TOURNE EN FOND : minuteurs, alarmes, chronometres de Jarvis, en direct
+        self.agenda_en_cours = tk.Canvas(f, bg=NUIT, highlightthickness=0, bd=0, height=1)
+        self.agenda_en_cours.pack(fill="x", padx=marge)
 
         corps = tk.Frame(f, bg=NUIT)
         corps.pack(fill="both", expand=True, padx=marge, pady=(self.px(12), 0))
-        barre = tk.Scrollbar(corps, orient="vertical")
-        barre.pack(side="right", fill="y")
-        c = tk.Canvas(corps, bg=NUIT, highlightthickness=0, bd=0, yscrollcommand=barre.set)
+        c = tk.Canvas(corps, bg=NUIT, highlightthickness=0, bd=0)
+        barre = self._barre_fine(corps, c)
+        barre.pack(side="right", fill="y", padx=(self.px(6), 0))
+        c.configure(yscrollcommand=barre.poser)
         c.pack(side="left", fill="both", expand=True)
-        barre.config(command=c.yview)
         c.bind("<MouseWheel>", lambda e: c.yview_scroll(int(-e.delta / 120), "units"))
         c.bind("<Button-4>", lambda e: c.yview_scroll(-2, "units"))
         c.bind("<Button-5>", lambda e: c.yview_scroll(2, "units"))
@@ -12792,6 +13027,115 @@ class Panneau:
         self.agenda_tuiles.bind("<Configure>", lambda _e: self._agenda_redessiner_bientot())
         self._agenda_mode(self.agenda_mode, relire=False)
         self.remplir_agenda()
+        self._agenda_tic()
+
+    def _barre_fine(self, parent, toile):
+        """Une barre de defilement fine, aux couleurs de la fenetre (celle de
+        Windows, grise et large, jurait). Un pouce arrondi ; on le tire, ou on
+        clique dans le rail."""
+        tk = self.tk
+        b = tk.Canvas(parent, bg=NUIT, highlightthickness=0, bd=0, width=self.px(6))
+        etat = {"debut": 0.0, "fin": 1.0, "prise": None}
+
+        def dessiner():
+            b.delete("all")
+            if etat["fin"] - etat["debut"] >= 0.999:
+                return                                   # tout tient : pas de barre
+            h = max(1, b.winfo_height())
+            y0, y1 = etat["debut"] * h, max(etat["debut"] * h + self.px(24), etat["fin"] * h)
+            self._arrondi(b, 0, y0, self.px(6), min(h, y1), self.px(3), fill=FIL, outline="")
+
+        def poser(debut, fin):
+            etat["debut"], etat["fin"] = float(debut), float(fin)
+            dessiner()
+
+        def tirer(e):
+            h = max(1, b.winfo_height())
+            if etat["prise"] is None:
+                etat["prise"] = e.y / h - etat["debut"]
+                if not (0 <= etat["prise"] <= etat["fin"] - etat["debut"]):
+                    etat["prise"] = (etat["fin"] - etat["debut"]) / 2
+            toile.yview_moveto(max(0.0, e.y / h - etat["prise"]))
+
+        b.bind("<Button-1>", tirer)
+        b.bind("<B1-Motion>", tirer)
+        b.bind("<ButtonRelease-1>", lambda _e: etat.update(prise=None))
+        b.bind("<Configure>", lambda _e: dessiner())
+        b.poser = poser
+        return b
+
+    def _agenda_tic(self):
+        """Chaque seconde, tant que la fenetre est ouverte : la bande « En cours »."""
+        f = getattr(self, "fen_agenda", None)
+        if f is None or not f.winfo_exists():
+            return
+        try:
+            self._agenda_en_cours()
+        except Exception as e:
+            print("Agenda : en cours (%s)" % type(e).__name__)
+        f.after(1000, self._agenda_tic)
+
+    def _agenda_en_cours(self):
+        c = self.agenda_en_cours
+        tous = sorted(JARVIS.get("minuteurs") or [], key=lambda m: (m.get("genre") == "chrono", m.get("fin") or 0))
+        c.delete("all")
+        if not tous:
+            if int(c.cget("height")) != 1:
+                c.configure(height=1)
+            return
+        H = self.px(64)
+        if int(c.cget("height")) != H + self.px(12):
+            c.configure(height=H + self.px(12))
+        W = max(c.winfo_width(), self.px(400))
+        t = time.time()
+        ecart = self.px(10)
+        n = min(len(tous), 4)
+        l = (W - (n - 1) * ecart) / float(n)
+        couleurs = {"minuteur": ETOILE, "alarme": ALERTE, "chrono": "#8FB8FF"}
+        noms = {"minuteur": "MINUTEUR", "alarme": "ALARME", "chrono": "CHRONO"}
+        for i, m in enumerate(tous[:n]):
+            x0 = i * (l + ecart)
+            y0 = self.px(12)
+            teinte = couleurs.get(m.get("genre"), ETOILE)
+            self._arrondi(c, x0, y0, x0 + l, y0 + H, self.px(10), fill=VELOURS, outline="")
+            p = self.px(12)
+            etiquette = noms.get(m.get("genre"), "")
+            if m.get("quoi"):
+                etiquette += "  ·  " + str(m["quoi"]).upper()[:24]
+            c.create_text(x0 + p, y0 + p, text=etiquette, anchor="nw", fill=teinte, font=(self.f_mono, 8))
+            if m.get("genre") == "chrono":
+                valeur = temps_ecoule(t - m["debut"])
+            elif m.get("genre") == "alarme":
+                valeur = time.strftime("%H:%M", time.localtime(m["fin"]))
+            else:
+                valeur = temps_ecoule(m["fin"] - t)
+            c.create_text(x0 + p, y0 + H - p + self.px(2), text=valeur, anchor="sw", fill=CRAIE,
+                          font=(self.f_mono, 17, "bold"))
+            if m.get("genre") == "alarme":
+                reste = int(max(0, m["fin"] - t)) // 60
+                c.create_text(x0 + l - p, y0 + H - p, anchor="se", fill=BRUME, font=(self.f_ui, 9),
+                              text="dans %d h %02d" % divmod(reste, 60) if reste >= 60 else "dans %d min" % reste)
+            elif m.get("genre") == "chrono":
+                c.create_text(x0 + l - p, y0 + H - p, anchor="se", fill=BRUME, font=(self.f_ui, 9),
+                              text="depuis %s" % time.strftime("%H:%M", time.localtime(m["debut"])))
+            if m.get("genre") == "minuteur" and m.get("duree"):
+                # ce qui reste, en bas de la carte
+                part = max(0.0, min(1.0, (m["fin"] - t) / float(m["duree"])))
+                xb0, xb1, yb = x0 + p, x0 + l - p, y0 + H - self.px(5)
+                c.create_line(xb0, yb, xb1, yb, fill=FIL, width=self.px(3), capstyle="round")
+                if part > 0:
+                    c.create_line(xb0, yb, xb0 + (xb1 - xb0) * part, yb, fill=teinte, width=self.px(3),
+                                  capstyle="round")
+            # la croix : l'annuler d'un clic
+            croix = c.create_text(x0 + l - p, y0 + p - self.px(2), text="×", anchor="ne", fill=BRUME,
+                                  font=(self.f_ui, 12))
+            c.tag_bind(croix, "<Button-1>", lambda _e, ident=m.get("id"): (annuler_chronos(str(ident)),
+                                                                          self._agenda_en_cours()))
+            c.tag_bind(croix, "<Enter>", lambda _e, k=croix: c.itemconfigure(k, fill=ALERTE))
+            c.tag_bind(croix, "<Leave>", lambda _e, k=croix: c.itemconfigure(k, fill=BRUME))
+        if len(tous) > n:
+            c.create_text(W, self.px(4), anchor="ne", fill=BRUME, font=(self.f_ui, 8),
+                          text="+ %d autre%s" % (len(tous) - n, "s" if len(tous) - n > 1 else ""))
 
     def _agenda_mode(self, mode, relire=False):
         self.agenda_mode = "frise" if mode == "frise" else "liste"
@@ -12957,6 +13301,9 @@ class Panneau:
             c.create_text(x0 + p, p + self.px(52), text="rien de prevu", fill=BRUME, font=moyen, anchor="nw")
 
     def _agenda_liste(self, d, a_venir):
+        """Une colonne par journee : son numero en grand a gauche ; des cartes a
+        bande de couleur, l'heure, et ce qui reste (« dans 2 h 10 »).
+        Aujourd'hui : ce qui est passe s'efface, une ligne dit « maintenant »."""
         c = self.agenda_toile
         c.delete("all")
         W = max(c.winfo_width(), self.px(400)) - self.px(4)
@@ -12973,43 +13320,87 @@ class Panneau:
                           text="Pose un rappel ci-dessous, dans BrainDebugger (Annee > Reperes), ou demande a Jarvis.")
             c.configure(scrollregion=(0, 0, W, self.px(120)))
             return
-        for titre, items in _jv.agenda_par_jour(a_venir, auj):
-            aujourdhui = titre.startswith("Aujourd'hui")
-            t = c.create_text(0, y, text=titre.replace(" -- ", "  \u00b7  "), fill=self.accent if aujourdhui else CRAIE,
-                              font=(self.f_ui, 10, "bold"), anchor="nw")
+        maintenant = time.localtime()
+        min_now = maintenant.tm_hour * 60 + maintenant.tm_min
+        gouttiere = self.px(66)
+        x_carte = gouttiere
+        h = self.px(46)
+        for jour, titre, items in _jv.agenda_jours(a_venir, auj):
+            dt = _jv._jour_iso(jour)
+            aujourdhui = jour == auj
+            y_jour = y
+            # la colonne du jour : son numero, en grand
+            couleur_jour = self.accent if aujourdhui else CRAIE
+            c.create_text(gouttiere / 2 - self.px(6), y + self.px(2), text=str(dt.day), anchor="n",
+                          fill=couleur_jour, font=(self.f_ui, 22, "bold"))
+            c.create_text(gouttiere / 2 - self.px(6), y + self.px(36), anchor="n", fill=BRUME,
+                          font=(self.f_mono, 8), text=_jv._JOURS_AG[dt.weekday()][:3].upper())
+            # le titre de la journee
+            nom = titre.split(" -- ")[0]
+            t = c.create_text(x_carte, y + self.px(4), text=nom.upper(), anchor="nw",
+                              fill=self.accent if aujourdhui else BRUME, font=(self.f_mono, 8, "bold"))
             bx = c.bbox(t)
+            if " -- " in titre:
+                bx = c.bbox(c.create_text(bx[2] + self.px(8), bx[1], text=titre.split(" -- ")[1], anchor="nw",
+                                          fill=BRUME, font=(self.f_mono, 8)))
             c.create_line(bx[2] + self.px(10), (bx[1] + bx[3]) / 2, W, (bx[1] + bx[3]) / 2, fill=FIL)
             y = bx[3] + self.px(8)
-            for heure, libelle, fin in items:
-                r = next((x for x in a_venir if str(x["label"]) == libelle and str(x.get("heure") or "") == heure),
-                         {"date": auj, "label": libelle})
-                h = self.px(44)
-                self._arrondi(c, 0, y, W, y + h, self.px(9), fill=self.AGENDA_FOND_CARTE, outline="")
+            ligne_posee = not aujourdhui
+            for r in items:
+                heure = str(r.get("heure") or "")
+                libelle = str(r["label"])
+                m_rdv = _jv.minutes_du_jour(heure)
+                passe = bool(aujourdhui and m_rdv is not None and m_rdv < min_now - 30)
+                if not ligne_posee and m_rdv is not None and m_rdv >= min_now - 30:
+                    # « maintenant » : entre ce qui est passe et ce qui vient
+                    ym = y + self.px(2)
+                    c.create_oval(x_carte - self.px(4), ym - self.px(4), x_carte + self.px(4), ym + self.px(4),
+                                  fill=self.accent, outline="")
+                    c.create_line(x_carte, ym, W, ym, fill=self.accent, width=self.px(1))
+                    c.create_text(W, ym + self.px(3), anchor="ne", fill=self.accent, font=(self.f_mono, 7),
+                                  text="MAINTENANT  %02d:%02d" % (maintenant.tm_hour, maintenant.tm_min))
+                    y += self.px(20)
+                    ligne_posee = True
                 teinte = _jv.teinte_rendez_vous(libelle)
-                c.create_oval(self.px(14), y + h / 2 - self.px(4), self.px(22), y + h / 2 + self.px(4),
-                              fill=teinte, outline="")
-                c.create_text(self.px(34), y + h / 2, text=heure or "journee", anchor="w",
-                              fill=CRAIE if heure else BRUME, font=(self.f_mono, 9))
-                c.create_text(self.px(104), y + h / 2, text=libelle, anchor="w", fill=CRAIE,
-                              font=(self.f_ui, 11), width=W - self.px(104) - self.px(210))
+                fond = ENCRE if passe else self.AGENDA_FOND_CARTE
+                self._arrondi(c, x_carte, y, W, y + h, self.px(9), fill=fond, outline="")
+                # la bande de couleur, a gauche
+                self._arrondi(c, x_carte, y, x_carte + self.px(5), y + h, self.px(2),
+                              fill=FIL if passe else teinte, outline="")
+                c.create_text(x_carte + self.px(18), y + h / 2, text=heure or "journée", anchor="w",
+                              fill=BRUME if (passe or not heure) else CRAIE,
+                              font=(self.f_mono, 10, "bold") if heure else (self.f_mono, 9))
+                x_lib = x_carte + self.px(82)
+                c.create_text(x_lib, y + h / 2, text=libelle, anchor="w", fill=BRUME if passe else CRAIE,
+                              font=(self.f_ui, 11), width=W - x_lib - self.px(180))
                 if r.get("fin"):
                     d0, d1 = _jv._jour_iso(r["date"]), _jv._jour_iso(r["fin"])
                     total = (d1 - d0).days + 1
-                    fait = max(0, min(total, (_jv._jour_iso(auj) - d0).days))
-                    c.create_text(W - self.px(14), y + h / 2 - self.px(1), anchor="e", fill=BRUME,
-                                  font=(self.f_ui, 9), text="%d jours · jusqu'au %s" % (total, _jv.jour_court(r["fin"])))
-                    # la periode : ou l'on en est
-                    x0, x1 = self.px(104), W - self.px(14)
-                    yb = y + h - self.px(6)
-                    c.create_line(x0, yb, x1, yb, fill=FIL, width=self.px(3), capstyle="round")
+                    fait = max(0, min(total, (_jv._jour_iso(auj) - d0).days + 1))
+                    c.create_text(W - self.px(14), y + h / 2 - self.px(2), anchor="e", fill=BRUME,
+                                  font=(self.f_ui, 9),
+                                  text=("jour %d sur %d" % (fait, total)) if fait else
+                                  "%d jours · jusqu'au %s" % (total, _jv.jour_court(r["fin"])))
+                    x0b, x1b = x_lib, W - self.px(14)
+                    yb = y + h - self.px(7)
+                    c.create_line(x0b, yb, x1b, yb, fill=FIL, width=self.px(3), capstyle="round")
                     if fait:
-                        c.create_line(x0, yb, x0 + (x1 - x0) * fait / float(total), yb, fill=teinte,
+                        c.create_line(x0b, yb, x0b + (x1b - x0b) * fait / float(total), yb, fill=teinte,
                                       width=self.px(3), capstyle="round")
                 else:
-                    c.create_text(W - self.px(14), y + h / 2, anchor="e", fill=BRUME, font=(self.f_ui, 9),
-                                  text=_jv.quand_lisible(r["date"], "", auj))
+                    rel = _jv.relatif_aujourdhui(heure, min_now) if aujourdhui else None
+                    texte = rel or _jv.quand_lisible(r["date"], "", auj)
+                    vif = rel and rel.startswith(("dans", "maintenant")) and (m_rdv - min_now) <= 60
+                    c.create_text(W - self.px(14), y + h / 2, anchor="e", font=(self.f_ui, 9),
+                                  fill=self.accent if vif else BRUME, text=texte)
                 y += h + self.px(6)
-            y += self.px(10)
+            if aujourdhui and not ligne_posee:
+                ym = y + self.px(2)
+                c.create_line(x_carte, ym, W, ym, fill=self.accent)
+                c.create_text(W, ym - self.px(3), anchor="se", fill=self.accent, font=(self.f_mono, 7),
+                              text="MAINTENANT  %02d:%02d" % (maintenant.tm_hour, maintenant.tm_min))
+                y += self.px(8)
+            y = max(y, y_jour + self.px(60)) + self.px(14)
         c.configure(scrollregion=(0, 0, W, y))
 
     def _agenda_frise(self, d):
@@ -14818,7 +15209,9 @@ class Panneau:
         self.texte(f, "Sans passer par Internet : « allume / eteins la lumiere », « mets la lumiere en bleu », "
                       "« mode ecran / son / applications », « minuteur de 10 minutes », « rappelle-moi dans 20 "
                       "minutes de... », « quelle heure est-il », « ouvre BrainDebugger », « stop », « arrete "
-                      "d'ecouter » (il se coupe pour de bon), « apprends ma voix ». Tout le reste va a Jarvis.",
+                      "d'ecouter » (il se coupe pour de bon), « apprends ma voix ». Tout le reste va a Jarvis -- "
+                      "« reveille-moi a 7 h », « lance un chrono », « il reste combien sur les pates ? » : ce qui "
+                      "tourne en fond se voit dans la fenetre Agenda.",
                    BRUME, 8, largeur=500).pack(fill="x", pady=(8, 0))
 
     # la cle de config -> la variable de la fenetre qui l'ecrit dans
@@ -17071,6 +17464,8 @@ def lancer():
     # le raccourci Ctrl+Maj+J : pose a chaque lancement (il n'etait pose qu'a
     # l'installation, et une mise a jour ne repasse pas par la)
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
+    # ce qui tournait avant (minuteurs, alarmes, chronometres) reprend
+    sans_faute("Minuteurs de Jarvis", restaurer_chronos, CFG)
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
     # Ctrl+J : il se reveille et t'ecoute ; Ctrl+Maj+Espace : il prend une
     # note pour le carnet (hors du fil de Tk). Un second appui le congedie.

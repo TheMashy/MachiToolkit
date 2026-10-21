@@ -5831,6 +5831,44 @@ def agenda_par_jour(rendez_vous, aujourdhui):
 
 
 
+def agenda_jours(rendez_vous, aujourdhui):
+    """Comme `agenda_par_jour`, mais pour le dessin : [(jour iso, titre, [rdv])],
+    chaque rdv gardant sa date, sa fin et son heure. Une periode commencee avant
+    apparait aujourd'hui."""
+    jours = {}
+    for r in rendez_vous or []:
+        if not isinstance(r, dict) or not r.get("date") or not r.get("label"):
+            continue
+        jours.setdefault(max(str(r["date"]), aujourdhui), []).append(r)
+    cle = lambda r: (not r.get("heure"), str(r.get("heure") or ""), str(r["label"]))
+    return [(j, nom_du_jour(j, aujourdhui), sorted(v, key=cle)) for j, v in sorted(jours.items())]
+
+
+def minutes_du_jour(hhmm):
+    try:
+        h, m = str(hhmm).split(":")[:2]
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def relatif_aujourdhui(heure, maintenant_min):
+    """« dans 2 h 10 », « dans 25 min », « maintenant », « passé » : pour un
+    rendez-vous d'aujourd'hui a HH:MM (None sans heure)."""
+    m = minutes_du_jour(heure)
+    if m is None:
+        return None
+    ecart = m - int(maintenant_min)
+    if ecart < -30:
+        return "passé"
+    if ecart <= 0:
+        return "maintenant"
+    if ecart < 60:
+        return "dans %d min" % ecart
+    h, mn = divmod(ecart, 60)
+    return "dans %d h %02d" % (h, mn) if mn else "dans %d h" % h
+
+
 # --- la fenetre Agenda : frise, bilan, saisie --------------------------------
 #
 # « Rends l'interface des rappels beaucoup plus belle, avec un mode frise ;
