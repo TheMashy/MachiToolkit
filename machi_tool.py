@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.87.0"
+VERSION = "1.88.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11396,7 +11396,9 @@ PANNEAU_BLANC_CHAUD = (255, 176, 80)   # la guirlande debranchee : rien a suivre
 PANNEAU_JARVIS_TRAINE_S = 2.0          # sa voix tue, le temps de lire la fin
 PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la meme liaison
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
-           "teinte": None, "jarvis": None, "mire_jusqua": 0.0, "ips": 0.0, "perdues": 0}
+           "teinte": None, "jarvis": None, "mire_jusqua": 0.0, "ips": 0.0, "perdues": 0,
+           "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0}
+PANNEAU_CROQUIS = 2                    # carte/machi_panneau/machi_panneau.ino
 
 _CHIFFRES_5X7 = {
     "0": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
@@ -11716,6 +11718,24 @@ def image_du_panneau(cfg, contenu, t):
     return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"))
 
 
+def version_croquis(lien, attente=0.5):
+    """Le croquis de la carte : « MV » -> "MACHI 2". La v1 ne repond rien
+    (elle ignore « MV ») : 1."""
+    try:
+        lien.reset_input_buffer()
+        lien.write(b"MV")
+        fin, recu = time.monotonic() + attente, b""
+        while time.monotonic() < fin and b"\n" not in recu:
+            n = lien.in_waiting
+            recu += lien.read(n) if n else b""
+            if not n:
+                time.sleep(0.02)
+        v = re.search(rb"MACHI (\d+)", recu)
+        return int(v.group(1)) if v else 1
+    except Exception:
+        return 1
+
+
 def piloter_panneau(cfg=None, tours=None):
     """Le fil du panneau : l'image du moment (l'apercu la montre, branche ou
     non), et, une carte trouvee, la luminosite puis une image toutes les
@@ -11726,12 +11746,13 @@ def piloter_panneau(cfg=None, tours=None):
     cfg = CFG if cfg is None else cfg
     lien, lum, recherche = None, None, 0.0
     n, prochaine, envois = 0, time.monotonic(), deque(maxlen=PANNEAU_IPS * 3)
+    durees = deque(maxlen=PANNEAU_IPS * 2)      # (calcul, envoi) en s : qui ralentit ?
     while ETAT["en_marche"] and (tours is None or n < tours):
         n += 1
         contenu = cfg.get("panneau_contenu", "horloge")
         contenu = contenu if contenu in PANNEAU_CONTENUS else "horloge"
         try:
-            t = time.time()
+            t, debut = time.time(), time.perf_counter()
             img = image_du_panneau(cfg, contenu, t)
             PANNEAU["image"] = img
             if not cfg.get("panneau_actif", True):
@@ -11747,7 +11768,9 @@ def piloter_panneau(cfg=None, tours=None):
                         lien = ouvrir_panneau(port)
                         lum = None
                         envois.clear()
-                        PANNEAU.update(etat="connecte", port=port, envoyees=0, ips=0.0)
+                        durees.clear()
+                        PANNEAU.update(etat="connecte", port=port, envoyees=0, ips=0.0,
+                                       croquis=version_croquis(lien))
                         print("Panneau LED : connecte sur %s" % port)
                     except Exception:
                         PANNEAU.update(etat="occupe", port=port)
@@ -11763,6 +11786,7 @@ def piloter_panneau(cfg=None, tours=None):
                         lien.write(b"MB" + bytes([voulue]))
                     lum = voulue
                 donnees = rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)), balance_panneau(cfg))
+                calcul = time.perf_counter()
                 try:
                     with PANNEAU_VERROU:
                         lien.write(b"MF" + donnees)
@@ -11772,6 +11796,9 @@ def piloter_panneau(cfg=None, tours=None):
                     if type(e).__name__ != "SerialTimeoutException":
                         raise
                     PANNEAU["perdues"] = PANNEAU.get("perdues", 0) + 1   # la carte suit moins vite
+                durees.append((calcul - debut, time.perf_counter() - calcul))
+                PANNEAU["calcul_ms"] = 1000 * max(d[0] for d in durees)
+                PANNEAU["envoi_ms"] = 1000 * max(d[1] for d in durees)
                 if len(envois) >= 2 and envois[-1] > envois[0]:
                     recentes = [x for x in envois if x > time.monotonic() - 2.0]
                     PANNEAU["ips"] = (len(recentes) - 1) / max(1e-3, recentes[-1] - recentes[0]) \
@@ -11830,8 +11857,18 @@ def etat_panneau_lisible():
         return "Il manque pyserial a cette version de Machi Tool.", ALERTE
     if e == "connecte":
         ips = float(PANNEAU.get("ips") or 0.0)
-        return ("Branche sur %s  ·  %.0f im/s (reglee %d)" % (port, ips, PANNEAU_IPS) if ips
-                else "Branche sur %s" % port), VIF
+        texte = ("Branche sur %s  ·  %.0f im/s (reglee %d)" % (port, ips, PANNEAU_IPS) if ips
+                 else "Branche sur %s" % port)
+        if PANNEAU.get("croquis") == 1:
+            texte += ("\nLa carte a l'ancien croquis : il redessine tout a chaque image et ne tient pas 30 i/s. "
+                      "Televerse carte/machi_panneau/machi_panneau.ino (version 2).")
+        elif ips and ips < PANNEAU_IPS * 0.8:
+            # « ca tombe a 5 fps parfois » : qui ralentit, la carte ou le PC ?
+            calcul, envoi = float(PANNEAU.get("calcul_ms") or 0), float(PANNEAU.get("envoi_ms") or 0)
+            texte += ("\nC'est la carte qui suit mal : une image met jusqu'a %.0f ms a partir." % envoi
+                      if envoi >= calcul else
+                      "\nC'est le PC qui ralentit : une image met jusqu'a %.0f ms a se faire." % calcul)
+        return texte, VIF
     if e == "occupe":
         return ("%s est pris par un autre programme (le Serial Monitor d'Arduino, ou test_panneau.py) : "
                 "ferme-le, je reessaie toutes les 5 s." % port), ALERTE
