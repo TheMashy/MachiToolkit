@@ -8138,7 +8138,12 @@ OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir"
                     "spotify_jouer", "spotify_en_cours", "spotify_aimer", "montrer_agenda",
                     "lancer_tache", "taches", "noter_projet",
                     # Machi Tool lui-meme est a lui : jamais sous code
-                    "lumiere", "routine_lumiere", "reglages_machi", "mise_a_jour"}
+                    "lumiere", "routine_lumiere", "reglages_machi", "mise_a_jour",
+                    # « verifie bien que Jarvis puisse declencher un minuteur de
+                    # lui-meme, pareil pour les alarmes et les chronometres » : il
+                    # manquait -- sans ses mains sur le PC, l'outil etait refuse ;
+                    # avec, il passait sous code
+                    "minuteurs"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600

@@ -3007,6 +3007,33 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(len(donnees), 8192)
         self.assertEqual(donnees[:2], b"\xf8\x00")
 
+    def test_jarvis_pose_minuteurs_alarmes_et_chronos_sans_permission(self):
+        # « verifie bien que Jarvis puisse declencher un minuteur de lui-meme : qu'il
+        # ait les droits, pareil pour les alarmes et les chronometres »
+        m = self.m
+        avant = list(m.JARVIS["minuteurs"])
+        self.addCleanup(lambda: (m.annuler_chronos(None, None, "fr"), m.JARVIS["minuteurs"].extend(avant)))
+        m.JARVIS["minuteurs"][:] = []
+        entrees = [{"action": "minuteur", "secondes": 600, "nom": "pates"},
+                   {"action": "alarme", "heure": "07:30", "nom": "reveil"},
+                   {"action": "chrono_lancer", "nom": "course"},
+                   {"action": "lister"},
+                   {"action": "chrono_arreter", "nom": "course"},
+                   {"action": "annuler", "tout": True}]
+        # sans ses mains sur le PC, et avec le code d'acces actif et ferme : direct, sans question
+        for cfg in (dict(m.CONFIG_DEFAUT, jarvis_pc=False),
+                    dict(m.CONFIG_DEFAUT, jarvis_pc=True, jarvis_code_actif=True)):
+            for e in entrees:
+                self.assertEqual(m._palier({"nom": "minuteurs", "entree": e}, cfg), m._jv.PALIER_DIRECT, e)
+        cfg = dict(m.CONFIG_DEFAUT, jarvis_pc=False)
+        genres = []
+        for i, e in enumerate(entrees):
+            r = m.executer_outil({"id": i, "nom": "minuteurs", "entree": e}, cfg)
+            self.assertNotIn("erreur", r, (e, r))
+            genres.append(sorted(x["genre"] for x in m.JARVIS["minuteurs"]))
+        self.assertEqual(genres[2], ["alarme", "chrono", "minuteur"], "les trois tournent en fond")
+        self.assertEqual(genres[-1], [], "et s'annulent")
+
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_le_panneau_led_tourne_pour_une_carte_posee_de_travers(self):
         # « add a way to rotate the display by 90° (I have installed the board at a 90° angle) »
