@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.89.0"
+VERSION = "1.90.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11397,8 +11397,9 @@ PANNEAU_JARVIS_TRAINE_S = 2.0          # sa voix tue, le temps de lire la fin
 PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la meme liaison
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
-           "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0}
-PANNEAU_CROQUIS = 2                    # carte/machi_panneau/machi_panneau.ino
+           "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
+PANNEAU_CROQUIS = 3                    # carte/machi_panneau/machi_panneau.ino
+PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
     "0": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
@@ -11718,10 +11719,49 @@ def image_du_panneau(cfg, contenu, t):
     return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"))
 
 
-def version_croquis(lien, attente=0.5):
-    """Le croquis de la carte : « MV » -> "MACHI 2". La v1 ne repond rien
-    (elle ignore « MV ») : 1."""
+def fletcher16(donnees):
+    """La somme de controle des images « MG », la meme que le croquis v3
+    (fletcher16) : (b << 8) | a, a = somme des octets, b = somme des sommes,
+    modulo 255. Calculee d'un bloc : b = somme des octets ponderes par leur
+    nombre d'occurrences dans les sommes partielles (n - i)."""
+    import numpy as np
+    o = np.frombuffer(bytes(donnees), np.uint8).astype(np.int64)
+    a = int(o.sum()) % 255
+    b = int((o * np.arange(len(o), 0, -1, dtype=np.int64)).sum()) % 255
+    return (b << 8) | a
+
+
+def trame_image(donnees, croquis):
+    """Une image pour la carte : controlee (« MG » + somme) pour le croquis v3,
+    « MF » nue sinon -- la v3 accepte les deux, une version mal lue ne fige rien."""
+    if (croquis or 1) >= 3:
+        return b"MG" + donnees + fletcher16(donnees).to_bytes(2, "big")
+    return b"MF" + donnees
+
+
+def lire_bilan_carte(lien):
+    """Les reponses « STATS recues jetees » de la carte (croquis v3), lues sans
+    attendre : ce qui est arrive depuis le dernier tour."""
+    n = getattr(lien, "in_waiting", 0) or 0
+    if not n:
+        return
+    PANNEAU["_recu"] = (PANNEAU.get("_recu") or b"") + lien.read(n)
+    *lignes, PANNEAU["_recu"] = PANNEAU["_recu"].split(b"\n")
+    PANNEAU["_recu"] = PANNEAU["_recu"][-200:]
+    for ligne in lignes:
+        v = re.search(rb"STATS (\d+) (\d+)", ligne)
+        if v:
+            PANNEAU.update(carte_recues=int(v.group(1)), carte_jetees=int(v.group(2)))
+
+
+def version_croquis(lien, attente=0.5, calme=0.3):
+    """Le croquis de la carte : « MV » -> "MACHI 3". La v1 ne repond rien
+    (elle ignore « MV ») : 1. `calme` : une image laissee a moitie par une
+    session d'avant doit d'abord expirer cote carte (200 ms), sinon « MV »
+    finirait dedans."""
     try:
+        lien.reset_input_buffer()
+        time.sleep(calme)
         lien.reset_input_buffer()
         lien.write(b"MV")
         fin, recu = time.monotonic() + attente, b""
@@ -11744,7 +11784,7 @@ def piloter_panneau(cfg=None, tours=None):
     reprise par Arduino) se recherche seule ; une image qui ne passe pas a
     temps (la carte deborde), elle, ne coupe rien. `tours` : pour les tests."""
     cfg = CFG if cfg is None else cfg
-    lien, lum, recherche = None, None, 0.0
+    lien, lum, recherche, bilan = None, None, 0.0, 0.0
     n, prochaine, envois = 0, time.monotonic(), deque(maxlen=PANNEAU_IPS * 3)
     durees = deque(maxlen=PANNEAU_IPS * 2)      # (calcul, envoi) en s : qui ralentit ?
     while ETAT["en_marche"] and (tours is None or n < tours):
@@ -11769,8 +11809,9 @@ def piloter_panneau(cfg=None, tours=None):
                         lum = None
                         envois.clear()
                         durees.clear()
-                        PANNEAU.update(etat="connecte", port=port, envoyees=0, ips=0.0,
-                                       croquis=version_croquis(lien))
+                        PANNEAU.update(etat="connecte", port=port, envoyees=0, ips=0.0, _recu=b"",
+                                       carte_recues=None, carte_jetees=None, croquis=version_croquis(lien))
+                        bilan = time.monotonic() + PANNEAU_BILAN_S
                         print("Panneau LED : connecte sur %s" % port)
                     except Exception:
                         PANNEAU.update(etat="occupe", port=port)
@@ -11789,7 +11830,11 @@ def piloter_panneau(cfg=None, tours=None):
                 calcul = time.perf_counter()
                 try:
                     with PANNEAU_VERROU:
-                        lien.write(b"MF" + donnees)
+                        lien.write(trame_image(donnees, PANNEAU.get("croquis")))
+                        if (PANNEAU.get("croquis") or 1) >= 3 and time.monotonic() >= bilan:
+                            lien.write(b"MS")
+                            bilan = time.monotonic() + PANNEAU_BILAN_S
+                    lire_bilan_carte(lien)
                     PANNEAU["envoyees"] += 1
                     envois.append(time.monotonic())
                 except Exception as e:
@@ -11859,9 +11904,15 @@ def etat_panneau_lisible():
         ips = float(PANNEAU.get("ips") or 0.0)
         texte = ("Branche sur %s  ·  %.0f im/s (reglee %d)" % (port, ips, PANNEAU_IPS) if ips
                  else "Branche sur %s" % port)
-        if PANNEAU.get("croquis") == 1:
-            texte += ("\nLa carte a l'ancien croquis : il redessine tout a chaque image et ne tient pas 30 i/s. "
-                      "Televerse carte/machi_panneau/machi_panneau.ino (version 2).")
+        jetees = PANNEAU.get("carte_jetees")
+        if jetees:
+            # depuis que la carte a demarre : le transfert USB abime-t-il des images ?
+            texte += "  ·  %d image%s abimee%s jetee%s par la carte" % ((jetees,) + ("s",) * 3 if jetees > 1
+                                                                        else (jetees, "", "", ""))
+        if (PANNEAU.get("croquis") or PANNEAU_CROQUIS) < PANNEAU_CROQUIS:
+            texte += ("\nLa carte a un ancien croquis (version %d) : televerse carte/machi_panneau/"
+                      "machi_panneau.ino (version %d) : images controlees, panneau rafraichi en continu."
+                      % (PANNEAU["croquis"], PANNEAU_CROQUIS))
         elif ips and ips < PANNEAU_IPS * 0.8:
             # « ca tombe a 5 fps parfois » : qui ralentit, la carte ou le PC ?
             calcul, envoi = float(PANNEAU.get("calcul_ms") or 0), float(PANNEAU.get("envoi_ms") or 0)

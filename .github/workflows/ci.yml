@@ -83,6 +83,11 @@ jobs:
           sudo apt-get install -y -qq xvfb >/dev/null
           xvfb-run -a python outils/test_panneau.py
 
+      # Le croquis de la carte, compile avec g++ et nourri des vraies trames de
+      # Machi Tool : une image abimee est jetee, un envoi coupe se rattrape.
+      - name: La carte du panneau LED, simulee
+        run: python outils/test_carte.py
+
       - name: Version lisible
         run: echo "version = $(python outils/version.py)"
 
