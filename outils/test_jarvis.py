@@ -693,6 +693,30 @@ class SesMains(unittest.TestCase):
         self.assertEqual(J.relatif_aujourdhui("09:00", quatorze_h), "passé")
         self.assertIsNone(J.relatif_aujourdhui("", quatorze_h))
 
+    def test_les_vues_semaine_mois_annee(self):
+        # « rajoute une vue a la semaine, au mois et a l'annee »
+        self.assertEqual(J.bornes_vue("semaine", "2026-10-21"), ("2026-10-19", "2026-10-25"))
+        self.assertEqual(J.bornes_vue("mois", "2026-10-21"), ("2026-09-28", "2026-11-01"))
+        self.assertEqual(J.bornes_vue("annee", "2026-10-21"), ("2026-01-01", "2026-12-31"))
+        self.assertIsNone(J.bornes_vue("liste", "2026-10-21"))
+        self.assertEqual(J.deplacer_vue("mois", "2026-12-15", 1), "2027-01-01")
+        self.assertEqual(J.deplacer_vue("mois", "2026-01-31", -1), "2025-12-01")
+        self.assertEqual(J.deplacer_vue("semaine", "2026-10-21", -1), "2026-10-14")
+        self.assertEqual(J.deplacer_vue("annee", "2026-10-21", 1), "2027-01-01")
+        self.assertEqual(J.titre_vue("semaine", "2026-10-29"), "Semaine 44  ·  26 oct. - 1 nov. 2026")
+        self.assertEqual(J.titre_vue("mois", "2026-02-03"), "Février 2026")
+        semaines = J.grille_mois("2026-10-21")
+        self.assertEqual(len(semaines), 5)
+        self.assertTrue(all(len(s) == 7 for s in semaines))
+        self.assertEqual((semaines[0][0], semaines[-1][-1]), ("2026-09-28", "2026-11-01"))
+        rdv = [{"date": "2026-10-20", "fin": "2026-10-23", "label": "Festival"},
+               {"date": "2026-10-21", "heure": "18:00", "label": "Appel"},
+               {"date": "2026-10-21", "heure": "09:00", "label": "Dentiste"},
+               {"date": "2026-10-21", "label": "Anniversaire"}]
+        self.assertEqual([r["label"] for r in J.rdv_du_jour(rdv, "2026-10-21")],
+                         ["Festival", "Dentiste", "Appel", "Anniversaire"])
+        self.assertEqual([r["label"] for r in J.rdv_du_jour(rdv, "2026-10-24")], [])
+
     def test_la_frise_de_l_agenda(self):
         # « un mode frise », « des rappels pouvant durer plusieurs jours »
         rdv = [{"date": "2026-09-20", "fin": "2026-09-27", "label": "Vacances"},
@@ -2949,6 +2973,52 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.poser_notes("note-témoin deux", m.CFG), 2)
         self.assertEqual([t for _, t in poses[1:]], ["note-témoin une", "note-témoin deux"])
         self.assertEqual(m.NOTES_EN_ATTENTE, [])
+
+    def test_l_agenda_synchro_meme_hors_ligne(self):
+        # « fait en sorte que l'agenda soit synchro sur brain debugger »
+        m = self.m
+        dossier = tempfile.mkdtemp()
+        vrais = (m.FICHIER_AGENDA, m._requete_bd, m._cle_presente)
+        self.addCleanup(lambda: (setattr(m, "FICHIER_AGENDA", vrais[0]), setattr(m, "_requete_bd", vrais[1]),
+                                 setattr(m, "_cle_presente", vrais[2])))
+        m.FICHIER_AGENDA = os.path.join(dossier, "agenda.json")
+        m._cle_presente = lambda cfg: True
+        base = [{"id": 1, "date": "2026-10-22", "heure": "09:00", "label": "Dentiste-témoin"},
+                {"id": 2, "date": "2026-10-25", "label": "Anniversaire-témoin"}]
+        envoyes, panne = [], []
+
+        def bd(chemin, corps, cfg, delai, **k):
+            if panne:
+                raise OSError("injoignable")
+            if corps is None:
+                return {"rendezVous": [dict(r) for r in base], "bilan": None}
+            envoyes.append(corps)
+            return {"ok": True, "texte": "fait"}
+        m._requete_bd = bd
+        r, hors = m.lire_agenda_synchro(m.CFG, "2026-10-20", 14)
+        self.assertIsNone(hors)
+        self.assertEqual(len(r["rendezVous"]), 2)
+        # BrainDebugger tombe : la copie, et ce qu'on fait attend dans la file
+        panne.append(1)
+        r, hors = m.lire_agenda_synchro(m.CFG, "2026-10-20", 14)
+        self.assertIn("copie du", hors)
+        self.assertEqual([x["label"] for x in r["rendezVous"]], ["Dentiste-témoin", "Anniversaire-témoin"])
+        m.mettre_en_attente({"op": "poser", "titre": "Kiné-témoin", "date": "2026-10-23", "heure": "18:00"})
+        m.mettre_en_attente({"op": "supprimer", "id": 2})
+        m.mettre_en_attente({"op": "modifier", "id": 1, "titre": "Dentiste-témoin", "date": "2026-10-22",
+                             "heure": "10:30", "fin": None})
+        r, _ = m.lire_agenda_synchro(m.CFG, "2026-10-20", 14)
+        vus = {x["label"]: x for x in r["rendezVous"]}
+        self.assertEqual(sorted(vus), ["Dentiste-témoin", "Kiné-témoin"], "la copie montre deja ce qui attend")
+        self.assertEqual(vus["Dentiste-témoin"]["heure"], "10:30")
+        self.assertTrue(vus["Kiné-témoin"]["attente"])
+        # il repond : la file part, dans l'ordre, puis se vide
+        panne.clear()
+        m.lire_agenda_synchro(m.CFG, "2026-10-20", 14)
+        self.assertEqual([("supprimer" in c, c.get("id"), c.get("titre")) for c in envoyes],
+                         [(False, None, "Kiné-témoin"), (True, None, None), (False, 1, "Dentiste-témoin")])
+        self.assertEqual(envoyes[1]["supprimer"], 2)
+        self.assertEqual(m.agenda_local()["attente"], [])
 
     def test_minuteurs_alarmes_et_chronos_tournent_en_fond(self):
         # « fait en sorte que je puisse demander a jarvis de mettre un minuteur,
