@@ -3075,19 +3075,36 @@ class DansMachiTool(unittest.TestCase):
             def read(self, n):
                 lu, self.attente = self.attente[:n], self.attente[n:]
                 return lu
-        self.assertEqual(m.version_croquis(Carte(b"MACHI 2\r\n")), 2)
-        self.assertEqual(m.version_croquis(Carte(b""), attente=0.05), 1, "la v1 ne repond rien")
+        self.assertEqual(m.version_croquis(Carte(b"MACHI 3\r\n"), calme=0), 3)
+        self.assertEqual(m.version_croquis(Carte(b"MACHI 2\r\n"), calme=0), 2)
+        self.assertEqual(m.version_croquis(Carte(b""), attente=0.05, calme=0), 1, "la v1 ne repond rien")
         self.assertEqual(m.version_croquis(object()), 1)
         self.assertTrue(os.path.exists(os.path.join(os.path.dirname(m.__file__), "carte", "machi_panneau",
                                                     "machi_panneau.ino")), "le croquis v2 est dans le depot")
         m.PANNEAU.update(etat="connecte", port="COM4", ips=29.0, croquis=1)
         self.assertIn("ancien croquis", m.etat_panneau_lisible()[0])
-        m.PANNEAU.update(croquis=2, ips=5.0, calcul_ms=3.0, envoi_ms=180.0)
+        self.assertIn("version 1", m.etat_panneau_lisible()[0])
+        m.PANNEAU.update(croquis=2)
+        self.assertIn("ancien croquis (version 2)", m.etat_panneau_lisible()[0], "la v2 : passer a la v3")
+        m.PANNEAU.update(croquis=3, ips=5.0, calcul_ms=3.0, envoi_ms=180.0, carte_jetees=None)
         self.assertIn("la carte qui suit mal", m.etat_panneau_lisible()[0])
         m.PANNEAU.update(calcul_ms=190.0, envoi_ms=4.0)
         self.assertIn("le PC qui ralentit", m.etat_panneau_lisible()[0])
         m.PANNEAU.update(ips=30.0)
         self.assertEqual(m.etat_panneau_lisible()[0], "Branche sur COM4  ·  30 im/s (reglee 30)")
+        # « j'ai des artefacts depuis le dernier flash » : la carte dit combien d'images elle a jetees
+        m.PANNEAU["_recu"] = b""
+
+        class Bilan:
+            in_waiting = 30
+
+            def read(self, n):
+                return b"STATS 812 3\nSTATS 9"
+        m.lire_bilan_carte(Bilan())
+        self.assertEqual((m.PANNEAU["carte_recues"], m.PANNEAU["carte_jetees"]), (812, 3))
+        self.assertEqual(m.PANNEAU["_recu"], b"STATS 9", "la ligne pas finie attend la suite")
+        self.assertIn("3 images abimees jetees par la carte", m.etat_panneau_lisible()[0])
+        m.lire_bilan_carte(object())                  # une carte sans tampon (les faux des tests)
 
     def test_jarvis_pose_minuteurs_alarmes_et_chronos_sans_permission(self):
         # « verifie bien que Jarvis puisse declencher un minuteur de lui-meme : qu'il
