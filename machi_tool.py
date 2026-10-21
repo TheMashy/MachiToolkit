@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.86.0"
+VERSION = "1.87.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11394,6 +11394,7 @@ PANNEAU_PAS_S = 1.0 / PANNEAU_IPS
 PANNEAU_CONTENUS = ("horloge", "ambiance", "eteint")
 PANNEAU_BLANC_CHAUD = (255, 176, 80)   # la guirlande debranchee : rien a suivre
 PANNEAU_JARVIS_TRAINE_S = 2.0          # sa voix tue, le temps de lire la fin
+PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la meme liaison
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire_jusqua": 0.0, "ips": 0.0, "perdues": 0}
 
@@ -11752,14 +11753,19 @@ def piloter_panneau(cfg=None, tours=None):
                         PANNEAU.update(etat="occupe", port=port)
                 else:
                     PANNEAU.update(etat="absent", port=None)
-            if lien is not None:
+            PANNEAU["lien"] = lien
+            if lien is not None and PANNEAU.get("fini"):
+                pass                               # Machi Tool s'en va : le panneau reste noir
+            elif lien is not None:
                 voulue = 0 if contenu == "eteint" else int(max(0, min(255, cfg.get("panneau_luminosite", 64))))
                 if voulue != lum:
-                    lien.write(b"MB" + bytes([voulue]))
+                    with PANNEAU_VERROU:
+                        lien.write(b"MB" + bytes([voulue]))
                     lum = voulue
                 donnees = rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)), balance_panneau(cfg))
                 try:
-                    lien.write(b"MF" + donnees)
+                    with PANNEAU_VERROU:
+                        lien.write(b"MF" + donnees)
                     PANNEAU["envoyees"] += 1
                     envois.append(time.monotonic())
                 except Exception as e:
@@ -11778,7 +11784,7 @@ def piloter_panneau(cfg=None, tours=None):
             except Exception:
                 pass
             lien = None
-            PANNEAU.update(etat="absent", port=None)
+            PANNEAU.update(etat="absent", port=None, lien=None)
             recherche = time.time() + 1.0
         if tours is None:
             # un rendez-vous fixe toutes les 1/30 s, pas « 1/30 s apres le
@@ -11790,11 +11796,32 @@ def piloter_panneau(cfg=None, tours=None):
                 time.sleep(reste)
             else:
                 prochaine = time.monotonic()
+    PANNEAU["lien"] = None
     if lien is not None:
         try:
             lien.close()
         except Exception:
             pass
+
+
+def eteindre_panneau():
+    """« Quand Machi Tool s'eteint, eteins automatiquement le panneau (comme la
+    guirlande). » Luminosite 0 et une image noire, sur la liaison du fil, puis
+    plus rien : le fil n'ecrit plus (PANNEAU["fini"]). Rend True si c'est parti."""
+    PANNEAU["fini"] = True
+    lien = PANNEAU.get("lien")
+    if lien is None:
+        return False
+    try:
+        with PANNEAU_VERROU:
+            lien.write(b"MB" + bytes([0]))
+            lien.write(b"MF" + bytes(PANNEAU_L * PANNEAU_H * 2))
+            lien.flush()
+        print("Panneau LED eteint.")
+        return True
+    except Exception as e:
+        print("Panneau LED : extinction impossible (%s)" % type(e).__name__)
+        return False
 
 
 def etat_panneau_lisible():
@@ -12850,6 +12877,7 @@ def surveiller_arret_windows():
             return 0
         if message in (WM_QUERYENDSESSION, WM_ENDSESSION):
             if CFG.get("eteindre_en_partant", True):
+                eteindre_panneau()
                 eteindre_guirlande()
             if CFG.get("collecte_active", False):
                 noter_session("extinction")    # vaut coucher : Windows s'arrete
@@ -16940,7 +16968,7 @@ class Panneau:
         self.curseurs = {}
         self.var_eteindre = tk.IntVar(
             value=1 if self.cfg.get("eteindre_en_partant", True) else 0)
-        self.case(f, "Eteindre la guirlande en quittant et a l'arret de Windows",
+        self.case(f, "Eteindre la guirlande et le panneau LED en quittant et a l'arret de Windows",
                   self.var_eteindre).pack(fill="x", pady=(0, 4))
         self.var_cpu = tk.IntVar(value=1 if self.cfg.get("reaction_processeur", True) else 0)
         self.case(f, "Plus le processeur travaille, plus elle brille (mode Regles)",
@@ -18885,6 +18913,7 @@ def lancer():
         if demande_arret.is_set():
             ETAT["en_marche"] = False
             if CFG.get("eteindre_en_partant", True):
+                eteindre_panneau()
                 eteindre_guirlande()
             arreter_activite()
             arreter_api()
