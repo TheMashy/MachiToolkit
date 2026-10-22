@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.91.0"
+VERSION = "1.92.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -349,6 +349,8 @@ CONFIG_DEFAUT = {
     "panneau_bleu": 100,
     # l'horloge suit la lumiere de la guirlande (sa respiration, la veille, le soir)
     "panneau_suit_eclat": True,
+    # le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes
+    "panneau_rdv": True,
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -421,7 +423,11 @@ CONFIG_DEFAUT = {
     "jarvis_debit": 0,                # voix de Windows : -10 .. 10
     "jarvis_suite": True,             # apres sa reponse, il ecoute la suite sans mot d'eveil
     "jarvis_suite_questions": False,  # ... seulement quand il a pose une question
-    "jarvis_repliques_spontanees": False,   # ses routines parlent aussi au reveil, a l'au revoir, pour une appli
+    "jarvis_repliques_spontanees": False,
+    # « Lorsque l'ordinateur est demarre, Jarvis resume la journee » -- apres
+    # ta premiere minute d'activite, si des choses sont prevues
+    "jarvis_resume_du_jour": True,
+    "jarvis_resume_dernier": 0.0,     # quand il l'a fait : pas deux fois en trois heures   # ses routines parlent aussi au reveil, a l'au revoir, pour une appli
     # « Prendre des initiatives » : surchauffe, volume trop fort tard le soir,
     # longue session sans pause -- toujours annoncees (voir veiller_initiatives)
     "jarvis_initiatives": False,
@@ -6576,6 +6582,7 @@ def veiller_sur_jarvis(cfg):
             # une tache de fond prete : il l'annonce des qu'il est libre (sans
             # attendre la guirlande, qui peut ne pas etre branchee)
             try:
+                veiller_resume_du_jour(cfg)  # le PC vient de demarrer : sa premiere minute d'activite
                 dire_les_annonces()
                 annoncer_taches(cfg)
             except Exception as e:
@@ -11090,7 +11097,8 @@ def annoncer(texte, langue="fr"):
 def dire_les_annonces():
     """Depuis sa veille : ce qui attendait qu'il soit libre."""
     while ANNONCES and JARVIS.get("etat") in ("attente", "eteint", None):
-        texte, langue, t = ANNONCES[0]
+        texte, langue, t = ANNONCES[0][:3]
+        avec = ANNONCES[0][3] if len(ANNONCES[0]) > 3 else {}
         if time.time() - t > ANNONCE_GARDEE_S:
             ANNONCES.pop(0)
             continue                          # trop vieux : la notification a suffi
@@ -11102,9 +11110,106 @@ def dire_les_annonces():
             if attendue and not voix_prete(cle) and time.time() - t < ANNONCE_VOIX_ATTENTE_S:
                 return                        # SA voix se charge encore : ca attend (puis Windows)
         ANNONCES.pop(0)
+        if avec.get("programme") is not None:
+            # le resume du jour : le panneau montre le programme, pas son visage
+            PANNEAU["programme"] = {"debut": time.time(), "rdv": avec["programme"],
+                                    "journee": avec.get("journee")}
         if CFG.get("jarvis_voix", True):
-            montrer_au_panneau(texte)
+            if avec.get("programme") is None:
+                montrer_au_panneau(texte)
             VOIX.dire(texte, None, langue)
+
+
+# LE RESUME DU JOUR. « Lorsque l'ordinateur est demarre et que Machi Tool
+# s'ouvre, Jarvis resume la journee si des choses sont prevues » -- « il doit
+# detecter un debut d'activite sur le PC (au moins une minute) ». Au lancement,
+# le PC vient-il de demarrer (moins de 15 min) ? Alors la premiere minute
+# d'activite sans pause declenche le resume : ce qui reste de la journee, dit
+# a voix haute, et le programme sur le panneau. Une relance de Machi Tool
+# (une mise a jour) ne le refait pas ; deux demarrages rapproches non plus.
+
+RESUME = {"attendu": False, "actif_depuis": None, "lance": False}
+RESUME_DEMARRAGE_S = 15 * 60           # Machi Tool lance moins de 15 min apres le PC : un demarrage
+RESUME_ACTIVITE_S = 60                 # « au moins une minute d'activite »
+RESUME_PAUSE_S = 30                    # sans clavier ni souris depuis 30 s : l'activite repart de zero
+RESUME_ECART_S = 3 * 3600              # pas deux resumes en trois heures
+
+
+def preparer_resume_du_jour(cfg, maintenant=None, demarrage_pc=None):
+    """Au lancement de Machi Tool. Rend True si le resume attend ta premiere
+    minute d'activite."""
+    t = time.time() if maintenant is None else maintenant
+    if demarrage_pc is None:
+        try:
+            import psutil
+            demarrage_pc = psutil.boot_time()
+        except Exception:
+            demarrage_pc = None
+    vient_de_demarrer = demarrage_pc is not None and 0 <= t - demarrage_pc < RESUME_DEMARRAGE_S
+    RESUME.update(attendu=bool(cfg.get("jarvis_resume_du_jour", True) and vient_de_demarrer
+                               and t - float(cfg.get("jarvis_resume_dernier") or 0) > RESUME_ECART_S),
+                  actif_depuis=None, lance=False)
+    return RESUME["attendu"]
+
+
+def veiller_resume_du_jour(cfg, maintenant=None, inactivite=None, lancer=None):
+    """Depuis sa veille (chaque seconde) : une minute d'activite sans pause
+    depuis le demarrage, et le resume part (dans un fil : l'agenda vient de
+    BrainDebugger). Rend True quand il part."""
+    if not RESUME["attendu"] or RESUME["lance"] or not cfg.get("jarvis_actif"):
+        return False
+    t = time.time() if maintenant is None else maintenant
+    i = secondes_inactivite() if inactivite is None else inactivite
+    if i >= RESUME_PAUSE_S:
+        RESUME["actif_depuis"] = None
+        return False
+    if RESUME["actif_depuis"] is None:
+        RESUME["actif_depuis"] = t
+    if t - RESUME["actif_depuis"] < RESUME_ACTIVITE_S:
+        return False
+    RESUME["lance"] = True
+    cfg["jarvis_resume_dernier"] = t
+    try:
+        sauver_config(cfg)
+    except Exception:
+        pass
+    if lancer is None:
+        threading.Thread(target=sans_faute, args=("Resume du jour", faire_resume_du_jour, cfg),
+                         daemon=True).start()
+    else:
+        lancer(cfg)
+    return True
+
+
+def faire_resume_du_jour(cfg, maintenant=None):
+    """Ce qui reste aujourd'hui, depuis BrainDebugger (sa copie locale s'il ne
+    repond pas) ; rien de prevu : il se tait. Sinon le resume rejoint ses
+    annonces -- dit des qu'il est libre et que sa voix est prete --, avec le
+    programme pour le panneau. Rend le texte, ou None."""
+    t = time.time() if maintenant is None else maintenant
+    jour = time.strftime("%Y-%m-%d", time.localtime(t))
+    try:
+        r, _ = lire_agenda_synchro(cfg, jour, 1)
+        journee = _jv.rdv_du_jour(r.get("rendezVous") or [], jour)
+        PANNEAU["agenda"] = None
+    except Exception:
+        d = agenda_local()
+        journee = _jv.rdv_du_jour(_appliquer_attente(d["rdv"], d["attente"]), jour)
+    lt = time.localtime(t)
+    restants = _jv.restants_du_jour(journee, lt.tm_hour * 60 + lt.tm_min)
+    L = langue_jarvis(cfg)
+    texte = _jv.resume_journee(restants, lt.tm_hour * 60 + lt.tm_min, L,
+                               str(cfg.get("jarvis_appellation", "") or "").strip())
+    if not texte:
+        print("Jarvis : rien de prevu aujourd'hui, pas de resume")
+        return None
+    print("Jarvis : resume du jour (%d chose%s)" % (len(restants), "s" if len(restants) > 1 else ""))
+    ANNONCES.append((texte, L, time.time(), {"programme": restants, "journee": journee}))
+    if not cfg.get("jarvis_voix", True):
+        n = JARVIS_CROCHETS.get("notifier")
+        if n:
+            n("Jarvis", texte)
+    return texte
 
 
 def rappel_dans_l_agenda(quoi, fin, cfg):
@@ -11608,6 +11713,185 @@ def image_mire(accent=None):
     return img
 
 
+# LA JOURNEE SUR LE PANNEAU. « Lorsque l'ordinateur est demarre, Jarvis
+# resume la journee si des choses sont prevues (un graphique des choses prevues
+# de l'agenda, avec leurs heures, sur le panneau) ; lorsqu'un evenement
+# arrive, le montrer a partir d'une heure avant (au-dessus de la ligne des
+# secondes). » L'agenda vient de sa copie locale (agenda.json, que la synchro
+# avec BrainDebugger tient a jour) : le fil du panneau ne touche pas au reseau.
+
+PANNEAU_PROCHAIN_S = 3600              # un rendez-vous s'affiche une heure avant...
+PANNEAU_PROCHAIN_APRES_S = 300         # ... et jusqu'a cinq minutes apres son heure
+PANNEAU_PROGRAMME_S = 20               # le programme du jour : au moins 20 s, et le temps de sa voix
+PANNEAU_AGENDA_RELU_S = 60             # la copie locale, relue toutes les minutes
+PANNEAU_AGENDA_SYNCHRO_S = 600         # et resynchronisee avec BrainDebugger toutes les 10 min
+COULEURS_RDV = ((255, 170, 60), (90, 200, 255), (255, 110, 150), (140, 230, 120), (190, 140, 255),
+                (255, 225, 90))
+TITRE_RDV = (215, 215, 225)
+
+
+def agenda_du_jour(cfg=None, jour=None, maintenant=None):
+    """Les rendez-vous d'aujourd'hui, depuis la copie locale (ce qui attend
+    d'etre envoye compris), gardes une minute. Une copie de plus de 10 min se
+    resynchronise en fond, sans jamais faire attendre le panneau."""
+    t = time.time() if maintenant is None else maintenant
+    jour = jour or time.strftime("%Y-%m-%d", time.localtime(t))
+    c = PANNEAU.get("agenda")
+    if c and c["jour"] == jour and t - c["lu"] < PANNEAU_AGENDA_RELU_S:
+        return c["rdv"]
+    d = agenda_local()
+    rdv = _jv.rdv_du_jour(_appliquer_attente(d["rdv"], d["attente"]), jour)
+    PANNEAU["agenda"] = {"jour": jour, "lu": t, "rdv": rdv}
+    cfg = CFG if cfg is None else cfg
+    if (t - float(d.get("quand") or 0) > PANNEAU_AGENDA_SYNCHRO_S and not PANNEAU.get("agenda_synchro")
+            and _cle_presente(cfg)):
+        PANNEAU["agenda_synchro"] = True
+
+        def synchro():
+            try:
+                lire_agenda_synchro(cfg, jour, 2)
+            except Exception:
+                pass
+            finally:
+                PANNEAU.update(agenda_synchro=False, agenda=None)
+        threading.Thread(target=synchro, daemon=True).start()
+    return rdv
+
+
+def _cle_rdv(r):
+    return (str(r.get("heure") or ""), str(r.get("label") or ""))
+
+
+def _couleurs_rdv(journee):
+    """Une couleur par rendez-vous a heure de la journee, dans l'ordre des
+    heures : la meme dans le programme (ce qui reste) et au-dessus des secondes."""
+    a_heure = sorted((r for r in journee if _jv.minutes_du_jour(r.get("heure")) is not None),
+                     key=lambda r: (_jv.minutes_du_jour(r.get("heure")), str(r.get("label") or "")))
+    return {_cle_rdv(r): COULEURS_RDV[i % len(COULEURS_RDV)] for i, r in enumerate(a_heure)}
+
+
+def prochain_rdv(rdv, maintenant):
+    """Le rendez-vous a montrer au-dessus des secondes : le premier qui arrive
+    dans l'heure (ou a commence il y a moins de 5 min). (rdv, secondes avant,
+    couleur), ou None."""
+    lt = time.localtime(maintenant)
+    m = lt.tm_hour * 60 + lt.tm_min + lt.tm_sec / 60.0
+    couleurs = _couleurs_rdv(rdv)
+    for r in sorted(rdv, key=lambda r: _jv.minutes_du_jour(r.get("heure")) or 0):
+        h = _jv.minutes_du_jour(r.get("heure"))
+        if h is None:
+            continue
+        avant = (h - m) * 60
+        if -PANNEAU_PROCHAIN_APRES_S <= avant <= PANNEAU_PROCHAIN_S:
+            return r, avant, couleurs.get(_cle_rdv(r), COULEURS_RDV[0])
+    return None
+
+
+_BANDES_PETITES = {}
+
+
+def _bande_petite(texte):
+    """Le texte en 3 x 5 sur une seule bande (5 lignes de booleens), gardee."""
+    import numpy as np
+    b = _BANDES_PETITES.get(texte)
+    if b is not None:
+        return b
+    motifs = _texte_petit(texte)
+    b = np.zeros((5, max(1, sum(len(m[0]) + 1 for m in motifs) - 1)), bool)
+    x = 0
+    for m in motifs:
+        for j, ligne in enumerate(m):
+            for i, c in enumerate(ligne):
+                if c == "#":
+                    b[j, x + i] = True
+        x += len(m[0]) + 1
+    if len(_BANDES_PETITES) > 32:
+        _BANDES_PETITES.clear()
+    _BANDES_PETITES[texte] = b
+    return b
+
+
+DEFILE_PAUSE_S = 1.5                   # un titre qui defile s'arrete sur son debut a chaque tour
+
+
+def ecrire_tenant(img, texte, x0, x1, y, couleur, ecoule=None, vitesse=12):
+    """Du texte 3 x 5 entre x0 et x1 : tel quel s'il tient ; sinon, `ecoule`
+    (les secondes depuis qu'il est a l'ecran) donne, il defile en boucle a
+    12 px/s, en partant de son debut et en s'y arretant 1,5 s a chaque tour ;
+    sans `ecoule`, coupe."""
+    b = _bande_petite(texte)
+    place, w = x1 - x0, b.shape[1]
+    if w <= place or ecoule is None:
+        w = min(w, place)
+        img[y:y + 5, x0:x0 + w][b[:, :w]] = couleur
+        return
+    tour = w + 12
+    p = max(0.0, ecoule) % (tour / float(vitesse) + DEFILE_PAUSE_S)
+    decale = 0 if p < DEFILE_PAUSE_S else int((p - DEFILE_PAUSE_S) * vitesse) % tour
+    for k in range(place):
+        col = (decale + k) % tour
+        if col < w:
+            img[y:y + 5, x0 + k][b[:, col]] = couleur
+
+
+def image_programme(rdv, maintenant, journee=None, ecoule=None):
+    """Le programme du jour : la date, une frise de la journee (un trait par
+    rendez-vous, a son heure, et maintenant en blanc), puis la liste -- l'heure
+    dans la couleur du rendez-vous, son titre (qui defile s'il est long ;
+    `ecoule` : depuis quand il est a l'ecran). `journee` : toute la journee
+    (pour les couleurs) ; sinon `rdv`."""
+    import numpy as np
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    lt = time.localtime(maintenant)
+    date = "%s %d %s" % (_JOURS_PANNEAU[lt.tm_wday], lt.tm_mday, _MOIS_PANNEAU[lt.tm_mon - 1])
+    ecrire_petit(img, date, None, 1, (150, 150, 165))
+    couleurs = _couleurs_rdv(journee if journee is not None else rdv)
+    heures = [_jv.minutes_du_jour(r.get("heure")) for r in rdv]
+    heures = [h for h in heures if h is not None]
+    maintenant_min = lt.tm_hour * 60 + lt.tm_min
+    debut = min([8 * 60, (maintenant_min // 60) * 60] + [(h // 60) * 60 for h in heures])
+    fin = max([22 * 60] + [(h // 60 + 1) * 60 for h in heures])
+
+    def x_de(minutes):
+        return 2 + int(round((minutes - debut) * 59.0 / max(1, fin - debut)))
+    img[10, 2:62] = (45, 45, 55)
+    for h in range(debut, fin + 1, 120):
+        img[11, x_de(h)] = (90, 90, 105)
+    for r in rdv:
+        h = _jv.minutes_du_jour(r.get("heure"))
+        if h is not None:
+            x = x_de(h)
+            img[8:13, x:x + 2] = couleurs.get(_cle_rdv(r), COULEURS_RDV[0])
+    if debut <= maintenant_min <= fin:
+        img[7:14, x_de(maintenant_min)] = (240, 240, 248)
+    lignes = 7
+    montres = rdv if len(rdv) <= lignes else rdv[:lignes - 1]
+    for i, r in enumerate(montres):
+        y = 16 + 7 * i
+        h = _jv.minutes_du_jour(r.get("heure"))
+        couleur = couleurs.get(_cle_rdv(r), (150, 150, 165))
+        img[y:y + 5, 2:4] = couleur
+        ecrire_petit(img, str(r["heure"])[:5] if h is not None else "JOUR", 6, y, couleur)
+        ecrire_tenant(img, str(r.get("label") or ""), 26, 63, y, TITRE_RDV, ecoule)
+    if len(rdv) > lignes:
+        ecrire_petit(img, "+%d" % (len(rdv) - len(montres)), 6, 16 + 7 * (lignes - 1), (150, 150, 165))
+    return img
+
+
+def programme_au_panneau(maintenant):
+    """Le programme du jour, s'il est a l'ecran : au moins 20 s, et tant que
+    Jarvis le dit (plus 8 s pour finir de lire)."""
+    p = PANNEAU.get("programme")
+    if not p:
+        return None
+    if VOIX.parle:
+        p["vu"] = maintenant
+    if maintenant < max(p["debut"] + PANNEAU_PROGRAMME_S, float(p.get("vu") or 0) + 8):
+        return p
+    PANNEAU["programme"] = None
+    return None
+
+
 def _prochain_chrono(minuteurs, t):
     """Le minuteur (ou l'alarme, ou le chrono) a montrer : celui qui sonne en
     premier. (genre, texte) ou None."""
@@ -11624,11 +11908,12 @@ def _prochain_chrono(minuteurs, t):
     return None
 
 
-def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None, eclat=None):
+def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None, eclat=None, rdv=None):
     """L'image de 64 x 64 (numpy, RGB) que le panneau doit montrer : ce que
     l'ecran en montre (voir `rgb565` pour ce que la carte en recoit).
     `eclat` (0 a 1) : l'horloge suit la lumiere de la guirlande, jamais sous
-    PANNEAU_ECLAT_MIN ; None : pleine lumiere."""
+    PANNEAU_ECLAT_MIN ; None : pleine lumiere. `rdv` : ceux du jour -- celui
+    qui arrive dans l'heure s'ecrit au-dessus des secondes."""
     import numpy as np
     img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
     t = time.time() if maintenant is None else maintenant
@@ -11657,6 +11942,17 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
         genre, texte = suivant
         couleur = {"minuteur": (255, 150, 40), "alarme": (255, 90, 70), "chrono": (110, 170, 255)}[genre]
         ecrire_petit(img, texte, None, 44, couleur)
+    # le prochain rendez-vous, une heure avant : son heure (qui bat les cinq
+    # dernieres minutes) dans sa couleur, son titre qui defile s'il est long
+    prochain = prochain_rdv(rdv or [], t)
+    if prochain:
+        r, avant, couleur = prochain
+        if 0 < avant <= 300:
+            couleur = tuple(int(c * (0.55 + 0.45 * abs(math.cos(t * math.pi)))) for c in couleur)
+        heure = str(r["heure"])[:5]
+        ecrire_petit(img, heure, 2, 52, couleur)
+        ecrire_tenant(img, str(r.get("label") or ""), 4 + largeur_petit(heure) + 2, 62, 52, TITRE_RDV,
+                      PANNEAU_PROCHAIN_S - avant)
     # les secondes : une ligne qui se remplit en bas, un pixel par seconde ;
     # celui du bout s'allume progressivement (a 30 i/s, elle glisse)
     s = min(59, lt.tm_sec) + (t % 1.0)
@@ -11747,8 +12043,18 @@ def image_du_panneau(cfg, contenu, t):
     etat = etat_jarvis_pour_le_panneau(cfg, t)
     if etat is not None:
         return image_jarvis_du_moment(etat, t, cfg, croix=False)
-    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"),
-                         eclat=eclat_guirlande() if cfg.get("panneau_suit_eclat", True) else None)
+    eclat = eclat_guirlande() if cfg.get("panneau_suit_eclat", True) else None
+    programme = programme_au_panneau(t)
+    if programme is not None:
+        img = image_programme(programme["rdv"], t, programme.get("journee"), t - programme["debut"])
+        return img if eclat is None else assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
+    rdv = []
+    if contenu == "horloge" and cfg.get("panneau_rdv", True):
+        try:
+            rdv = agenda_du_jour(cfg, maintenant=t)
+        except Exception:
+            rdv = []
+    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv)
 
 
 def fletcher16(donnees):
@@ -15606,7 +15912,8 @@ class Panneau:
         Tout s'applique tout de suite (le fil du panneau relit la config)."""
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
-                    "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat"):
+                    "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
+                    "panneau_rdv"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -15646,6 +15953,11 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_suit_eclat"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        self.var_panneau_rdv = tk.IntVar(value=1 if self.cfg.get("panneau_rdv", True) else 0)
+        c = self.case(col, "Le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes",
+                      self.var_panneau_rdv, lambda: self.regler_panneau("panneau_rdv"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
         self.var_panneau_jarvis = tk.IntVar(value=1 if self.cfg.get("panneau_jarvis", True) else 0)
         c = self.case(col, "Le panneau de Jarvis s'affiche ici, plus a l'ecran : quand il t'ecoute, reflechit, "
                            "parle -- et quand il parle de lui-meme (un minuteur, un rappel)", self.var_panneau_jarvis,
@@ -15682,8 +15994,9 @@ class Panneau:
         self.bouton_mire = self.bouton(col, self._texte_mire(), self.basculer_mire, compact=True)
         self.bouton_mire.pack(anchor="w", pady=(4, 0))
 
-        self.texte(f, "Ni journal, ni humeur, ni messages n'y passent. Seule exception, si la case est cochee : "
-                      "le panneau de Jarvis, avec ce qu'il dit (le nom d'un rappel compris). "
+        self.texte(f, "Ni journal, ni humeur, ni messages n'y passent. Exceptions, si leur case est cochee : "
+                      "le panneau de Jarvis, avec ce qu'il dit (le nom d'un rappel compris), et ton agenda du "
+                      "jour (le programme au demarrage, le prochain rendez-vous). "
                       "Pour televerser un croquis avec Arduino, decoche d'abord « Machi Tool pilote le panneau » : "
                       "un seul programme a la fois peut tenir le port USB de la carte.",
                    BRUME, 8, largeur=560).pack(fill="x", pady=(18, 0))
@@ -15693,6 +16006,8 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_actif.get())
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
+        elif cle == "panneau_rdv":
+            self.cfg[cle] = bool(self.var_panneau_rdv.get())
         elif cle == "panneau_suit_eclat":
             self.cfg[cle] = bool(self.var_panneau_suit_eclat.get())
         elif cle == "panneau_rotation":
@@ -16496,6 +16811,8 @@ class Panneau:
                 ("jarvis_journal", "Ce qu'on se dit va aussi dans le journal de BrainDebugger (marque "
                                    "« Jarvis »)"),
                 ("jarvis_annoncer_maj", "Il annonce les mises a jour de Machi Tool (et peut les lancer)"),
+                ("jarvis_resume_du_jour", "Au demarrage du PC, apres ta premiere minute d'activite, il resume ce "
+                                          "qui est prevu aujourd'hui (et le panneau LED en montre le programme)"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),
                 ("jarvis_ma_voix", "Seulement ma voix, a mon volume : la tele, une video, quelqu'un plus loin "
                                    "ne le reveillent pas (une fois ta voix apprise)"),
@@ -18792,6 +19109,8 @@ def lancer():
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)
     # ce qui tournait avant (minuteurs, alarmes, chronometres) reprend
     sans_faute("Minuteurs de Jarvis", restaurer_chronos, CFG)
+    if sans_faute("Resume du jour", preparer_resume_du_jour, CFG):
+        print("Jarvis : le PC vient de demarrer -- le resume du jour attend une minute d'activite")
     # le panneau LED : trouve seul, des qu'il est branche
     threading.Thread(target=sans_faute, args=("Panneau LED", piloter_panneau, CFG), daemon=True,
                      name="panneau").start()

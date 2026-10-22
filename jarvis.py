@@ -5951,6 +5951,59 @@ def rdv_du_jour(rendez_vous, jour):
                                       str(r.get("label") or "")))
 
 
+def restants_du_jour(rdv_jour, maintenant_min):
+    """Ce qui reste aujourd'hui : les rendez-vous a heure pas encore passes, et
+    ceux de toute la journee (sans heure, ou une periode qui couvre le jour)."""
+    out = []
+    for r in rdv_jour or []:
+        m = minutes_du_jour(r.get("heure"))
+        if m is None or m >= maintenant_min:
+            out.append(r)
+    return out
+
+
+def _heure_parlee(hhmm, langue):
+    m = minutes_du_jour(hhmm)
+    if langue == "en":
+        return "%d:%02d" % (m // 60, m % 60)
+    return "%d h %02d" % (m // 60, m % 60) if m % 60 else "%d h" % (m // 60)
+
+
+RESUME_HEURES_MAX = 5            # au-dela, « et 3 autres »
+
+
+def resume_journee(restants, maintenant_min, langue="fr", qui=""):
+    """« Lorsque l'ordinateur est demarre, Jarvis resume la journee si des
+    choses sont prevues. » Ce qu'il dit : les rendez-vous a heure, dans
+    l'ordre, puis ceux de toute la journee. Rien de prevu : None (il se tait).
+    `qui` : comment il t'appelle (« Bonjour, Monsieur. »)."""
+    a_heure = [r for r in restants or [] if minutes_du_jour(r.get("heure")) is not None]
+    a_heure.sort(key=lambda r: minutes_du_jour(r.get("heure")))
+    du_jour = [r for r in restants or [] if minutes_du_jour(r.get("heure")) is None]
+    if not a_heure and not du_jour:
+        return None
+    en = langue == "en"
+    lien = " at " if en else " à "
+    morceaux = [str(r.get("label") or "").strip() + lien + _heure_parlee(r["heure"], langue)
+                for r in a_heure[:RESUME_HEURES_MAX]]
+    reste = len(a_heure) - RESUME_HEURES_MAX
+    if reste > 0:
+        morceaux.append(("and %d more" if en else "et %d autres") % reste)
+    jour = ", ".join(str(r.get("label") or "").strip() for r in du_jour)
+    if en:
+        salut = ("Good morning" if maintenant_min < 12 * 60 else
+                 "Good afternoon" if maintenant_min < 18 * 60 else "Good evening")
+        salut += (", " + qui if qui else "") + "."
+        if not morceaux:
+            return "%s Today: %s." % (salut, jour)
+        return "%s On today's schedule: %s%s." % (salut, ", ".join(morceaux), "; and all day: " + jour if jour else "")
+    salut = ("Bonjour" if maintenant_min < 18 * 60 else "Bonsoir") + (", " + qui if qui else "") + "."
+    if not morceaux:
+        return "%s Aujourd'hui : %s." % (salut, jour)
+    return "%s Au programme aujourd'hui : %s%s." % (salut, ", ".join(morceaux),
+                                                     " ; et toute la journée : " + jour if jour else "")
+
+
 # --- la fenetre Agenda : frise, bilan, saisie --------------------------------
 #
 # « Rends l'interface des rappels beaucoup plus belle, avec un mode frise ;
