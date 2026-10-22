@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.100.0"
+VERSION = "1.101.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -362,6 +362,7 @@ CONFIG_DEFAUT = {
     "panneau_cycle_bonhomme": True,
     "panneau_cycle_saut": True,       # un morceau qui change : la musique tout de suite
     "panneau_cycle_chat": True,       # « un petit :3 qui arrive, qui cligne des yeux »
+    "panneau_cycle_maid": True,       # « un petit chat en maid », cheveux noirs, tenue noire et blanche
     "panneau_eq_sensibilite": 1.0,    # l'egaliseur : 0,2 (calme) a 3 (tout monte)
     "meteo_ville": "",                # vide : le lieu approximatif de la connexion
     "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
@@ -449,9 +450,14 @@ CONFIG_DEFAUT = {
     # journal ! » : chaque echange avec le majordome, verse dans BrainDebugger
     # (voir verser_au_journal)
     "jarvis_journal": True,
-    # « Ainsi qu'annoncer une mise a jour (il peut la lancer) » : il dit qu'une
-    # version attend, qu'il s'en va l'installer, puis qu'il est revenu
+    # « Ainsi qu'annoncer une mise a jour (il peut la lancer) » : il sait
+    # qu'une version attend et peut la lancer (« oui ? » avant)...
     "jarvis_annoncer_maj": True,
+    # ... mais « fais en sorte que Jarvis puisse deployer des MAJ sans
+    # l'annoncer audiblement (comme avant, sans qu'il parle) » : il les pose en
+    # silence. Coche, il retrouve la parole : « une mise a jour est
+    # disponible », « j'installe la version... », « me revoila ».
+    "jarvis_maj_a_voix_haute": False,
     # « Un raccourci clavier pour basculer Jarvis » : tenu par WINDOWS (la
     # touche de raccourci d'une entree du menu Demarrer), jamais par Machi
     # Tool -- qui ne lit pas le clavier. Vide : pas de raccourci.
@@ -9773,7 +9779,7 @@ def appliquer_reglage(cle, avant, v, cfg):
 # pose par main dans DECLENCHER_MAJ) : un seul chemin vers l'installeur.
 
 DECLENCHER_MAJ = [None]
-REFUS_MAJ_DECOCHE = ("« Il annonce les mises a jour (et peut les lancer) » est decoche dans ses options : "
+REFUS_MAJ_DECOCHE = ("« Il peut proposer et lancer les mises a jour » est decoche dans ses options : "
                      "je ne lance pas la mise a jour.")
 MAJ_ANNONCEES = set()          # (quoi, version) deja dits : une fois chacun
 MAJ_POSE_ATTENTE_S = 6.0       # le temps de dire « je reviens » avant de partir
@@ -9836,10 +9842,12 @@ def outil_mise_a_jour(action, cfg):
 
 def annoncer_maj(quoi, version, cfg=None):
     """Il dit, une fois par version, qu'une mise a jour attend (« disponible »),
-    qu'il part l'installer (« pose ») ou qu'il est revenu (« posee »). Rend
-    True s'il le dit tout de suite (sinon c'est en file, ou rien)."""
+    qu'il part l'installer (« pose ») ou qu'il est revenu (« posee ») -- si
+    « a voix haute » est coche ; sinon la mise a jour se pose en silence.
+    Rend True s'il le dit tout de suite (sinon c'est en file, ou rien)."""
     cfg = CFG if cfg is None else cfg
-    if not version or not cfg.get("jarvis_actif") or not cfg.get("jarvis_annoncer_maj", True):
+    if not version or not cfg.get("jarvis_actif") or not cfg.get("jarvis_annoncer_maj", True) \
+            or not cfg.get("jarvis_maj_a_voix_haute", False):
         return False
     if (quoi, version) in MAJ_ANNONCEES:
         return False
@@ -11978,7 +11986,7 @@ def programme_au_panneau(maintenant):
 # s'arrete sur l'heure.
 
 ZONE_CYCLE = slice(39, 59)
-CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme", "chat")
+CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme", "chat", "maid")
 # « ralentis le fade, fais un fade toutes les 30 s » -- puis « rajoute tout ca
 # en settings » : panneau_cycle_duree et panneau_cycle_fondu, bornes ici
 CYCLE_DUREE_S = 30.0
@@ -12030,6 +12038,8 @@ def cycle_disponible(maintenant, cfg=None):
         d.append("bonhomme")
     if cfg.get("panneau_cycle_chat", True):
         d.append("chat")
+    if cfg.get("panneau_cycle_maid", True):
+        d.append("maid")
     return d
 
 
@@ -12051,7 +12061,7 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYC
         c = PANNEAU["cycle"] = {"actuel": "heure", "precedent": None, "depuis": maintenant}
 
     def passer(vers):
-        c.update(precedent=c["actuel"], actuel=vers, depuis=maintenant)
+        c.update(precedent=c["actuel"], actuel=vers, precedent_depuis=c["depuis"], depuis=maintenant)
     if urgent:
         if c["actuel"] != "heure":
             passer("heure")
@@ -12067,7 +12077,10 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYC
                 break
     ecoule = maintenant - c["depuis"]
     fondu = (min(1.0, ecoule / fondu_s) if fondu_s > 0 else 1.0) if c["precedent"] else 1.0
-    return {"actuel": c["actuel"], "precedent": c["precedent"], "fondu": fondu, "ecoule": ecoule}
+    # celle qui s'en va garde son propre temps pendant le fondu (sans quoi elle sauterait)
+    avant = c.get("precedent_depuis")
+    return {"actuel": c["actuel"], "precedent": c["precedent"], "fondu": fondu, "ecoule": ecoule,
+            "ecoule_precedent": None if avant is None else maintenant - avant}
 
 
 # LE PETIT :3. « Rajoute un petit :3 qui arrive (qui cligne des yeux de temps
@@ -12112,6 +12125,8 @@ def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule, sensibilite=1.0):
         _zone_musique(img, t, accent, PANNEAU.get("morceau"), ecoule, sensibilite)
     elif nom == "chat":
         _zone_chat(img, t, accent, ecoule)
+    elif nom == "maid":
+        _zone_maid(img, t, accent, ecoule)
     elif nom == "bonhomme":
         _zone_bonhomme(img, t, accent, ecoule)
     else:
@@ -12255,9 +12270,9 @@ def _zone_musique(img, t, accent, morceau, ecoule, sensibilite=1.0):
 BONHOMME_PAS_S = 1.1                   # un cycle de marche (deux pas)
 BONHOMME_COUCOU = (4.0, 6.2)           # coucou, en secondes depuis l'arrivee de la vue (apres le fondu)
 BONHOMME_SOL = 56                      # la ligne du chemin
-_BONHOMME_FIN = 4                      # sur-echantillonnage
 _BONHOMME_L, _BONHOMME_H = 16, 18      # la boite ou il tient, en pixels du panneau
 PEAU, CHEVEUX, JEAN, BASKETS = (255, 196, 150), (110, 65, 35), (60, 85, 150), (235, 235, 240)
+JOUES = (255, 130, 120)
 
 
 def _membre(origine, a1, l1, a2, l2):
@@ -12308,29 +12323,78 @@ def bonhomme_pose(x, t, ecoule=None):
     return pose
 
 
-def dessiner_bonhomme(img, x, t, accent, ecoule=None):
-    import numpy as np
-    pose = bonhomme_pose(x, t, ecoule)
-    F, L, H = _BONHOMME_FIN, _BONHOMME_L, _BONHOMME_H
-    x0, y0 = int(math.floor(x)) - L // 2, BONHOMME_SOL - H
-    ys, xs = np.mgrid[0:H * F, 0:L * F]
-    X, Y = x0 + (xs + 0.5) / F, y0 + (ys + 0.5) / F
-    fin = np.zeros((H * F, L * F, 4), np.float32)
+def _sombre(couleur, f=0.7):
+    return tuple(int(v * f) for v in couleur)
 
-    def peindre(m, couleur):
-        fin[m, :3] = couleur
-        fin[m, 3] = 1.0
 
-    def trait(a, b, r, couleur):
+class _Toile:
+    """Une toile quatre fois plus fine que le panneau, pour les petits
+    personnages : on y peint des traits, des ronds, des polygones, puis
+    `poser` la reduit (la moyenne des sous-pixels, en alpha premultiplie) et
+    la colle sur l'image, coupee aux bords. Les contours adoucis font glisser
+    les membres d'un pixel a l'autre au lieu de sauter."""
+    FIN = 4
+
+    def __init__(self, x0, y0, largeur, hauteur):
+        import numpy as np
+        self.x0, self.y0, self.L, self.H = x0, y0, largeur, hauteur
+        ys, xs = np.mgrid[0:hauteur * self.FIN, 0:largeur * self.FIN]
+        self.X, self.Y = x0 + (xs + 0.5) / self.FIN, y0 + (ys + 0.5) / self.FIN
+        self.fin = np.zeros((hauteur * self.FIN, largeur * self.FIN, 4), np.float32)
+
+    def peindre(self, m, couleur):
+        self.fin[m, :3] = couleur
+        self.fin[m, 3] = 1.0
+
+    def trait(self, a, b, r, couleur):
+        import numpy as np
+        X, Y = self.X, self.Y
         dx, dy = b[0] - a[0], b[1] - a[1]
         u = np.clip(((X - a[0]) * dx + (Y - a[1]) * dy) / (dx * dx + dy * dy or 1e-9), 0, 1)
-        peindre((X - a[0] - u * dx) ** 2 + (Y - a[1] - u * dy) ** 2 <= r * r, couleur)
+        self.peindre((X - a[0] - u * dx) ** 2 + (Y - a[1] - u * dy) ** 2 <= r * r, couleur)
 
-    def rond(c, r, couleur):
-        peindre((X - c[0]) ** 2 + (Y - c[1]) ** 2 <= r * r, couleur)
+    def rond(self, c, r, couleur):
+        self.peindre(self.dans_rond(c, r), couleur)
 
-    def sombre(couleur, f=0.7):
-        return tuple(int(v * f) for v in couleur)
+    def dans_rond(self, c, r):
+        return (self.X - c[0]) ** 2 + (self.Y - c[1]) ** 2 <= r * r
+
+    def polygone(self, points, couleur):
+        """Un polygone convexe, dans un sens ou dans l'autre."""
+        aire = sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(points, points[1:] + points[:1]))
+        m = True
+        for a, b in zip(points, points[1:] + points[:1]):
+            m = m & (((b[0] - a[0]) * (self.Y - a[1]) - (b[1] - a[1]) * (self.X - a[0])) * aire >= 0)
+        self.peindre(m, couleur)
+
+    def poser(self, img):
+        import numpy as np
+        F, L, H, x0, y0 = self.FIN, self.L, self.H, self.x0, self.y0
+        p = self.fin.reshape(H, F, L, F, 4).mean(axis=(1, 3))
+        a = p[..., 3:4]
+        couleur = np.where(a > 0, p[..., :3] / np.maximum(a, 1e-6), 0)
+        gx0, gx1 = max(0, x0), min(PANNEAU_L, x0 + L)
+        gy0, gy1 = max(0, y0), min(PANNEAU_H, y0 + H)
+        if gx1 <= gx0 or gy1 <= gy0:
+            return
+        a = a[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
+        couleur = couleur[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
+        fond = img[gy0:gy1, gx0:gx1].astype(np.float32)
+        img[gy0:gy1, gx0:gx1] = np.clip(np.round(fond * (1 - a) + couleur * a), 0, 255).astype(np.uint8)
+
+
+def _point(img, x, y, couleur):
+    """Un pixel net, s'il tombe dans le panneau."""
+    x, y = int(math.floor(x)), int(math.floor(y))
+    if 0 <= x < PANNEAU_L and 0 <= y < PANNEAU_H:
+        img[y, x] = couleur
+
+
+def dessiner_bonhomme(img, x, t, accent, ecoule=None):
+    pose = bonhomme_pose(x, t, ecoule)
+    toile = _Toile(int(math.floor(x)) - _BONHOMME_L // 2, BONHOMME_SOL - _BONHOMME_H, _BONHOMME_L, _BONHOMME_H)
+    X, Y = toile.X, toile.Y
+    peindre, trait, rond, sombre = toile.peindre, toile.trait, toile.rond, _sombre
 
     def bras(k, manche, main):
         trait(pose["epaule"], pose["coude%d" % k], 0.55, manche)
@@ -12365,30 +12429,18 @@ def dessiner_bonhomme(img, x, t, accent, ecoule=None):
         peindre(cheveux & ((Y < tete[1] - 0.7) | (X < tete[0] - 1.0)), CHEVEUX)
         bras(1, accent, PEAU)
 
-    # reduit : la moyenne des sous-pixels, en alpha premultiplie ; coupe aux bords
-    p = fin.reshape(H, F, L, F, 4).mean(axis=(1, 3))
-    a = p[..., 3:4]
-    couleur = np.where(a > 0, p[..., :3] / np.maximum(a, 1e-6), 0)
-    gx0, gx1 = max(0, x0), min(PANNEAU_L, x0 + L)
-    if gx1 <= gx0:
-        return pose
-    a, couleur = a[:, gx0 - x0:gx1 - x0], couleur[:, gx0 - x0:gx1 - x0]
-    fond = img[y0:y0 + H, gx0:gx1].astype(np.float32)
-    img[y0:y0 + H, gx0:gx1] = np.clip(np.round(fond * (1 - a) + couleur * a), 0, 255).astype(np.uint8)
+    toile.poser(img)
     # les yeux, nets (un pixel chacun), sauf quand il cligne ; de face, les joues roses
-    oy = int(math.floor(tete[1] + 0.3))
+    oy = tete[1] + 0.3
     if pose["face"]:
-        yeux = [(int(math.floor(tete[0] + d)), oy) for d in (-1.0, 1.0)]
+        yeux = [(tete[0] + d, oy) for d in (-1.0, 1.0)]
         for d in (-1.6, 1.6):
-            jx = int(math.floor(tete[0] + d))
-            if 0 <= jx < PANNEAU_L:
-                img[oy + 1, jx] = (255, 130, 120)
+            _point(img, tete[0] + d, oy + 1, JOUES)
     else:
-        yeux = [(int(math.floor(tete[0] + 1.2)), oy)]
+        yeux = [(tete[0] + 1.2, oy)]
     if not chat_cligne(t + 1.7):
         for ox, oy in yeux:
-            if 0 <= ox < PANNEAU_L:
-                img[oy, ox] = (30, 20, 20)
+            _point(img, ox, oy, (30, 20, 20))
     return pose
 
 
@@ -12408,6 +12460,174 @@ def _zone_bonhomme(img, t, accent, ecoule=None):
     else:
         _motif(img, (".##..", "##...", "##...", "##...", ".##.."), 56, 41, LUNE)   # un croissant, dessine
     dessiner_bonhomme(img, x, t, accent, ecoule)        # devant le ciel
+
+
+# LE CHATON MAID. « Tu peux faire un petit chat ? En maid ? Genre femboy ? »
+# -- « avec des cheveux noirs et un costume de maid noir et blanc » -- « la
+# maid ne tient rien dans la main, elle marche vers la droite ». De profil,
+# elle traverse le panneau a petits pas rapides (la marche du bonhomme, plus
+# menue), et revient par la gauche. Cheveux, oreilles et queue noirs, la
+# coiffe a volants, un grand oeil, la joue rose ; la robe noire, le tablier
+# blanc, la dentelle de l'ourlet, le noeud blanc dans le dos, le col et les
+# poignets blancs, le ruban du cou et de la queue de la couleur de la
+# guirlande, des chaussettes hautes blanches. Le noir pur, sur le panneau,
+# c'est une LED eteinte : ce noir-la est un bleu nuit tres sombre, les
+# cheveux ont un reflet, et c'est le blanc de la tenue qui dessine la
+# silhouette. Tout bouge a 30 images par seconde : les jambes, les bras, la
+# jupe qui ondule, la queue, une oreille qui frissonne, les yeux qui
+# clignent, et de temps en temps un petit coeur qui s'envole.
+MAID_PAS_S = 0.9                       # de petits pas rapides (un cycle : deux pas)
+MAID_FOULEE, MAID_JAMBE = 3.2, 2.4     # la longueur d'un pas ; la cuisse comme le mollet
+MAID_SOL = 59                          # ses souliers remplissent la derniere ligne de la zone
+MAID_COEUR_S = 7.0                     # un petit coeur, toutes les 7 s
+_MAID_L, _MAID_H = 18, 21
+# le pied pose recule d'un pas pendant un demi-cycle, et elle avance d'autant : elle ne glisse pas
+MAID_VITESSE = MAID_FOULEE / (MAID_PAS_S / 2)
+MAID_TOUR = PANNEAU_L + 7              # sortie a droite, elle rentre aussitot a gauche
+NOIR_CHAT, REFLET_CHAT, ROSE_OREILLE = (50, 50, 74), (110, 118, 165), (255, 120, 165)
+ROBE, TABLIER, SOULIERS = (40, 38, 56), (240, 240, 245), (62, 58, 80)
+YEUX_CHAT, BOUCHE_CHAT = (35, 25, 60), (200, 90, 120)
+_COEUR = ("##.##", "#####", ".###.", "..#..")
+
+
+def _genou(hanche, pied, l):
+    """Le genou d'une jambe dont on connait la hanche et le pied (cuisse et
+    mollet de longueur l) : plie vers l'avant."""
+    dx, dy = pied[0] - hanche[0], pied[1] - hanche[1]
+    d = max(1e-3, min(2 * l - 1e-3, math.hypot(dx, dy)))
+    vx, vy = dx / d, dy / d
+    h = math.sqrt(max(0.0, l * l - (d / 2) ** 2))
+    return (hanche[0] + dx / 2 + h * vy, hanche[1] + dy / 2 - h * vx)
+
+
+def maid_pose(t, ecoule=None):
+    """Ou elle en est : sa marche (la hanche, les genoux, les bras...), sa
+    tete, sa queue, l'oreille qui frissonne, le coeur. Elle entre par la
+    gauche quand sa vue arrive et traverse ; sortie a droite, elle revient.
+    Ses pieds d'abord : pose, un pied reste ou il est pendant qu'elle avance
+    (il recule sous elle d'un pas) ; leve, il repasse devant en montant un
+    peu. Les genoux s'en deduisent."""
+    e = t if ecoule is None else ecoule
+    x = -3.5 + (MAID_VITESSE * e) % MAID_TOUR
+    phase = 2 * math.pi * t / MAID_PAS_S
+    l, sol = MAID_JAMBE, MAID_SOL - 0.9
+    rebond = 0.3 * (1 - math.cos(2 * phase)) / 2         # plus haute quand un pied passe sous elle
+    hanche = (x, sol - 2 * l * 0.9 - rebond)
+    epaule = (x + 0.4, hanche[1] - 3.0)
+    pose = {"hanche": hanche, "epaule": epaule, "tete": (epaule[0] + 0.5, epaule[1] - 3.0)}
+    for k in (0, 1):                                     # 0 : la jambe du fond, 1 : celle de devant
+        p = (phase + k * math.pi) % (2 * math.pi)
+        if p < math.pi:                                  # pose : il recule, a la vitesse ou elle avance
+            pied = (x + MAID_FOULEE * (0.5 - p / math.pi), sol)
+        else:                                            # leve : il revient devant
+            u = (p - math.pi) / math.pi
+            pied = (x + MAID_FOULEE * (0.5 * (1 - math.cos(math.pi * u)) - 0.5), sol - 1.2 * math.sin(math.pi * u))
+        pose["cheville%d" % k], pose["genou%d" % k] = pied, _genou(hanche, pied, l)
+        a1 = -0.5 * math.cos(p)                          # le bras du meme cote, a l'oppose de la jambe
+        pose["coude%d" % k], pose["main%d" % k] = _membre(epaule, a1, 1.9, a1 + 0.4, 1.7)
+    pose["queue"] = 2 * math.pi * t / 1.6
+    pose["frisson"] = (t % 5.3) < 0.35
+    u = (t % MAID_COEUR_S) / 2.2
+    pose["coeur"] = u if u < 1 else None                 # 0 -> 1 : il monte et s'efface
+    return pose
+
+
+def dessiner_maid(img, t, accent, ecoule=None):
+    pose = maid_pose(t, ecoule)
+    h, ep, tete = pose["hanche"], pose["epaule"], pose["tete"]
+    tx, ty = tete
+    toile = _Toile(int(math.floor(h[0])) - _MAID_L // 2, MAID_SOL - _MAID_H, _MAID_L, _MAID_H)
+    X, Y = toile.X, toile.Y
+
+    # la queue, derriere tout : du bas du dos, elle part en arriere et remonte en ondulant
+    p = (h[0] - 1.5, h[1] - 0.8)
+    for i in range(6):
+        a = math.pi + 0.15 + 0.3 * i + 0.35 * math.sin(pose["queue"] - i * 0.7)
+        q = (p[0] + 1.15 * math.cos(a), p[1] + 1.15 * math.sin(a))
+        toile.trait(p, q, 0.7 if i < 5 else 0.8, NOIR_CHAT)
+        if i == 3:
+            ruban = q
+        p = q
+    toile.rond((ruban[0], ruban[1] - 0.45), 0.42, accent)
+    toile.rond((ruban[0], ruban[1] + 0.45), 0.42, accent)
+
+    def bras(k, sombre):
+        f = 0.7 if sombre else 1.0
+        coude, main = pose["coude%d" % k], pose["main%d" % k]
+        toile.trait(ep, coude, 0.45, _sombre(PEAU, f))
+        toile.trait(coude, main, 0.45, _sombre(PEAU, f))
+        poignet = (coude[0] * 0.3 + main[0] * 0.7, coude[1] * 0.3 + main[1] * 0.7)
+        toile.rond(poignet, 0.5, _sombre(TABLIER, f))
+        toile.rond((ep[0], ep[1] + 0.3), 1.0, _sombre(ROBE, f) if sombre else ROBE)    # la manche bouffante
+
+    bras(0, True)
+    # les jambes : chaussettes hautes blanches (celle du fond plus sombre), souliers
+    for k, f in ((0, 0.7), (1, 1.0)):
+        genou, cheville = pose["genou%d" % k], pose["cheville%d" % k]
+        toile.trait(h, genou, 0.55, _sombre(TABLIER, f))
+        toile.trait(genou, cheville, 0.5, _sombre(TABLIER, f))
+        toile.trait((cheville[0] - 0.2, cheville[1] + 0.4), (cheville[0] + 0.9, cheville[1] + 0.4), 0.5,
+                    _sombre(SOULIERS, f))
+    # la jupe, qui ondule un peu au rythme des pas ; la dentelle ; le tablier devant
+    ondule = 0.3 * math.sin(2 * 2 * math.pi * t / MAID_PAS_S)
+    taille, ourlet = h[1] - 1.2, h[1] + 2.3
+    toile.polygone([(h[0] - 1.5, taille), (h[0] + 1.4, taille), (h[0] + 2.8 + ondule, ourlet),
+                    (h[0] - 3.1 - ondule, ourlet)], ROBE)
+    toile.trait((h[0] - 3.0 - ondule, ourlet + 0.1), (h[0] + 2.7 + ondule, ourlet + 0.1), 0.55, TABLIER)
+    toile.polygone([(h[0] + 0.1, taille + 0.2), (h[0] + 1.5, taille + 0.2), (h[0] + 2.8 + ondule, ourlet),
+                    (h[0] + 0.8 + ondule, ourlet)], TABLIER)
+    # le buste, la bavette du tablier, le noeud blanc dans le dos
+    toile.trait((h[0], h[1] - 1.0), ep, 1.25, ROBE)
+    toile.trait((ep[0] + 0.9, ep[1] + 0.7), (h[0] + 1.0, taille + 0.2), 0.3, TABLIER)
+    toile.rond((h[0] - 2.0, taille - 0.4), 0.65, TABLIER)
+    toile.rond((h[0] - 2.5, taille + 0.6), 0.6, TABLIER)
+    # les oreilles (celle du fond plus sombre ; celle de devant frissonne parfois)
+    tourne = 0.9 if pose["frisson"] else 0.0
+    for base_a, base_b, bout, devant in (
+            ((tx - 2.5, ty - 1.8), (tx - 0.5, ty - 2.9), (tx - 1.9, ty - 5.1), False),
+            ((tx + 0.1, ty - 3.0), (tx + 2.2, ty - 2.1), (tx + 1.7 + 0.4 * tourne, ty - 5.2 + tourne), True)):
+        toile.polygone([base_a, base_b, bout], NOIR_CHAT if devant else _sombre(NOIR_CHAT, 0.8))
+        if devant:
+            milieu = ((base_a[0] + base_b[0]) / 2, (base_a[1] + base_b[1]) / 2)
+            vers = lambda p, f: (p[0] + (milieu[0] - p[0]) * f, p[1] + (milieu[1] - p[1]) * f)
+            toile.polygone([vers(base_a, 0.35), vers(base_b, 0.35), vers(bout, 0.3)], ROSE_OREILLE)
+    # la tete ; les cheveux : le dessus, l'arriere qui tombe en carre, la frange
+    toile.rond(tete, 3.1, PEAU)
+    autour = toile.dans_rond(tete, 3.35)
+    toile.peindre(autour & ((Y < ty - 0.8) | (X < tx - 0.3)), NOIR_CHAT)
+    toile.trait((tx - 2.0, ty + 0.5), (tx - 1.8, ty + 2.6), 1.0, NOIR_CHAT)
+    toile.rond((tx + 1.7, ty - 1.0), 0.85, NOIR_CHAT)
+    toile.trait((tx - 2.2, ty - 1.6), (tx - 0.9, ty - 2.5), 0.3, REFLET_CHAT)    # le reflet
+    # la coiffe : des volants blancs entre les oreilles
+    for d, hh in ((-1.0, 2.9), (0.3, 3.2)):
+        toile.rond((tx + d, ty - hh), 0.6, TABLIER)
+    bras(1, False)
+    toile.poser(img)
+
+    # au pixel pres : le ruban du cou, l'oeil (grand), la joue, la bouche
+    _point(img, ep[0] + 0.9, ep[1] - 0.2, accent)
+    if chat_cligne(t + 0.9):
+        _point(img, tx + 1.6, ty + 1.2, YEUX_CHAT)
+    else:
+        _point(img, tx + 1.6, ty + 0.2, YEUX_CHAT)
+        _point(img, tx + 1.6, ty + 1.2, YEUX_CHAT)
+    _point(img, tx + 0.7, ty + 1.9, JOUES)
+    _point(img, tx + 2.5, ty + 2.1, BOUCHE_CHAT)
+    # le petit coeur : il monte derriere elle et s'efface
+    if pose["coeur"] is not None:
+        u = pose["coeur"]
+        f = min(1.0, u * 5) * (1 - u)
+        couleur = tuple(int(c * f) for c in (255, 90, 140))
+        hx, hy = int(round(tx - 9 - 2 * u)), int(round(ty - 2 - 3 * u))
+        for j, ligne in enumerate(_COEUR):
+            for i, c in enumerate(ligne):
+                if c == "#" and 0 <= hx + i < PANNEAU_L and 39 <= hy + j < 59:
+                    img[hy + j, hx + i] = couleur
+    return pose
+
+
+def _zone_maid(img, t, accent, ecoule):
+    dessiner_maid(img, t, accent, ecoule)
 
 
 def _prochain_chrono(minuteurs, t):
@@ -12467,7 +12687,7 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
         b = zone(cycle["actuel"], cycle.get("ecoule"))[ZONE_CYCLE].astype(np.float32)
         w = float(cycle.get("fondu", 1.0))
         if cycle.get("precedent") and w < 1.0:
-            a = zone(cycle["precedent"], None)[ZONE_CYCLE].astype(np.float32)
+            a = zone(cycle["precedent"], cycle.get("ecoule_precedent"))[ZONE_CYCLE].astype(np.float32)
             b = a * (1.0 - w) + b * w
         img[ZONE_CYCLE] = np.clip(np.round(b), 0, 255).astype(np.uint8)
     # les secondes : une ligne qui se remplit en bas, un pixel par seconde ;
@@ -16617,7 +16837,7 @@ class Panneau:
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
                     "panneau_rdv", "panneau_cycle", "meteo_ville", "panneau_cycle_duree", "panneau_cycle_fondu",
                     "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme", "panneau_cycle_saut",
-                    "panneau_cycle_chat", "panneau_eq_sensibilite"):
+                    "panneau_cycle_chat", "panneau_cycle_maid", "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -16678,7 +16898,8 @@ class Panneau:
         vues.pack(fill="x", pady=(6, 0), padx=(self.px(22), 0))
         self.texte(vues, "Vues", BRUME, 8).pack(side="left")
         for cle, nom in (("panneau_cycle_meteo", "Meteo"), ("panneau_cycle_musique", "Musique"),
-                         ("panneau_cycle_bonhomme", "Bonhomme"), ("panneau_cycle_chat", ":3")):
+                         ("panneau_cycle_bonhomme", "Bonhomme"), ("panneau_cycle_chat", ":3"),
+                         ("panneau_cycle_maid", "Chaton maid")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             setattr(self, "var_" + cle, v)
             self.case(vues, nom, v, lambda cle=cle: self.regler_panneau(cle)).pack(side="left", padx=(self.px(8), 0))
@@ -16755,7 +16976,7 @@ class Panneau:
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
-                     "panneau_cycle_saut", "panneau_cycle_chat"):
+                     "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "meteo_ville":
             ville = self.champ_meteo_ville.get().strip()[:60]
@@ -17575,7 +17796,9 @@ class Panneau:
                                        "trop fort tard le soir, une pause apres deux heures"),
                 ("jarvis_journal", "Ce qu'on se dit va aussi dans le journal de BrainDebugger (marque "
                                    "« Jarvis »)"),
-                ("jarvis_annoncer_maj", "Il annonce les mises a jour de Machi Tool (et peut les lancer)"),
+                ("jarvis_annoncer_maj", "Il peut proposer et lancer les mises a jour de Machi Tool (en silence)"),
+                ("jarvis_maj_a_voix_haute", "... et il les annonce a voix haute (« J'installe la version... », "
+                                            "« Me revoila »)"),
                 ("jarvis_resume_du_jour", "Au demarrage du PC, apres ta premiere minute d'activite, il resume ce "
                                           "qui est prevu aujourd'hui (et le panneau LED en montre le programme)"),
                 ("jarvis_couper", "Lui couper la parole en parlant par-dessus"),

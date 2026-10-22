@@ -3276,10 +3276,10 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(vu(t0 + 400, tous, urgent=True)["actuel"], "heure", "fige tant que ca presse")
         # qui est disponible
         m.PANNEAU.update(meteo=None, musique_vue=0)
-        self.assertEqual(m.cycle_disponible(t0), ["heure", "bonhomme", "chat"])
+        self.assertEqual(m.cycle_disponible(t0), ["heure", "bonhomme", "chat", "maid"])
         m.PANNEAU.update(meteo={"temp": 12, "code": 3, "quand": t0 - 60}, musique_vue=t0 - 3)
-        self.assertEqual(m.cycle_disponible(t0), tous + ["chat"])
-        self.assertEqual(m.cycle_disponible(t0 + 4 * 3600), ["heure", "bonhomme", "chat"],
+        self.assertEqual(m.cycle_disponible(t0), tous + ["chat", "maid"])
+        self.assertEqual(m.cycle_disponible(t0 + 4 * 3600), ["heure", "bonhomme", "chat", "maid"],
                          "une vieille meteo, la musique tue")
         self.assertTrue(m.cycle_urgent([{"genre": "minuteur", "fin": t0 + 200}], [], t0))
         self.assertFalse(m.cycle_urgent([{"genre": "minuteur", "fin": t0 + 900}], [], t0))
@@ -3333,7 +3333,7 @@ class DansMachiTool(unittest.TestCase):
         t0 = 1_800_000_000.0
         m.PANNEAU.update(meteo={"temp": 12, "code": 3, "quand": t0}, musique_vue=t0)
         self.assertEqual(m.cycle_disponible(t0, {"panneau_cycle_meteo": False, "panneau_cycle_bonhomme": False,
-                                                 "panneau_cycle_chat": False}),
+                                                 "panneau_cycle_chat": False, "panneau_cycle_maid": False}),
                          ["heure", "musique"], "des vues decochees : sautees ; l'heure reste")
         # 10 s par vue, sans fondu : un changement net a 10 s
         m.PANNEAU["cycle"] = None
@@ -3446,6 +3446,73 @@ class DansMachiTool(unittest.TestCase):
         for h, mi in ((0, 0), (23, 59)):
             bord = zone(time.mktime((2026, 10, 22, h, mi, 59, 0, 0, -1)))
             self.assertTrue((bord[39:56] != 0).any())
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_chaton_maid(self):
+        # « tu peux faire un petit chat ? en maid ? genre femboy ? » -- « avec des cheveux
+        # noirs et un costume de maid noir et blanc :) » -- « la maid ne tient rien dans la
+        # main, elle marche vers la droite »
+        m = self.m
+        acc = (255, 170, 40)
+        t0 = 1_800_000_003.5
+        t0 += 0.5 - ((t0 + 0.9) % 4.0)                       # les yeux ouverts...
+        while not 2.5 < t0 % m.MAID_COEUR_S < 6.8:           # ... et loin du petit coeur
+            t0 += 4.0
+        e0 = (30 + 5) / m.MAID_VITESSE                       # au milieu du panneau
+        zone = lambda t, ecoule=e0: m._zone_du_cycle("maid", t, acc, [], [], ecoule)
+        proche = lambda img, couleur, tol=30: (np.abs(img[39:59].astype(int) - np.array(couleur)).max(axis=2) <= tol)
+        repos = zone(t0)
+        self.assertTrue((repos[:39] == 0).all() and (repos[59:] == 0).all(), "elle tient sous la date")
+        self.assertTrue(proche(repos, m.NOIR_CHAT).sum() >= 15, "les cheveux, les oreilles, la queue : noirs")
+        self.assertTrue(proche(repos, m.ROBE).sum() >= 4, "la robe noire")
+        self.assertTrue(proche(repos, m.TABLIER, 60).sum() >= 6, "le tablier, la coiffe, les chaussettes : blancs")
+        self.assertTrue(proche(repos, m.ROSE_OREILLE, 60).any(), "le dedans de l'oreille, rose")
+        self.assertTrue(proche(repos, acc, 0).any(), "le ruban, de la couleur de la guirlande")
+        self.assertLess(max(m.NOIR_CHAT + m.ROBE), 90, "du noir, mais pas une LED eteinte")
+        self.assertGreater(min(m.NOIR_CHAT + m.ROBE), 30)
+        # rien dans les mains : devant elle, plus rien (ni plateau, ni tasse)
+        x = m.maid_pose(t0, e0)["hanche"][0]
+        self.assertTrue((repos[39:59, int(x) + 6:] == 0).all())
+        # elle marche vers la droite : entre par la gauche, traverse, revient par la gauche
+        xs = [m.maid_pose(t0, e)["hanche"][0] for e in (0.0, 2.0, 4.0, 6.0)]
+        self.assertLess(xs[0], 0)
+        self.assertTrue(all(b > a + 5 for a, b in zip(xs, xs[1:])), xs)
+        tour = m.MAID_TOUR / m.MAID_VITESSE
+        self.assertLess(m.maid_pose(t0, tour + 0.1)["hanche"][0], 2, "sortie a droite, elle revient")
+        for e in np.arange(0.5, 2 * tour, 0.25):            # et le panneau n'est jamais vide
+            self.assertTrue((zone(t0 + e, e)[39:59] != 0).any(), e)
+        # a petits pas, sans glisser : le pied pose ne bouge pas pendant qu'elle avance
+        poses = [m.maid_pose(t0 + k / 60.0, e0 + k / 60.0) for k in range(60)]
+        for k in (0, 1):
+            poses_au_sol = [p["cheville%d" % k][0] for p in poses if p["cheville%d" % k][1] >= m.MAID_SOL - 0.91]
+            self.assertGreater(len(poses_au_sol), 10)
+            for a, b in zip(poses_au_sol, poses_au_sol[1:]):
+                self.assertTrue(abs(a - b) < 0.01 or abs(a - b) > 2, "pose, il ne glisse pas")
+        self.assertTrue(any(p["cheville0"][1] < m.MAID_SOL - 1.5 for p in poses), "leve, il monte")
+        # 30 images par seconde
+        images = [zone(t0 + k / 30.0, e0 + k / 30.0) for k in range(30)]
+        self.assertEqual(len({i.tobytes() for i in images}), 30, "chaque image de la seconde est neuve")
+        # elle cligne des yeux : un grand oeil de deux pixels, un trait ferme
+        ouvert = int(proche(repos, m.YEUX_CHAT, 0).sum())
+        ferme = int(proche(zone(t0 - ((t0 + 0.9) % 4.0) + 0.05), m.YEUX_CHAT, 0).sum())
+        self.assertEqual((ouvert, ferme), (2, 1))
+        # de temps en temps, un petit coeur s'envole derriere elle
+        coeur = t0 - (t0 % m.MAID_COEUR_S) + m.MAID_COEUR_S + 0.9
+        def rose(img, t, e):                                  # du rose (qui s'efface), derriere elle
+            r, g, b = (img[39:59].astype(int)[..., i] for i in range(3))
+            derriere = np.arange(m.PANNEAU_L) < m.maid_pose(t, e)["hanche"][0] - 2
+            return int(((r > 40) & (r > 2 * g) & (b > g) & derriere).sum())
+        self.assertGreaterEqual(rose(zone(coeur), coeur, e0), 12, "le coeur")         # (au meme endroit)
+        self.assertEqual(rose(repos, t0, e0), 0)
+        # dans le cycle, apres le :3, et une case pour la garder ou non
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_cycle_maid"])
+        self.assertEqual(m.CYCLE_ORDRE[-1], "maid")
+        m.PANNEAU["cycle"] = {"actuel": "chat", "precedent": None, "depuis": t0 - 31}
+        self.addCleanup(lambda: m.PANNEAU.update(cycle=None))
+        c = m.cycle_du_panneau(t0, m.cycle_disponible(t0))
+        self.assertEqual(c["actuel"], "maid")
+        self.assertEqual(c["ecoule_precedent"], 31, "la vue qui s'en va garde son temps : elle ne saute pas")
+        self.assertNotIn("maid", m.cycle_disponible(t0, {"panneau_cycle_maid": False}))
 
     def test_les_sources_du_cycle(self):
         m = self.m
@@ -7211,7 +7278,8 @@ class DansMachiTool(unittest.TestCase):
         m.MAJ_ANNONCEES.clear()
         dits = []
         m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
-        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True)
+        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True, jarvis_maj_a_voix_haute=True)
+        self.addCleanup(m.CFG.__setitem__, "jarvis_maj_a_voix_haute", False)
         # l'annonce : une fois par version
         self.assertTrue(m.annoncer_maj("disponible", "9.9.9"))
         self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
@@ -7353,7 +7421,8 @@ class DansMachiTool(unittest.TestCase):
             self.assertEqual(J.palier_application("reglages_machi", {"action": "changer", "cle": cle}),
                              J.PALIER_POUVOIR, cle)
         # une annonce ne tombe ni chez le psychologue, ni pendant une question
-        m.CFG.update(jarvis_annoncer_maj=True, jarvis_actif=True)
+        m.CFG.update(jarvis_annoncer_maj=True, jarvis_actif=True, jarvis_maj_a_voix_haute=True)
+        self.addCleanup(m.CFG.__setitem__, "jarvis_maj_a_voix_haute", False)
         dits = []
         m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
         m.MAJ_ANNONCEES.clear()
@@ -7365,6 +7434,43 @@ class DansMachiTool(unittest.TestCase):
         m.JARVIS["attente_oui"] = None
         self.assertTrue(m.annoncer_maj("disponible", "9.9.9"), "et plus tard, elle est dite")
         self.assertEqual(len(dits), 1)
+
+    def test_une_mise_a_jour_se_pose_en_silence(self):
+        # « fais en sorte que Jarvis puisse deployer des MAJ sans l'annoncer audiblement
+        # (comme avant, sans qu'il parle) »
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("annoncer", "FIGE")}
+        garde = {k: m.CFG.get(k) for k in ("jarvis_actif", "jarvis_annoncer_maj", "jarvis_maj_a_voix_haute")}
+        self.addCleanup(lambda: ([setattr(m, k, v) for k, v in vrais.items()], m.CFG.update(garde),
+                                 m.MAJ_ANNONCEES.clear(), m.DECLENCHER_MAJ.__setitem__(0, None)))
+        self.assertIs(m.CONFIG_DEFAUT["jarvis_maj_a_voix_haute"], False, "en silence, par defaut")
+        self.assertIs(m.CONFIG_DEFAUT["jarvis_annoncer_maj"], True, "mais il peut toujours les lancer")
+        dits = []
+        m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
+        m.MAJ_ANNONCEES.clear()
+        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True)
+        m.CFG.pop("jarvis_maj_a_voix_haute", None)              # une config d'avant n'a pas la cle
+        n = len(m.ANNONCES)
+        for quoi in ("disponible", "pose", "posee"):
+            self.assertFalse(m.annoncer_maj(quoi, "9.9.9"), quoi)
+        self.assertEqual((dits, len(m.ANNONCES)), ([], n), "ni « j'installe », ni « me revoila »")
+        # il peut toujours la lancer, quand on la lui demande
+        self.assertTrue(m.capacites_jarvis(m.CFG)["mise_a_jour"])
+        m.FIGE = True
+        lances = []
+        m.DECLENCHER_MAJ[0] = lances.append
+        self.addCleanup(m.MAJ.update, dict(m.MAJ))
+        m.MAJ.update(etat="disponible", version="9.9.9")
+        m.outil_mise_a_jour("installer", m.CFG)
+        self.assertEqual(lances, ["installer"])
+        # la case cochee : il retrouve la parole
+        m.CFG["jarvis_maj_a_voix_haute"] = True
+        self.assertTrue(m.annoncer_maj("pose", "9.9.9"))
+        self.assertEqual(len(dits), 1)
+        # un reglage simple, qu'il peut changer sans code ni « oui ? »
+        self.assertTrue(J.reglage_modifiable("jarvis_maj_a_voix_haute", m.CONFIG_DEFAUT))
+        self.assertIsNone(J.palier_application("reglages_machi", {"action": "changer",
+                                                                  "cle": "jarvis_maj_a_voix_haute"}))
 
     def test_le_journal_et_son_envoi_un_seul_interrupteur(self):
         # Contre-revue : « J'active le journal d'activite ? » allumait aussi l'envoi
@@ -7413,7 +7519,8 @@ class DansMachiTool(unittest.TestCase):
         dits = []
         m.annoncer = lambda texte, langue="fr": dits.append(texte) or True
         m.MAJ_ANNONCEES.clear()
-        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True)
+        m.CFG.update(jarvis_actif=True, jarvis_annoncer_maj=True, jarvis_maj_a_voix_haute=True)
+        self.addCleanup(m.CFG.__setitem__, "jarvis_maj_a_voix_haute", False)
         self.assertTrue(m.annoncer_maj("pose", "9.9.9"))
         self.assertFalse(m.annoncer_maj("disponible", "9.9.9"))
         self.assertEqual(len(dits), 1)

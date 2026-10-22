@@ -6339,7 +6339,8 @@ NOMS_REGLAGES = {
     "maj_installation_auto": ("l'installation automatique des mises à jour", "automatic update installs"),
     "maj_verifier": ("la recherche des mises à jour", "update checks"),
     "maj_prereleases": ("les versions d'essai", "test builds"),
-    "jarvis_annoncer_maj": ("mes annonces de mises à jour", "my update announcements"),
+    "jarvis_annoncer_maj": ("le lancement des mises à jour", "update installs"),
+    "jarvis_maj_a_voix_haute": ("mes annonces de mises à jour à voix haute", "my spoken update announcements"),
 }
 
 
