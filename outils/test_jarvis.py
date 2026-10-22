@@ -3622,6 +3622,138 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(int(proche(dort, m.PYJAMA, 20).sum()), 0)
         self.assertGreaterEqual(int(proche(veille, acc, 60).sum()), 6, "le bonnet de nuit")
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_bulle_de_claude_code(self):
+        # « tu peux ajouter une bulle de statut quand Claude est en train de reflechir ? rouge lorsque
+        # quelque chose est bloque et demande une confirmation de l'utilisateur, jaune quand Claude
+        # travaille et vert lorsque c'est fini »
+        m = self.m
+        self.addCleanup(lambda: (m.CLAUDE_CODE["sessions"].clear(), m.CLAUDE_CODE.update(vu=0.0)))
+        m.CLAUDE_CODE["sessions"].clear()
+        t = 1_800_000_000.0
+        evt = lambda nom, **k: dict({"hook_event_name": nom, "session_id": "s1",
+                                     "cwd": "C:\\Users\\moi\\MachiToolkit"}, **k)
+        # ce que disent les crochets de Claude Code
+        self.assertEqual(m.etat_de_claude_code(evt("UserPromptSubmit", prompt="ma demande")), "travaille")
+        self.assertEqual(m.etat_de_claude_code(evt("PreToolUse", tool_name="Bash")), "travaille")
+        self.assertEqual(m.etat_de_claude_code(evt("PostToolUse", tool_name="Bash")), "travaille")
+        self.assertEqual(m.etat_de_claude_code(evt("PreToolUse", tool_name="AskUserQuestion")), "bloque")
+        self.assertEqual(m.etat_de_claude_code(evt("PreToolUse", tool_name="ExitPlanMode")), "bloque")
+        self.assertEqual(m.etat_de_claude_code(evt("Notification", notification_type="permission_prompt")), "bloque")
+        self.assertEqual(m.etat_de_claude_code(evt("Notification", message="Claude needs your permission to use Bash")),
+                         "bloque")
+        self.assertIsNone(m.etat_de_claude_code(evt("Notification", notification_type="idle_prompt",
+                                                    message="Claude is waiting for your input")))
+        self.assertEqual(m.etat_de_claude_code(evt("Stop")), "fini")
+        self.assertEqual(m.etat_de_claude_code(evt("SessionEnd")), "termine")
+        # une session : jaune, rouge (il attend ton accord), jaune (accorde), vert ; puis plus rien
+        self.assertIsNone(m.etat_claude(t))
+        m.recevoir_claude_code(evt("UserPromptSubmit", prompt="ma demande"), t)
+        self.assertEqual(m.etat_claude(t), "travaille")
+        self.assertNotIn("ma demande", json.dumps(m.CLAUDE_CODE), "la demande n'est pas gardee")
+        self.assertEqual(m.CLAUDE_CODE["sessions"]["s1"]["dossier"], "MachiToolkit")
+        m.recevoir_claude_code(evt("Notification", notification_type="permission_prompt"), t + 5)
+        self.assertEqual(m.etat_claude(t + 5), "bloque")
+        m.recevoir_claude_code(evt("PostToolUse", tool_name="Bash"), t + 9)
+        self.assertEqual(m.etat_claude(t + 9), "travaille")
+        m.recevoir_claude_code(evt("Stop"), t + 20)
+        self.assertEqual(m.etat_claude(t + 20), "fini")
+        self.assertIsNone(m.etat_claude(t + 21 + m.CLAUDE_VERT_S), "vert dix minutes, puis plus rien")
+        # deux sessions : la plus pressante l'emporte ; une session fermee s'efface
+        m.recevoir_claude_code(dict(evt("UserPromptSubmit"), session_id="s2"), t + 30)
+        m.recevoir_claude_code(evt("PreToolUse", tool_name="AskUserQuestion"), t + 32)
+        self.assertEqual(m.etat_claude(t + 33), "bloque")
+        m.recevoir_claude_code(evt("SessionEnd"), t + 34)
+        self.assertEqual(m.etat_claude(t + 35), "travaille")
+        self.assertIsNone(m.etat_claude(t + 31 + m.CLAUDE_OUBLI_S), "sans nouvelles en plein travail : on ne sait plus")
+        # sur le panneau : en haut a droite, au-dessus de l'heure, de la couleur de l'etat
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False}
+        m.CLAUDE_CODE["sessions"].clear()
+        coin = lambda img: img[0:9, 50:64]
+        sans = m.image_du_panneau(cfg, "horloge", t)
+        self.assertFalse(coin(sans).any())
+        for nom, etat in (("UserPromptSubmit", "travaille"), ("Stop", "fini")):
+            m.recevoir_claude_code(evt(nom), t)
+            img = m.image_du_panneau(cfg, "horloge", t)
+            self.assertGreaterEqual(int((coin(img) == m.CLAUDE_COULEURS[etat]).all(axis=2).sum()), 40, etat)
+            self.assertTrue((img[9:] == sans[9:]).all(), "le reste ne bouge pas")
+        m.recevoir_claude_code(evt("Notification", notification_type="permission_prompt"), t)
+        rouges = [coin(m.image_du_panneau(cfg, "horloge", t + k / 10.0)) for k in range(7)]
+        self.assertGreater(len({r.tobytes() for r in rouges}), 2, "rouge : elle bat")
+        r = rouges[0].astype(int)
+        self.assertGreaterEqual(int(((r[..., 0] > 100) & (r[..., 1] < r[..., 0] // 2)).sum()), 40)
+        m.recevoir_claude_code(evt("UserPromptSubmit"), t)
+        points = {coin(m.image_du_panneau(cfg, "horloge", t + k / 10.0)).tobytes() for k in range(10)}
+        self.assertGreaterEqual(len(points), 3, "jaune : les trois points sautillent")
+        self.assertFalse(coin(m.image_du_panneau(dict(cfg, panneau_claude=False), "horloge", t)).any(), "decochee")
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_claude"])
+        # par le serveur local : la cle exigee, et rien en retour (ce qu'un crochet ecrit, Claude Code le lit)
+        m.CLAUDE_CODE["sessions"].clear()
+        garde = m.CFG.get("api_jeton")
+        m.CFG["api_jeton"] = "cle-locale"
+        self.addCleanup(m.CFG.__setitem__, "api_jeton", garde)
+        serveur = m.http.server.ThreadingHTTPServer(("127.0.0.1", 0), m.Passerelle)
+        threading.Thread(target=serveur.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (serveur.shutdown(), serveur.server_close()))
+        port = serveur.server_address[1]
+
+        def poster(jeton):
+            req = urllib.request.Request("http://127.0.0.1:%d/claude" % port, method="POST",
+                                         data=json.dumps(evt("UserPromptSubmit")).encode(),
+                                         headers={"Content-Type": "application/json", "X-Jeton": jeton})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as rep:
+                    return rep.status, rep.read()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read()
+        self.assertEqual(poster("faux")[0], 401)
+        self.assertIsNone(m.etat_claude())
+        self.assertEqual(poster("cle-locale"), (204, b""))
+        self.assertEqual(m.etat_claude(), "travaille")
+        # brancher : nos crochets dans les reglages de Claude Code, le reste intact ; puis les retirer
+        dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dossier, True)
+        chemin = os.path.join(dossier, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(chemin))
+        a_toi = {"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo fini"}]}]}}
+        with open(chemin, "w", encoding="utf-8") as f:
+            json.dump(a_toi, f)
+        cfg = {"api_port": port, "api_jeton": "cle-locale"}
+        m.brancher_claude_code(cfg, chemin)
+        m.brancher_claude_code(cfg, chemin)                  # deux fois : pas de doublon
+        with open(chemin, encoding="utf-8") as f:
+            r = json.load(f)
+        self.assertEqual(r["model"], "opus")
+        self.assertEqual(set(r["hooks"]), set(m.CLAUDE_EVENEMENTS))
+        self.assertEqual(r["hooks"]["Stop"][0]["hooks"][0]["command"], "echo fini", "ton crochet reste")
+        self.assertEqual(sum(m._crochet_a_nous(g) for g in r["hooks"]["Stop"]), 1)
+        self.assertEqual(r["hooks"]["PreToolUse"][0]["matcher"], "*")
+        commande = r["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertIn("X-Jeton: cle-locale", commande)
+        self.assertIn("127.0.0.1:%d/claude" % port, commande)
+        self.assertTrue(m.claude_code_branche(chemin))
+        self.assertTrue(os.path.exists(chemin + ".machitool.bak"))
+        if shutil.which("curl") and shutil.which("bash"):
+            # la vraie commande, comme Claude Code la lance : ce qu'il lui donne arrive, rien ne ressort
+            m.CLAUDE_CODE["sessions"].clear()
+            sortie = subprocess.run(["bash", "-c", commande], input=json.dumps(evt("Stop")), capture_output=True,
+                                    text=True, timeout=10)
+            self.assertEqual((sortie.returncode, sortie.stdout), (0, ""))
+            self.assertEqual(m.etat_claude(), "fini")
+        m.brancher_claude_code(cfg, chemin, brancher=False)
+        with open(chemin, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), a_toi, "debranche : comme avant")
+        self.assertFalse(m.claude_code_branche(chemin))
+        # un fichier qui ne se lit pas n'est pas ecrase ; pas de fichier du tout : il le cree
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write("{ abime")
+        self.assertRaises(ValueError, m.brancher_claude_code, cfg, chemin)
+        with open(chemin, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{ abime")
+        neuf = os.path.join(dossier, "autre", ".claude", "settings.json")
+        m.brancher_claude_code(cfg, neuf)
+        self.assertTrue(m.claude_code_branche(neuf))
+
     def test_les_sources_du_cycle(self):
         m = self.m
         sauve = {k: m.PANNEAU.get(k) for k in ("meteo", "musique_vue", "morceau", "morceau_cle", "musique_saut",
