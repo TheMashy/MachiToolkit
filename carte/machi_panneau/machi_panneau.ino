@@ -1,10 +1,10 @@
-// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 3.
+// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 4.
 // Un panneau 64x64 sur une Adafruit MatrixPortal S3, nourri par USB :
 //   "MG" + 8 192 octets (RGB565, poids fort d'abord) + 2 octets de controle
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 3" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 4" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees).
 //
 // v2 : « ca tombe a 5 fps parfois ». La v1 redessinait les 4 096 pixels a
@@ -17,6 +17,13 @@
 // abimee, elle est jetee (et comptee). Et deux lignes sont redessinees
 // d'office a chaque image : tout le panneau est refait en une seconde,
 // quoi qu'il ait pu s'y glisser.
+//
+// v4 : « lorsque j'eteins le PC, le panneau ressemble a ca ». Eteint, le PC
+// garde souvent l'USB alimente : la carte continue, avec la derniere image --
+// ou, si elle redemarre, la mire, pour toujours. Maintenant, sans image
+// depuis 5 s (PC eteint, Machi Tool ferme ou plante, « pilote le panneau »
+// decoche), le panneau s'eteint de lui-meme. Au demarrage, la mire ne
+// reste que ces 5 s.
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 
 // Les broches HUB75 de la MatrixPortal S3 (celles d'Adafruit)
@@ -36,6 +43,15 @@ uint8_t image[N];
 uint8_t affichee[N];           // ce que le panneau montre deja
 bool tout_redessiner = true;
 uint32_t recues = 0, jetees = 0;
+const unsigned long SILENCE_MS = 5000;   // sans image depuis 5 s : noir
+unsigned long derniere_ms = 0;
+bool eteint = false;
+
+void eteindre() {
+  panneau->clearScreen();
+  memset(affichee, 0, N);      // ce que le panneau montre : du noir
+  eteint = true;
+}
 
 // Fletcher-16, comme Machi Tool la calcule (fletcher16 dans machi_tool.py)
 uint16_t fletcher16(const uint8_t *d, int n) {
@@ -81,10 +97,12 @@ void setup() {
   panneau->begin();
   panneau->setBrightness8(min((uint8_t)40, PLAFOND));
   panneau->clearScreen();
-  mire();
+  mire();                      // 5 s, le temps de voir que tout va bien
+  derniere_ms = millis();
 }
 
 void loop() {
+  if (!eteint && millis() - derniere_ms > SILENCE_MS) eteindre();
   if (Serial.available() < 2) return;
   if (Serial.read() != 'M') return;
   int genre = Serial.read();
@@ -92,7 +110,7 @@ void loop() {
     uint8_t b;
     if (Serial.readBytes(&b, 1) == 1) panneau->setBrightness8(min(b, PLAFOND));
   } else if (genre == 'V') {
-    Serial.println("MACHI 3");
+    Serial.println("MACHI 4");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'F' || genre == 'G') {
@@ -105,6 +123,8 @@ void loop() {
       }
     }
     recues++;
+    derniere_ms = millis();
+    eteint = false;
     dessiner();
   }
 }

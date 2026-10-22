@@ -75,20 +75,34 @@ struct MatrixPanel_I2S_DMA {
   }
 };
 
+// Le temps : il avance avec les octets recus (250 Ko/s, le debit de Machi
+// Tool), et d'un coup a chaque pause.
+unsigned long horloge_ms = 0;
+inline unsigned long millis() { return horloge_ms; }
+
 // Le port serie : tout le flux d'un coup, et des « pauses » (plus longues que
 // le delai de la carte) ou readBytes rend ce qu'il a, comme sur la vraie.
 struct FauxSerial {
   std::vector<uint8_t> entree; size_t pos = 0;
-  std::vector<size_t> pauses; std::string sortie;
+  std::vector<std::pair<size_t, unsigned long>> pauses; size_t passees = 0; std::string sortie;
   void setRxBufferSize(int) {} void begin(long) {} void setTimeout(long) {}
-  int available() { return (int)(entree.size() - pos); }
-  int read() { return pos < entree.size() ? entree[pos++] : -1; }
+  void avancer(size_t nouvelle) {
+    horloge_ms += (nouvelle / 250) - (pos / 250);
+    pos = nouvelle;
+  }
+  void franchir() {             // une pause atteinte : le temps passe
+    while (passees < pauses.size() && pauses[passees].first <= pos) horloge_ms += pauses[passees++].second;
+  }
+  int available() { franchir(); return (int)(entree.size() - pos); }
+  int read() { franchir(); if (pos >= entree.size()) return -1; int c = entree[pos]; avancer(pos + 1); return c; }
   size_t readBytes(uint8_t *d, size_t n) {
+    franchir();
     size_t fin = std::min(entree.size(), pos + n);
-    for (size_t p : pauses) if (p > pos && p < fin) { fin = p; break; }
+    for (size_t i = passees; i < pauses.size(); i++)
+      if (pauses[i].first > pos && pauses[i].first < fin) { fin = pauses[i].first; break; }
     size_t k = fin - pos;
     memcpy(d, entree.data() + pos, k);
-    pos = fin;
+    avancer(fin);
     return k;
   }
   void println(const char *s) { sortie += s; sortie += "\r\n"; }
@@ -111,10 +125,17 @@ int main(int argc, char **argv) {
   int c;
   while ((c = fgetc(f)) != EOF) Serial.entree.push_back((uint8_t)c);
   fclose(f);
-  for (int i = 3; i < argc; i++) Serial.pauses.push_back((size_t)atol(argv[i]));
+  // les pauses : « position » (300 ms) ou « position:ms » ; « +ms » : le silence apres le flux
+  unsigned long apres = 0;
+  for (int i = 3; i < argc; i++) {
+    if (argv[i][0] == '+') { apres = strtoul(argv[i] + 1, nullptr, 10); continue; }
+    char *deux = strchr(argv[i], ':');
+    Serial.pauses.push_back({(size_t)atol(argv[i]), deux ? strtoul(deux + 1, nullptr, 10) : 300});
+  }
   setup();
   long avant = panneau->dessins;
   while (Serial.available() >= 2) loop();
+  for (unsigned long fait = 0; fait < apres; fait += 100) { horloge_ms += 100; loop(); }
   FILE *o = fopen(argv[2], "wb");
   for (int i = 0; i < 64 * 64; i++) { fputc(panneau->px[i] >> 8, o); fputc(panneau->px[i] & 0xFF, o); }
   fclose(o);
@@ -196,7 +217,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 3", reponses)
+        self.assertIn("MACHI 4", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -261,6 +282,27 @@ class LaCarte(unittest.TestCase):
         panneau, reponses, _ = self.envoyer(self.M.trame_image(d, 1) + b"MS")
         self.assertTrue((panneau == self.attendu(d)).all())
         self.assertIn("STATS 1 0", reponses)
+
+    def test_sans_image_le_panneau_s_eteint_seul(self):
+        # « lorsque j'eteins le PC, le panneau ressemble a ca » : l'USB reste alimente,
+        # la carte continue -- sans image depuis 5 s, elle s'eteint d'elle-meme
+        d = self.image(7)
+        trame = self.M.trame_image(d, 3)
+        tient, _, _ = self.envoyer(trame, ["+4000"])
+        self.assertTrue((tient == self.attendu(d)).all(), "4 s sans image : il garde l'image (un a-coup du PC)")
+        noir, _, _ = self.envoyer(trame, ["+6000"])
+        self.assertFalse(noir.any(), "6 s : noir")
+        # et la suivante repart, exacte, sur ce noir
+        e = self.image(8)
+        retour, _, _ = self.envoyer(trame + self.M.trame_image(e, 3), ["%d:6000" % len(trame)])
+        self.assertTrue((retour == self.attendu(e)).all())
+
+    def test_au_demarrage_la_mire_ne_reste_que_5_s(self):
+        # la carte redemarre (l'USB du PC eteint coupe et revient) : la mire, puis noir
+        mire, _, _ = self.envoyer(b"", ["+1000"])
+        self.assertEqual(int(mire[5, 5]), 0xF800, "la mire : rouge en haut a gauche")
+        noir, _, _ = self.envoyer(b"", ["+6000"])
+        self.assertFalse(noir.any())
 
     def test_la_luminosite_reste_sous_le_plafond(self):
         _, reponses, _ = self.envoyer(b"MB\xff" + self.M.trame_image(self.image(6), 3) + b"MS")
