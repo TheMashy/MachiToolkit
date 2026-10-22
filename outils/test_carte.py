@@ -217,7 +217,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 4", reponses)
+        self.assertIn("MACHI 5", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -297,12 +297,16 @@ class LaCarte(unittest.TestCase):
         retour, _, _ = self.envoyer(trame + self.M.trame_image(e, 3), ["%d:6000" % len(trame)])
         self.assertTrue((retour == self.attendu(e)).all())
 
-    def test_au_demarrage_la_mire_ne_reste_que_5_s(self):
-        # la carte redemarre (l'USB du PC eteint coupe et revient) : la mire, puis noir
-        mire, _, _ = self.envoyer(b"", ["+1000"])
-        self.assertEqual(int(mire[5, 5]), 0xF800, "la mire : rouge en haut a gauche")
-        noir, _, _ = self.envoyer(b"", ["+6000"])
-        self.assertFalse(noir.any())
+    def test_au_demarrage_le_panneau_reste_noir(self):
+        # « desactiver la mire qui s'allume en permanence quand l'ordi est eteint ou quand
+        # Machi Tool n'est pas detecte » : la carte (re)demarre noire, et le reste
+        for apres in ("+1000", "+6000"):
+            noir, _, dessins = self.envoyer(b"", [apres])
+            self.assertFalse(noir.any(), apres)
+        # puis la premiere image s'affiche, exacte
+        donnees = self.image(4)
+        panneau, _, _ = self.envoyer(self.M.trame_image(donnees, 3))
+        self.assertTrue((panneau == self.attendu(donnees)).all())
 
     def test_la_luminosite_reste_sous_le_plafond(self):
         _, reponses, _ = self.envoyer(b"MB\xff" + self.M.trame_image(self.image(6), 3) + b"MS")

@@ -1,10 +1,10 @@
-// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 4.
+// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 5.
 // Un panneau 64x64 sur une Adafruit MatrixPortal S3, nourri par USB :
 //   "MG" + 8 192 octets (RGB565, poids fort d'abord) + 2 octets de controle
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 4" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 5" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees).
 //
 // v2 : « ca tombe a 5 fps parfois ». La v1 redessinait les 4 096 pixels a
@@ -24,6 +24,14 @@
 // depuis 5 s (PC eteint, Machi Tool ferme ou plante, « pilote le panneau »
 // decoche), le panneau s'eteint de lui-meme. Au demarrage, la mire ne
 // reste que ces 5 s.
+//
+// v5 : « desactiver la mire qui s'allume en permanence quand l'ordi est
+// eteint ou quand Machi Tool n'est pas detecte ». Plus de mire au demarrage :
+// la carte demarre noire et le reste jusqu'a la premiere image. (Sur l'USB
+// d'un PC eteint, ses grands aplats lumineux pouvaient faire flancher
+// l'alimentation : la carte redemarrait, remontrait la mire, et ainsi de
+// suite.) Pour verifier le cablage et les couleurs, le bouton « Montrer la
+// mire » de Machi Tool l'envoie toujours.
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 
 // Les broches HUB75 de la MatrixPortal S3 (celles d'Adafruit)
@@ -63,16 +71,6 @@ uint16_t fletcher16(const uint8_t *d, int n) {
   return (b << 8) | a;
 }
 
-// La mire : rouge en haut a gauche, vert en haut a droite,
-// bleu en bas a gauche, blanc en bas a droite, un cadre orange.
-void mire() {
-  panneau->fillRect(0, 0, 32, 32, panneau->color565(255, 0, 0));
-  panneau->fillRect(32, 0, 32, 32, panneau->color565(0, 255, 0));
-  panneau->fillRect(0, 32, 32, 32, panneau->color565(0, 0, 255));
-  panneau->fillRect(32, 32, 32, 32, panneau->color565(255, 255, 255));
-  panneau->drawRect(0, 0, 64, 64, panneau->color565(255, 140, 0));
-}
-
 void dessiner() {
   // deux lignes d'office a chaque image : 32 images, et tout le panneau est refait
   const int bande = recues % (H / 2);
@@ -96,8 +94,7 @@ void setup() {
   panneau = new MatrixPanel_I2S_DMA(cfg);
   panneau->begin();
   panneau->setBrightness8(min((uint8_t)40, PLAFOND));
-  panneau->clearScreen();
-  mire();                      // 5 s, le temps de voir que tout va bien
+  eteindre();                  // noir jusqu'a la premiere image : plus de mire
   derniere_ms = millis();
 }
 
@@ -110,7 +107,7 @@ void loop() {
     uint8_t b;
     if (Serial.readBytes(&b, 1) == 1) panneau->setBrightness8(min(b, PLAFOND));
   } else if (genre == 'V') {
-    Serial.println("MACHI 4");
+    Serial.println("MACHI 5");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'F' || genre == 'G') {
