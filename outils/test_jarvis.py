@@ -3305,7 +3305,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue((musique[53:58] == m.TITRE_RDV).all(axis=2).any(), "le titre du morceau")
         def x_du_bonhomme(h):
             img = vue("bonhomme", t=time.mktime((2026, 10, 22, h, 0, 0, 0, 0, -1)))
-            return int(np.nonzero((img[49:56] == acc).all(axis=2).any(axis=0))[0].min())
+            return int(np.nonzero((img[39:56] == acc).all(axis=2).any(axis=0))[0].min())     # son t-shirt
         self.assertLess(x_du_bonhomme(6) + 20, x_du_bonhomme(18), "il marche avec la journee, de gauche a droite")
         # le fondu : a mi-chemin, la moyenne des deux
         mi = vue("musique", precedent="meteo", fondu=0.5)
@@ -3407,6 +3407,45 @@ class DansMachiTool(unittest.TestCase):
         m.image_du_panneau({"panneau_contenu": "horloge", "panneau_eq_sensibilite": 2.5, "panneau_rdv": False}, "horloge", t)
         self.assertEqual(vus[-1]["sensibilite"], 2.5)
         self.assertTrue(m.CONFIG_DEFAUT["panneau_cycle_chat"])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_bonhomme_marche_en_douceur(self):
+        # « tu peux rendre le petit bonhomme plus sympa avec un peu plus de fps sur l'animation ? »
+        m = self.m
+        acc = (255, 170, 40)
+        t0 = time.mktime((2026, 10, 22, 14, 20, 0, 0, 0, -1)) + 0.5     # yeux ouverts
+        zone = lambda t, ecoule=10.0: m._zone_du_cycle("bonhomme", t, acc, [], [], ecoule)
+        # avant : deux dessins, quatre fois par seconde ; maintenant une pose par image, 30 par seconde
+        images = [zone(t0 + k / 30.0) for k in range(31)]
+        self.assertEqual(len({i.tobytes() for i in images[:30]}), 30, "chaque image de la seconde est neuve")
+        for a, b in zip(images, images[1:]):
+            change = int((a.astype(int) != b.astype(int)).any(axis=2).sum())
+            self.assertTrue(0 < change < 80, "d'une image a l'autre, il bouge un peu, sans sauter : %d" % change)
+        hanches = [m.bonhomme_pose(30.0, t0 + k / 30.0)["hanche"][1] for k in range(34)]
+        self.assertGreater(max(hanches) - min(hanches), 0.3, "il rebondit a chaque pas")
+        p = m.bonhomme_pose(30.0, t0)
+        self.assertLessEqual(max(p["cheville0"][1], p["cheville1"][1]), m.BONHOMME_SOL - 0.8,
+                             "le pied le plus bas touche le chemin, sans s'y enfoncer")
+        # habille : son t-shirt de la couleur de la guirlande, la peau, le jean, les baskets
+        img = images[0]
+        for couleur in (acc, m.PEAU, m.JEAN, m.BASKETS):     # (sur un pas ; a peu pres : les bords sont adoucis)
+            ecart = np.abs(np.stack(images)[:, 39:56].astype(int) - np.array(couleur)).max(axis=3)
+            self.assertTrue((ecart <= 40).any(), couleur)
+        self.assertTrue((img[:39] == 0).all() and (img[59:] == 0).all(), "il tient sous la date")
+        # un coucou par passage : il se tourne vers nous et leve la main au-dessus de la tete
+        coucou = m.bonhomme_pose(30.0, t0, ecoule=5.0)
+        self.assertTrue(coucou["face"])
+        self.assertLess(coucou["main1"][1], coucou["tete"][1])
+        self.assertFalse(m.bonhomme_pose(30.0, t0, ecoule=10.0)["face"], "puis il repart")
+        self.assertFalse(m.bonhomme_pose(30.0, t0, ecoule=None)["face"], "pas pendant un fondu")
+        main = [m.bonhomme_pose(30.0, t0 + k / 30.0, ecoule=5.0)["main1"][0] for k in range(10)]
+        self.assertGreater(max(main) - min(main), 1.0, "la main s'agite")
+        face = zone(t0, 5.0)
+        self.assertGreaterEqual(int((face[39:59] == (30, 20, 20)).all(axis=2).sum()), 2, "de face : deux yeux")
+        # minuit, 23 h 59 : il entre et sort par les bords sans rien casser
+        for h, mi in ((0, 0), (23, 59)):
+            bord = zone(time.mktime((2026, 10, 22, h, mi, 59, 0, 0, -1)))
+            self.assertTrue((bord[39:56] != 0).any())
 
     def test_les_sources_du_cycle(self):
         m = self.m

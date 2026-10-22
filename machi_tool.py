@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.99.0"
+VERSION = "1.100.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -12113,7 +12113,7 @@ def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule, sensibilite=1.0):
     elif nom == "chat":
         _zone_chat(img, t, accent, ecoule)
     elif nom == "bonhomme":
-        _zone_bonhomme(img, t, accent)
+        _zone_bonhomme(img, t, accent, ecoule)
     else:
         _zone_heure(img, t, minuteurs, rdv)
     return img
@@ -12244,31 +12244,170 @@ def _zone_musique(img, t, accent, morceau, ecoule, sensibilite=1.0):
         ecrire_tenant(img, titre, 2, 62, 53, TITRE_RDV, ecoule if ecoule is not None else 0.0)
 
 
-# le petit bonhomme, 5 x 9, deux pas
-_BONHOMME = (
-    ("..#..", ".###.", "..#..", ".###.", "#.#.#", "..#..", ".#.#.", ".#.#.", "#...#"),
-    ("..#..", ".###.", "..#..", "..#..", ".###.", "..#..", "..#..", ".#.#.", ".#.#."),
-)
+# LE PETIT BONHOMME. « Rends le petit bonhomme plus sympa, avec un peu plus
+# de fps sur l'animation. » Plus de dessin a deux pas : un bonhomme articule
+# (grosse tete, cheveux, un oeil, le t-shirt de la couleur de la guirlande, un
+# jean, des baskets), dont les jambes et les bras balancent en continu,
+# recalcules a chaque image -- 30 par seconde. Il est dessine quatre fois plus
+# fin puis reduit, pour que ses membres glissent d'un pixel a l'autre au lieu
+# de sauter. Il rebondit un peu a chaque pas, cligne des yeux, et une fois par
+# passage s'arrete pour faire coucou.
+BONHOMME_PAS_S = 1.1                   # un cycle de marche (deux pas)
+BONHOMME_COUCOU = (4.0, 6.2)           # coucou, en secondes depuis l'arrivee de la vue (apres le fondu)
+BONHOMME_SOL = 56                      # la ligne du chemin
+_BONHOMME_FIN = 4                      # sur-echantillonnage
+_BONHOMME_L, _BONHOMME_H = 16, 18      # la boite ou il tient, en pixels du panneau
+PEAU, CHEVEUX, JEAN, BASKETS = (255, 196, 150), (110, 65, 35), (60, 85, 150), (235, 235, 240)
 
 
-def _zone_bonhomme(img, t, accent):
+def _membre(origine, a1, l1, a2, l2):
+    """Deux segments depuis `origine` ; un angle 0 pend vers le bas, positif
+    part vers l'avant (+x, il marche vers la droite). Rend (articulation, bout)."""
+    m = (origine[0] + l1 * math.sin(a1), origine[1] + l1 * math.cos(a1))
+    return m, (m[0] + l2 * math.sin(a2), m[1] + l2 * math.cos(a2))
+
+
+def bonhomme_pose(x, t, ecoule=None):
+    """Ou sont ses articulations a l'instant t, en pixels du panneau (a
+    virgule) ; x est sa hanche. Pour le coucou, il ralentit, se tourne vers
+    nous et leve la main (de profil, sa grosse tete cacherait le geste)."""
+    phase = 2 * math.pi * t / BONHOMME_PAS_S
+    c = 0.0
+    if ecoule is not None:
+        d, f = BONHOMME_COUCOU
+        c = max(0.0, min(1.0, (ecoule - d) / 0.25, (f - ecoule) / 0.25))
+    if c >= 0.5:
+        hanche = (x, BONHOMME_SOL - 0.9 - 5.8)
+        epaule = (x, hanche[1] - 3.6)
+        agite = 0.7 * math.sin(2 * math.pi * 3 * t)     # la main va et vient, trois fois par seconde
+        return {"face": True, "coucou": c, "hanche": hanche, "epaule": epaule,
+                "tete": (x, epaule[1] - 2.9),
+                "cheville0": (x - 0.8, BONHOMME_SOL - 0.9), "cheville1": (x + 0.8, BONHOMME_SOL - 0.9),
+                "coude0": (x - 2.0, epaule[1] + 2.0), "main0": (x - 2.2, epaule[1] + 4.0),
+                "coude1": (x + 3.2, epaule[1] - 0.8), "main1": (x + 3.9 + agite, epaule[1] - 3.2)}
+    jambes = []
+    for k in (0, 1):                                    # 0 : la jambe de derriere, 1 : celle de devant
+        p = phase + k * math.pi
+        a1 = 0.5 * math.sin(p)
+        # le genou plie quand la jambe repasse devant, surtout juste apres le decollage
+        a2 = a1 - (0.1 + 0.9 * max(0.0, math.cos(p)) * max(0.0, 0.6 - math.sin(p)) / 1.6)
+        jambes.append((a1 * (1 - c), a2 * (1 - c)))
+    l1 = l2 = 2.9
+    bas = max(l1 * math.cos(a1) + l2 * math.cos(a2) for a1, a2 in jambes)
+    hanche = (x, BONHOMME_SOL - 0.9 - bas)              # le pied le plus bas touche le chemin : il rebondit
+    epaule = (x + 0.4, hanche[1] - 3.6)
+    pose = {"face": False, "coucou": c, "hanche": hanche, "epaule": epaule,
+            "tete": (epaule[0] + 0.4, epaule[1] - 2.9)}
+    for k, (a1, a2) in enumerate(jambes):
+        pose["genou%d" % k], pose["cheville%d" % k] = _membre(hanche, a1, l1, a2, l2)
+    for k in (0, 1):                                    # le bras balance avec la jambe opposee
+        p = phase + (1 - k) * math.pi
+        a1 = -0.55 * math.sin(p) * (1 - c)
+        a2 = a1 + 0.5 + 0.3 * max(0.0, -math.sin(p)) * (1 - c)
+        pose["coude%d" % k], pose["main%d" % k] = _membre(epaule, a1, 2.3, a2, 2.1)
+    return pose
+
+
+def dessiner_bonhomme(img, x, t, accent, ecoule=None):
+    import numpy as np
+    pose = bonhomme_pose(x, t, ecoule)
+    F, L, H = _BONHOMME_FIN, _BONHOMME_L, _BONHOMME_H
+    x0, y0 = int(math.floor(x)) - L // 2, BONHOMME_SOL - H
+    ys, xs = np.mgrid[0:H * F, 0:L * F]
+    X, Y = x0 + (xs + 0.5) / F, y0 + (ys + 0.5) / F
+    fin = np.zeros((H * F, L * F, 4), np.float32)
+
+    def peindre(m, couleur):
+        fin[m, :3] = couleur
+        fin[m, 3] = 1.0
+
+    def trait(a, b, r, couleur):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        u = np.clip(((X - a[0]) * dx + (Y - a[1]) * dy) / (dx * dx + dy * dy or 1e-9), 0, 1)
+        peindre((X - a[0] - u * dx) ** 2 + (Y - a[1] - u * dy) ** 2 <= r * r, couleur)
+
+    def rond(c, r, couleur):
+        peindre((X - c[0]) ** 2 + (Y - c[1]) ** 2 <= r * r, couleur)
+
+    def sombre(couleur, f=0.7):
+        return tuple(int(v * f) for v in couleur)
+
+    def bras(k, manche, main):
+        trait(pose["epaule"], pose["coude%d" % k], 0.55, manche)
+        trait(pose["coude%d" % k], pose["main%d" % k], 0.55, manche)
+        rond(pose["main%d" % k], 0.6, main)
+
+    tete, hanche, epaule = pose["tete"], pose["hanche"], pose["epaule"]
+    cheveux = (X - tete[0]) ** 2 + (Y - tete[1]) ** 2 <= 2.65 ** 2
+    if pose["face"]:                                    # de face : jambes cote a cote, une main levee
+        for k, cote in ((0, -1), (1, 1)):
+            cheville = pose["cheville%d" % k]
+            trait((hanche[0] + 0.8 * cote, hanche[1]), cheville, 0.62, JEAN)
+            trait((cheville[0], cheville[1] + 0.4), (cheville[0] + 0.6 * cote, cheville[1] + 0.4), 0.5, BASKETS)
+        trait((hanche[0], hanche[1] - 0.6), epaule, 1.5, accent)
+        for k, cote in ((0, -1), (1, 1)):
+            depart = (epaule[0] + 1.3 * cote, epaule[1] + 0.4)
+            trait(depart, pose["coude%d" % k], 0.55, accent)
+            trait(pose["coude%d" % k], pose["main%d" % k], 0.55, accent if k == 0 else PEAU)
+            rond(pose["main%d" % k], 0.65, PEAU)
+        rond(tete, 2.5, PEAU)
+        peindre(cheveux & ((Y < tete[1] - 0.7) | ((abs(X - tete[0]) > 1.9) & (Y < tete[1] + 0.6))), CHEVEUX)
+    else:                                               # de profil, du fond vers l'avant
+        bras(0, sombre(accent), sombre(PEAU, 0.75))
+        for k, (jean, basket) in enumerate(((sombre(JEAN), sombre(BASKETS)), (JEAN, BASKETS))):
+            genou, cheville = pose["genou%d" % k], pose["cheville%d" % k]
+            trait(hanche, genou, 0.62, jean)
+            trait(genou, cheville, 0.6, jean)
+            # une basket posee remplit juste la ligne au-dessus du chemin : nette
+            trait((cheville[0] - 0.2, cheville[1] + 0.4), (cheville[0] + 1.1, cheville[1] + 0.4), 0.5, basket)
+        trait((hanche[0], hanche[1] - 0.6), epaule, 1.3, accent)
+        rond(tete, 2.5, PEAU)
+        peindre(cheveux & ((Y < tete[1] - 0.7) | (X < tete[0] - 1.0)), CHEVEUX)
+        bras(1, accent, PEAU)
+
+    # reduit : la moyenne des sous-pixels, en alpha premultiplie ; coupe aux bords
+    p = fin.reshape(H, F, L, F, 4).mean(axis=(1, 3))
+    a = p[..., 3:4]
+    couleur = np.where(a > 0, p[..., :3] / np.maximum(a, 1e-6), 0)
+    gx0, gx1 = max(0, x0), min(PANNEAU_L, x0 + L)
+    if gx1 <= gx0:
+        return pose
+    a, couleur = a[:, gx0 - x0:gx1 - x0], couleur[:, gx0 - x0:gx1 - x0]
+    fond = img[y0:y0 + H, gx0:gx1].astype(np.float32)
+    img[y0:y0 + H, gx0:gx1] = np.clip(np.round(fond * (1 - a) + couleur * a), 0, 255).astype(np.uint8)
+    # les yeux, nets (un pixel chacun), sauf quand il cligne ; de face, les joues roses
+    oy = int(math.floor(tete[1] + 0.3))
+    if pose["face"]:
+        yeux = [(int(math.floor(tete[0] + d)), oy) for d in (-1.0, 1.0)]
+        for d in (-1.6, 1.6):
+            jx = int(math.floor(tete[0] + d))
+            if 0 <= jx < PANNEAU_L:
+                img[oy + 1, jx] = (255, 130, 120)
+    else:
+        yeux = [(int(math.floor(tete[0] + 1.2)), oy)]
+    if not chat_cligne(t + 1.7):
+        for ox, oy in yeux:
+            if 0 <= ox < PANNEAU_L:
+                img[oy, ox] = (30, 20, 20)
+    return pose
+
+
+def _zone_bonhomme(img, t, accent, ecoule=None):
     """Un bonhomme qui marche avec la journee : minuit a gauche, minuit a
     droite. Le chemin deja fait s'eclaire ; un trait tous les six heures ; le
     soleil le jour, la lune la nuit."""
     lt = time.localtime(t)
     jour = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (t % 1.0)) / 86400.0
-    x = 2 + int(round(jour * (61 - 2 - 5)))
-    img[56, 2:62] = (40, 40, 50)
-    img[56, 2:x + 3] = tuple(int(c * 0.35) for c in accent)
+    x = 5 + jour * 53
+    img[BONHOMME_SOL, 2:62] = (40, 40, 50)
+    img[BONHOMME_SOL, 2:int(round(x)) + 1] = tuple(int(c * 0.35) for c in accent)
     for h in (0, 6, 12, 18, 24):
-        img[57, 2 + int(round(h / 24.0 * 59))] = (90, 90, 105)
-    pas = _BONHOMME[int(t * 4) % 2]
-    _motif(img, pas[:2], x, 47, tuple(min(255, int(c * 1.0 + 30)) for c in accent))
-    _motif(img, pas[2:], x, 49, accent)
+        img[BONHOMME_SOL + 1, 2 + int(round(h / 24.0 * 59))] = (90, 90, 105)
     if 7 <= lt.tm_hour < 20:
         _disque(img, 57, 43, 2.3, SOLEIL)
     else:
         _motif(img, (".##..", "##...", "##...", "##...", ".##.."), 56, 41, LUNE)   # un croissant, dessine
+    dessiner_bonhomme(img, x, t, accent, ecoule)        # devant le ciel
 
 
 def _prochain_chrono(minuteurs, t):
