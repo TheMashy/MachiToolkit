@@ -3451,15 +3451,15 @@ class DansMachiTool(unittest.TestCase):
     def test_le_chaton_maid(self):
         # « tu peux faire un petit chat ? en maid ? genre femboy ? » -- « avec des cheveux
         # noirs et un costume de maid noir et blanc :) » -- « la maid ne tient rien dans la
-        # main, elle marche vers la droite »
+        # main, elle marche vers la droite » -- « fais marcher la maid sur place en fonction
+        # de l'avancement de la journee, comme avec le bonhomme »
         m = self.m
         acc = (255, 170, 40)
-        t0 = 1_800_000_003.5
-        t0 += 0.5 - ((t0 + 0.9) % 4.0)                       # les yeux ouverts...
+        t0 = time.mktime((2026, 10, 22, 14, 20, 0, 0, 0, -1))
+        t0 += 0.5 - ((t0 + 0.9) % 4.0) + 4.0                 # les yeux ouverts...
         while not 2.5 < t0 % m.MAID_COEUR_S < 6.8:           # ... et loin du petit coeur
             t0 += 4.0
-        e0 = (30 + 5) / m.MAID_VITESSE                       # au milieu du panneau
-        zone = lambda t, ecoule=e0: m._zone_du_cycle("maid", t, acc, [], [], ecoule)
+        zone = lambda t: m._zone_du_cycle("maid", t, acc, [], [], 10.0)
         proche = lambda img, couleur, tol=30: (np.abs(img[39:59].astype(int) - np.array(couleur)).max(axis=2) <= tol)
         repos = zone(t0)
         self.assertTrue((repos[:39] == 0).all() and (repos[59:] == 0).all(), "elle tient sous la date")
@@ -3470,27 +3470,28 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue(proche(repos, acc, 0).any(), "le ruban, de la couleur de la guirlande")
         self.assertLess(max(m.NOIR_CHAT + m.ROBE), 90, "du noir, mais pas une LED eteinte")
         self.assertGreater(min(m.NOIR_CHAT + m.ROBE), 30)
+        # sur le chemin de la journee, comme le bonhomme : sa place, c'est l'heure
+        decor = np.zeros_like(repos)
+        x = m.chemin_de_la_journee(decor, t0, acc)
+        self.assertTrue((repos[m.BONHOMME_SOL] == decor[m.BONHOMME_SOL]).all(axis=1).sum() >= 50, "le chemin")
+        self.assertTrue((repos == m.SOLEIL).all(axis=2).any(), "l'apres-midi, le soleil")
+        self.assertAlmostEqual(m.maid_pose(x, t0)["hanche"][0], x)
+        def x_de_la_maid(h):
+            img = zone(time.mktime((2026, 10, 22, h, 0, 0, 0, 0, -1)))
+            return int(np.nonzero(proche(img[:, :, :], m.NOIR_CHAT)[:17].any(axis=0))[0].min())
+        self.assertLess(x_de_la_maid(6) + 20, x_de_la_maid(18), "elle avance avec la journee")
+        plus_tard = m.chemin_de_la_journee(np.zeros_like(repos), t0 + 3, acc)
+        self.assertLess(abs(m.maid_pose(plus_tard, t0 + 3)["hanche"][0] - x), 0.01, "elle reste sur place")
         # rien dans les mains : devant elle, plus rien (ni plateau, ni tasse)
-        x = m.maid_pose(t0, e0)["hanche"][0]
-        self.assertTrue((repos[39:59, int(x) + 6:] == 0).all())
-        # elle marche vers la droite : entre par la gauche, traverse, revient par la gauche
-        xs = [m.maid_pose(t0, e)["hanche"][0] for e in (0.0, 2.0, 4.0, 6.0)]
-        self.assertLess(xs[0], 0)
-        self.assertTrue(all(b > a + 5 for a, b in zip(xs, xs[1:])), xs)
-        tour = m.MAID_TOUR / m.MAID_VITESSE
-        self.assertLess(m.maid_pose(t0, tour + 0.1)["hanche"][0], 2, "sortie a droite, elle revient")
-        for e in np.arange(0.5, 2 * tour, 0.25):            # et le panneau n'est jamais vide
-            self.assertTrue((zone(t0 + e, e)[39:59] != 0).any(), e)
-        # a petits pas, sans glisser : le pied pose ne bouge pas pendant qu'elle avance
-        poses = [m.maid_pose(t0 + k / 60.0, e0 + k / 60.0) for k in range(60)]
-        for k in (0, 1):
-            poses_au_sol = [p["cheville%d" % k][0] for p in poses if p["cheville%d" % k][1] >= m.MAID_SOL - 0.91]
-            self.assertGreater(len(poses_au_sol), 10)
-            for a, b in zip(poses_au_sol, poses_au_sol[1:]):
-                self.assertTrue(abs(a - b) < 0.01 or abs(a - b) > 2, "pose, il ne glisse pas")
+        self.assertTrue((repos[46:56, int(x) + 6:] == 0).all())
+        # elle marche sur place : les pieds passent sous elle, se levent, touchent le chemin
+        poses = [m.maid_pose(x, t0 + k / 60.0) for k in range(60)]
+        pieds = [p["cheville0"][0] - x for p in poses]
+        self.assertGreater(max(pieds) - min(pieds), 2.5, "un pas")
         self.assertTrue(any(p["cheville0"][1] < m.MAID_SOL - 1.5 for p in poses), "leve, il monte")
+        self.assertAlmostEqual(max(max(p["cheville0"][1], p["cheville1"][1]) for p in poses), m.MAID_SOL - 0.9)
         # 30 images par seconde
-        images = [zone(t0 + k / 30.0, e0 + k / 30.0) for k in range(30)]
+        images = [zone(t0 + k / 30.0) for k in range(30)]
         self.assertEqual(len({i.tobytes() for i in images}), 30, "chaque image de la seconde est neuve")
         # elle cligne des yeux : un grand oeil de deux pixels, un trait ferme
         ouvert = int(proche(repos, m.YEUX_CHAT, 0).sum())
@@ -3498,12 +3499,20 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual((ouvert, ferme), (2, 1))
         # de temps en temps, un petit coeur s'envole derriere elle
         coeur = t0 - (t0 % m.MAID_COEUR_S) + m.MAID_COEUR_S + 0.9
-        def rose(img, t, e):                                  # du rose (qui s'efface), derriere elle
+        def rose(img):                                        # du rose (qui s'efface), derriere elle
             r, g, b = (img[39:59].astype(int)[..., i] for i in range(3))
-            derriere = np.arange(m.PANNEAU_L) < m.maid_pose(t, e)["hanche"][0] - 2
+            derriere = np.arange(m.PANNEAU_L) < x - 2
             return int(((r > 40) & (r > 2 * g) & (b > g) & derriere).sum())
-        self.assertGreaterEqual(rose(zone(coeur), coeur, e0), 12, "le coeur")         # (au meme endroit)
-        self.assertEqual(rose(repos, t0, e0), 0)
+        self.assertGreaterEqual(rose(zone(coeur)), 12, "le coeur")
+        self.assertEqual(rose(repos), 0)
+        # au petit matin, pres du bord : le coeur passe devant elle ; minuit, 23 h 59 : rien ne casse
+        matin = time.mktime((2026, 10, 22, 0, 30, 0, 0, 0, -1))
+        matin += 0.9 - (matin % m.MAID_COEUR_S)
+        img = zone(matin)
+        r, g, b = (img[39:59].astype(int)[..., i] for i in range(3))
+        self.assertGreaterEqual(int(((r > 40) & (r > 2 * g) & (b > g)).sum()), 12)
+        for h, mi in ((0, 0), (23, 59)):
+            self.assertTrue((zone(time.mktime((2026, 10, 22, h, mi, 59, 0, 0, -1)))[39:56] != 0).any())
         # dans le cycle, apres le :3, et une case pour la garder ou non
         self.assertTrue(m.CONFIG_DEFAUT["panneau_cycle_maid"])
         self.assertEqual(m.CYCLE_ORDRE[-1], "maid")
