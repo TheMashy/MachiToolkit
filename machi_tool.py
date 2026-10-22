@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.104.0"
+VERSION = "1.105.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -491,7 +491,12 @@ CONFIG_DEFAUT = {
     # Chaque fusion sur main sort une pre-version : la refuser reviendrait
     # a ne rien voir passer entre deux versions stables.
     "maj_prereleases": True,
-    "maj_intervalle_heures": 1,       # delai entre deux verifications
+    "maj_intervalle_heures": 1,       # (avant la 1.105 : delai entre deux verifications)
+    # « fais en sorte que Machi Tool detecte les nouvelles PR automatiquement
+    # et fasse les majs » : chaque fusion publie une version ; il regarde
+    # toutes les deux minutes (une reponse inchangee ne compte pas dans la
+    # limite de GitHub), et la pose des que personne ne le regarde
+    "maj_intervalle_minutes": 2,
 }
 
 # ==========================================================================
@@ -9832,7 +9837,7 @@ def outil_mise_a_jour(action, cfg):
             return "Deja en cours : %s" % MAJ.get("message", "")
         if MAJ.get("etat") == "a_poser":
             return ("La version %s attend deja : elle se pose des que la fenetre de Machi Tool est "
-                    "refermee." % MAJ.get("version"))
+                    "refermee, ou apres deux minutes sans clavier ni souris." % MAJ.get("version"))
         declencher = DECLENCHER_MAJ[0]
         if declencher is None:
             raise RuntimeError("Les mises a jour ne sont pas encore pretes (Machi Tool demarre).")
@@ -18967,8 +18972,8 @@ class Panneau:
 
         self.var_maj_verifier = tk.IntVar(
             value=1 if self.cfg.get("maj_verifier", True) else 0)
-        self.case(f, "Verifier automatiquement toutes les %s heures"
-                  % self.cfg.get("maj_intervalle_heures", 6),
+        self.case(f, "Verifier automatiquement, toutes les %d minutes (chaque fusion sur GitHub publie une "
+                     "version)" % (attente_verification_maj(self.cfg) // 60),
                   self.var_maj_verifier, self.options_maj).pack(fill="x")
         self.var_maj_auto = tk.IntVar(
             value=1 if self.cfg.get("maj_installation_auto", True) else 0)
@@ -19594,8 +19599,8 @@ class Panneau:
         a_poser = MAJ["etat"] == "a_poser"
         if a_poser and MAJ.get("differee"):
             texte_maj = ("Version %s prete. Elle se pose des que tu fermes "
-                         "cette fenetre, et l'application revient seule."
-                         % MAJ["version"])
+                         "cette fenetre, ou apres deux minutes sans toucher au PC ; "
+                         "l'application revient seule." % MAJ["version"])
         elif a_poser:
             texte_maj = "Pose de la version %s..." % MAJ["version"]
         else:
@@ -19805,16 +19810,38 @@ def _nouveau_contexte_ssl():
 _jv.CONTEXTE_SSL = _contexte_ssl          # Spotify (http_json) : le meme magasin de certificats
 
 
-def _ouvrir(url, delai=20):
-    requete = urllib.request.Request(url, headers={
+def _ouvrir(url, delai=20, entetes=None):
+    requete = urllib.request.Request(url, headers=dict({
         # Sans numero de version : la page « Mises a jour » et le README
         # promettent que rien de la machine n'est transmis, l'en-tete doit
         # tenir cette promesse.
         "User-Agent": "MachiToolkit",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-    })
+    }, **(entetes or {})))
     return urllib.request.urlopen(requete, timeout=delai, context=_contexte_ssl())
+
+
+_GITHUB_DEJA_LU = {}                   # url -> (ETag, reponse) : « rien de neuf » ne coute rien
+
+
+def _lire_github(url):
+    """Le JSON de GitHub. Demande conditionnelle : s'il n'a pas change depuis
+    la derniere fois, GitHub repond 304 -- ce qui ne compte pas dans sa limite
+    de 60 demandes par heure sans compte. C'est ce qui permet de regarder
+    toutes les deux minutes."""
+    deja = _GITHUB_DEJA_LU.get(url)
+    try:
+        with _ouvrir(url, entetes={"If-None-Match": deja[0]} if deja else None) as reponse:
+            donnees = json.loads(reponse.read().decode("utf-8"))
+            etag = reponse.headers.get("ETag")
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and deja:
+            return deja[1]
+        raise
+    if etag:
+        _GITHUB_DEJA_LU[url] = (etag, donnees)
+    return donnees
 
 
 def derniere_publication(prereleases=False):
@@ -19827,8 +19854,7 @@ def derniere_publication(prereleases=False):
     """
     url = (API_GITHUB + "/releases?per_page=20") if prereleases \
         else (API_GITHUB + "/releases/latest")
-    with _ouvrir(url) as reponse:
-        donnees = json.loads(reponse.read().decode("utf-8"))
+    donnees = _lire_github(url)
 
     if isinstance(donnees, list):
         publiees = [p for p in donnees if not p.get("draft")]
@@ -20662,7 +20688,7 @@ def lancer():
                 return
             if FIGE and CFG.get("maj_verifier", True):
                 travail_maj_exclusif("verifier")
-            attente = max(1, int(CFG.get("maj_intervalle_heures", 6))) * 3600
+            attente = attente_verification_maj(CFG)
 
     panneau.declencher_maj = declencher_maj
     DECLENCHER_MAJ[0] = declencher_maj       # Jarvis passe par le meme chemin
@@ -20861,26 +20887,21 @@ def lancer():
         secondes plus tard. C'est correct quand personne ne regarde ; c'est
         indiscernable d'un plantage quand quelqu'un vient d'ouvrir le panneau.
 
-        La regle est donc simple : tant que la fenetre est VISIBLE, on ne pose
-        rien, et le panneau dit ce qui attend. Des qu'elle est refermee -- ou
-        tout de suite si elle ne l'etait pas -- la pose part, apres avoir ecrit
-        dans le journal POURQUOI l'application s'arrete. Sans cette ligne, un
-        redemarrage pour mise a jour et un plantage laissent la meme trace :
-        aucune.
+        La regle est donc simple : tant que la fenetre est VISIBLE et que
+        quelqu'un est au clavier, on ne pose rien, et le panneau dit ce qui
+        attend. Des qu'elle est refermee, ou que personne n'a touche au PC
+        depuis deux minutes -- ou tout de suite si elle n'etait pas ouverte --
+        la pose part, apres avoir ecrit dans le journal POURQUOI l'application
+        s'arrete (sans cette ligne, un redemarrage pour mise a jour et un
+        plantage laissent la meme trace : aucune) ; la fenetre ouverte, la
+        nouvelle version la rouvre.
         """
-        if poser_la_maj(panneau.interface_visible()):
-            if lancer_installeur_maj():
-                # La trace APRES le depart de l'installeur, pas avant : un
-                # « ARRET » ecrit pour un arret qui n'a pas eu lieu rendrait le
-                # journal moins fiable que pas de journal du tout.
-                journaliser_arret("mise a jour vers %s" % MAJ["version"])
+        if MAJ["etat"] == "a_poser":
+            visible = panneau.interface_visible()
+            if tenter_la_pose(visible, secondes_inactivite() if visible else 0.0):
                 demande_arret.set()
-            else:
-                # L'installeur n'est pas parti : on ne quitte surtout pas, et le
-                # message d'erreur pose par `lancer_installeur_maj` reste a
-                # l'ecran. Il a aussi bascule l'etat en « erreur », donc on ne
-                # reessaie pas toutes les cent cinquante millisecondes.
-                MAJ["differee"] = False
+        else:
+            MAJ["differee"] = False
         if time.time() - dernier[0] > 2.0:
             dernier[0] = time.time()
             try:
@@ -20952,7 +20973,37 @@ def main():
     lancer()
 
 
-def poser_la_maj(fenetre_visible):
+MAJ_INACTIF_S = 120     # la fenetre ouverte, mais personne au clavier depuis deux minutes : on pose
+
+
+def attente_verification_maj(cfg):
+    """Le temps entre deux verifications, en secondes (une minute au moins)."""
+    return max(1, entier(cfg.get("maj_intervalle_minutes", 2), 2)) * 60
+
+
+def tenter_la_pose(fenetre_visible, inactivite=0.0):
+    """Depuis la boucle de la fenetre : pose la version si c'est le moment.
+    La fenetre etait ouverte : la nouvelle version la rouvrira (le meme mot
+    qu'un second lancement). Rend True si l'application doit s'arreter."""
+    if not poser_la_maj(fenetre_visible, inactivite):
+        return False
+    if fenetre_visible:
+        demander_panneau()
+    if lancer_installeur_maj():
+        # La trace APRES le depart de l'installeur, pas avant : un
+        # « ARRET » ecrit pour un arret qui n'a pas eu lieu rendrait le
+        # journal moins fiable que pas de journal du tout.
+        journaliser_arret("mise a jour vers %s" % MAJ["version"])
+        return True
+    # L'installeur n'est pas parti : on ne quitte surtout pas, et le
+    # message d'erreur pose par `lancer_installeur_maj` reste a
+    # l'ecran. Il a aussi bascule l'etat en « erreur », donc on ne
+    # reessaie pas toutes les cent cinquante millisecondes.
+    MAJ["differee"] = False
+    return False
+
+
+def poser_la_maj(fenetre_visible, inactivite=0.0):
     """Faut-il poser la mise a jour maintenant ? Et sinon, le dire.
 
     POSER UNE VERSION TUE CETTE INSTANCE. La fenetre se ferme, le processus
@@ -20964,13 +21015,18 @@ def poser_la_maj(fenetre_visible):
 
     Tant que la fenetre est VISIBLE, on ne pose donc rien, et `differee` dit au
     panneau d'expliquer ce qui attend. Une fenetre reduite ou rangee dans la
-    barre ne compte pas comme visible : personne ne la regarde.
+    barre ne compte pas comme visible : personne ne la regarde. Ni une
+    fenetre ouverte devant un PC ou personne n'a touche ni clavier ni souris
+    depuis deux minutes (`inactivite`, en secondes) : « fais en sorte qu'il
+    fasse les majs » -- une fenetre laissee ouverte ne les retient plus des
+    heures. Elle se rouvre ensuite toute seule (voir tenter_la_pose).
     """
     if MAJ["etat"] != "a_poser":
         MAJ["differee"] = False
         return False
-    MAJ["differee"] = bool(fenetre_visible)
-    return not fenetre_visible
+    libre = not fenetre_visible or inactivite >= MAJ_INACTIF_S
+    MAJ["differee"] = not libre
+    return libre
 
 
 def journaliser_arret(pourquoi):
