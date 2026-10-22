@@ -422,6 +422,34 @@ class AL_Ecran(unittest.TestCase):
             p.root.destroy()
 
 
+    def test_la_bulle_de_claude_code_sur_la_page(self):
+        """« Une bulle de statut quand Claude reflechit » : la case, et le bouton
+        qui branche Claude Code (ses reglages, ici un fichier jetable)."""
+        vrais = (M.sauver_config, M.reglages_claude_code)
+        self.addCleanup(lambda: (setattr(M, "sauver_config", vrais[0]), setattr(M, "reglages_claude_code", vrais[1])))
+        M.sauver_config = lambda cfg: True
+        dossier = tempfile.mkdtemp()
+        chemin = os.path.join(dossier, ".claude", "settings.json")
+        M.reglages_claude_code = lambda: chemin
+        p = M.Panneau(M.CFG, lambda: None)
+        try:
+            p.aller("panneau")
+            p.root.update()
+            self.assertEqual(p.var_panneau_claude.get(), 1)
+            p.var_panneau_claude.set(0)
+            p.regler_panneau("panneau_claude")
+            self.assertFalse(M.CFG["panneau_claude"])
+            self.assertEqual(p.bouton_claude_code.cget("text"), "Brancher Claude Code")
+            p.basculer_claude_code()
+            self.assertTrue(M.claude_code_branche(chemin))
+            self.assertEqual(p.bouton_claude_code.cget("text"), "Debrancher Claude Code")
+            self.assertIn("Ajoute", p.txt_claude_code.cget("text"))
+            p.basculer_claude_code()
+            self.assertFalse(M.claude_code_branche(chemin))
+        finally:
+            M.CFG["panneau_claude"] = True
+            p.root.destroy()
+
     def test_le_cycle_se_regle_sur_la_page_du_panneau(self):
         """« Rajoute tout ca en settings dans le tab panel » : les reglettes et
         les cases du cycle ecrivent la config, le panneau les suit."""

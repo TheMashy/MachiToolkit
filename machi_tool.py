@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.103.0"
+VERSION = "1.104.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -351,6 +351,8 @@ CONFIG_DEFAUT = {
     "panneau_suit_eclat": True,
     # le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes
     "panneau_rdv": True,
+    # « une bulle de statut quand Claude est en train de reflechir » (voir CLAUDE_CODE)
+    "panneau_claude": True,
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -12966,6 +12968,200 @@ def ouvrir_panneau(port):
     return serial.Serial(port, 115200, timeout=1, write_timeout=1)
 
 
+# LA BULLE DE CLAUDE CODE. « Tu peux ajouter une bulle de statut quand Claude
+# est en train de reflechir ? Rouge lorsque quelque chose est bloque et
+# demande une confirmation de l'utilisateur, jaune quand Claude travaille, et
+# vert lorsque c'est fini. » Claude Code previent Machi Tool a chaque etape
+# par ses crochets (« hooks ») : une commande, qui envoie au serveur local ce
+# que Claude Code lui passe (POST /claude). On n'en garde que l'etape, la
+# session et le nom du dossier -- ni la demande, ni les outils, ni les
+# fichiers. La bulle, en haut a droite du panneau : rouge (il attend ton
+# accord, une reponse, la validation de son plan ; elle bat), jaune (il
+# travaille : trois points qui sautillent), verte (il a fini : une coche, dix
+# minutes). Plusieurs sessions : la plus pressante l'emporte.
+CLAUDE_CODE = {"sessions": {}, "vu": 0.0}
+CLAUDE_VERROU = threading.Lock()
+CLAUDE_VERT_S = 600                    # « fini » reste dix minutes
+CLAUDE_OUBLI_S = 20 * 60               # en plein travail sans nouvelles depuis 20 min : on ne sait plus
+CLAUDE_BLOQUE_OUBLI_S = 2 * 3600
+CLAUDE_COULEURS = {"bloque": (255, 60, 50), "travaille": (255, 200, 40), "fini": (60, 220, 90)}
+CLAUDE_MARQUE = "machitool-bulle"      # dans l'adresse : reconnaitre nos crochets parmi les tiens
+CLAUDE_EVENEMENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd")
+_BULLE_CLAUDE = (".##########.", "############", "############", "############", "############",
+                 ".##########.", "..##........", ".#..........")
+
+
+def etat_de_claude_code(evenement):
+    """Ce que dit un crochet de Claude Code : "bloque", "travaille", "fini",
+    "termine" (la session se ferme), ou None (rien a en dire)."""
+    nom = str(evenement.get("hook_event_name") or "")
+    if nom == "Notification":
+        genre = str(evenement.get("notification_type") or "")
+        message = str(evenement.get("message") or "").lower()
+        if genre in ("permission_prompt", "elicitation_dialog") or (not genre and "permission" in message):
+            return "bloque"
+        return None
+    if nom == "PreToolUse" and evenement.get("tool_name") in ("AskUserQuestion", "ExitPlanMode"):
+        return "bloque"                                  # une question pour toi, ou son plan a valider
+    if nom in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+        return "travaille"
+    if nom == "Stop":
+        return "fini"
+    if nom == "SessionEnd":
+        return "termine"
+    return None
+
+
+def recevoir_claude_code(evenement, maintenant=None):
+    """Un crochet de Claude Code est arrive : ou en est sa session."""
+    t = time.time() if maintenant is None else maintenant
+    etat = etat_de_claude_code(evenement if isinstance(evenement, dict) else {})
+    if etat is None:
+        return None
+    session = str(evenement.get("session_id") or "?")[:80]
+    dossier = re.split(r"[\\/]", str(evenement.get("cwd") or "").rstrip("\\/"))[-1][:40]
+    with CLAUDE_VERROU:
+        CLAUDE_CODE["vu"] = t
+        sessions = CLAUDE_CODE["sessions"]
+        if etat == "termine":
+            sessions.pop(session, None)
+        else:
+            sessions[session] = {"etat": etat, "quand": t, "dossier": dossier}
+            for vieille in sorted(sessions, key=lambda s: sessions[s]["quand"])[:-20]:
+                sessions.pop(vieille)
+    return etat
+
+
+def etat_claude(maintenant=None):
+    """L'etat de la bulle : "bloque" si une session attend ton accord,
+    "travaille" si une travaille, "fini" si une vient de finir, None sinon."""
+    t = time.time() if maintenant is None else maintenant
+    limites = {"bloque": CLAUDE_BLOQUE_OUBLI_S, "travaille": CLAUDE_OUBLI_S, "fini": CLAUDE_VERT_S}
+    with CLAUDE_VERROU:
+        vus = {s["etat"] for s in CLAUDE_CODE["sessions"].values() if t - s["quand"] <= limites[s["etat"]]}
+    return next((e for e in ("bloque", "travaille", "fini") if e in vus), None)
+
+
+def dessiner_bulle_claude(img, etat, t, eclat=None):
+    """La bulle, en haut a droite, au-dessus de l'heure : pleine de sa
+    couleur, son signe en creux (des LED eteintes)."""
+    x0, y0 = PANNEAU_L - len(_BULLE_CLAUDE[0]) - 1, 1
+    couleur = CLAUDE_COULEURS[etat]
+    if etat == "bloque":                                 # elle bat, pour attirer l'oeil
+        couleur = tuple(int(c * (0.45 + 0.55 * abs(math.cos(t * math.pi * 1.5)))) for c in couleur)
+    if eclat is not None:
+        couleur = tuple(int(c * max(PANNEAU_ECLAT_MIN, eclat)) for c in couleur)
+    _motif(img, _BULLE_CLAUDE, x0, y0, couleur)
+    if etat == "travaille":                              # trois points qui sautillent l'un apres l'autre
+        for k in range(3):
+            haut = 1 if int(t * 5) % 4 == k else 0
+            img[y0 + 2 - haut:y0 + 4 - haut, x0 + 2 + 3 * k:x0 + 4 + 3 * k] = 0
+    elif etat == "bloque":                               # « ! »
+        img[y0 + 1:y0 + 3, x0 + 5:x0 + 7] = 0
+        img[y0 + 4, x0 + 5:x0 + 7] = 0
+    else:                                                # une coche
+        for dx, dy in ((3, 2), (4, 3), (5, 4), (6, 3), (7, 2), (8, 1)):
+            img[y0 + dy, x0 + dx] = 0
+
+
+def reglages_claude_code():
+    """Le fichier de reglages de Claude Code, pour toi : ~/.claude/settings.json."""
+    return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+
+
+def commande_claude_code(cfg):
+    """La commande que lance chaque crochet : elle passe a Machi Tool, par le
+    serveur local et sa cle, ce que Claude Code lui donne. Muette (le serveur
+    repond 204, sans rien), et bornee a 2 s : Machi Tool ferme ne ralentit
+    pas Claude Code."""
+    port = entier(cfg.get("api_port", 7373), 7373)
+    # « curl.exe » : sous PowerShell, « curl » est un autre programme ; « "@-" » entre guillemets, pour lui aussi
+    return ('%s -s -m 2 -X POST -H "Content-Type: application/json" -H "X-Jeton: %s" --data-binary "@-" '
+            '"http://127.0.0.1:%d/claude?de=%s"' % ("curl.exe" if os.name == "nt" else "curl", jeton_courant(cfg),
+                                                    port, CLAUDE_MARQUE))
+
+
+def _crochet_a_nous(groupe):
+    return isinstance(groupe, dict) and any(
+        isinstance(c, dict) and CLAUDE_MARQUE in str(c.get("command") or "") for c in groupe.get("hooks") or [])
+
+
+def _lire_reglages_claude_code(chemin):
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            texte = f.read()
+    except FileNotFoundError:
+        return {}
+    reglages = json.loads(texte) if texte.strip() else {}
+    if not isinstance(reglages, dict) or not isinstance(reglages.get("hooks", {}), dict):
+        raise ValueError("ce fichier n'a pas la forme attendue")
+    return reglages
+
+
+def claude_code_branche(chemin=None):
+    """Nos crochets sont-ils dans les reglages de Claude Code ?"""
+    try:
+        reglages = _lire_reglages_claude_code(chemin or reglages_claude_code())
+    except Exception:
+        return False
+    return any(_crochet_a_nous(g) for groupes in reglages.get("hooks", {}).values()
+               if isinstance(groupes, list) for g in groupes)
+
+
+def brancher_claude_code(cfg, chemin=None, brancher=True):
+    """Ajoute (ou retire) les crochets de Machi Tool dans les reglages de
+    Claude Code. Le reste du fichier -- tes reglages, tes propres crochets --
+    n'est pas touche ; l'ancien est garde a cote (.machitool.bak). Un fichier
+    illisible n'est pas ecrase : ValueError."""
+    chemin = chemin or reglages_claude_code()
+    try:
+        reglages = _lire_reglages_claude_code(chemin)
+    except ValueError as e:
+        raise ValueError("Les reglages de Claude Code (%s) ne se lisent pas : %s. Rien n'a ete touche."
+                         % (chemin, str(e)[:80]))
+    crochets = reglages.setdefault("hooks", {})
+    commande = commande_claude_code(cfg) if brancher else None
+    for evenement in CLAUDE_EVENEMENTS:
+        groupes = [g for g in (crochets.get(evenement) or []) if not _crochet_a_nous(g)]
+        if brancher:
+            groupe = {"hooks": [{"type": "command", "command": commande, "timeout": 5}]}
+            if evenement in ("PreToolUse", "PostToolUse"):
+                groupe = dict({"matcher": "*"}, **groupe)
+            groupes.append(groupe)
+        if groupes:
+            crochets[evenement] = groupes
+        else:
+            crochets.pop(evenement, None)
+    if not crochets:
+        reglages.pop("hooks")
+    os.makedirs(os.path.dirname(chemin), exist_ok=True)
+    if os.path.exists(chemin):
+        shutil.copyfile(chemin, chemin + ".machitool.bak")
+    provisoire = chemin + ".machitool.tmp"
+    with open(provisoire, "w", encoding="utf-8") as f:
+        json.dump(reglages, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(provisoire, chemin)
+    return chemin
+
+
+def etat_claude_code_lisible(cfg, maintenant=None):
+    """Une ligne pour la page : branche ou non, et les dernieres nouvelles."""
+    t = time.time() if maintenant is None else maintenant
+    if not cfg.get("api_active"):
+        return "Le serveur local est coupe (Reglages) : Claude Code ne peut rien lui dire."
+    if not claude_code_branche():
+        return "Pas encore branche : le bouton ajoute nos crochets a Claude Code (le reste n'est pas touche)."
+    vu = CLAUDE_CODE.get("vu") or 0.0
+    if not vu:
+        return "Branche. Pas encore de nouvelles : la bulle viendra a la prochaine demande."
+    ecart = max(0, int(t - vu))
+    il_y_a = "%d s" % ecart if ecart < 60 else ("%d min" % (ecart // 60) if ecart < 3600 else "%d h" % (ecart // 3600))
+    return "Branche. Dernieres nouvelles il y a %s%s." % (
+        il_y_a, {"bloque": " : il attend ton accord", "travaille": " : il travaille",
+                 "fini": " : il a fini"}.get(etat_claude(t), ""))
+
+
 def image_du_panneau(cfg, contenu, t):
     """Ce que le panneau montre a l'instant t : la mire pendant un reglage,
     Jarvis quand il est la, sinon son contenu."""
@@ -12999,7 +13195,11 @@ def image_du_panneau(cfg, contenu, t):
         cycle = cycle_du_panneau(t, cycle_disponible(t, cfg), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
                                  duree, fondu_s)
         cycle["sensibilite"] = sensibilite_eq(cfg)
-    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
+    img = image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
+    etat_cc = etat_claude(t) if cfg.get("panneau_claude", True) else None
+    if etat_cc is not None:
+        dessiner_bulle_claude(img, etat_cc, t, eclat)   # par-dessus, en haut a droite
+    return img
 
 
 def fletcher16(donnees):
@@ -13759,6 +13959,16 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
         if chemin == "/relacher":
             ETAT["forcage"] = None
             return self.repondre(200, {"ok": True})
+
+        if chemin == "/claude":
+            # un crochet de Claude Code : rien en retour (204) -- ce qu'un crochet
+            # ecrit, Claude Code peut le lire
+            recevoir_claude_code(corps)
+            self.send_response(204)
+            self.entetes_cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
 
         # ---- BrainDebugger ----
 
@@ -17032,9 +17242,9 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv", "panneau_cycle", "meteo_ville", "panneau_cycle_duree", "panneau_cycle_fondu",
-                    "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme", "panneau_cycle_saut",
-                    "panneau_cycle_chat", "panneau_cycle_maid", "panneau_eq_sensibilite"):
+                    "panneau_rdv", "panneau_claude", "panneau_cycle", "meteo_ville", "panneau_cycle_duree",
+                    "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
+                    "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid", "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -17130,6 +17340,20 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_jarvis"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « une bulle de statut quand Claude est en train de reflechir »
+        self.var_panneau_claude = tk.IntVar(value=1 if self.cfg.get("panneau_claude", True) else 0)
+        c = self.case(col, "La bulle de Claude Code, en haut a droite : rouge, il attend ton accord ; jaune, il "
+                           "travaille ; verte, il a fini", self.var_panneau_claude,
+                      lambda: self.regler_panneau("panneau_claude"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
+        ligne = tk.Frame(col, bg=NUIT)
+        ligne.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
+        self.bouton_claude_code = self.bouton(ligne, self._texte_claude_code(), self.basculer_claude_code,
+                                              compact=True)
+        self.bouton_claude_code.pack(side="left")
+        self.txt_claude_code = self.texte(ligne, etat_claude_code_lisible(self.cfg), BRUME, 8, largeur=260)
+        self.txt_claude_code.pack(side="left", padx=(8, 0))
         self.titre(col, "Sens du panneau").pack(fill="x", pady=(14, 4))
         rangee = tk.Frame(col, bg=NUIT)
         rangee.pack(fill="x")
@@ -17172,6 +17396,8 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_actif.get())
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
+        elif cle == "panneau_claude":
+            self.cfg[cle] = bool(self.var_panneau_claude.get())
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
                      "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
@@ -17191,6 +17417,27 @@ class Panneau:
             self.cfg[cle] = self.var_panneau_contenu.get()
         sauver_config(self.cfg)
         self._peindre_panneau()
+
+    @staticmethod
+    def _texte_claude_code():
+        return "Debrancher Claude Code" if claude_code_branche() else "Brancher Claude Code"
+
+    def basculer_claude_code(self):
+        """Ajoute nos crochets aux reglages de Claude Code -- ou les retire."""
+        branche = claude_code_branche()
+        try:
+            chemin = brancher_claude_code(self.cfg, brancher=not branche)
+            message = ("Retire de %s." if branche else
+                       "Ajoute a %s : la bulle viendra a ta prochaine demande a Claude Code.") % chemin
+        except Exception as e:
+            message = str(e)[:240] if isinstance(e, ValueError) else "Impossible : %s" % type(e).__name__
+        for widget, texte in ((getattr(self, "bouton_claude_code", None), self._texte_claude_code()),
+                              (getattr(self, "txt_claude_code", None), message)):
+            if widget is not None:
+                try:
+                    widget.configure(text=texte)
+                except Exception:
+                    pass
 
     @staticmethod
     def _texte_mire():
@@ -17260,6 +17507,11 @@ class Panneau:
             c.delete("all")
             c.create_image(0, 0, image=grande, anchor="nw")
             memo[nom] = (cle, grande)
+        if getattr(self, "txt_claude_code", None) is not None and CLAUDE_CODE.get("vu"):
+            try:
+                self.txt_claude_code.configure(text=etat_claude_code_lisible(self.cfg))
+            except Exception:
+                pass
         texte, couleur = etat_panneau_lisible()
         if getattr(self, "txt_panneau_etat", None) is not None:
             try:
