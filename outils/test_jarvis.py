@@ -3915,6 +3915,147 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue(m.CONFIG_DEFAUT["panneau_discord"])
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_vue_fl_studio(self):
+        # « tu peux detecter quand je vais sur FL Studio et me faire une interface dediee ? »
+        import numpy as np
+        m = self.m
+        cles = ("fl", "fl_cretes", "fl_pics", "etat", "discord")
+        sauve = {k: m.PANNEAU.get(k) for k in cles}
+        sauve_audio = {k: m.AUDIO.get(k) for k in ("actif", "brut", "spectre20", "gauche", "droite", "onde")}
+        sauve_son = m.SON.get("panneau")
+        vrais = {n: getattr(m, n) for n in ("fenetre_active", "demarrer_audio", "arreter_audio", "lire_discord")}
+        def remettre():
+            for n, f in vrais.items():
+                setattr(m, n, f)
+            for k in cles:
+                m.PANNEAU.pop(k, None)
+            m.PANNEAU.update({k: v for k, v in sauve.items() if v is not None})
+            m.AUDIO.update(sauve_audio)
+            m.SON["panneau"] = sauve_son
+        self.addCleanup(remettre)
+        # qui est FL Studio : le processus d'abord, le titre s'il est inconnu
+        est = m.est_fl_studio
+        self.assertTrue(est("fl64.exe | nuit blanche.flp - fl studio 21"))
+        self.assertTrue(est("fl64 (scaled).exe | untitled - fl studio 2024"))
+        self.assertTrue(est(" | ma prod - fl studio 21"), "processus illisible : le titre suffit")
+        self.assertFalse(est("chrome.exe | fl studio 21 tutorial - youtube"), "un tuto n'est pas FL Studio")
+        self.assertFalse(est("chrome.exe | ma prod - fl studio 21"))
+        self.assertFalse(est(""))
+        self.assertFalse(est("explorer.exe | musique"))
+        # le projet, d'apres le titre
+        projet = m.projet_fl
+        self.assertEqual(projet("fl64.exe | nuit blanche v3.flp - fl studio 21"), "nuit blanche v3")
+        self.assertEqual(projet("fl64.exe | *nuit blanche.flp - fl studio 21"), "nuit blanche", "modifie, pas enregistre")
+        self.assertEqual(projet("fl64.exe | untitled - fl studio 21"), "")
+        self.assertEqual(projet("fl64.exe | fl studio 21"), "")
+        self.assertEqual(projet("fl64.exe | beat - remix.flp - fl studio 2024"), "beat")
+        # la seance : un coup d'oeil ailleurs ne la coupe pas, une demi-heure ailleurs la remet a 0
+        m.PANNEAU["fl"] = None
+        titre = "fl64.exe | nuit blanche.flp - fl studio 21"
+        self.assertTrue(m.suivre_fl_studio(1000.0, titre))
+        self.assertTrue(m.suivre_fl_studio(1600.0, titre))
+        self.assertEqual(m.PANNEAU["fl"]["depuis"], 1000.0)
+        self.assertFalse(m.suivre_fl_studio(1603.0, "chrome.exe | youtube"))
+        self.assertIsNotNone(m.fl_au_premier_plan(1603.0 + m.FL_GRACE_S - 4), "huit secondes de grace")
+        self.assertIsNone(m.fl_au_premier_plan(1600.0 + m.FL_GRACE_S + 1))
+        m.suivre_fl_studio(1700.0, titre)
+        self.assertEqual(m.PANNEAU["fl"]["depuis"], 1000.0, "revenu vite : la meme seance")
+        m.suivre_fl_studio(1700.0 + m.FL_SEANCE_S + 1, titre)
+        self.assertEqual(m.PANNEAU["fl"]["depuis"], 1700.0 + m.FL_SEANCE_S + 1, "une demi-heure ailleurs : on repart")
+        # les mesures : un son de synthese (une basse, une voix, des aigus), la droite plus faible
+        x = np.arange(2048) / 48000.0
+        g = 0.6 * np.sin(2 * np.pi * 80 * x) + 0.25 * np.sin(2 * np.pi * 660 * x) + 0.08 * np.sin(2 * np.pi * 5000 * x)
+        bloc = np.stack([g, 0.5 * g], axis=1)
+        spectre = np.abs(np.fft.rfft(bloc.mean(axis=1) * np.hanning(2048)))
+        freqs = np.fft.rfftfreq(2048, 1 / 48000.0)
+        memo = {}
+        m.AUDIO.update(gauche=0.0, droite=0.0)
+        for _ in range(12):
+            m.mesures_studio(bloc, spectre, freqs, memo)
+        s20 = m.AUDIO["spectre20"]
+        self.assertEqual(len(s20), 20)
+        bande = lambda f: int(np.searchsorted(memo["bornes"], f)) - 1
+        for f in (80, 660, 5000):
+            self.assertGreater(s20[bande(f)], 0.6, "%d Hz se voit" % f)
+        self.assertLess(s20[bande(2000)], 0.3, "un seul gain pour toutes : un trou reste un trou")
+        self.assertGreater(m.AUDIO["gauche"], 0.9)
+        self.assertAlmostEqual(m.AUDIO["droite"], m.AUDIO["gauche"] * 0.5, delta=0.08)
+        onde = m.AUDIO["onde"]
+        self.assertEqual(len(onde), 64)
+        self.assertLessEqual(max(abs(o) for o in onde), 1.0)
+        self.assertLess(abs(onde[0]), 0.2, "calee sur un passage par zero")
+        self.assertGreater(onde[1], onde[0], "en montant")
+        m.mesures_studio(np.zeros(2048), np.zeros_like(spectre), freqs, {})
+        self.assertEqual(m.AUDIO["onde"], [0.0] * 64, "le silence : une ligne plate, sans division par zero")
+        # la vue : le projet en orange, le spectre, l'oscilloscope, les VU, le temps
+        m.mesures_studio(bloc, spectre, freqs, memo)
+        m.AUDIO.update(actif=True, brut=1.0)
+        m.PANNEAU.update(fl={"depuis": 1_800_000_000.0 - 25 * 60, "vu": 1_800_000_000.0, "projet": "nuit"},
+                         discord=None)
+        m.PANNEAU.pop("fl_cretes", None)
+        m.PANNEAU.pop("fl_pics", None)
+        t = 1_800_000_000.0
+        img = m.image_fl_studio(t, m.PANNEAU["fl"])
+        self.assertEqual(img.shape, (64, 64, 3))
+        self.assertGreater(int((img[0:8] == m.FL_ORANGE).all(axis=2).sum()), 20, "le nom du projet")
+        verts = (img[9:31] == (60, 220, 90)).all(axis=2).sum()
+        self.assertGreater(int(verts), 40, "le spectre")
+        self.assertGreater(int((img[32:47] == m.FL_ORANGE).all(axis=2).sum()), 30, "l'oscilloscope")
+        g_vu = int((img[48] != m.FL_GRIS).any(axis=1)[2:62].sum())
+        d_vu = int((img[51] != m.FL_GRIS).any(axis=1)[2:62].sum())
+        self.assertGreater(g_vu, d_vu, "la gauche plus forte que la droite")
+        self.assertGreaterEqual(int((img[57:62, 2:5] == (60, 220, 90)).all(axis=2).sum()), 6, "▶ : ca joue")
+        self.assertGreater(int((img[57:62, 8:30] == m.FL_ORANGE).all(axis=2).sum()), 15, "0H25")
+        m.AUDIO.update(brut=0.0)
+        pause = m.image_fl_studio(t, m.PANNEAU["fl"])
+        self.assertFalse((pause[57:62, 2:5] == (60, 220, 90)).all(axis=2).any(), "‖ : rien ne sort")
+        self.assertFalse((pause[32:47] == m.FL_ORANGE).all(axis=2).any(), "l'oscilloscope au repos")
+        sombre = m.image_fl_studio(t, m.PANNEAU["fl"], eclat=0.3)
+        self.assertLess(int(sombre.sum()), int(pause.sum()), "elle suit l'eclat de la guirlande")
+        # sur le panneau : devant l'horloge, sous les pastilles ; decochee, l'horloge revient
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
+               "panneau_claude": False}
+        m.AUDIO.update(brut=1.0)
+        studio = m.image_du_panneau(cfg, "horloge", t)
+        self.assertGreater(int((studio[0:8] == m.FL_ORANGE).all(axis=2).sum()), 20)
+        horloge = m.image_du_panneau(dict(cfg, panneau_fl=False), "horloge", t)
+        self.assertFalse((horloge[0:8] == m.FL_ORANGE).all(axis=2).sum() > 20)
+        m.PANNEAU["discord"] = 2
+        avec = m.image_du_panneau(cfg, "horloge", t)
+        self.assertTrue((avec[0:9, 0:14] == m.DISCORD_VIOLET).all(axis=2).any(), "la pastille Discord par-dessus")
+        m.PANNEAU["discord"] = None
+        self.assertFalse(m.image_du_panneau(cfg, "eteint", t).any(), "eteint reste eteint")
+        m.PANNEAU["fl"]["vu"] = t - m.FL_GRACE_S - 1
+        self.assertFalse((m.image_du_panneau(cfg, "horloge", t)[0:8] == m.FL_ORANGE).all(axis=2).sum() > 20,
+                         "FL quitte : l'horloge revient")
+        # le fil des sources : il regarde la fenetre, et ecoute le son tant que FL est devant
+        lancees = []
+        m.demarrer_audio = lambda cfg: lancees.append("demarre")
+        m.arreter_audio = lambda: lancees.append("arrete")
+        m.lire_discord = lambda titres=None: None
+        m.fenetre_active = lambda: titre
+        m.PANNEAU.update(etat="connecte", fl=None)
+        m.SON["panneau"] = False
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance"}, tours=1, maintenant=5000.0)
+        self.assertIsNotNone(m.fl_au_premier_plan(5000.0))
+        self.assertEqual(lancees, ["demarre"], "hors horloge, FL devant : le son s'ecoute quand meme")
+        m.fenetre_active = lambda: "chrome.exe | youtube"
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance"}, tours=1, maintenant=5004.0)
+        self.assertEqual(lancees, ["demarre"], "un coup d'oeil ailleurs : on ecoute toujours")
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance"}, tours=1, maintenant=5020.0)
+        self.assertEqual(lancees, ["demarre", "arrete"], "FL parti : la capture s'arrete")
+        m.PANNEAU["fl"] = None
+        m.fenetre_active = lambda: titre
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance", "panneau_fl": False}, tours=1, maintenant=6000.0)
+        self.assertIsNone(m.PANNEAU["fl"], "decochee : il ne regarde rien")
+        m.veiller_sources_panneau({"panneau_contenu": "eteint"}, tours=1, maintenant=6001.0)
+        self.assertIsNone(m.PANNEAU["fl"], "panneau eteint : rien a montrer")
+        m.PANNEAU["etat"] = "absent"
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance"}, tours=1, maintenant=6002.0)
+        self.assertIsNone(m.PANNEAU["fl"], "pas de panneau : rien a regarder")
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_fl"])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
     def test_les_mises_a_jour_sur_le_panneau(self):
         # « rajoute un effet sur le panneau lorsqu'une maj est en cours sur Machi Tool »
         m = self.m

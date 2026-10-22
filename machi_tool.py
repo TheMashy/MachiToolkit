@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.110.1"
+VERSION = "1.111.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -357,6 +357,8 @@ CONFIG_DEFAUT = {
     "panneau_discord": True,
     # « un effet sur le panneau lorsqu'une maj est en cours » (voir MAJ_TEINTE)
     "panneau_maj": True,
+    # « detecte quand je vais sur FL Studio, et fais-moi une interface dediee » (voir FL_PROCESSUS)
+    "panneau_fl": True,
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -3841,6 +3843,7 @@ def fil_audio(cfg):
     lisses = {nom: 0.0 for nom in list(plafonds)}
     bornes = np.geomspace(40, 16000, 13)
     plafonds_eq, lisses_eq = np.full(12, 1e-3), np.zeros(12)
+    studio = {}                        # les plafonds de la vue FL Studio (mesures_studio)
 
     while SON["marche"]:
         try:
@@ -3874,6 +3877,8 @@ def fil_audio(cfg):
                     v = np.minimum(1.0, eq / plafonds_eq)
                     lisses_eq += (v - lisses_eq) * np.where(v > lisses_eq, 0.6, 0.15)
                     AUDIO["spectre"] = [float(x) for x in lisses_eq]
+                    if fl_au_premier_plan(time.time()) is not None:    # la vue FL Studio
+                        mesures_studio(bloc, spectre, freqs, studio)
 
                     # Centroide calcule sur les trois bandes plutot que sur le
                     # spectre brut : un centroide classique est tire vers le haut
@@ -13433,6 +13438,157 @@ def image_maj_du_moment(t, eclat=None):
     return image_bienvenue(t, ecoule, b.get("vers"), eclat)
 
 
+# FL STUDIO. « Tu peux detecter quand je vais sur FL Studio, et me faire une
+# interface dediee ? » FL Studio au premier plan (FL64.exe, ou « FL Studio »
+# dans le titre), le panneau passe en studio, aux couleurs de FL : le nom du
+# projet (lu dans le titre de la fenetre), un spectre de 20 bandes vert,
+# jaune, rouge avec ses cretes, un oscilloscope de la forme d'onde, les
+# VU-metres gauche et droite avec leur pic, et en bas : lecture ou pause
+# (quelque chose sort des haut-parleurs ou non), le temps passe sur le
+# projet, l'heure. Le son, c'est celui que Machi Tool capte deja pour
+# l'egaliseur. Huit secondes ailleurs (un coup d'oeil a une autre fenetre)
+# ne le font pas quitter ; une demi-heure ailleurs, et la seance repart a 0.
+FL_PROCESSUS = ("fl64.exe", "fl.exe", "fl64 (scaled).exe", "fl (scaled).exe", "fl studio.exe")
+FL_GRACE_S = 8
+FL_SEANCE_S = 30 * 60
+FL_ORANGE, FL_GRIS = (255, 150, 30), (34, 34, 40)
+FL_ETENDUE_DB, FL_PENTE_DB = 48.0, 3.0
+
+
+def est_fl_studio(fenetre):
+    """`fenetre` : ce que rend fenetre_active() (« processus | titre »). Le
+    processus d'abord : un tuto « FL Studio » dans le navigateur n'en est pas.
+    Processus inconnu (droits refuses) : un titre qui finit par « FL Studio »."""
+    proc, _, titre = str(fenetre or "").lower().partition(" | ")
+    if proc.strip():
+        return proc.strip() in FL_PROCESSUS
+    return bool(re.search(r"(^|\s-\s)fl studio( [\w.]+)?$", titre.strip()))
+
+
+def projet_fl(fenetre):
+    """Le nom du projet, d'apres le titre : « mon morceau.flp - FL Studio 21 »
+    -> « mon morceau » ; rien d'ouvert (ou « untitled ») -> ""."""
+    _, _, titre = str(fenetre or "").partition(" | ")
+    morceaux = [m.strip() for m in re.split(r"\s+-\s+", titre) if m.strip()]
+    morceaux = [m for m in morceaux if not re.match(r"(?i)^fl studio( [\w.]+)?$", m)]
+    nom = re.sub(r"(?i)\.flp$", "", morceaux[0].strip("* ")).strip() if morceaux else ""
+    return "" if nom.lower() in ("", "untitled") else nom
+
+
+def suivre_fl_studio(t, fenetre=None):
+    """Depuis le fil des sources : FL Studio est-il au premier plan ? Rend vrai
+    s'il l'est, et tient la seance (depuis quand, le projet)."""
+    f = fenetre_active() if fenetre is None else fenetre
+    if not est_fl_studio(f):
+        return False
+    fl = PANNEAU.get("fl")
+    if not fl or t - fl.get("vu", 0) > FL_SEANCE_S:
+        fl = PANNEAU["fl"] = {"depuis": t}
+    fl.update(vu=t, projet=projet_fl(f))
+    return True
+
+
+def fl_au_premier_plan(t):
+    """La seance FL Studio a montrer, ou None (FL ailleurs depuis plus de huit secondes)."""
+    fl = PANNEAU.get("fl")
+    return fl if fl and 0 <= t - fl.get("vu", 0) <= FL_GRACE_S else None
+
+
+def mesures_studio(bloc, spectre, freqs, memo):
+    """Depuis le fil du son, pour la vue FL Studio : 20 bandes en dB (un seul
+    gain pour toutes, comme un analyseur : la forme du spectre se voit ; 48 dB
+    de haut, penche de 3 dB par octave pour qu'un mix equilibre paraisse a
+    plat ; montee vive, descente douce), gauche et droite, et 64 points de la
+    forme d'onde, calee sur un passage par zero (elle ne defile pas). `memo`
+    garde les plafonds d'un bloc a l'autre."""
+    import numpy as np
+    bornes = memo.setdefault("bornes", np.geomspace(40, 16000, 21))
+    eq = np.zeros(20)
+    for i in range(20):
+        m = (freqs >= bornes[i]) & (freqs < bornes[i + 1])
+        if m.any():
+            eq[i] = np.sqrt((spectre[m] ** 2).mean())
+    centres = np.sqrt(bornes[:-1] * bornes[1:])
+    eq = eq * 10 ** (FL_PENTE_DB * np.log2(centres / 1000.0) / 20)
+    plafond = max(float(eq.max()), memo.get("plafond", 1e-3) * 0.9992, 1e-4)
+    memo["plafond"] = plafond
+    v = np.clip(1 + 20 * np.log10(np.maximum(eq, 1e-12) / plafond) / FL_ETENDUE_DB, 0.0, 1.0)
+    lisses = memo.get("lisses", np.zeros(20))
+    lisses = lisses + (v - lisses) * np.where(v > lisses, 0.6, 0.15)
+    memo["lisses"] = lisses
+    AUDIO["spectre20"] = [float(x) for x in lisses]
+    stereo = bloc.ndim > 1 and bloc.shape[1] >= 2
+    g = float(np.sqrt((bloc[:, 0] ** 2).mean())) if stereo else float(np.sqrt((np.ravel(bloc) ** 2).mean()))
+    d = float(np.sqrt((bloc[:, 1] ** 2).mean())) if stereo else g
+    plafond = max(g, d, memo.get("plafond_lr", 1e-3) * 0.9995, 1e-4)
+    memo["plafond_lr"] = plafond
+    for cote, val in (("gauche", g), ("droite", d)):
+        x, avant = min(1.0, val / plafond), float(AUDIO.get(cote) or 0.0)
+        AUDIO[cote] = avant + (x - avant) * (0.7 if x > avant else 0.2)
+    mono = np.asarray(bloc.mean(axis=1) if bloc.ndim > 1 else np.ravel(bloc), dtype=float)
+    moitie = len(mono) // 2
+    montees = np.nonzero((mono[:moitie] <= 0) & (mono[1:moitie + 1] > 0))[0]
+    depart = int(montees[0]) + 1 if len(montees) else 0
+    points = mono[depart:depart + moitie][::max(1, moitie // 64)][:64]
+    amplitude = max(float(np.abs(points).max()) if len(points) else 0.0, memo.get("plafond_onde", 1e-3) * 0.995, 1e-4)
+    memo["plafond_onde"] = amplitude
+    AUDIO["onde"] = [float(x) for x in np.clip(points / amplitude, -1, 1)]
+
+
+def image_fl_studio(t, fl, eclat=None):
+    """La vue FL Studio, 64 x 64 (voir FL_PROCESSUS)."""
+    import numpy as np
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    joue = bool(AUDIO.get("actif")) and float(AUDIO.get("brut") or 0) > 1e-3
+    # le projet, en haut (entre les pastilles de Discord et de Claude)
+    ecrire_tenant(img, fl.get("projet") or "FL STUDIO", 12, 52, 2, FL_ORANGE, t - fl.get("depuis", t))
+    img[8, 2:62] = FL_GRIS
+    # le spectre : 20 bandes, vert, jaune, rouge, et leur crete
+    spectre = list(AUDIO.get("spectre20") or []) if joue else []
+    if len(spectre) != 20:
+        spectre = [0.04] * 20
+    cretes = PANNEAU.setdefault("fl_cretes", [0.0] * 20)
+    haut, bas = 21, 30
+    for i, v in enumerate(spectre):
+        h = int(round(max(0.0, min(1.0, v)) * haut))
+        cretes[i] = max(float(h), cretes[i] - 0.4)
+        x = 2 + 3 * i
+        for k in range(h):
+            r = k / float(haut)
+            img[bas - k, x:x + 2] = (60, 220, 90) if r < 0.6 else ((255, 200, 40) if r < 0.85 else (255, 60, 50))
+        if cretes[i] >= 2:                              # au repos, la ligne du bas reste nue
+            img[bas - min(haut - 1, int(round(cretes[i]))), x:x + 2] = (235, 235, 245)
+    # l'oscilloscope : la forme d'onde, sur sa ligne d'equilibre
+    centre, ampleur = 39, 6
+    img[centre, 2:62] = FL_GRIS
+    onde = list(AUDIO.get("onde") or []) if joue else []
+    if len(onde) == 64:
+        ys = [int(round(centre - max(-1.0, min(1.0, o)) * ampleur)) for o in onde]
+        for x in range(2, 62):
+            a, b = ys[x], ys[x + 1] if x + 1 < 64 else ys[x]
+            img[min(a, b):max(a, b) + 1, x] = FL_ORANGE
+    # les VU-metres gauche et droite, et leur pic qui retombe doucement
+    pics = PANNEAU.setdefault("fl_pics", [0.0, 0.0])
+    for k, (cote, y) in enumerate((("gauche", 48), ("droite", 51))):
+        v = max(0.0, min(1.0, float(AUDIO.get(cote) or 0.0))) if joue else 0.0
+        img[y:y + 2, 2:62] = FL_GRIS
+        n = int(round(v * 60))
+        for x in range(n):
+            r = x / 60.0
+            img[y:y + 2, 2 + x] = (60, 220, 90) if r < 0.6 else ((255, 200, 40) if r < 0.85 else (255, 60, 50))
+        pics[k] = max(float(n), pics[k] - 0.5)
+        if pics[k] >= 2:
+            img[y:y + 2, 2 + min(59, int(round(pics[k])) - 1)] = (235, 235, 245)
+    # en bas : lecture ou pause, le temps sur le projet, l'heure
+    _motif(img, ("#..", "##.", "###", "##.", "#..") if joue else ("#.#",) * 5, 2, 57,
+           (60, 220, 90) if joue else (150, 150, 165))
+    seance = max(0, int(t - fl.get("depuis", t)))
+    ecrire_petit(img, "%dH%02d" % (seance // 3600, seance // 60 % 60), 8, 57, FL_ORANGE)
+    heure = time.strftime("%H:%M", time.localtime(t))
+    ecrire_petit(img, heure, 62 - largeur_petit(heure), 57, (150, 150, 165))
+    return img if eclat is None else assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
+
+
 # DISCORD. « Tu peux faire en sorte que ca detecte quand j'ai une
 # notification en attente sur Discord ? » Discord ecrit ce qui t'attend dans
 # le titre de sa fenetre, comme un onglet : « (3) Discord | ... » -- trois
@@ -13503,6 +13659,28 @@ def dessiner_pastille_discord(img, n, eclat=None):
     ecrire_petit(img, texte, 3, 2, blanc)
 
 
+def _image_du_contenu(cfg, contenu, t, eclat):
+    """Le contenu choisi (l'horloge, son cycle, l'agenda du jour), sans ce qui
+    passe par-dessus."""
+    rdv = []
+    if contenu == "horloge" and cfg.get("panneau_rdv", True):
+        try:
+            rdv = agenda_du_jour(cfg, maintenant=t)
+        except Exception:
+            rdv = []
+    cycle = None
+    if contenu == "horloge" and cfg.get("panneau_cycle", True):
+        saut = None
+        if PANNEAU.get("musique_saut"):                  # un morceau vient de changer
+            PANNEAU["musique_saut"] = None
+            saut = "musique" if cfg.get("panneau_cycle_saut", True) else None
+        duree, fondu_s = reglages_cycle(cfg)
+        cycle = cycle_du_panneau(t, cycle_disponible(t, cfg), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
+                                 duree, fondu_s)
+        cycle["sensibilite"] = sensibilite_eq(cfg)
+    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
+
+
 def image_du_panneau(cfg, contenu, t):
     """Ce que le panneau montre a l'instant t : la mire pendant un reglage,
     Jarvis quand il est la, sinon son contenu."""
@@ -13531,23 +13709,9 @@ def image_du_panneau(cfg, contenu, t):
     etat = etat_jarvis_pour_le_panneau(cfg, t)
     if etat is not None:
         return image_jarvis_du_moment(etat, t, cfg, croix=False)
-    rdv = []
-    if contenu == "horloge" and cfg.get("panneau_rdv", True):
-        try:
-            rdv = agenda_du_jour(cfg, maintenant=t)
-        except Exception:
-            rdv = []
-    cycle = None
-    if contenu == "horloge" and cfg.get("panneau_cycle", True):
-        saut = None
-        if PANNEAU.get("musique_saut"):                  # un morceau vient de changer
-            PANNEAU["musique_saut"] = None
-            saut = "musique" if cfg.get("panneau_cycle_saut", True) else None
-        duree, fondu_s = reglages_cycle(cfg)
-        cycle = cycle_du_panneau(t, cycle_disponible(t, cfg), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
-                                 duree, fondu_s)
-        cycle["sensibilite"] = sensibilite_eq(cfg)
-    img = image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
+    # FL Studio au premier plan : son studio passe devant l'horloge
+    fl = fl_au_premier_plan(t) if cfg.get("panneau_fl", True) else None
+    img = image_fl_studio(t, fl, eclat) if fl is not None else _image_du_contenu(cfg, contenu, t, eclat)
     etat_cc = etat_claude(t) if cfg.get("panneau_claude", True) else None
     if etat_cc is not None:
         dessiner_bulle_claude(img, etat_cc, t, eclat)   # par-dessus, en haut a droite
@@ -13724,19 +13888,25 @@ def suivre_musique(cfg, maintenant=None, morceau=None):
 
 
 def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
-    """Le fil des sources : la capture du son pour l'egaliseur, la meteo tous
-    les quarts d'heure, le morceau toutes les 5 s. `tours` : pour les tests."""
+    """Le fil des sources : la capture du son pour l'egaliseur (et pour la vue
+    FL Studio), la meteo tous les quarts d'heure, le morceau toutes les 5 s,
+    FL Studio au premier plan ou non. `tours` : pour les tests."""
     cfg = CFG if cfg is None else cfg
     n, meteo_t, spotify_t, discord_t = 0, 0.0, 0.0, 0.0
     while ETAT["en_marche"] and (tours is None or n < tours):
         n += 1
         t = time.time() if maintenant is None else maintenant
-        actif = bool(cfg.get("panneau_actif", True) and cfg.get("panneau_cycle", True)
-                     and cfg.get("panneau_contenu", "horloge") == "horloge" and PANNEAU.get("etat") == "connecte")
-        if actif and not SON.get("panneau"):
+        connecte = bool(cfg.get("panneau_actif", True) and PANNEAU.get("etat") == "connecte")
+        actif = bool(connecte and cfg.get("panneau_cycle", True) and cfg.get("panneau_contenu", "horloge") == "horloge")
+        studio = False                                  # FL Studio au premier plan : sa vue ecoute le son
+        if connecte and cfg.get("panneau_fl", True) and cfg.get("panneau_contenu", "horloge") != "eteint":
+            suivre_fl_studio(t)
+            studio = fl_au_premier_plan(t) is not None
+        ecoute = actif or studio
+        if ecoute and not SON.get("panneau"):
             SON["panneau"] = True
             demarrer_audio(cfg)
-        elif not actif and SON.get("panneau"):
+        elif not ecoute and SON.get("panneau"):
             SON["panneau"] = False
             if cfg.get("mode") != "son":
                 arreter_audio()
@@ -17613,7 +17783,8 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_maj", "panneau_cycle", "meteo_ville",
+                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_maj", "panneau_fl", "panneau_cycle",
+                    "meteo_ville",
                     "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
                     "panneau_eq_sensibilite"):
@@ -17719,6 +17890,13 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_maj"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « detecter quand je vais sur FL Studio et me faire une interface dediee »
+        self.var_panneau_fl = tk.IntVar(value=1 if self.cfg.get("panneau_fl", True) else 0)
+        c = self.case(col, "FL Studio au premier plan : sa vue a lui, a la place de l'horloge -- le projet, un "
+                           "spectre, l'oscilloscope, les VU-metres gauche/droite et le temps de la seance",
+                      self.var_panneau_fl, lambda: self.regler_panneau("panneau_fl"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
         # « qu'il detecte quand j'ai une notification en attente sur Discord »
         self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
         c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
@@ -17793,6 +17971,10 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_claude.get())
         elif cle == "panneau_maj":
             self.cfg[cle] = bool(self.var_panneau_maj.get())
+        elif cle == "panneau_fl":
+            self.cfg[cle] = bool(self.var_panneau_fl.get())
+            if not self.cfg[cle]:
+                PANNEAU["fl"] = None
         elif cle == "panneau_discord":
             self.cfg[cle] = bool(self.var_panneau_discord.get())
             if not self.cfg[cle]:
