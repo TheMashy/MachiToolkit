@@ -3244,6 +3244,130 @@ class DansMachiTool(unittest.TestCase):
         i = src.index('if donnees.get("agenda_modifie"):')
         self.assertIn("relire_agenda_au_fond(cfg)", src[i:i + 300])
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_cycle_sous_la_date(self):
+        # « rajoute des cycles en dessous de la date : un cycle qui fade sur la meteo, puis un
+        # fade sur un petit egaliseur avec le nom de la musique (quand Spotify change de
+        # musique), puis un petit bonhomme qui marche (selon l'heure de la journee), puis
+        # l'heure a nouveau »
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("cycle", "meteo", "musique_vue", "morceau", "musique_saut", "cretes")}
+        sauve_audio = {k: m.AUDIO.get(k) for k in ("actif", "spectre")}
+        self.addCleanup(lambda: (m.PANNEAU.update(sauve), m.AUDIO.update(sauve_audio)))
+        tous = ["heure", "meteo", "musique", "bonhomme"]
+        m.PANNEAU["cycle"] = None
+        t0 = 1_800_000_000.0
+        vu = lambda t, d=tous, **k: m.cycle_du_panneau(t, d, **k)
+        self.assertEqual(vu(t0)["actuel"], "heure")
+        c = vu(t0 + 12)
+        self.assertEqual((c["actuel"], c["precedent"], c["fondu"]), ("meteo", "heure", 0.0), "le fondu commence")
+        self.assertAlmostEqual(vu(t0 + 12.5)["fondu"], 0.5)
+        self.assertEqual(vu(t0 + 20)["actuel"], "musique")
+        self.assertEqual(vu(t0 + 30)["actuel"], "bonhomme")
+        self.assertEqual(vu(t0 + 38)["actuel"], "heure", "puis l'heure a nouveau")
+        # rien ne joue : la musique est sautee ; pas de meteo : elle aussi
+        self.assertEqual(vu(t0 + 50, ["heure", "bonhomme"])["actuel"], "bonhomme")
+        # un morceau qui change : le cycle y saute ; un minuteur qui va sonner : l'heure reste
+        self.assertEqual(vu(t0 + 51, tous, saut="musique")["actuel"], "musique")
+        self.assertEqual(vu(t0 + 52, tous, urgent=True)["actuel"], "heure")
+        self.assertEqual(vu(t0 + 70, tous, urgent=True)["actuel"], "heure", "fige tant que ca presse")
+        # qui est disponible
+        m.PANNEAU.update(meteo=None, musique_vue=0)
+        self.assertEqual(m.cycle_disponible(t0), ["heure", "bonhomme"])
+        m.PANNEAU.update(meteo={"temp": 12, "code": 3, "quand": t0 - 60}, musique_vue=t0 - 3)
+        self.assertEqual(m.cycle_disponible(t0), tous)
+        self.assertEqual(m.cycle_disponible(t0 + 4 * 3600), ["heure", "bonhomme"], "une vieille meteo, la musique tue")
+        self.assertTrue(m.cycle_urgent([{"genre": "minuteur", "fin": t0 + 200}], [], t0))
+        self.assertFalse(m.cycle_urgent([{"genre": "minuteur", "fin": t0 + 900}], [], t0))
+
+        # les dessins, sous la date (lignes 39 a 58), le haut ne bouge pas
+        acc = (255, 170, 40)
+        t = time.mktime((2026, 10, 22, 9, 41, 20, 0, 0, -1))
+        heure = m.image_panneau("horloge", t, accent=acc)
+        vue = lambda nom, ecoule=0.0, **k: m.image_panneau("horloge", k.pop("t", t), accent=acc, cycle=dict(
+            {"actuel": nom, "precedent": None, "fondu": 1.0, "ecoule": ecoule}, **k))
+        m.CFG["jarvis_langue"] = "fr"
+        m.PANNEAU["meteo"] = {"temp": 12.4, "code": 61, "jour": True, "min": 8, "max": 15, "quand": t}
+        meteo = vue("meteo")
+        self.assertTrue((meteo[:39] == heure[:39]).all() and (meteo[59:] == heure[59:]).all())
+        self.assertTrue((meteo[42:49] == (235, 235, 245)).all(axis=2).any(), "la temperature")
+        self.assertTrue((meteo[39:59] == m.GOUTTE).all(axis=2).any(), "il pleut : des gouttes")
+        self.assertTrue((meteo[52:57] == (150, 150, 165)).all(axis=2).any(), "« PLUIE »")
+        m.AUDIO.update(actif=True, spectre=[1.0] + [0.1] * 11)
+        m.PANNEAU.update(morceau={"titre": "Midnight City", "artistes": "M83"}, cretes=[0.0] * 12)
+        musique = vue("musique")
+        hauteur = lambda x: int((musique[39:51, x] != 0).any(axis=1).sum())
+        self.assertGreater(hauteur(4), hauteur(59) + 5, "la premiere bande, a fond, monte bien plus haut")
+        self.assertTrue((musique[53:58] == m.TITRE_RDV).all(axis=2).any(), "le titre du morceau")
+        def x_du_bonhomme(h):
+            img = vue("bonhomme", t=time.mktime((2026, 10, 22, h, 0, 0, 0, 0, -1)))
+            return int(np.nonzero((img[49:56] == acc).all(axis=2).any(axis=0))[0].min())
+        self.assertLess(x_du_bonhomme(6) + 20, x_du_bonhomme(18), "il marche avec la journee, de gauche a droite")
+        # le fondu : a mi-chemin, la moyenne des deux
+        mi = vue("musique", precedent="meteo", fondu=0.5)
+        m.PANNEAU["cretes"] = [0.0] * 12
+        a, b = vue("meteo")[39:59].astype(int), vue("musique")[39:59].astype(int)
+        self.assertLessEqual(int(np.abs(mi[39:59].astype(int) - (a + b) / 2).max()), 1)
+        # par la boucle : un morceau qui vient de changer, et la vue saute dessus
+        m.PANNEAU.update(cycle=None, musique_vue=t, musique_saut=t)
+        m.image_du_panneau({"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False}, "horloge", t)
+        self.assertEqual(m.PANNEAU["cycle"]["actuel"], "musique")
+        self.assertIsNone(m.PANNEAU["musique_saut"], "le saut ne sert qu'une fois")
+
+    def test_les_sources_du_cycle(self):
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("meteo", "musique_vue", "morceau", "morceau_cle", "musique_saut",
+                                               "etat", "meteo_a_relire")}
+        vrais = {k: getattr(m, k) for k in ("demarrer_audio", "sauver_config", "morceau_en_cours", "_lire_url_json")}
+        son = dict(m.SON)
+        self.addCleanup(lambda: (m.PANNEAU.update(sauve), m.SON.update(son),
+                                 [setattr(m, k, v) for k, v in vrais.items()]))
+        m.sauver_config = lambda cfg: True
+        demandes = []
+
+        def lire(url):
+            demandes.append(url.split("?")[0])
+            if "geocoding" in url:
+                return {"results": [{"name": "Lyon", "latitude": 45.76, "longitude": 4.84}]}
+            if "ipapi" in url:
+                return {"city": "Paris", "latitude": 48.85, "longitude": 2.35}
+            return {"current": {"temperature_2m": 11.6, "weather_code": 3, "is_day": 1},
+                    "daily": {"temperature_2m_min": [7.9], "temperature_2m_max": [14.2]}}
+        cfg = {"meteo_ville": "Lyon"}
+        m.rafraichir_meteo(cfg, lire, maintenant=100.0)
+        self.assertEqual(m.PANNEAU["meteo"]["temp"], 11.6)
+        self.assertEqual((m.PANNEAU["meteo"]["lieu"], m.PANNEAU["meteo"]["min"]), ("Lyon", 7.9))
+        demandes.clear()
+        m.rafraichir_meteo(cfg, lire)
+        self.assertEqual(demandes, ["https://api.open-meteo.com/v1/forecast"], "la ville situee est gardee")
+        cfg["meteo_ville"] = ""
+        m.rafraichir_meteo(cfg, lire)
+        self.assertEqual(cfg["meteo_lieu"]["nom"], "Paris", "vide : d'apres la connexion")
+        self.assertEqual(m._jv.meteo_lisible(0, False), ("lune", "NUIT CLAIRE"))
+        self.assertEqual(m._jv.meteo_lisible(95, True, "en"), ("orage", "STORM"))
+        # un morceau qui change : le cycle y sautera ; le meme : non
+        m.PANNEAU.update(morceau_cle=None, musique_saut=None)
+        m.suivre_musique({}, 10.0, {"titre": "Midnight City", "artistes": "M83"})
+        self.assertEqual((m.PANNEAU["musique_vue"], m.PANNEAU["musique_saut"]), (10.0, 10.0))
+        m.PANNEAU["musique_saut"] = None
+        m.suivre_musique({}, 15.0, {"titre": "Midnight City", "artistes": "M83"})
+        self.assertIsNone(m.PANNEAU["musique_saut"])
+        # le fil : panneau branche, il ecoute le son ; le mode de la guirlande ne la coupe pas
+        lances = []
+        m.demarrer_audio = lambda cfg: lances.append(1)
+        m.morceau_en_cours = lambda cfg: None
+        m._lire_url_json = lire
+        m.SON.update(panneau=False, marche=True)
+        m.PANNEAU["etat"] = "connecte"
+        m.veiller_sources_panneau({"panneau_contenu": "horloge", "meteo_ville": "Lyon"}, tours=1, maintenant=200.0)
+        self.assertTrue(m.SON["panneau"])
+        self.assertEqual(lances, [1])
+        m.arreter_audio()
+        self.assertTrue(m.SON["marche"], "la guirlande quitte le mode son : l'egaliseur garde la capture")
+        m.PANNEAU["etat"] = "absent"
+        m.veiller_sources_panneau({"panneau_contenu": "horloge", "mode": "ecran"}, tours=1, maintenant=300.0)
+        self.assertFalse(m.SON["panneau"] or m.SON["marche"], "plus de panneau : la capture s'arrete")
+
     def test_le_resume_se_dit_bien(self):
         J = self.m._jv
         r = [{"label": "Dentiste", "heure": "10:15"}, {"label": "Anniversaire de Paul"}]
@@ -3306,7 +3430,7 @@ class DansMachiTool(unittest.TestCase):
         m.PANNEAU["agenda"] = {"jour": time.strftime("%Y-%m-%d", time.localtime(a(14, 0))), "lu": a(14, 0),
                                "rdv": jour}
         self.addCleanup(lambda: m.PANNEAU.update(agenda=None))
-        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False}
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_cycle": False}
         self.assertTrue((m.image_du_panneau(cfg, "horloge", a(14, 0))[52:57] != 0).any())
         self.assertFalse((m.image_du_panneau(dict(cfg, panneau_rdv=False), "horloge", a(14, 0))[50:58] != 0).any())
 
