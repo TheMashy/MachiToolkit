@@ -38,6 +38,9 @@ hiddenimports += ['jarvis', 'winsound', 'pythoncom', 'win32com.client']
 # Le son de chaque appli (« baisse Discord ») : pycaw, sur comtypes. Et
 # win32con pour les fenetres de Jarvis.
 hiddenimports += ['win32con']
+# Le presse-papiers (copier_presse_papiers), importe dans une fonction : sans
+# lui, la copie retombait sur clip.exe et sa marque d'encodage invisible.
+hiddenimports += ['win32clipboard']
 # Le panneau LED : pyserial, importe dans des fonctions (trouver_panneau).
 hiddenimports += ['serial', 'serial.tools.list_ports',
                   'serial.tools.list_ports_windows']

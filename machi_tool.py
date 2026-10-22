@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.107.0"
+VERSION = "1.108.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -353,6 +353,8 @@ CONFIG_DEFAUT = {
     "panneau_rdv": True,
     # « une bulle de statut quand Claude est en train de reflechir » (voir CLAUDE_CODE)
     "panneau_claude": True,
+    # « qu'il detecte quand j'ai une notification en attente sur Discord » (voir DISCORD_PROCESSUS)
+    "panneau_discord": True,
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -10864,10 +10866,24 @@ def continuer_jarvis(etat, resultats, cfg):
 
 
 def copier_presse_papiers(texte):
-    """Le texte dans le presse-papiers de Windows (clip.exe, en UTF-16 avec sa
-    marque, pour les accents). Rend False hors de Windows ou en echec."""
+    """Le texte dans le presse-papiers de Windows. Rend False hors de Windows
+    ou en echec. Par l'API du presse-papiers (CF_UNICODETEXT) : clip.exe,
+    lui, gardait la marque d'encodage (\ufeff) en tete du texte -- collee
+    devant « MACHITOOL_BULLE_CLE », elle en changeait le nom. clip.exe (en
+    UTF-16 avec sa marque, pour les accents) ne sert plus qu'a defaut."""
     if os.name != "nt" or not texte:
         return False
+    try:
+        import win32clipboard
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(texte, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+        return True
+    except Exception:
+        pass
     try:
         subprocess.run(["clip"], input=texte.encode("utf-16"), check=True, timeout=5,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -11611,7 +11627,7 @@ _PETITE_3X5 = {
     "6": (".##", "#..", "###", "#.#", "###"), "7": ("###", "..#", ".#.", ".#.", ".#."),
     "8": ("###", "#.#", "###", "#.#", "###"), "9": ("###", "#.#", "###", "..#", "##."),
     ":": (".", "#", ".", "#", "."), ".": (".", ".", ".", ".", "#"), "-": ("...", "...", "###", "...", "..."),
-    "/": ("..#", "..#", ".#.", "#..", "#.."),
+    "/": ("..#", "..#", ".#.", "#..", "#.."), "+": ("...", ".#.", "###", ".#.", "..."),
     " ": ("..", "..", "..", "..", ".."),
 }
 _JOURS_PANNEAU = ("LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM")
@@ -13314,6 +13330,76 @@ def etat_claude_code_lisible(cfg, maintenant=None):
                  "fini": " : il a fini"}.get(etat_claude(t), ""))
 
 
+# DISCORD. « Tu peux faire en sorte que ca detecte quand j'ai une
+# notification en attente sur Discord ? » Discord ecrit ce qui t'attend dans
+# le titre de sa fenetre, comme un onglet : « (3) Discord | ... » -- trois
+# mentions ou messages prives non lus. Machi Tool le lit toutes les cinq
+# secondes (meme Discord range dans la barre : sa fenetre existe toujours),
+# et le panneau montre une pastille violette, en haut a gauche, avec le
+# nombre. Rien d'autre du titre ne sort de Machi Tool.
+DISCORD_PROCESSUS = ("discord.exe", "discordptb.exe", "discordcanary.exe")
+DISCORD_RELEVE_S = 5
+DISCORD_VIOLET = (88, 101, 242)
+
+
+def notifications_discord_du_titre(titre):
+    """Combien de notifications t'attendent, d'apres un titre de fenetre de
+    Discord : « (3) Discord | #general » -> 3 ; « Discord » -> 0."""
+    m = re.match(r"^\s*\((\d+)\)", str(titre or ""))
+    return int(m.group(1)) if m else 0
+
+
+def lire_discord(titres=None):
+    """Le plus grand nombre de notifications que montrent les fenetres de
+    Discord ; 0 s'il n'y en a pas ; None si Discord n'est pas ouvert.
+    `titres` : pour les tests, les titres de ses fenetres."""
+    if titres is None:
+        if os.name != "nt":
+            return None
+        import win32gui
+        import win32process
+        titres = []
+
+        def voir(h, _):
+            try:
+                titre = win32gui.GetWindowText(h)
+                if titre:
+                    _, pid = win32process.GetWindowThreadProcessId(h)
+                    if (_nom_du_processus(pid) or "").lower() in DISCORD_PROCESSUS:
+                        titres.append(titre)
+            except Exception:
+                pass
+            return True
+        win32gui.EnumWindows(voir, None)
+    if not titres:
+        return None
+    return max(notifications_discord_du_titre(t) for t in titres)
+
+
+def suivre_discord(lire=None):
+    """Depuis le fil des sources : ce que Discord montre, dans PANNEAU."""
+    try:
+        PANNEAU["discord"] = (lire or lire_discord)()
+    except Exception:
+        PANNEAU["discord"] = None
+    return PANNEAU["discord"]
+
+
+def dessiner_pastille_discord(img, n, eclat=None):
+    """La pastille, en haut a gauche : violette (la couleur de Discord), le
+    nombre en blanc, « 9+ » au-dela."""
+    texte = str(n) if n <= 9 else "9+"
+    larg = largeur_petit(texte) + 4
+    fond, blanc = DISCORD_VIOLET, (255, 255, 255)
+    if eclat is not None:
+        f = max(PANNEAU_ECLAT_MIN, eclat)
+        fond, blanc = tuple(int(c * f) for c in fond), tuple(int(c * f) for c in blanc)
+    img[1:8, 1:1 + larg] = fond
+    for y, x in ((1, 1), (1, larg), (7, 1), (7, larg)):     # les coins arrondis
+        img[y, x] = 0
+    ecrire_petit(img, texte, 3, 2, blanc)
+
+
 def image_du_panneau(cfg, contenu, t):
     """Ce que le panneau montre a l'instant t : la mire pendant un reglage,
     Jarvis quand il est la, sinon son contenu."""
@@ -13351,6 +13437,9 @@ def image_du_panneau(cfg, contenu, t):
     etat_cc = etat_claude(t) if cfg.get("panneau_claude", True) else None
     if etat_cc is not None:
         dessiner_bulle_claude(img, etat_cc, t, eclat)   # par-dessus, en haut a droite
+    discord = PANNEAU.get("discord") if cfg.get("panneau_discord", True) else None
+    if discord:
+        dessiner_pastille_discord(img, discord, eclat)  # en haut a gauche
     return img
 
 
@@ -13522,7 +13611,7 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
     """Le fil des sources : la capture du son pour l'egaliseur, la meteo tous
     les quarts d'heure, le morceau toutes les 5 s. `tours` : pour les tests."""
     cfg = CFG if cfg is None else cfg
-    n, meteo_t, spotify_t = 0, 0.0, 0.0
+    n, meteo_t, spotify_t, discord_t = 0, 0.0, 0.0, 0.0
     while ETAT["en_marche"] and (tours is None or n < tours):
         n += 1
         t = time.time() if maintenant is None else maintenant
@@ -13550,6 +13639,10 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
             if t >= spotify_t:
                 spotify_t = t + SPOTIFY_S
                 suivre_musique(cfg, t)
+        if cfg.get("panneau_actif", True) and cfg.get("panneau_discord", True) \
+                and PANNEAU.get("etat") == "connecte" and t >= discord_t:
+            discord_t = t + DISCORD_RELEVE_S
+            suivre_discord()
         if tours is None:
             time.sleep(1.0)
 
@@ -17394,9 +17487,10 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv", "panneau_claude", "panneau_cycle", "meteo_ville", "panneau_cycle_duree",
-                    "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
-                    "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid", "panneau_eq_sensibilite"):
+                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_cycle", "meteo_ville",
+                    "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
+                    "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
+                    "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -17492,6 +17586,13 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_jarvis"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « qu'il detecte quand j'ai une notification en attente sur Discord »
+        self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
+        c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
+                           "leur nombre (lu dans le titre de la fenetre de Discord)", self.var_panneau_discord,
+                      lambda: self.regler_panneau("panneau_discord"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
         # « une bulle de statut quand Claude est en train de reflechir »
         self.var_panneau_claude = tk.IntVar(value=1 if self.cfg.get("panneau_claude", True) else 0)
         c = self.case(col, "La bulle de Claude Code, en haut a droite : rouge, il attend ton accord ; jaune, il "
@@ -17557,6 +17658,10 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
         elif cle == "panneau_claude":
             self.cfg[cle] = bool(self.var_panneau_claude.get())
+        elif cle == "panneau_discord":
+            self.cfg[cle] = bool(self.var_panneau_discord.get())
+            if not self.cfg[cle]:
+                PANNEAU["discord"] = None
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
                      "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
