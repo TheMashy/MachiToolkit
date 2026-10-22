@@ -33,3 +33,7 @@ postes_v2
 dernier_envoi.txt
 agenda.json
 agenda.json.tmp
+
+# La cle de la bulle de Claude Code, posee a la main dans une session (voir
+# .claude/bulle_claude.py) : un secret, jamais dans le depot.
+.claude/bulle_cle.local

@@ -10,7 +10,9 @@ sur le panneau LED.
 Ce qui part : le nom de l'etape, la session, l'outil, le type de notification
 (et son court message), le nom du dossier -- ni la demande, ni ce que Claude
 lit ou ecrit. Sans la variable MACHITOOL_BULLE_CLE (la page Panneau LED de
-Machi Tool la donne), il ne fait rien. Il ne gene jamais Claude Code : trois
+Machi Tool la donne) -- ou, pour une session ouverte avant qu'on l'ajoute a
+l'environnement (elle ne la recoit jamais), le fichier .claude/bulle_cle.local
+a cote de ce script, jamais commite --, il ne fait rien. Il ne gene jamais Claude Code : trois
 secondes au plus, il ne dit rien, il rend toujours 0.
 """
 import json
@@ -44,11 +46,19 @@ def a_envoyer(e):
 
 def cle_de_l_environnement():
     """La variable MACHITOOL_BULLE_CLE -- meme collee avec une marque
-    d'encodage invisible (\ufeff) ou des espaces, dans son nom ou sa valeur."""
+    d'encodage invisible (\ufeff) ou des espaces, dans son nom ou sa valeur.
+    Sinon, le fichier bulle_cle.local (MACHITOOL_BULLE_FICHIER pour les tests)."""
     for nom, valeur in os.environ.items():
         if nom.strip().lstrip("\ufeff") == "MACHITOOL_BULLE_CLE":
             return valeur.strip().lstrip("\ufeff").strip()
-    return ""
+    fichier = os.environ.get("MACHITOOL_BULLE_FICHIER") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                         "bulle_cle.local")
+    try:
+        with open(fichier, encoding="utf-8-sig") as f:
+            texte = f.read().strip()
+    except OSError:
+        return ""
+    return texte.split("=", 1)[-1].strip()           # la cle seule, ou la ligne « MACHITOOL_BULLE_CLE=... »
 
 
 def main():
