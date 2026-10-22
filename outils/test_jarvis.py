@@ -3183,6 +3183,67 @@ class DansMachiTool(unittest.TestCase):
         self.assertIsNone(m.faire_resume_du_jour(cfg, t))
         self.assertEqual(m.ANNONCES, [])
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_resume_se_rejoue_sur_demande(self):
+        # « fais en sorte de pouvoir rejouer le resume sur demande (lorsqu'on demande a Jarvis) »
+        m = self.m
+        vrais = {k: getattr(m, k) for k in ("lire_agenda_synchro",)}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        self.addCleanup(lambda: m.PANNEAU.update(programme=None, agenda=None, jarvis=None, agenda_synchro=False))
+        etat = m.JARVIS.get("etat")
+        self.addCleanup(lambda: m.JARVIS.update(etat=etat))
+        if time.localtime().tm_hour * 60 + time.localtime().tm_min >= 23 * 60 + 50:
+            self.skipTest("trop tard : le rendez-vous de 23 h 58 serait passe")
+        jour = time.strftime("%Y-%m-%d")
+        journee = [{"id": 1, "date": jour, "heure": "23:58", "label": "Tard-témoin"},
+                   {"id": 2, "date": jour, "label": "Journée-témoin"}]
+        m.lire_agenda_synchro = lambda cfg, depuis, jours, bilan=False: ({"rendezVous": journee}, None)
+        cfg = dict(m.CONFIG_DEFAUT, jarvis_pc=False, jarvis_code_actif=True, jarvis_langue="fr")
+        o = {"id": 7, "nom": "resume_du_jour", "entree": {}}
+        self.assertEqual(m._palier(o, cfg), m._jv.PALIER_DIRECT, "sans mains, code ferme : direct")
+        m.PANNEAU["programme"] = None
+        r = m.executer_outil(o, cfg)
+        self.assertIn("Tard-témoin à 23 h 58", r["texte"])
+        self.assertIn("Journée-témoin", r["texte"])
+        p = m.PANNEAU["programme"]
+        self.assertEqual([x["id"] for x in p["rdv"]], [1, 2], "le programme sur le panneau")
+        # il est actif (il parle) : le programme passe devant son visage, une minute au plus
+        m.JARVIS["etat"] = "parle"
+        cfg_p = {"panneau_contenu": "horloge", "panneau_suit_eclat": False}
+        img = m.image_du_panneau(cfg_p, "horloge", p["debut"] + 2)
+        self.assertTrue((img == m.image_programme(p["rdv"], p["debut"] + 2, p["journee"], 2)).all())
+        vrai_parle = m.VOIX.parle
+        self.addCleanup(lambda: setattr(m.VOIX, "parle", vrai_parle))
+        m.VOIX.parle = True
+        self.assertIsNotNone(m.programme_au_panneau(p["debut"] + 50))
+        self.assertIsNone(m.programme_au_panneau(p["debut"] + 61), "une conversation qui dure : son visage revient")
+        # rien de prevu : il le dit, et le panneau ne change pas
+        m.PANNEAU["programme"] = None
+        m.lire_agenda_synchro = lambda cfg, depuis, jours, bilan=False: ({"rendezVous": []}, None)
+        self.assertEqual(m.executer_outil(o, cfg)["texte"], "Rien d'autre de prévu aujourd'hui.")
+        self.assertIsNone(m.PANNEAU["programme"])
+
+    def test_un_rendez_vous_change_par_jarvis_se_relit_au_panneau(self):
+        # « Jarvis doit pouvoir modifier ou supprimer des rendez-vous » : BrainDebugger le fait,
+        # et previent (agenda_modifie) -- le panneau relit son agenda tout de suite
+        m = self.m
+        vrai = m.lire_agenda_synchro
+        self.addCleanup(lambda: setattr(m, "lire_agenda_synchro", vrai))
+        self.addCleanup(lambda: m.PANNEAU.update(agenda=None, agenda_synchro=False))
+        fait = threading.Event()
+        m.lire_agenda_synchro = lambda cfg, depuis, jours, bilan=False: (fait.set(), ({"rendezVous": []}, None))[1]
+        m.PANNEAU.update(agenda={"jour": "x", "lu": time.time(), "rdv": [{"label": "vieux"}]}, agenda_synchro=False)
+        m.relire_agenda_au_fond(dict(m.CONFIG_DEFAUT))
+        self.assertTrue(fait.wait(5))
+        for _ in range(50):
+            if not m.PANNEAU.get("agenda_synchro"):
+                break
+            time.sleep(0.02)
+        self.assertIsNone(m.PANNEAU["agenda"], "la copie gardee par le panneau est jetee")
+        src = open(m.__file__, encoding="utf-8").read()
+        i = src.index('if donnees.get("agenda_modifie"):')
+        self.assertIn("relire_agenda_au_fond(cfg)", src[i:i + 300])
+
     def test_le_resume_se_dit_bien(self):
         J = self.m._jv
         r = [{"label": "Dentiste", "heure": "10:15"}, {"label": "Anniversaire de Paul"}]
