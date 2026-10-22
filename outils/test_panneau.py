@@ -376,5 +376,51 @@ class AL_Ecran(unittest.TestCase):
         self.assertLess(max(r, v, b), 48, "sombre")
 
 
+    def test_l_agenda_se_modifie_et_se_vide_a_la_main(self):
+        """« Rajoute une interface pour le faire directement a la main via
+        l'agenda » : chaque rendez-vous se clique, dans toutes les vues (la
+        frise comprise) ; en modification, « Retirer » et « Annuler » sont la."""
+        vrais = (M.retirer_agenda, M.sauver_config)
+        self.addCleanup(lambda: (setattr(M, "retirer_agenda", vrais[0]), setattr(M, "sauver_config", vrais[1])))
+        M.sauver_config = lambda cfg: True
+        retires = []
+        M.retirer_agenda = lambda cfg, ident: (retires.append(ident), {"texte": "Retire."})[1]
+        auj = time.strftime("%Y-%m-%d")
+        rdv = [{"id": 11, "date": auj, "heure": "18:00", "label": "Kine-temoin"},
+               {"id": 12, "date": M._jv.plus_jours(auj, 1), "heure": "10:15", "label": "Dentiste-temoin"},
+               {"id": 13, "date": M._jv.plus_jours(auj, 1), "fin": M._jv.plus_jours(auj, 4), "label": "Vacances-temoin"}]
+        p = M.Panneau(M.CFG, lambda: None)
+        try:
+            p.remplir_agenda = lambda discret=False: None        # pas de BrainDebugger ici
+            p.ouvrir_agenda()
+            p.root.update()
+            self.assertIn("clic sur un rendez-vous", p.agenda_tete.cget("text"))
+            for mode in ("frise", "liste", "semaine", "mois"):
+                vue = M._jv.bornes_vue(mode, auj) if mode in ("semaine", "mois") else None
+                p._agenda_mode(mode)
+                p._agenda_recu({"etat": "ok", "rdv": [dict(r) for r in rdv], "bilan": M.bilan_local(auj),
+                                "aujourdhui": auj, "message": "", "vue": vue, "rdv_vue": [dict(r) for r in rdv]})
+                p.root.update()
+                cliquables = [z for z in p._agenda_zones if "_agenda_menu" in z[4].__code__.co_names]
+                self.assertGreaterEqual(len(cliquables), 3, "%s : chaque rendez-vous se clique" % mode)
+            p._agenda_editer(rdv[1])
+            p.root.update()
+            self.assertEqual((p.agenda_bouton_retirer.winfo_manager(), p.agenda_bouton_annuler.winfo_manager()),
+                             ("pack", "pack"), "en modification : « Retirer » et « Annuler » sont poses")
+            self.assertIn("DENTISTE-TEMOIN", p.agenda_tete.cget("text"))
+            p.agenda_bouton_annuler.invoke()
+            p.root.update()
+            self.assertEqual(p.agenda_bouton_retirer.winfo_manager(), "", "annule : le formulaire redevient « ajouter »")
+            p._agenda_editer(rdv[1])
+            p.agenda_bouton_retirer.invoke()
+            for _ in range(50):
+                if retires:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(retires, [12])
+        finally:
+            p.root.destroy()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
