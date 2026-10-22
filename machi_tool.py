@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.105.0"
+VERSION = "1.106.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -12984,7 +12984,7 @@ def ouvrir_panneau(port):
 # accord, une reponse, la validation de son plan ; elle bat), jaune (il
 # travaille : trois points qui sautillent), verte (il a fini : une coche, dix
 # minutes). Plusieurs sessions : la plus pressante l'emporte.
-CLAUDE_CODE = {"sessions": {}, "vu": 0.0}
+CLAUDE_CODE = {"sessions": {}, "vu": 0.0, "distantes": {}, "vu_cloud": 0.0}
 CLAUDE_VERROU = threading.Lock()
 CLAUDE_VERT_S = 600                    # « fini » reste dix minutes
 CLAUDE_OUBLI_S = 20 * 60               # en plein travail sans nouvelles depuis 20 min : on ne sait plus
@@ -13043,7 +13043,8 @@ def etat_claude(maintenant=None):
     t = time.time() if maintenant is None else maintenant
     limites = {"bloque": CLAUDE_BLOQUE_OUBLI_S, "travaille": CLAUDE_OUBLI_S, "fini": CLAUDE_VERT_S}
     with CLAUDE_VERROU:
-        vus = {s["etat"] for s in CLAUDE_CODE["sessions"].values() if t - s["quand"] <= limites[s["etat"]]}
+        toutes = list(CLAUDE_CODE["sessions"].values()) + list(CLAUDE_CODE["distantes"].values())
+    vus = {s["etat"] for s in toutes if t - s["quand"] <= limites[s["etat"]]}
     return next((e for e in ("bloque", "travaille", "fini") if e in vus), None)
 
 
@@ -13067,6 +13068,79 @@ def dessiner_bulle_claude(img, etat, t, eclat=None):
     else:                                                # une coche
         for dx, dy in ((3, 2), (4, 3), (5, 4), (6, 3), (7, 2), (8, 1)):
             img[y0 + dy, x0 + dx] = 0
+
+
+# LES SESSIONS DANS LE CLOUD. « On peut partir sur le lien des sessions
+# cloud, avec la variable d'environnement. » Une session Claude Code dans le
+# cloud ne joint pas ce PC : ses crochets (.claude/bulle_claude.py, dans le
+# depot) posent son etape chez BrainDebugger, avec la cle de la bulle -- tiree
+# de celle de la passerelle, elle ne sert qu'a ca --, et Machi Tool vient la
+# relever toutes les quatre secondes.
+CLAUDE_RELEVE_S = 4
+CLAUDE_VARIABLE = "MACHITOOL_BULLE_CLE"
+
+
+def cle_bulle_claude(cfg):
+    """La cle de la bulle, pour la variable d'environnement des sessions
+    cloud : un HMAC de la cle de la passerelle, comme BrainDebugger la calcule."""
+    import hashlib
+    import hmac
+    cle = str(cfg.get("pont_cle") or "").strip()
+    return hmac.new(cle.encode("utf-8"), b"bulle-claude", hashlib.sha256).hexdigest()[:32] if cle else ""
+
+
+def _lire_bulle_distante(cfg):
+    base = str(cfg.get("pont_site", "")).strip().rstrip("/")
+    cle = str(cfg.get("pont_cle", "")).strip()
+    requete = urllib.request.Request(base + "/api/machitool/claude", headers={
+        "User-Agent": "MachiToolkit/" + VERSION, "Authorization": "Bearer " + cle, "X-Machitool-Cle": cle})
+    with urllib.request.urlopen(requete, timeout=5, context=_contexte_ssl()) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def relever_bulle_distante(cfg, maintenant=None, lire=None):
+    """Les sessions du cloud, telles que BrainDebugger les a recues : leur
+    derniere etape, et depuis quand. Rend leur nombre."""
+    t = time.time() if maintenant is None else maintenant
+    donnees = (lire or _lire_bulle_distante)(cfg)
+    distantes = {}
+    for e in (donnees or {}).get("sessions") or []:
+        etat = etat_de_claude_code(e) if isinstance(e, dict) else None
+        if etat in CLAUDE_COULEURS:
+            try:
+                age = max(0.0, float(e.get("age_s") or 0))
+            except (TypeError, ValueError):
+                age = 0.0
+            distantes[str(e.get("session_id") or "?")[:80]] = {
+                "etat": etat, "quand": t - age, "dossier": str(e.get("dossier") or "")[:40]}
+    with CLAUDE_VERROU:
+        CLAUDE_CODE["distantes"] = distantes
+        if distantes:
+            CLAUDE_CODE["vu_cloud"] = max(CLAUDE_CODE["vu_cloud"], max(s["quand"] for s in distantes.values()))
+    return len(distantes)
+
+
+def veiller_bulle_distante(cfg=None, tours=None):
+    """Le fil du relais : toutes les quatre secondes, tant que la bulle est
+    cochee et la passerelle reglee. Un BrainDebugger d'avant (404) : il repasse
+    dans cinq minutes ; une erreur : dans trente secondes. `tours` : pour les tests."""
+    cfg = CFG if cfg is None else cfg
+    n = 0
+    while ETAT["en_marche"] and (tours is None or n < tours):
+        n += 1
+        attente = CLAUDE_RELEVE_S
+        if cfg.get("panneau_claude", True) and cfg.get("panneau_actif", True) \
+                and str(cfg.get("pont_cle") or "").strip() and str(cfg.get("pont_site") or "").strip():
+            try:
+                relever_bulle_distante(cfg)
+            except urllib.error.HTTPError as e:
+                attente = 300 if e.code == 404 else 60
+            except Exception:
+                attente = 30
+        if tours is None:
+            fin = time.time() + attente
+            while ETAT["en_marche"] and time.time() < fin:
+                time.sleep(min(1.0, attente))
 
 
 def reglages_claude_code():
@@ -13148,6 +13222,21 @@ def brancher_claude_code(cfg, chemin=None, brancher=True):
         f.write("\n")
     os.replace(provisoire, chemin)
     return chemin
+
+
+def etat_cloud_lisible(cfg, maintenant=None):
+    """Une ligne pour la page : les sessions du cloud."""
+    t = time.time() if maintenant is None else maintenant
+    if not str(cfg.get("pont_cle") or "").strip():
+        return "Sessions cloud : il faut d'abord la cle de la passerelle (Reglages, BrainDebugger)."
+    vu = CLAUDE_CODE.get("vu_cloud") or 0.0
+    if not vu:
+        return ("Sessions cloud : dans l'environnement Claude Code (menu de l'environnement, Modifier), autorise "
+                "braindebugger-production.up.railway.app dans l'acces reseau, et colle la variable copiee dans "
+                "ses variables d'environnement. Puis ouvre une nouvelle session.")
+    ecart = max(0, int(t - vu))
+    il_y_a = "%d s" % ecart if ecart < 60 else ("%d min" % (ecart // 60) if ecart < 3600 else "%d h" % (ecart // 3600))
+    return "Sessions cloud : dernieres nouvelles il y a %s." % il_y_a
 
 
 def etat_claude_code_lisible(cfg, maintenant=None):
@@ -17359,6 +17448,13 @@ class Panneau:
         self.bouton_claude_code.pack(side="left")
         self.txt_claude_code = self.texte(ligne, etat_claude_code_lisible(self.cfg), BRUME, 8, largeur=260)
         self.txt_claude_code.pack(side="left", padx=(8, 0))
+        # « le lien des sessions cloud, avec la variable d'environnement »
+        ligne = tk.Frame(col, bg=NUIT)
+        ligne.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
+        self.bouton(ligne, "Copier la variable des sessions cloud", self.copier_cle_bulle,
+                    compact=True).pack(side="left")
+        self.txt_claude_cloud = self.texte(ligne, etat_cloud_lisible(self.cfg), BRUME, 8, largeur=260)
+        self.txt_claude_cloud.pack(side="left", padx=(8, 0))
         self.titre(col, "Sens du panneau").pack(fill="x", pady=(14, 4))
         rangee = tk.Frame(col, bg=NUIT)
         rangee.pack(fill="x")
@@ -17422,6 +17518,22 @@ class Panneau:
             self.cfg[cle] = self.var_panneau_contenu.get()
         sauver_config(self.cfg)
         self._peindre_panneau()
+
+    def copier_cle_bulle(self):
+        """« MACHITOOL_BULLE_CLE=... » dans le presse-papiers : la ligne a coller
+        dans les variables d'environnement de l'environnement Claude Code."""
+        cle = cle_bulle_claude(self.cfg)
+        if not cle:
+            message = "Il faut d'abord la cle de la passerelle (Reglages, BrainDebugger)."
+        elif copier_presse_papiers("%s=%s" % (CLAUDE_VARIABLE, cle)):
+            message = ("Copie : colle-la dans les variables d'environnement de l'environnement Claude Code, et "
+                       "autorise braindebugger-production.up.railway.app dans son acces reseau.")
+        else:
+            message = "%s=%s" % (CLAUDE_VARIABLE, cle)
+        try:
+            self.txt_claude_cloud.configure(text=message)
+        except Exception:
+            pass
 
     @staticmethod
     def _texte_claude_code():
@@ -17515,6 +17627,11 @@ class Panneau:
         if getattr(self, "txt_claude_code", None) is not None and CLAUDE_CODE.get("vu"):
             try:
                 self.txt_claude_code.configure(text=etat_claude_code_lisible(self.cfg))
+            except Exception:
+                pass
+        if getattr(self, "txt_claude_cloud", None) is not None and CLAUDE_CODE.get("vu_cloud"):
+            try:
+                self.txt_claude_cloud.configure(text=etat_cloud_lisible(self.cfg))
             except Exception:
                 pass
         texte, couleur = etat_panneau_lisible()
@@ -20579,6 +20696,8 @@ def lancer():
                      name="panneau").start()
     threading.Thread(target=sans_faute, args=("Sources du panneau", veiller_sources_panneau, CFG), daemon=True,
                      name="panneau-sources").start()
+    threading.Thread(target=sans_faute, args=("Bulle de Claude (cloud)", veiller_bulle_distante, CFG), daemon=True,
+                     name="bulle-claude").start()
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
     # Ctrl+J : il se reveille et t'ecoute ; Ctrl+Maj+Espace : il prend une
     # note pour le carnet (hors du fil de Tk). Un second appui le congedie.
