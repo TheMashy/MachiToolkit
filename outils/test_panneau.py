@@ -422,5 +422,33 @@ class AL_Ecran(unittest.TestCase):
             p.root.destroy()
 
 
+    def test_le_cycle_se_regle_sur_la_page_du_panneau(self):
+        """« Rajoute tout ca en settings dans le tab panel » : les reglettes et
+        les cases du cycle ecrivent la config, le panneau les suit."""
+        vrai = M.sauver_config
+        self.addCleanup(lambda: setattr(M, "sauver_config", vrai))
+        M.sauver_config = lambda cfg: True
+        p = M.Panneau(M.CFG, lambda: None)
+        try:
+            p.aller("panneau")
+            p.root.update()
+            self.assertEqual(int(p.var_panneau_cycle_duree.get()), 30)
+            self.assertAlmostEqual(float(p.var_panneau_cycle_fondu.get()), 3.0)
+            p.var_panneau_cycle_duree.set(45)
+            p.var_panneau_cycle_fondu.set(5.5)
+            self.assertEqual((M.CFG["panneau_cycle_duree"], M.CFG["panneau_cycle_fondu"]), (45, 5.5))
+            self.assertEqual(M.reglages_cycle(M.CFG), (45.0, 5.5))
+            p.var_panneau_cycle_meteo.set(0)
+            p.regler_panneau("panneau_cycle_meteo")
+            self.assertFalse(M.CFG["panneau_cycle_meteo"])
+            p.var_panneau_cycle_saut.set(0)
+            p.regler_panneau("panneau_cycle_saut")
+            self.assertFalse(M.CFG["panneau_cycle_saut"])
+        finally:
+            for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_saut"):
+                M.CFG[cle] = M.CONFIG_DEFAUT[cle]
+            p.root.destroy()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -3258,19 +3258,22 @@ class DansMachiTool(unittest.TestCase):
         m.PANNEAU["cycle"] = None
         t0 = 1_800_000_000.0
         vu = lambda t, d=tous, **k: m.cycle_du_panneau(t, d, **k)
+        # « ralentis le fade, fais un fade toutes les 30 s » : 30 s par vue, 3 s de fondu
         self.assertEqual(vu(t0)["actuel"], "heure")
-        c = vu(t0 + 12)
+        self.assertEqual(vu(t0 + 29)["actuel"], "heure")
+        c = vu(t0 + 30)
         self.assertEqual((c["actuel"], c["precedent"], c["fondu"]), ("meteo", "heure", 0.0), "le fondu commence")
-        self.assertAlmostEqual(vu(t0 + 12.5)["fondu"], 0.5)
-        self.assertEqual(vu(t0 + 20)["actuel"], "musique")
-        self.assertEqual(vu(t0 + 30)["actuel"], "bonhomme")
-        self.assertEqual(vu(t0 + 38)["actuel"], "heure", "puis l'heure a nouveau")
+        self.assertAlmostEqual(vu(t0 + 31.5)["fondu"], 0.5, msg="lent : a mi-chemin apres 1,5 s")
+        self.assertEqual(vu(t0 + 33)["fondu"], 1.0)
+        self.assertEqual(vu(t0 + 60)["actuel"], "musique")
+        self.assertEqual(vu(t0 + 90)["actuel"], "bonhomme")
+        self.assertEqual(vu(t0 + 120)["actuel"], "heure", "puis l'heure a nouveau")
         # rien ne joue : la musique est sautee ; pas de meteo : elle aussi
-        self.assertEqual(vu(t0 + 50, ["heure", "bonhomme"])["actuel"], "bonhomme")
+        self.assertEqual(vu(t0 + 150, ["heure", "bonhomme"])["actuel"], "bonhomme")
         # un morceau qui change : le cycle y saute ; un minuteur qui va sonner : l'heure reste
-        self.assertEqual(vu(t0 + 51, tous, saut="musique")["actuel"], "musique")
-        self.assertEqual(vu(t0 + 52, tous, urgent=True)["actuel"], "heure")
-        self.assertEqual(vu(t0 + 70, tous, urgent=True)["actuel"], "heure", "fige tant que ca presse")
+        self.assertEqual(vu(t0 + 151, tous, saut="musique")["actuel"], "musique")
+        self.assertEqual(vu(t0 + 152, tous, urgent=True)["actuel"], "heure")
+        self.assertEqual(vu(t0 + 400, tous, urgent=True)["actuel"], "heure", "fige tant que ca presse")
         # qui est disponible
         m.PANNEAU.update(meteo=None, musique_vue=0)
         self.assertEqual(m.cycle_disponible(t0), ["heure", "bonhomme"])
@@ -3313,6 +3316,41 @@ class DansMachiTool(unittest.TestCase):
         m.image_du_panneau({"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False}, "horloge", t)
         self.assertEqual(m.PANNEAU["cycle"]["actuel"], "musique")
         self.assertIsNone(m.PANNEAU["musique_saut"], "le saut ne sert qu'une fois")
+
+    def test_le_cycle_se_regle(self):
+        # « au pire rajoute tout ca en settings dans le tab panel de Machi Tool, comme ca je
+        # peux gerer l'affichage du panneau comme je veux »
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("cycle", "meteo", "musique_vue", "musique_saut")}
+        self.addCleanup(lambda: m.PANNEAU.update(sauve))
+        self.assertEqual(m.reglages_cycle({}), (30.0, 3.0), "par defaut : 30 s par vue, 3 s de fondu")
+        self.assertEqual(m.reglages_cycle({"panneau_cycle_duree": 500, "panneau_cycle_fondu": "abime"}), (120, 3.0))
+        self.assertEqual(m.reglages_cycle({"panneau_cycle_duree": 1, "panneau_cycle_fondu": -2}), (5, 0.0))
+        for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
+                    "panneau_cycle_bonhomme", "panneau_cycle_saut"):
+            self.assertIn(cle, m.CONFIG_DEFAUT)
+        t0 = 1_800_000_000.0
+        m.PANNEAU.update(meteo={"temp": 12, "code": 3, "quand": t0}, musique_vue=t0)
+        self.assertEqual(m.cycle_disponible(t0, {"panneau_cycle_meteo": False, "panneau_cycle_bonhomme": False}),
+                         ["heure", "musique"], "des vues decochees : sautees ; l'heure reste")
+        # 10 s par vue, sans fondu : un changement net a 10 s
+        m.PANNEAU["cycle"] = None
+        m.cycle_du_panneau(t0, ["heure", "bonhomme"], duree=10, fondu_s=0)
+        self.assertEqual(m.cycle_du_panneau(t0 + 9, ["heure", "bonhomme"], duree=10, fondu_s=0)["actuel"], "heure")
+        c = m.cycle_du_panneau(t0 + 10, ["heure", "bonhomme"], duree=10, fondu_s=0)
+        self.assertEqual((c["actuel"], c["fondu"]), ("bonhomme", 1.0))
+        # par la boucle : la duree reglee, et le saut sur un nouveau morceau qu'on peut couper
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False,
+               "panneau_cycle_duree": 15, "panneau_cycle_meteo": False}
+        m.PANNEAU.update(cycle=None, musique_saut=None)
+        m.image_du_panneau(cfg, "horloge", t0)
+        m.PANNEAU["musique_vue"] = t0 + 14                 # quelque chose joue
+        m.image_du_panneau(cfg, "horloge", t0 + 15)
+        self.assertEqual(m.PANNEAU["cycle"]["actuel"], "musique", "15 s, et la meteo decochee est sautee")
+        m.PANNEAU.update(cycle=None, musique_saut=t0 + 16)
+        m.image_du_panneau(dict(cfg, panneau_cycle_saut=False), "horloge", t0 + 16)
+        self.assertEqual(m.PANNEAU["cycle"]["actuel"], "heure", "saut coupe : le cycle suit son cours")
+        self.assertIsNone(m.PANNEAU["musique_saut"])
 
     def test_les_sources_du_cycle(self):
         m = self.m

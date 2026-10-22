@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.96.0"
+VERSION = "1.97.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -353,6 +353,14 @@ CONFIG_DEFAUT = {
     "panneau_rdv": True,
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
+    # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
+    # chaque vue, celle du fondu, et quelles vues
+    "panneau_cycle_duree": 30,        # s, chaque vue
+    "panneau_cycle_fondu": 3.0,       # s, d'une vue a l'autre
+    "panneau_cycle_meteo": True,
+    "panneau_cycle_musique": True,
+    "panneau_cycle_bonhomme": True,
+    "panneau_cycle_saut": True,       # un morceau qui change : la musique tout de suite
     "meteo_ville": "",                # vide : le lieu approximatif de la connexion
     "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
@@ -11962,15 +11970,31 @@ def programme_au_panneau(maintenant):
 # a la musique avec le nom de la musique (quand Spotify change de musique),
 # puis un petit bonhomme qui marche (de gauche a droite en fonction de l'heure
 # de la journee), puis l'heure a nouveau. » Les lignes 39 a 58, entre la date
-# et les secondes ; un fondu d'une seconde d'une vue a l'autre. La musique ne
+# et les secondes ; une vue toutes les 30 s, en fondu de 3 s. La musique ne
 # vient que si quelque chose joue ; un morceau qui change y saute tout de
 # suite. Un minuteur qui va sonner, un rendez-vous qui arrive : le cycle
 # s'arrete sur l'heure.
 
 ZONE_CYCLE = slice(39, 59)
 CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme")
-CYCLE_DUREES = {"heure": 12.0, "meteo": 8.0, "musique": 10.0, "bonhomme": 8.0}
-CYCLE_FONDU_S = 1.0
+# « ralentis le fade, fais un fade toutes les 30 s » -- puis « rajoute tout ca
+# en settings » : panneau_cycle_duree et panneau_cycle_fondu, bornes ici
+CYCLE_DUREE_S = 30.0
+CYCLE_FONDU_S = 3.0
+CYCLE_DUREE_BORNES = (5, 120)
+CYCLE_FONDU_BORNES = (0.0, 10.0)
+
+
+def reglages_cycle(cfg):
+    """(duree d'une vue, duree du fondu), lues dans la config et bornees."""
+    def lire(cle, defaut, bornes):
+        try:
+            v = float(cfg.get(cle, defaut))
+        except (TypeError, ValueError):
+            v = defaut
+        return max(bornes[0], min(bornes[1], v))
+    return (lire("panneau_cycle_duree", CYCLE_DUREE_S, CYCLE_DUREE_BORNES),
+            lire("panneau_cycle_fondu", CYCLE_FONDU_S, CYCLE_FONDU_BORNES))
 CYCLE_URGENT_MINUTEUR_S = 300          # un minuteur a moins de 5 min : l'heure reste
 CYCLE_URGENT_RDV_S = 600               # un rendez-vous a moins de 10 min : aussi
 MUSIQUE_VUE_S = 10                     # quelque chose a joue dans les 10 dernieres secondes
@@ -11979,15 +12003,19 @@ METEO_VIEILLE_S = 3 * 3600             # au-dela, elle ne s'affiche plus
 SPOTIFY_S = 5                          # le morceau, regarde toutes les 5 s
 
 
-def cycle_disponible(maintenant):
-    """Les vues du cycle qui ont quelque chose a montrer."""
+def cycle_disponible(maintenant, cfg=None):
+    """Les vues du cycle qui ont quelque chose a montrer -- et qu'on a gardees
+    (l'heure, elle, reste toujours : c'est le fond)."""
+    cfg = cfg or {}
     d = ["heure"]
     m = PANNEAU.get("meteo")
-    if m and maintenant - float(m.get("quand") or 0) < METEO_VIEILLE_S:
+    if cfg.get("panneau_cycle_meteo", True) and m and maintenant - float(m.get("quand") or 0) < METEO_VIEILLE_S:
         d.append("meteo")
-    if maintenant - float(PANNEAU.get("musique_vue") or 0) < MUSIQUE_VUE_S:
+    if cfg.get("panneau_cycle_musique", True) and \
+            maintenant - float(PANNEAU.get("musique_vue") or 0) < MUSIQUE_VUE_S:
         d.append("musique")
-    d.append("bonhomme")
+    if cfg.get("panneau_cycle_bonhomme", True):
+        d.append("bonhomme")
     return d
 
 
@@ -12001,8 +12029,9 @@ def cycle_urgent(minuteurs, rdv, maintenant):
     return bool(p and p[1] <= CYCLE_URGENT_RDV_S)
 
 
-def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None):
-    """Ou en est le cycle : {actuel, precedent, fondu (0 a 1), ecoule}."""
+def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYCLE_DUREE_S, fondu_s=CYCLE_FONDU_S):
+    """Ou en est le cycle : {actuel, precedent, fondu (0 a 1), ecoule}. Une vue
+    tient `duree` secondes ; le fondu de l'une a l'autre, `fondu_s`."""
     c = PANNEAU.get("cycle")
     if not c or maintenant < c["depuis"] or maintenant - c["depuis"] > 3600:
         c = PANNEAU["cycle"] = {"actuel": "heure", "precedent": None, "depuis": maintenant}
@@ -12014,7 +12043,7 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None):
             passer("heure")
     elif saut and saut in disponibles and c["actuel"] != saut:
         passer(saut)
-    elif c["actuel"] not in disponibles or maintenant - c["depuis"] >= CYCLE_DUREES[c["actuel"]]:
+    elif c["actuel"] not in disponibles or maintenant - c["depuis"] >= duree:
         i = CYCLE_ORDRE.index(c["actuel"])
         for k in range(1, len(CYCLE_ORDRE) + 1):
             suivante = CYCLE_ORDRE[(i + k) % len(CYCLE_ORDRE)]
@@ -12023,7 +12052,7 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None):
                     passer(suivante)
                 break
     ecoule = maintenant - c["depuis"]
-    fondu = min(1.0, ecoule / CYCLE_FONDU_S) if c["precedent"] else 1.0
+    fondu = (min(1.0, ecoule / fondu_s) if fondu_s > 0 else 1.0) if c["precedent"] else 1.0
     return {"actuel": c["actuel"], "precedent": c["precedent"], "fondu": fondu, "ecoule": ecoule}
 
 
@@ -12359,8 +12388,11 @@ def image_du_panneau(cfg, contenu, t):
     if contenu == "horloge" and cfg.get("panneau_cycle", True):
         saut = None
         if PANNEAU.get("musique_saut"):                  # un morceau vient de changer
-            saut, PANNEAU["musique_saut"] = "musique", None
-        cycle = cycle_du_panneau(t, cycle_disponible(t), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut)
+            PANNEAU["musique_saut"] = None
+            saut = "musique" if cfg.get("panneau_cycle_saut", True) else None
+        duree, fondu_s = reglages_cycle(cfg)
+        cycle = cycle_du_panneau(t, cycle_disponible(t, cfg), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
+                                 duree, fondu_s)
     return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
 
 
@@ -16393,7 +16425,8 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv", "panneau_cycle", "meteo_ville"):
+                    "panneau_rdv", "panneau_cycle", "meteo_ville", "panneau_cycle_duree", "panneau_cycle_fondu",
+                    "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme", "panneau_cycle_saut"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -16449,6 +16482,31 @@ class Panneau:
         lieu = (self.cfg.get("meteo_lieu") or {}).get("nom")
         self.texte(ligne_meteo, "vide : estimee d'apres ta connexion" + (" (%s)" % lieu if lieu else ""),
                    BRUME, 8, largeur=220).pack(side="left", padx=(self.px(6), 0))
+        # « rajoute tout ca en settings : je peux gerer l'affichage du panneau comme je veux »
+        vues = tk.Frame(col, bg=NUIT)
+        vues.pack(fill="x", pady=(6, 0), padx=(self.px(22), 0))
+        self.texte(vues, "Vues", BRUME, 8).pack(side="left")
+        for cle, nom in (("panneau_cycle_meteo", "Meteo"), ("panneau_cycle_musique", "Musique"),
+                         ("panneau_cycle_bonhomme", "Bonhomme")):
+            v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
+            setattr(self, "var_" + cle, v)
+            self.case(vues, nom, v, lambda cle=cle: self.regler_panneau(cle)).pack(side="left", padx=(self.px(8), 0))
+        self.var_panneau_cycle_saut = tk.IntVar(value=1 if self.cfg.get("panneau_cycle_saut", True) else 0)
+        c = self.case(col, "Quand le morceau change, montrer la musique tout de suite", self.var_panneau_cycle_saut,
+                      lambda: self.regler_panneau("panneau_cycle_saut"))
+        c.configure(wraplength=self.px(360))
+        c.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
+        reglettes = tk.Frame(col, bg=NUIT)
+        reglettes.pack(fill="x", pady=(6, 0), padx=(self.px(22), 0))
+        for cle, nom, bornes, pas, aide, entiere in (
+                ("panneau_cycle_duree", "Chaque vue (s)", CYCLE_DUREE_BORNES, 5,
+                 "Le temps que reste chaque vue avant de passer a la suivante.", True),
+                ("panneau_cycle_fondu", "Fondu (s)", CYCLE_FONDU_BORNES, 0.5,
+                 "La duree du fondu d'une vue a l'autre ; 0 : un changement net.", False)):
+            v = self.reglette(reglettes, cle, nom, bornes[0], bornes[1], pas, aide, entier=entiere)
+            v.trace_add("write", lambda *_, cle=cle, v=v, entiere=entiere: self._panneau_reglage_bientot(
+                cle, int(v.get()) if entiere else round(float(v.get()), 1)))
+            setattr(self, "var_" + cle, v)
         self.var_panneau_rdv = tk.IntVar(value=1 if self.cfg.get("panneau_rdv", True) else 0)
         c = self.case(col, "Le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes",
                       self.var_panneau_rdv, lambda: self.regler_panneau("panneau_rdv"))
@@ -16502,8 +16560,9 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_actif.get())
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
-        elif cle == "panneau_cycle":
-            self.cfg[cle] = bool(self.var_panneau_cycle.get())
+        elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
+                     "panneau_cycle_saut"):
+            self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "meteo_ville":
             ville = self.champ_meteo_ville.get().strip()[:60]
             if ville == str(self.cfg.get("meteo_ville") or ""):
@@ -16534,6 +16593,14 @@ class Panneau:
             except Exception:
                 pass
         self._peindre_panneau()
+
+    def _panneau_reglage_bientot(self, cle, valeur):
+        """Une reglette du cycle : le panneau la suit tout de suite, la config
+        s'ecrit une fois le geste fini."""
+        self.cfg[cle] = valeur
+        if getattr(self, "_panneau_sauve", None):
+            self.root.after_cancel(self._panneau_sauve)
+        self._panneau_sauve = self.root.after(500, lambda: sauver_config(self.cfg))
 
     def _panneau_balance_bientot(self, cle, v):
         """La balance s'applique a l'image suivante ; la config s'ecrit une fois
