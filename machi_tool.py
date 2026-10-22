@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.106.0"
+VERSION = "1.107.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -12339,8 +12339,11 @@ class _Toile:
     personnages : on y peint des traits, des ronds, des polygones, puis
     `poser` la reduit (la moyenne des sous-pixels, en alpha premultiplie) et
     la colle sur l'image, coupee aux bords. Les contours adoucis font glisser
-    les membres d'un pixel a l'autre au lieu de sauter."""
+    les membres d'un pixel a l'autre au lieu de sauter. Ou, `net` : du pixel
+    art sans adoucissement -- chaque pixel prend UNE couleur, celle de la piece
+    la plus en avant qui le couvre assez --, et `contour` l'entoure d'un trait."""
     FIN = 4
+    COUVERT = 4                        # en net : 4 sous-pixels sur 16 suffisent (un bras fin reste)
 
     def __init__(self, x0, y0, largeur, hauteur):
         import numpy as np
@@ -12348,10 +12351,14 @@ class _Toile:
         ys, xs = np.mgrid[0:hauteur * self.FIN, 0:largeur * self.FIN]
         self.X, self.Y = x0 + (xs + 0.5) / self.FIN, y0 + (ys + 0.5) / self.FIN
         self.fin = np.zeros((hauteur * self.FIN, largeur * self.FIN, 4), np.float32)
+        self.couche = np.zeros((hauteur * self.FIN, largeur * self.FIN), np.int32)   # quelle piece, par sous-pixel
+        self.couleurs = [(0, 0, 0)]                                                   # la couleur de chaque piece
 
     def peindre(self, m, couleur):
         self.fin[m, :3] = couleur
         self.fin[m, 3] = 1.0
+        self.couleurs.append(tuple(int(c) for c in couleur))
+        self.couche[m] = len(self.couleurs) - 1
 
     def trait(self, a, b, r, couleur):
         import numpy as np
@@ -12374,8 +12381,10 @@ class _Toile:
             m = m & (((b[0] - a[0]) * (self.Y - a[1]) - (b[1] - a[1]) * (self.X - a[0])) * aire >= 0)
         self.peindre(m, couleur)
 
-    def poser(self, img):
+    def poser(self, img, net=False, contour=None):
         import numpy as np
+        if net:
+            return self._poser_net(img, contour)
         F, L, H, x0, y0 = self.FIN, self.L, self.H, self.x0, self.y0
         p = self.fin.reshape(H, F, L, F, 4).mean(axis=(1, 3))
         a = p[..., 3:4]
@@ -12388,6 +12397,51 @@ class _Toile:
         couleur = couleur[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
         fond = img[gy0:gy1, gx0:gx1].astype(np.float32)
         img[gy0:gy1, gx0:gx1] = np.clip(np.round(fond * (1 - a) + couleur * a), 0, 255).astype(np.uint8)
+
+    def _poser_net(self, img, contour):
+        """Le pixel art net : la piece peinte la plus tard parmi celles qui
+        couvrent au moins COUVERT sous-pixels donne sa couleur au pixel ;
+        aucune : il reste vide. `contour` (0 a 1) : les pixels vides qui
+        touchent la silhouette prennent la couleur de leur voisin, assombrie
+        d'autant -- un trait net autour d'elle (pas sur ce qui est deja allume
+        dessous : le chemin, la lune)."""
+        import numpy as np
+        F, L, H, x0, y0 = self.FIN, self.L, self.H, self.x0, self.y0
+        if len(self.couleurs) < 2:
+            return
+        sous = self.couche.reshape(H, F, L, F).transpose(0, 2, 1, 3).reshape(H, L, F * F)
+        pieces = np.arange(1, len(self.couleurs))
+        assez = (sous[..., None] == pieces).sum(axis=2) >= self.COUVERT
+        plein = assez.any(axis=2)
+        haute = len(pieces) - 1 - np.argmax(assez[..., ::-1], axis=2)
+        couleur = np.array(self.couleurs[1:], np.uint8)[haute]
+        bord = np.zeros((H, L), bool)
+        teinte = np.zeros((H, L, 3), np.uint8)
+        if contour:
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                voisin = np.zeros((H, L), bool)
+                vcouleur = np.zeros((H, L, 3), np.uint8)
+                ys = slice(max(0, -dy), H - max(0, dy))
+                yd = slice(max(0, dy), H - max(0, -dy))
+                xs = slice(max(0, -dx), L - max(0, dx))
+                xd = slice(max(0, dx), L - max(0, -dx))
+                voisin[yd, xd] = plein[ys, xs]
+                vcouleur[yd, xd] = couleur[ys, xs]
+                neuf = voisin & ~plein & ~bord
+                if isinstance(contour, tuple):                 # une couleur franche
+                    teinte[neuf] = contour
+                else:                                          # la couleur du voisin, assombrie
+                    teinte[neuf] = (vcouleur[neuf].astype(np.float32) * contour).astype(np.uint8)
+                bord |= neuf
+        gx0, gx1 = max(0, x0), min(PANNEAU_L, x0 + L)
+        gy0, gy1 = max(0, y0), min(PANNEAU_H, y0 + H)
+        if gx1 <= gx0 or gy1 <= gy0:
+            return
+        coupe = (slice(gy0 - y0, gy1 - y0), slice(gx0 - x0, gx1 - x0))
+        zone = img[gy0:gy1, gx0:gx1]
+        trait = bord[coupe] & (zone.astype(int).sum(axis=2) < 60)
+        zone[trait] = teinte[coupe][trait]
+        zone[plein[coupe]] = couleur[coupe][plein[coupe]]
 
 
 def _point(img, x, y, couleur):
@@ -12489,7 +12543,11 @@ def chemin_de_la_journee(img, t, accent):
 # cheveux ont un reflet, et c'est le blanc de la tenue qui dessine la
 # silhouette. Tout bouge a 30 images par seconde : les jambes, les bras, la
 # jupe qui ondule, la queue, une oreille qui frissonne, les yeux qui
-# clignent ; et ses petites envies, et sa tenue de nuit (plus bas).
+# clignent ; et ses petites envies, et sa tenue de nuit (plus bas). « Pas
+# d'anti-aliasing : du pixel art net, avec un contour net » : elle est
+# dessinee sur la toile fine, mais reduite sans adoucissement (chaque pixel
+# prend une seule couleur), et entouree d'un trait violet sombre.
+MAID_CONTOUR = (40, 34, 70)
 MAID_PAS_S = (0.9, 1.15, 1.5)          # un cycle (deux pas) : en forme, fatiguee, epuisee
 MAID_FOULEE, MAID_JAMBE = 3.2, 2.4     # la longueur d'un pas ; la cuisse comme le mollet
 MAID_SOL = BONHOMME_SOL                # sur le chemin de la journee
@@ -12769,7 +12827,7 @@ def dessiner_maid(img, x, t, accent, fatigue=0.0, nuit=False):
         for d, hh in ((-1.0, 2.9), (0.3, 3.2)):          # la coiffe : des volants blancs entre les oreilles
             toile.rond((tx + d, ty - hh), 0.6, TABLIER)
     bras(1, False)
-    toile.poser(img)
+    toile.poser(img, net=True, contour=MAID_CONTOUR)       # du pixel art net, un trait autour
 
     # au pixel pres : le ruban du cou, l'oeil (grand), la joue, la bouche -- en miroir si elle s'est retournee
     def point(px, py, couleur):

@@ -3485,6 +3485,12 @@ class DansMachiTool(unittest.TestCase):
         self.assertLess(abs(m.maid_pose(plus_tard, t0 + 3)["hanche"][0] - x), 0.01, "elle reste sur place")
         # rien dans les mains : devant elle, plus rien (ni plateau, ni tasse)
         self.assertTrue((repos[46:56, int(x) + 6:] == 0).all())
+        # « pas d'anti-aliasing : du pixel art net, avec un contour net » -- adoucie, elle en avait 85
+        boite = repos[39:56, int(x) - 9:int(x) + 9]
+        teintes = {tuple(int(v) for v in p) for p in boite.reshape(-1, 3)} - {(0, 0, 0)}
+        self.assertLessEqual(len(teintes), 20, "pas de demi-teintes : quelques couleurs franches")
+        self.assertGreaterEqual(int((boite == m.MAID_CONTOUR).all(axis=2).sum()), 20, "un trait autour d'elle")
+        self.assertTrue((repos[m.BONHOMME_SOL] != m.MAID_CONTOUR).any(axis=1).all(), "le trait ne mord pas le chemin")
         # elle marche sur place : les pieds passent sous elle, se levent, touchent le chemin
         poses = [m.maid_pose(x, t0 + k / 60.0) for k in range(60)]
         pieds = [p["cheville0"][0] - x for p in poses]
