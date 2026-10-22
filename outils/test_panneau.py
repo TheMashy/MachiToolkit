@@ -443,6 +443,11 @@ class AL_Ecran(unittest.TestCase):
             self.assertFalse(M.CFG["panneau_discord"])
             self.assertIsNone(M.PANNEAU["discord"], "decochee : la pastille s'en va tout de suite")
             M.CFG["panneau_discord"] = True
+            # « un effet sur le panneau lorsqu'une maj est en cours » : sa case
+            p.var_panneau_maj.set(0)
+            p.regler_panneau("panneau_maj")
+            self.assertFalse(M.CFG["panneau_maj"])
+            M.CFG["panneau_maj"] = True
             p.var_panneau_claude.set(0)
             p.regler_panneau("panneau_claude")
             self.assertFalse(M.CFG["panneau_claude"])
