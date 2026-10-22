@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.92.0"
+VERSION = "1.93.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11505,7 +11505,7 @@ PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la 
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
-PANNEAU_CROQUIS = 3                    # carte/machi_panneau/machi_panneau.ino
+PANNEAU_CROQUIS = 4                    # carte/machi_panneau/machi_panneau.ino
 PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
@@ -12093,7 +12093,7 @@ def lire_bilan_carte(lien):
 
 
 def version_croquis(lien, attente=0.5, calme=0.3):
-    """Le croquis de la carte : « MV » -> "MACHI 3". La v1 ne repond rien
+    """Le croquis de la carte : « MV » -> "MACHI 4". La v1 ne repond rien
     (elle ignore « MV ») : 1. `calme` : une image laissee a moitie par une
     session d'avant doit d'abord expirer cote carte (200 ms), sinon « MV »
     finirait dedans."""
@@ -12249,7 +12249,7 @@ def etat_panneau_lisible():
                                                                         else (jetees, "", "", ""))
         if (PANNEAU.get("croquis") or PANNEAU_CROQUIS) < PANNEAU_CROQUIS:
             texte += ("\nLa carte a un ancien croquis (version %d) : televerse carte/machi_panneau/"
-                      "machi_panneau.ino (version %d) : images controlees, panneau rafraichi en continu."
+                      "machi_panneau.ino (version %d) : images controlees, et noir quand le PC s'eteint."
                       % (PANNEAU["croquis"], PANNEAU_CROQUIS))
         elif ips and ips < PANNEAU_IPS * 0.8:
             # « ca tombe a 5 fps parfois » : qui ralentit, la carte ou le PC ?

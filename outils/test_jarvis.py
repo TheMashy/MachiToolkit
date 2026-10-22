@@ -3086,7 +3086,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("version 1", m.etat_panneau_lisible()[0])
         m.PANNEAU.update(croquis=2)
         self.assertIn("ancien croquis (version 2)", m.etat_panneau_lisible()[0], "la v2 : passer a la v3")
-        m.PANNEAU.update(croquis=3, ips=5.0, calcul_ms=3.0, envoi_ms=180.0, carte_jetees=None)
+        m.PANNEAU.update(croquis=m.PANNEAU_CROQUIS, ips=5.0, calcul_ms=3.0, envoi_ms=180.0, carte_jetees=None)
         self.assertIn("la carte qui suit mal", m.etat_panneau_lisible()[0])
         m.PANNEAU.update(calcul_ms=190.0, envoi_ms=4.0)
         self.assertIn("le PC qui ralentit", m.etat_panneau_lisible()[0])
