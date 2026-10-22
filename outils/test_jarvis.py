@@ -3049,7 +3049,9 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(carte.ecrit, [])
         # les deux sorties : quitter Machi Tool et l'arret de Windows
         src = open(m.__file__, encoding="utf-8").read()
-        self.assertEqual(src.count("eteindre_panneau()\n                eteindre_guirlande()"), 2)
+        self.assertEqual(src.count("eteindre_panneau()\n                eteindre_guirlande()"), 1, "l'arret de Windows")
+        self.assertEqual(src.count("eteindre_en_partant()\n                eteindre_guirlande()"), 1,
+                         "quitter : noir, sauf pour une mise a jour (voir test_les_mises_a_jour_sur_le_panneau)")
 
     def test_le_panneau_dit_qui_ralentit_et_reconnait_son_croquis(self):
         # « ca tombe a 5 fps parfois, tu pourrais fixer ca ? »
@@ -3899,6 +3901,71 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("+", m._PETITE_3X5, "le « + » s'ecrit")
         self.assertFalse(coin(m.image_du_panneau(dict(cfg, panneau_discord=False), "horloge", t)).any())
         self.assertTrue(m.CONFIG_DEFAUT["panneau_discord"])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_les_mises_a_jour_sur_le_panneau(self):
+        # « rajoute un effet sur le panneau lorsqu'une maj est en cours sur Machi Tool »
+        m = self.m
+        sauve_maj = dict(m.MAJ)
+        sauve = {k: m.PANNEAU.get(k) for k in ("etat", "bienvenue", "fini")}
+        self.addCleanup(lambda: (m.MAJ.clear(), m.MAJ.update(sauve_maj), m.PANNEAU.update(sauve)))
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False}
+        t = 1_800_000_000.0
+        m.PANNEAU.update(bienvenue=None, etat="connecte")
+        m.MAJ.update(etat="a_jour", pose_lancee=None)
+        normale = m.image_du_panneau(cfg, "horloge", t)
+        # le telechargement : une barre en bas, a la mesure de ce qui est arrive, et « MAJ » en haut
+        def barre(p):
+            m.MAJ.update(etat="telechargement", progression=p)
+            img = m.image_du_panneau(cfg, "horloge", t)
+            return img, int((img[62:64] != (30, 34, 48)).any(axis=2).any(axis=0)[2:62].sum())
+        a, quart = barre(0.25)
+        _, trois_quarts = barre(0.75)
+        self.assertTrue(10 <= quart < trois_quarts <= 50, (quart, trois_quarts))
+        self.assertTrue(a[0:8].any() and not normale[0:8].any(), "« MAJ » en haut")
+        self.assertTrue((a[9:60] == normale[9:60]).all(), "l'heure reste lisible")
+        # la pose : l'anneau tourne autour de « MAJ » et de la version, plein ecran
+        m.MAJ.update(etat="a_poser", version="9.9.9", pose_lancee=t)
+        poses = [m.image_du_panneau(cfg, "horloge", t + k / 4.0) for k in range(4)]
+        self.assertEqual(len({p.tobytes() for p in poses}), 4, "l'anneau tourne")
+        self.assertTrue(poses[0][22:29].any() and not (poses[0] == normale).all())
+        self.assertTrue(((poses[0] == m.MAJ_TEINTE).all(axis=2)).any())
+        # la pose attend deux secondes que l'anneau se voie (panneau branche), puis part ;
+        # en partant, le panneau garde l'anneau au lieu de noircir
+        vrais = (m.lancer_installeur_maj, m.eteindre_panneau)
+        self.addCleanup(lambda: (setattr(m, "lancer_installeur_maj", vrais[0]),
+                                 setattr(m, "eteindre_panneau", vrais[1])))
+        lances, noircis = [], []
+        m.lancer_installeur_maj = lambda: lances.append(1) or True
+        m.eteindre_panneau = lambda: noircis.append(1) or True
+        m.MAJ.update(pose_lancee=None)
+        self.assertFalse(m.tenter_la_pose(False, maintenant=t))
+        self.assertEqual(m.MAJ["pose_lancee"], t)
+        self.assertFalse(m.tenter_la_pose(False, maintenant=t + 1.0))
+        self.assertTrue(m.tenter_la_pose(False, maintenant=t + m.MAJ_EFFET_S + 0.1))
+        self.assertEqual(lances, [1])
+        self.assertFalse(m.eteindre_en_partant())
+        self.assertEqual(noircis, [], "l'anneau reste")
+        m.MAJ.update(etat="a_jour", pose_lancee=None)
+        m.eteindre_en_partant()
+        self.assertEqual(noircis, [1], "un depart ordinaire : noir, comme avant")
+        # la nouvelle version : une coche, son numero ; seulement panneau branche ; puis l'heure en fondu
+        m.PANNEAU.update(etat="absent", bienvenue={"de": "9.9.8", "vers": "9.9.9", "debut": None})
+        self.assertIsNone(m.image_maj_du_moment(t), "personne ne la verrait : elle attend")
+        m.PANNEAU["etat"] = "connecte"
+        debut = m.image_du_panneau(cfg, "horloge", t)
+        milieu = m.image_du_panneau(cfg, "horloge", t + 1.5)
+        self.assertTrue(((milieu == (60, 220, 90)).all(axis=2)).sum() >= 20, "la coche")
+        self.assertFalse((debut == milieu).all())
+        fin = m.image_du_panneau(cfg, "horloge", t + m.MAJ_BIENVENUE_S - 0.1)
+        self.assertGreater(int(np.abs(fin.astype(int) - normale.astype(int)).sum()), 0)
+        apres = m.image_du_panneau(cfg, "horloge", t + m.MAJ_BIENVENUE_S + 0.1)
+        self.assertTrue((apres[:60] == normale[:60]).all(), "puis l'heure, comme avant (les secondes ont avance)")
+        self.assertIsNone(m.PANNEAU["bienvenue"])
+        # decochee : rien de tout ca
+        m.MAJ.update(etat="telechargement", progression=0.5)
+        self.assertTrue((m.image_du_panneau(dict(cfg, panneau_maj=False), "horloge", t) == normale).all())
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_maj"])
 
     def test_les_sources_du_cycle(self):
         m = self.m

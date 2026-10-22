@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.109.0"
+VERSION = "1.110.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -355,6 +355,8 @@ CONFIG_DEFAUT = {
     "panneau_claude": True,
     # « qu'il detecte quand j'ai une notification en attente sur Discord » (voir DISCORD_PROCESSUS)
     "panneau_discord": True,
+    # « un effet sur le panneau lorsqu'une maj est en cours » (voir MAJ_TEINTE)
+    "panneau_maj": True,
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -759,6 +761,7 @@ def charger_config():
     if vue and vue != VERSION:
         MAJ["etat"] = "a_jour"
         MAJ["message"] = "Mise a jour posee : %s vers %s." % (vue, VERSION)
+        PANNEAU["bienvenue"] = {"de": vue, "vers": VERSION, "debut": None}   # le panneau l'accueille
         print("Mise a jour posee : %s vers %s." % (vue, VERSION))
         # il le dit des que sa voix est prete (« Me revoila, en version... »)
         annoncer_maj("posee", VERSION, cfg)
@@ -13330,6 +13333,106 @@ def etat_claude_code_lisible(cfg, maintenant=None):
                  "fini": " : il a fini"}.get(etat_claude(t), ""))
 
 
+# LES MISES A JOUR, SUR LE PANNEAU. « Rajoute un effet sur le panneau
+# lorsqu'une mise a jour est en cours sur Machi Tool. » Trois moments :
+#   - le telechargement : une barre en bas, sous les secondes, qu'un reflet
+#     parcourt, et « MAJ » en haut ;
+#   - la pose : un anneau qui tourne autour de « MAJ » et de la version.
+#     Machi Tool le montre deux secondes avant de partir, et ne noircit pas
+#     le panneau en partant : l'animation reste (la carte l'eteint d'elle-meme
+#     cinq secondes plus tard) le temps que la nouvelle version reprenne ;
+#   - la nouvelle version : une coche qui se dessine, son numero, des
+#     etincelles, quatre secondes, puis l'horloge revient en fondu.
+MAJ_TEINTE = (80, 200, 255)
+MAJ_EFFET_S = 2.0                      # l'anneau de la pose, avant de partir
+MAJ_BIENVENUE_S = 4.0
+
+
+def largeur_5x7(texte):
+    return sum(len(_jv._glyphe(c)[0]) + 1 for c in str(texte)) - 1
+
+
+def _teinte(couleur, f):
+    return tuple(int(c * max(0.0, min(1.0, f))) for c in couleur)
+
+
+def dessiner_telechargement(img, progression, t, eclat=None):
+    """La barre du telechargement (deux lignes, en bas) et « MAJ » en haut."""
+    f = 1.0 if eclat is None else max(PANNEAU_ECLAT_MIN, eclat)
+    p = max(0.0, min(1.0, float(progression or 0.0)))
+    plein = int(round(p * (PANNEAU_L - 4)))
+    img[62:64, 2:PANNEAU_L - 2] = _teinte((30, 34, 48), f)
+    if plein:
+        img[62:64, 2:2 + plein] = _teinte(MAJ_TEINTE, f)
+        reflet = 2 + int((t * 40) % max(1, plein))
+        img[62:64, reflet:min(2 + plein, reflet + 3)] = _teinte((235, 250, 255), f)
+    ecrire_petit(img, "MAJ", None, 2, _teinte(MAJ_TEINTE, f * (0.6 + 0.4 * abs(math.sin(t * 2)))))
+
+
+def image_pose_maj(t, version, eclat=None):
+    """La pose : « MAJ » au milieu, la version dessous, et un anneau dont une
+    comete fait le tour, une fois par seconde."""
+    import numpy as np
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    f = 1.0 if eclat is None else max(PANNEAU_ECLAT_MIN, eclat)
+    cx, cy, r = 31.5, 29.5, 20.0
+    tete = (t % 1.0) * 2 * math.pi
+    for k in range(48):
+        a = k * 2 * math.pi / 48
+        derriere = (tete - a) % (2 * math.pi)            # 0 : la tete de la comete
+        lum = 0.3 + 0.7 * max(0.0, 1 - derriere / 2.2)
+        x, y = int(round(cx + r * math.cos(a))), int(round(cy + r * math.sin(a)))
+        if 0 <= x < PANNEAU_L and 0 <= y < PANNEAU_H:
+            img[y, x] = _teinte(MAJ_TEINTE if derriere > 0.2 else (235, 250, 255), f * lum)
+    ecrire_5x7(img, "MAJ", (PANNEAU_L - largeur_5x7("MAJ")) // 2, 22, _teinte((235, 240, 255), f))
+    v = str(version or "")
+    ecrire_petit(img, v, None, 33, _teinte(MAJ_TEINTE, f))
+    return img
+
+
+def image_bienvenue(t, ecoule, version, eclat=None):
+    """La nouvelle version arrive : une coche qui se dessine, son numero,
+    des etincelles qui scintillent."""
+    import numpy as np
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    f = 1.0 if eclat is None else max(PANNEAU_ECLAT_MIN, eclat)
+    vert = (60, 220, 90)
+    coche = [(22, 26), (25, 29), (28, 32), (31, 29), (34, 26), (37, 23), (40, 20), (43, 17)]
+    n = int(len(coche) * min(1.0, ecoule / 0.8)) + 1
+    for (x0, y0), (x1, y1) in zip(coche[:n], coche[1:n]):
+        for k in range(7):
+            x, y = int(round(x0 + (x1 - x0) * k / 6)), int(round(y0 + (y1 - y0) * k / 6))
+            img[y - 1:y + 2, x - 1:x + 1] = _teinte(vert, f)
+    ecrire_petit(img, "V" + str(version or ""), None, 42, _teinte((235, 240, 255), f * min(1.0, ecoule / 0.8)))
+    for k in range(16):                                  # des etincelles, chacune a son rythme
+        x = int(_hasard(k * 7 + 1) * (PANNEAU_L - 4)) + 2
+        y = int(_hasard(k * 7 + 3) * 50) + 4
+        lum = max(0.0, math.sin(t * 3.1 + k * 1.7)) ** 3
+        if lum > 0.05 and not img[y, x].any():
+            img[y, x] = _teinte(MAJ_TEINTE if k % 2 else (255, 220, 120), f * lum)
+    return img
+
+
+def image_maj_du_moment(t, eclat=None):
+    """Ce que la mise a jour montre plein ecran a l'instant t (la pose, ou la
+    nouvelle version qui arrive), ou None. La bienvenue ne commence qu'une
+    fois le panneau branche : sinon personne ne la verrait."""
+    if MAJ.get("pose_lancee") and MAJ.get("etat") == "a_poser":
+        return image_pose_maj(t, MAJ.get("version"), eclat)
+    b = PANNEAU.get("bienvenue")
+    if not b:
+        return None
+    if b.get("debut") is None:
+        if PANNEAU.get("etat") != "connecte":
+            return None
+        b["debut"] = t
+    ecoule = t - b["debut"]
+    if ecoule >= MAJ_BIENVENUE_S or ecoule < 0:
+        PANNEAU["bienvenue"] = None
+        return None
+    return image_bienvenue(t, ecoule, b.get("vers"), eclat)
+
+
 # DISCORD. « Tu peux faire en sorte que ca detecte quand j'ai une
 # notification en attente sur Discord ? » Discord ecrit ce qui t'attend dans
 # le titre de sa fenetre, comme un onglet : « (3) Discord | ... » -- trois
@@ -13408,6 +13511,17 @@ def image_du_panneau(cfg, contenu, t):
     if PANNEAU.get("mire"):
         return image_mire()
     eclat = eclat_guirlande() if cfg.get("panneau_suit_eclat", True) else None
+    effet = image_maj_du_moment(t, eclat) if cfg.get("panneau_maj", True) else None
+    if effet is not None:
+        if PANNEAU.get("bienvenue") and PANNEAU["bienvenue"].get("debut") is not None:
+            # les dernieres 0,6 s : la bienvenue s'efface dans l'image d'apres
+            reste = MAJ_BIENVENUE_S - (t - PANNEAU["bienvenue"]["debut"])
+            if reste < 0.6:
+                import numpy as np
+                dessous = image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat)
+                k = max(0.0, reste / 0.6)
+                return np.clip(np.round(effet * k + dessous * (1 - k)), 0, 255).astype(np.uint8)
+        return effet
     # le programme du jour passe devant Jarvis : demande (« resume-moi ma
     # journee »), il est actif pendant qu'il le dit
     programme = programme_au_panneau(t)
@@ -13440,6 +13554,8 @@ def image_du_panneau(cfg, contenu, t):
     discord = PANNEAU.get("discord") if cfg.get("panneau_discord", True) else None
     if discord:
         dessiner_pastille_discord(img, discord, eclat)  # en haut a gauche
+    if cfg.get("panneau_maj", True) and MAJ.get("etat") == "telechargement":
+        dessiner_telechargement(img, MAJ.get("progression"), t, eclat)
     return img
 
 
@@ -13745,6 +13861,16 @@ def piloter_panneau(cfg=None, tours=None):
             lien.close()
         except Exception:
             pass
+
+
+def eteindre_en_partant():
+    """Le panneau, quand Machi Tool s'en va : noir -- sauf pour une mise a
+    jour, ou l'anneau de la pose reste le temps que la nouvelle version
+    reprenne (la carte s'eteint d'elle-meme cinq secondes sans image)."""
+    if MAJ.get("pose_lancee") and MAJ.get("etat") == "a_poser":
+        PANNEAU["fini"] = True                   # le fil n'ecrit plus, le panneau garde l'anneau
+        return False
+    return eteindre_panneau()
 
 
 def eteindre_panneau():
@@ -17487,7 +17613,7 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_cycle", "meteo_ville",
+                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_maj", "panneau_cycle", "meteo_ville",
                     "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
                     "panneau_eq_sensibilite"):
@@ -17586,6 +17712,13 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_jarvis"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « un effet sur le panneau lorsqu'une maj est en cours »
+        self.var_panneau_maj = tk.IntVar(value=1 if self.cfg.get("panneau_maj", True) else 0)
+        c = self.case(col, "Les mises a jour de Machi Tool : la barre du telechargement, un anneau pendant la pose, "
+                           "et la nouvelle version qui arrive", self.var_panneau_maj,
+                      lambda: self.regler_panneau("panneau_maj"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
         # « qu'il detecte quand j'ai une notification en attente sur Discord »
         self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
         c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
@@ -17658,6 +17791,8 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
         elif cle == "panneau_claude":
             self.cfg[cle] = bool(self.var_panneau_claude.get())
+        elif cle == "panneau_maj":
+            self.cfg[cle] = bool(self.var_panneau_maj.get())
         elif cle == "panneau_discord":
             self.cfg[cle] = bool(self.var_panneau_discord.get())
             if not self.cfg[cle]:
@@ -21121,7 +21256,7 @@ def lancer():
         if demande_arret.is_set():
             ETAT["en_marche"] = False
             if CFG.get("eteindre_en_partant", True):
-                eteindre_panneau()
+                eteindre_en_partant()
                 eteindre_guirlande()
             arreter_activite()
             arreter_api()
@@ -21263,12 +21398,22 @@ def attente_verification_maj(cfg):
     return max(1, entier(cfg.get("maj_intervalle_minutes", 2), 2)) * 60
 
 
-def tenter_la_pose(fenetre_visible, inactivite=0.0):
+def tenter_la_pose(fenetre_visible, inactivite=0.0, maintenant=None):
     """Depuis la boucle de la fenetre : pose la version si c'est le moment.
     La fenetre etait ouverte : la nouvelle version la rouvrira (le meme mot
-    qu'un second lancement). Rend True si l'application doit s'arreter."""
+    qu'un second lancement). Rend True si l'application doit s'arreter.
+    Le panneau branche, l'anneau de la pose y tourne d'abord MAJ_EFFET_S."""
+    t = time.time() if maintenant is None else maintenant
     if not poser_la_maj(fenetre_visible, inactivite):
+        MAJ["pose_lancee"] = None
         return False
+    if PANNEAU.get("etat") == "connecte" and CFG.get("panneau_maj", True):
+        if not MAJ.get("pose_lancee"):
+            MAJ["pose_lancee"] = t
+        if t - MAJ["pose_lancee"] < MAJ_EFFET_S:
+            return False
+    else:
+        MAJ["pose_lancee"] = MAJ.get("pose_lancee") or t
     if fenetre_visible:
         demander_panneau()
     if lancer_installeur_maj():
