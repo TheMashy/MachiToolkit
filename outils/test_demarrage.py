@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 
 RACINE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1338,6 +1339,73 @@ class MiseAJourQuiDisparait(unittest.TestCase):
         self.assertFalse(mt.poser_la_maj(True))
         self.assertFalse(mt.poser_la_maj(True))
         self.assertTrue(mt.poser_la_maj(False))
+
+    def test_personne_au_clavier_libere_la_pose(self):
+        """« Fais en sorte que Machi Tool detecte les nouvelles PR et fasse les
+        majs » : une fenetre laissee ouverte devant un PC ou personne ne touche
+        a rien ne retient plus la version des heures."""
+        mt = self.mt
+        mt.MAJ["etat"] = "a_poser"
+        self.assertFalse(mt.poser_la_maj(True, inactivite=10), "quelqu'un est la : elle attend")
+        self.assertTrue(mt.MAJ["differee"])
+        self.assertTrue(mt.poser_la_maj(True, inactivite=mt.MAJ_INACTIF_S + 1))
+        self.assertFalse(mt.MAJ["differee"])
+
+    def test_la_pose_rouvre_la_fenetre_qui_etait_ouverte(self):
+        mt = self.mt
+        vrais = (mt.lancer_installeur_maj, mt.demander_panneau)
+        self.addCleanup(lambda: (setattr(mt, "lancer_installeur_maj", vrais[0]),
+                                 setattr(mt, "demander_panneau", vrais[1])))
+        lances, rouvertes = [], []
+        mt.lancer_installeur_maj = lambda: lances.append(1) or True
+        mt.demander_panneau = lambda: rouvertes.append(1) or True
+        mt.MAJ["etat"] = "a_poser"
+        self.assertFalse(mt.tenter_la_pose(True, 5))
+        self.assertEqual(lances, [])
+        self.assertTrue(mt.tenter_la_pose(True, mt.MAJ_INACTIF_S + 1))
+        self.assertEqual((lances, rouvertes), ([1], [1]), "la nouvelle version rouvrira la fenetre")
+        self.assertIn("mise a jour vers 9.9.9", open(mt.FICHIER_JOURNAL, encoding="utf-8").read())
+        self.assertTrue(mt.tenter_la_pose(False))
+        self.assertEqual(rouvertes, [1], "fermee, elle reste fermee")
+        mt.lancer_installeur_maj = lambda: False
+        self.assertFalse(mt.tenter_la_pose(False), "l'installeur n'est pas parti : on reste")
+        self.assertFalse(mt.MAJ["differee"])
+
+    def test_verifier_toutes_les_deux_minutes(self):
+        mt = self.mt
+        self.assertEqual(mt.attente_verification_maj(mt.CONFIG_DEFAUT), 120)
+        self.assertEqual(mt.attente_verification_maj({"maj_intervalle_minutes": "abime"}), 120)
+        self.assertEqual(mt.attente_verification_maj({"maj_intervalle_minutes": 0}), 60)
+
+    def test_github_ne_compte_pas_ce_qui_n_a_pas_change(self):
+        """Regarder toutes les deux minutes sans compte GitHub : 60 demandes par
+        heure au plus -- sauf les reponses « rien de neuf » (304), gratuites."""
+        mt = self.mt
+        vrai = mt._ouvrir
+        self.addCleanup(lambda: setattr(mt, "_ouvrir", vrai))
+        mt._GITHUB_DEJA_LU.clear()
+        demandes = []
+        publication = [{"tag_name": "v9.9.9", "body": "", "html_url": "x", "draft": False,
+                        "assets": [{"name": "MachiTool.exe", "browser_download_url": "u", "size": 3}]}]
+
+        class Reponse(io.BytesIO):
+            headers = {"ETag": '"v1"'}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def ouvrir(url, delai=20, entetes=None):
+            demandes.append(dict(entetes or {}))
+            if (entetes or {}).get("If-None-Match") == '"v1"':
+                raise urllib.error.HTTPError(url, 304, "Not Modified", {}, None)
+            return Reponse(json.dumps(publication).encode())
+        mt._ouvrir = ouvrir
+        self.assertEqual(mt.derniere_publication(True)["version"], "9.9.9")
+        self.assertEqual(mt.derniere_publication(True)["version"], "9.9.9", "304 : la meme, relue de la memoire")
+        self.assertEqual(demandes, [{}, {"If-None-Match": '"v1"'}])
 
     def test_une_guirlande_qui_retombe_aussitot_espace_ses_tentatives(self):
         """UNE GUIRLANDE QUI CLIGNOTE, C'EST UNE SESSION QUI NE TIENT PAS.
