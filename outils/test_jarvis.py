@@ -3754,6 +3754,99 @@ class DansMachiTool(unittest.TestCase):
         m.brancher_claude_code(cfg, neuf)
         self.assertTrue(m.claude_code_branche(neuf))
 
+    def test_la_bulle_des_sessions_cloud(self):
+        # « on peut partir sur le lien des sessions cloud, avec la variable d'environnement » :
+        # les crochets du depot posent l'etape chez BrainDebugger, Machi Tool la releve
+        m = self.m
+        self.addCleanup(lambda: (m.CLAUDE_CODE["sessions"].clear(), m.CLAUDE_CODE.update(distantes={}, vu_cloud=0.0)))
+        m.CLAUDE_CODE["sessions"].clear()
+        # la cle de la bulle : la meme que BrainDebugger calcule (vecteur commun, voir son test)
+        self.assertEqual(m.cle_bulle_claude({"pont_cle": "cle-de-test"}), "bbb1f950f42614c413242a554340eaac")
+        self.assertEqual(m.cle_bulle_claude({"pont_cle": ""}), "")
+        # ce que BrainDebugger rend : la derniere etape de chaque session, et son age
+        t = 1_800_000_000.0
+        rendu = {"sessions": [
+            {"hook_event_name": "PreToolUse", "session_id": "c1", "tool_name": "Bash", "age_s": 3, "dossier": "MachiToolkit"},
+            {"hook_event_name": "Stop", "session_id": "c2", "age_s": 30}]}
+        self.assertEqual(m.relever_bulle_distante({}, t, lire=lambda cfg: rendu), 2)
+        self.assertEqual(m.etat_claude(t), "travaille")
+        self.assertEqual(m.CLAUDE_CODE["distantes"]["c1"]["quand"], t - 3)
+        rendu["sessions"][0] = {"hook_event_name": "Notification", "session_id": "c1",
+                                "notification_type": "permission_prompt", "age_s": 1}
+        m.relever_bulle_distante({}, t, lire=lambda cfg: rendu)
+        self.assertEqual(m.etat_claude(t), "bloque", "une session cloud attend ton accord : rouge")
+        m.relever_bulle_distante({}, t, lire=lambda cfg: {"sessions": [rendu["sessions"][1]]})
+        self.assertEqual(m.etat_claude(t), "fini", "chaque releve remplace la precedente")
+        m.relever_bulle_distante({}, t, lire=lambda cfg: {"sessions": []})
+        self.assertIsNone(m.etat_claude(t))
+        # les sessions locales comptent toujours, avec celles du cloud
+        m.recevoir_claude_code({"hook_event_name": "UserPromptSubmit", "session_id": "local"}, t)
+        m.relever_bulle_distante({}, t, lire=lambda cfg: {"sessions": [rendu["sessions"][1]]})
+        self.assertEqual(m.etat_claude(t), "travaille")
+        # le fil : seulement la passerelle reglee ; un BrainDebugger d'avant ne casse rien
+        vrai = m._lire_bulle_distante
+        self.addCleanup(lambda: setattr(m, "_lire_bulle_distante", vrai))
+        lus = []
+        m._lire_bulle_distante = lambda cfg: lus.append(1) or {"sessions": []}
+        m.veiller_bulle_distante({"pont_cle": "", "pont_site": "https://x"}, tours=1)
+        self.assertEqual(lus, [], "sans cle de passerelle : rien")
+        m.veiller_bulle_distante({"pont_cle": "k", "pont_site": "https://x", "panneau_claude": False}, tours=1)
+        self.assertEqual(lus, [], "bulle decochee : rien")
+        m.veiller_bulle_distante({"pont_cle": "k", "pont_site": "https://x"}, tours=1)
+        self.assertEqual(lus, [1])
+
+        def introuvable(cfg):
+            raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+        m._lire_bulle_distante = introuvable
+        m.veiller_bulle_distante({"pont_cle": "k", "pont_site": "https://x"}, tours=1)
+        # les crochets du depot : le script, tel que Claude Code le lance dans le cloud
+        with open(os.path.join(RACINE, ".claude", "settings.json"), encoding="utf-8") as f:
+            reglages = json.load(f)
+        self.assertEqual(set(reglages["hooks"]), set(m.CLAUDE_EVENEMENTS))
+        commande = reglages["hooks"]["Stop"][0]["hooks"][0]["command"]
+        self.assertIn(".claude/bulle_claude.py", commande)
+        self.assertTrue(commande.endswith("|| true"), "jamais d'erreur dans Claude Code")
+        recus = []
+
+        class Faux(m.http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                corps = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                recus.append((self.headers.get("X-Machitool-Bulle"), json.loads(corps)))
+                self.send_response(204)
+                self.end_headers()
+        serveur = m.http.server.ThreadingHTTPServer(("127.0.0.1", 0), Faux)
+        threading.Thread(target=serveur.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (serveur.shutdown(), serveur.server_close()))
+        script = os.path.join(RACINE, ".claude", "bulle_claude.py")
+
+        def crochet(evenement, cle="la-cle"):
+            env = dict(os.environ, MACHITOOL_BULLE_URL="http://127.0.0.1:%d/api/machitool/claude"
+                       % serveur.server_address[1], NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+            env.pop("MACHITOOL_BULLE_CLE", None)
+            if cle:
+                env["MACHITOOL_BULLE_CLE"] = cle
+            r = subprocess.run([sys.executable, script], input=json.dumps(evenement), capture_output=True,
+                               text=True, env=env, timeout=10)
+            self.assertEqual((r.returncode, r.stdout), (0, ""), "il ne dit rien a Claude Code")
+        crochet({"hook_event_name": "PreToolUse", "session_id": "c1", "cwd": "/home/user/MachiToolkit",
+                 "tool_name": "Write", "tool_input": {"content": "un secret"}, "transcript_path": "/x"})
+        self.assertEqual(recus, [("la-cle", {"hook_event_name": "PreToolUse", "session_id": "c1",
+                                             "dossier": "MachiToolkit", "tool_name": "Write"})])
+        self.assertNotIn("secret", json.dumps(recus))
+        crochet({"hook_event_name": "UserPromptSubmit", "session_id": "c1", "prompt": "ma demande"})
+        self.assertNotIn("ma demande", json.dumps(recus), "la demande ne part pas")
+        n = len(recus)
+        crochet({"hook_event_name": "Notification", "session_id": "c1", "notification_type": "idle_prompt",
+                 "message": "Claude is waiting for your input"})
+        crochet({"hook_event_name": "Stop", "session_id": "c1"}, cle="")
+        self.assertEqual(len(recus), n, "rien a dire, ou pas de cle : rien ne part")
+        crochet({"hook_event_name": "Notification", "session_id": "c1", "notification_type": "permission_prompt",
+                 "message": "Claude needs your permission to use Bash"})
+        self.assertEqual(m.etat_de_claude_code(recus[-1][1]), "bloque")
+
     def test_les_sources_du_cycle(self):
         m = self.m
         sauve = {k: m.PANNEAU.get(k) for k in ("meteo", "musique_vue", "morceau", "morceau_cle", "musique_saut",

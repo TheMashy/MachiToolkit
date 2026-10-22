@@ -446,6 +446,12 @@ class AL_Ecran(unittest.TestCase):
             self.assertIn("Ajoute", p.txt_claude_code.cget("text"))
             p.basculer_claude_code()
             self.assertFalse(M.claude_code_branche(chemin))
+            # les sessions cloud : la variable a copier (hors de Windows, elle s'affiche)
+            garde = M.CFG.get("pont_cle")
+            M.CFG["pont_cle"] = "cle-de-test"
+            p.copier_cle_bulle()
+            M.CFG["pont_cle"] = garde
+            self.assertEqual(p.txt_claude_cloud.cget("text"), "MACHITOOL_BULLE_CLE=bbb1f950f42614c413242a554340eaac")
         finally:
             M.CFG["panneau_claude"] = True
             p.root.destroy()
