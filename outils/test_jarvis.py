@@ -3456,9 +3456,10 @@ class DansMachiTool(unittest.TestCase):
         m = self.m
         acc = (255, 170, 40)
         t0 = time.mktime((2026, 10, 22, 14, 20, 0, 0, 0, -1))
-        t0 += 0.5 - ((t0 + 0.9) % 4.0) + 4.0                 # les yeux ouverts...
-        while not 2.5 < t0 % m.MAID_COEUR_S < 6.8:           # ... et loin du petit coeur
-            t0 += 4.0
+        t0 = (t0 // m.MAID_ENVIE_S) * m.MAID_ENVIE_S + 4.2      # hors de ses petites envies...
+        while m.chat_cligne(t0 + 0.9) or m.chat_cligne(t0 + 1.9):  # ... les yeux ouverts
+            t0 += m.MAID_ENVIE_S
+        self.assertEqual(m.maid_envie(t0, 0), (None, 0.0))
         zone = lambda t: m._zone_du_cycle("maid", t, acc, [], [], 10.0)
         proche = lambda img, couleur, tol=30: (np.abs(img[39:59].astype(int) - np.array(couleur)).max(axis=2) <= tol)
         repos = zone(t0)
@@ -3476,10 +3477,10 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue((repos[m.BONHOMME_SOL] == decor[m.BONHOMME_SOL]).all(axis=1).sum() >= 50, "le chemin")
         self.assertTrue((repos == m.SOLEIL).all(axis=2).any(), "l'apres-midi, le soleil")
         self.assertAlmostEqual(m.maid_pose(x, t0)["hanche"][0], x)
-        def x_de_la_maid(h):
-            img = zone(time.mktime((2026, 10, 22, h, 0, 0, 0, 0, -1)))
-            return int(np.nonzero(proche(img[:, :, :], m.NOIR_CHAT)[:17].any(axis=0))[0].min())
-        self.assertLess(x_de_la_maid(6) + 20, x_de_la_maid(18), "elle avance avec la journee")
+        x_a = lambda h: m.chemin_de_la_journee(np.zeros_like(repos), time.mktime((2026, 10, 22, h, 0, 0, 0, 0, -1)), acc)
+        self.assertLess(x_a(6) + 20, x_a(18), "elle avance avec la journee")
+        cols = np.nonzero(proche(repos, m.NOIR_CHAT)[:16].any(axis=0))[0]      # (au-dessus du chemin)
+        self.assertTrue(x - 7 <= cols.min() and cols.max() <= x + 5, "et elle est bien la ou en est la journee")
         plus_tard = m.chemin_de_la_journee(np.zeros_like(repos), t0 + 3, acc)
         self.assertLess(abs(m.maid_pose(plus_tard, t0 + 3)["hanche"][0] - x), 0.01, "elle reste sur place")
         # rien dans les mains : devant elle, plus rien (ni plateau, ni tasse)
@@ -3495,10 +3496,13 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(len({i.tobytes() for i in images}), 30, "chaque image de la seconde est neuve")
         # elle cligne des yeux : un grand oeil de deux pixels, un trait ferme
         ouvert = int(proche(repos, m.YEUX_CHAT, 0).sum())
-        ferme = int(proche(zone(t0 - ((t0 + 0.9) % 4.0) + 0.05), m.YEUX_CHAT, 0).sum())
+        cligne = next(t0 + k / 100.0 for k in range(400) if m.chat_cligne(t0 + k / 100.0 + 0.9))
+        self.assertIsNone(m.maid_envie(cligne, 0)[0])
+        ferme = int(proche(zone(cligne), m.YEUX_CHAT, 0).sum())
         self.assertEqual((ouvert, ferme), (2, 1))
         # de temps en temps, un petit coeur s'envole derriere elle
-        coeur = t0 - (t0 % m.MAID_COEUR_S) + m.MAID_COEUR_S + 0.9
+        coeur = next(n * m.MAID_ENVIE_S + 0.9 for n in range(int(t0 // m.MAID_ENVIE_S), int(t0 // m.MAID_ENVIE_S) + 500)
+                     if m.maid_envie(n * m.MAID_ENVIE_S + 0.9, 0)[0] == "coeur")
         def rose(img):                                        # du rose (qui s'efface), derriere elle
             r, g, b = (img[39:59].astype(int)[..., i] for i in range(3))
             derriere = np.arange(m.PANNEAU_L) < x - 2
@@ -3507,7 +3511,10 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(rose(repos), 0)
         # au petit matin, pres du bord : le coeur passe devant elle ; minuit, 23 h 59 : rien ne casse
         matin = time.mktime((2026, 10, 22, 0, 30, 0, 0, 0, -1))
-        matin += 0.9 - (matin % m.MAID_COEUR_S)
+        m.PANNEAU["present"] = False                         # (pas de veille : rien que le coeur en rose)
+        self.addCleanup(m.PANNEAU.pop, "present", None)
+        matin = next(n * m.MAID_ENVIE_S + 0.9 for n in range(int(matin // m.MAID_ENVIE_S), int(matin // 9) + 2000)
+                     if m.maid_envie(n * m.MAID_ENVIE_S + 0.9, 1)[0] == "coeur")
         img = zone(matin)
         r, g, b = (img[39:59].astype(int)[..., i] for i in range(3))
         self.assertGreaterEqual(int(((r > 40) & (r > 2 * g) & (b > g)).sum()), 12)
@@ -3523,11 +3530,104 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(c["ecoule_precedent"], 31, "la vue qui s'en va garde son temps : elle ne saute pas")
         self.assertNotIn("maid", m.cycle_disponible(t0, {"panneau_cycle_maid": False}))
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_maid_la_nuit_et_ses_envies(self):
+        # « rajoute aussi une interface de nuit lorsque je veille tard pour la maid » -- « rajoute
+        # plusieurs animations en fonction de la fatigue, ou des petites animations random »
+        m = self.m
+        acc = (255, 170, 40)
+        sauve = {k: m.PANNEAU.get(k) for k in ("present", "debout_depuis")}
+        self.addCleanup(lambda: m.PANNEAU.update(sauve))
+        heure = lambda h, mi=0: time.mktime((2026, 10, 22, h, mi, 0, 0, 0, -1))
+        # la fatigue : l'heure, puis les heures devant le PC sans pause
+        self.assertEqual(m.fatigue_maid(heure(14)), 0.0)
+        self.assertTrue(0 < m.fatigue_maid(heure(22)) < 0.3)
+        self.assertGreaterEqual(m.fatigue_maid(heure(1)), 0.6)
+        self.assertEqual(m.fatigue_maid(heure(4)), 1.0)
+        self.assertEqual(m.fatigue_maid(heure(8)), 0.0)
+        self.assertAlmostEqual(m.fatigue_maid(heure(14), heure(14) - 6 * 3600), 0.3, msg="six heures sans pause")
+        self.assertEqual([m.niveau_fatigue(f) for f in (0.0, 0.5, 0.9)], [0, 1, 2])
+        self.assertLess(m.MAID_PAS_S[0], m.MAID_PAS_S[2], "epuisee, elle traine des pieds")
+        # es-tu la ? le clavier et la souris le disent
+        m.PANNEAU.update(present=None, debout_depuis=None)
+        self.assertTrue(m.suivre_presence(heure(1), inactivite=10))
+        self.assertEqual(m.PANNEAU["debout_depuis"], heure(1) - 10)
+        self.assertFalse(m.suivre_presence(heure(1), inactivite=400))
+        self.assertIsNone(m.PANNEAU["debout_depuis"])
+        # l'interface de nuit : tard, et seulement si tu veilles
+        self.assertTrue(m.maid_veille(heure(1), True) and m.maid_veille(heure(23, 30), True))
+        self.assertFalse(m.maid_veille(heure(1), False), "tu dors : pas d'interface de nuit")
+        self.assertFalse(m.maid_veille(heure(22), True) or m.maid_veille(heure(6), True))
+        # les envies : tirees au sort -- le meme instant donne la meme --, selon la fatigue
+        def envies(niveau):
+            return {m.maid_envie(heure(12) + k * m.MAID_ENVIE_S + 0.5, niveau)[0] for k in range(400)}
+        self.assertEqual(m.maid_envie(heure(12) + 0.5, 0), m.maid_envie(heure(12) + 0.5, 0))
+        en_forme, fatiguee, epuisee = envies(0), envies(1), envies(2)
+        self.assertEqual(en_forme, {"saut", "derriere", "coeur", "reverence", None})
+        self.assertTrue({"baille", "frotte"} <= fatiguee and not {"zzz", "pique"} & fatiguee)
+        self.assertTrue({"pique", "zzz", "baille"} <= epuisee and "saut" not in epuisee)
+        self.assertIsNone(m.maid_envie(heure(12) + 4.5, 2)[0], "entre deux envies, elle marche")
+
+        def instant(nom, niveau, u=0.5, h=14):
+            for n in range(int(heure(h) // m.MAID_ENVIE_S), int(heure(h) // m.MAID_ENVIE_S) + 4000):
+                t = n * m.MAID_ENVIE_S + u * m.MAID_ENVIES[nom]
+                if m.maid_envie(t, niveau)[0] == nom:
+                    return t
+            self.fail(nom)
+        x = 30.0
+        fatigues = (0.0, 0.5, 0.9)
+        pose = lambda nom, niveau=0, u=0.5: m.maid_pose(x, instant(nom, niveau, u=u), fatigues[niveau])
+        calme = (heure(14) // m.MAID_ENVIE_S) * m.MAID_ENVIE_S + 5.0
+        repos = m.maid_pose(x, calme)
+        self.assertEqual((repos["envie"], repos["calme"], repos["oreilles"]), (None, 0.0, 0.0))
+        # en forme : un petit saut, se retourner, un coeur (sans s'arreter), une reverence
+        saut = pose("saut")
+        self.assertLess(saut["hanche"][1], repos["hanche"][1] - 1.5)
+        self.assertEqual(saut["yeux"], "contents")
+        self.assertTrue(pose("derriere")["miroir"] and not repos["miroir"])
+        coeur = pose("coeur")
+        self.assertEqual((coeur["calme"], coeur["yeux"]), (0.0, "contents"))
+        rev = pose("reverence")
+        self.assertGreater(rev["tete"][0], repos["tete"][0] + 1)
+        self.assertGreater(rev["tete"][1], repos["tete"][1] + 0.5)
+        # fatiguee : les paupieres lourdes, les oreilles basses ; elle baille, se frotte l'oeil
+        lourde = m.maid_pose(x, calme + 0.3 if not m.chat_cligne(calme + 1.2) else calme + 2.3, 0.5)
+        self.assertEqual((lourde["yeux"], lourde["oreilles"]), ("lourds", 0.6))
+        baille = pose("baille", 1)
+        self.assertEqual((baille["bouche"], baille["yeux"]), ("ouverte", "fermes"))
+        dist = lambda a, b: float(np.hypot(a[0] - b[0], a[1] - b[1]))
+        self.assertLess(dist(baille["main1"], (baille["tete"][0] + 2.4, baille["tete"][1] + 2.2)), 0.1,
+                        "la main devant la bouche")
+        frotte = pose("frotte", 1)
+        self.assertLess(dist(frotte["main1"], (frotte["tete"][0] + 1.9, frotte["tete"][1] + 0.9)), 0.5)
+        # epuisee : elle pique du nez (la tete tombe puis se releve), s'endort debout
+        tombe, releve = pose("pique", 2, 0.7), pose("pique", 2, 0.95)
+        self.assertGreater(tombe["tete"][1], releve["tete"][1] + 1.0)
+        self.assertEqual(tombe["oreilles"], 1.1)
+        m.PANNEAU["present"] = False
+        img = m._zone_du_cycle("maid", instant("zzz", 2, h=3, u=0.4), acc, [], [], 10.0)
+        r, g, b = (img[39:59].astype(int)[..., i] for i in range(3))
+        self.assertGreaterEqual(int(((r > 100) & (r == g) & (b > r + 25)).sum()), 8, "des « z » qui montent")
+        # la nuit, si tu veilles : des etoiles, la chemise de nuit, le bonnet
+        proche = lambda img, couleur, tol=30: (np.abs(img[39:59].astype(int) - np.array(couleur)).max(axis=2) <= tol)
+        nuit_t = (heure(1) // m.MAID_ENVIE_S) * m.MAID_ENVIE_S + 5.0
+        m.PANNEAU.update(present=True, debout_depuis=None)
+        veille = m._zone_du_cycle("maid", nuit_t, acc, [], [], 10.0)
+        m.PANNEAU["present"] = False
+        dort = m._zone_du_cycle("maid", nuit_t, acc, [], [], 10.0)
+        etoiles = lambda img: sum(bool(img[y, x_].any()) for x_, y in m._ETOILES)
+        self.assertGreaterEqual(etoiles(veille), 8)
+        self.assertLessEqual(etoiles(dort), 2, "tu dors : pas d'etoiles")
+        self.assertGreaterEqual(int(proche(veille, m.PYJAMA, 20).sum()), 6, "la chemise de nuit")
+        self.assertEqual(int(proche(dort, m.PYJAMA, 20).sum()), 0)
+        self.assertGreaterEqual(int(proche(veille, acc, 60).sum()), 6, "le bonnet de nuit")
+
     def test_les_sources_du_cycle(self):
         m = self.m
         sauve = {k: m.PANNEAU.get(k) for k in ("meteo", "musique_vue", "morceau", "morceau_cle", "musique_saut",
-                                               "etat", "meteo_a_relire")}
-        vrais = {k: getattr(m, k) for k in ("demarrer_audio", "sauver_config", "morceau_en_cours", "_lire_url_json")}
+                                               "etat", "meteo_a_relire", "present", "debout_depuis")}
+        vrais = {k: getattr(m, k) for k in ("demarrer_audio", "sauver_config", "morceau_en_cours", "_lire_url_json",
+                                            "secondes_inactivite")}
         son = dict(m.SON)
         self.addCleanup(lambda: (m.PANNEAU.update(sauve), m.SON.update(son),
                                  [setattr(m, k, v) for k, v in vrais.items()]))
@@ -3567,9 +3667,11 @@ class DansMachiTool(unittest.TestCase):
         m.morceau_en_cours = lambda cfg: None
         m._lire_url_json = lire
         m.SON.update(panneau=False, marche=True)
-        m.PANNEAU["etat"] = "connecte"
+        m.PANNEAU.update(etat="connecte", debout_depuis=None)
+        m.secondes_inactivite = lambda: 42.0
         m.veiller_sources_panneau({"panneau_contenu": "horloge", "meteo_ville": "Lyon"}, tours=1, maintenant=200.0)
         self.assertTrue(m.SON["panneau"])
+        self.assertEqual((m.PANNEAU["present"], m.PANNEAU["debout_depuis"]), (True, 158.0), "la maid sait si tu es la")
         self.assertEqual(lances, [1])
         m.arreter_audio()
         self.assertTrue(m.SON["marche"], "la guirlande quitte le mode son : l'egaliseur garde la capture")
