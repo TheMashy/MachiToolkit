@@ -444,8 +444,16 @@ class AL_Ecran(unittest.TestCase):
             p.var_panneau_cycle_saut.set(0)
             p.regler_panneau("panneau_cycle_saut")
             self.assertFalse(M.CFG["panneau_cycle_saut"])
+            # « un petit :3 » se decoche, la sensibilite de l'egaliseur se regle
+            p.var_panneau_cycle_chat.set(0)
+            p.regler_panneau("panneau_cycle_chat")
+            self.assertFalse(M.CFG["panneau_cycle_chat"])
+            self.assertAlmostEqual(float(p.var_panneau_eq_sensibilite.get()), 1.0)
+            p.var_panneau_eq_sensibilite.set(1.8)
+            self.assertEqual(M.CFG["panneau_eq_sensibilite"], 1.8)
         finally:
-            for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_saut"):
+            for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_saut",
+                        "panneau_cycle_chat", "panneau_eq_sensibilite"):
                 M.CFG[cle] = M.CONFIG_DEFAUT[cle]
             p.root.destroy()
 

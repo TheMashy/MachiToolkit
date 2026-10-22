@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.97.0"
+VERSION = "1.98.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -361,6 +361,8 @@ CONFIG_DEFAUT = {
     "panneau_cycle_musique": True,
     "panneau_cycle_bonhomme": True,
     "panneau_cycle_saut": True,       # un morceau qui change : la musique tout de suite
+    "panneau_cycle_chat": True,       # « un petit :3 qui arrive, qui cligne des yeux »
+    "panneau_eq_sensibilite": 1.0,    # l'egaliseur : 0,2 (calme) a 3 (tout monte)
     "meteo_ville": "",                # vide : le lieu approximatif de la connexion
     "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
@@ -11976,13 +11978,23 @@ def programme_au_panneau(maintenant):
 # s'arrete sur l'heure.
 
 ZONE_CYCLE = slice(39, 59)
-CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme")
+CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme", "chat")
 # « ralentis le fade, fais un fade toutes les 30 s » -- puis « rajoute tout ca
 # en settings » : panneau_cycle_duree et panneau_cycle_fondu, bornes ici
 CYCLE_DUREE_S = 30.0
 CYCLE_FONDU_S = 3.0
 CYCLE_DUREE_BORNES = (5, 120)
 CYCLE_FONDU_BORNES = (0.0, 10.0)
+EQ_SENSIBILITE_BORNES = (0.2, 3.0)
+
+
+def sensibilite_eq(cfg):
+    """« Rajoute une sensibilite pour l'egaliseur » : multiplie chaque bande."""
+    try:
+        v = float(cfg.get("panneau_eq_sensibilite", 1.0))
+    except (TypeError, ValueError):
+        v = 1.0
+    return max(EQ_SENSIBILITE_BORNES[0], min(EQ_SENSIBILITE_BORNES[1], v))
 
 
 def reglages_cycle(cfg):
@@ -12016,6 +12028,8 @@ def cycle_disponible(maintenant, cfg=None):
         d.append("musique")
     if cfg.get("panneau_cycle_bonhomme", True):
         d.append("bonhomme")
+    if cfg.get("panneau_cycle_chat", True):
+        d.append("chat")
     return d
 
 
@@ -12056,13 +12070,45 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYC
     return {"actuel": c["actuel"], "precedent": c["precedent"], "fondu": fondu, "ecoule": ecoule}
 
 
-def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule):
+# LE PETIT :3. « Rajoute un petit :3 qui arrive (qui cligne des yeux de temps
+# en temps). » Les deux points et le 3 en grand, couches comme l'emoticone ;
+# il glisse depuis la droite et se pose au milieu, puis cligne toutes les
+# quatre secondes environ -- parfois deux fois de suite.
+CHAT_ARRIVEE_S = 1.2
+
+
+def chat_cligne(t):
+    """Les yeux fermes a l'instant t ? Un clin toutes les 4 s, un double une fois sur trois."""
+    phase = t % 4.0
+    return phase < 0.14 or (int(t // 4.0) % 3 == 0 and 0.32 < phase < 0.46)
+
+
+def _zone_chat(img, t, accent, ecoule):
+    larg = 3 + 3 + 10                                   # les yeux, un ecart, le 3 double
+    cible = (PANNEAU_L - larg) // 2
+    a = 1.0 if ecoule is None else min(1.0, max(0.0, ecoule / CHAT_ARRIVEE_S))
+    a = 1 - (1 - a) ** 3                                # il ralentit en arrivant
+    x = int(round(cible + (PANNEAU_L - cible) * (1 - a)))
+    y = 42
+    yeux = (y + 2, y + 9)                               # les deux points, l'un au-dessus de l'autre
+    for yo in yeux:
+        if chat_cligne(t):
+            if 0 <= x + 1 < PANNEAU_L:
+                img[yo:yo + 3, x + 1] = accent             # ferme : un trait
+        else:
+            img[yo:yo + 3, max(0, x):max(0, min(PANNEAU_L, x + 3))] = accent
+    _motif(img, _CHIFFRES_5X7["3"], x + 6, y, accent, 2)
+
+
+def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule, sensibilite=1.0):
     import numpy as np
     img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
     if nom == "meteo":
         _zone_meteo(img, PANNEAU.get("meteo"))
     elif nom == "musique":
-        _zone_musique(img, t, accent, PANNEAU.get("morceau"), ecoule)
+        _zone_musique(img, t, accent, PANNEAU.get("morceau"), ecoule, sensibilite)
+    elif nom == "chat":
+        _zone_chat(img, t, accent, ecoule)
     elif nom == "bonhomme":
         _zone_bonhomme(img, t, accent)
     else:
@@ -12169,7 +12215,7 @@ def _zone_meteo(img, m):
     ecrire_tenant(img, libelle, 18, 62, 52, (150, 150, 165))
 
 
-def _zone_musique(img, t, accent, morceau, ecoule):
+def _zone_musique(img, t, accent, morceau, ecoule, sensibilite=1.0):
     """Douze barres qui suivent le son (le spectre de ce qui sort des
     haut-parleurs), un point qui retombe au-dessus de chacune ; dessous, le
     morceau, qui defile depuis qu'il a commence."""
@@ -12185,7 +12231,7 @@ def _zone_musique(img, t, accent, morceau, ecoule):
         spectre = [0.25 + 0.2 * math.sin(t * 3 + i * 0.7) for i in range(12)]
     cretes = PANNEAU.setdefault("cretes", [0.0] * 12)
     for i, v in enumerate(spectre):
-        h = max(1, int(round(max(0.0, min(1.0, v)) * haut)))
+        h = max(1, int(round(max(0.0, min(1.0, v * sensibilite)) * haut)))
         cretes[i] = max(float(h), cretes[i] - 0.35)
         x = 3 + i * 5
         for k in range(h):
@@ -12271,7 +12317,8 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
     ecrire_petit(img, date, None, 32, (150, 150, 165))
     # sous la date : l'heure (son minuteur, son prochain rendez-vous), ou le
     # cycle -- meteo, musique, bonhomme --, en fondu de l'une a l'autre
-    zone = lambda nom, ecoule: _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule)
+    sens = float((cycle or {}).get("sensibilite", 1.0))
+    zone = lambda nom, ecoule: _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule, sens)
     if not cycle:
         img[ZONE_CYCLE] = zone("heure", None)[ZONE_CYCLE]
     else:
@@ -12393,6 +12440,7 @@ def image_du_panneau(cfg, contenu, t):
         duree, fondu_s = reglages_cycle(cfg)
         cycle = cycle_du_panneau(t, cycle_disponible(t, cfg), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
                                  duree, fondu_s)
+        cycle["sensibilite"] = sensibilite_eq(cfg)
     return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
 
 
@@ -16426,7 +16474,8 @@ class Panneau:
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
                     "panneau_rdv", "panneau_cycle", "meteo_ville", "panneau_cycle_duree", "panneau_cycle_fondu",
-                    "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme", "panneau_cycle_saut"):
+                    "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme", "panneau_cycle_saut",
+                    "panneau_cycle_chat", "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -16487,7 +16536,7 @@ class Panneau:
         vues.pack(fill="x", pady=(6, 0), padx=(self.px(22), 0))
         self.texte(vues, "Vues", BRUME, 8).pack(side="left")
         for cle, nom in (("panneau_cycle_meteo", "Meteo"), ("panneau_cycle_musique", "Musique"),
-                         ("panneau_cycle_bonhomme", "Bonhomme")):
+                         ("panneau_cycle_bonhomme", "Bonhomme"), ("panneau_cycle_chat", ":3")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             setattr(self, "var_" + cle, v)
             self.case(vues, nom, v, lambda cle=cle: self.regler_panneau(cle)).pack(side="left", padx=(self.px(8), 0))
@@ -16502,7 +16551,10 @@ class Panneau:
                 ("panneau_cycle_duree", "Chaque vue (s)", CYCLE_DUREE_BORNES, 5,
                  "Le temps que reste chaque vue avant de passer a la suivante.", True),
                 ("panneau_cycle_fondu", "Fondu (s)", CYCLE_FONDU_BORNES, 0.5,
-                 "La duree du fondu d'une vue a l'autre ; 0 : un changement net.", False)):
+                 "La duree du fondu d'une vue a l'autre ; 0 : un changement net.", False),
+                ("panneau_eq_sensibilite", "Sensibilite de l'egaliseur", EQ_SENSIBILITE_BORNES, 0.1,
+                 "Sous 1 : les barres montent moins, seuls les passages forts les poussent. Au-dessus : elles "
+                 "montent plus vite, meme sur une musique douce.", False)):
             v = self.reglette(reglettes, cle, nom, bornes[0], bornes[1], pas, aide, entier=entiere)
             v.trace_add("write", lambda *_, cle=cle, v=v, entiere=entiere: self._panneau_reglage_bientot(
                 cle, int(v.get()) if entiere else round(float(v.get()), 1)))
@@ -16561,7 +16613,7 @@ class Panneau:
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
-                     "panneau_cycle_saut"):
+                     "panneau_cycle_saut", "panneau_cycle_chat"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "meteo_ville":
             ville = self.champ_meteo_ville.get().strip()[:60]
