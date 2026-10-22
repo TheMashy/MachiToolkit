@@ -3828,12 +3828,12 @@ class DansMachiTool(unittest.TestCase):
         self.addCleanup(lambda: (serveur.shutdown(), serveur.server_close()))
         script = os.path.join(RACINE, ".claude", "bulle_claude.py")
 
-        def crochet(evenement, cle="la-cle"):
+        def crochet(evenement, cle="la-cle", nom="MACHITOOL_BULLE_CLE"):
             env = dict(os.environ, MACHITOOL_BULLE_URL="http://127.0.0.1:%d/api/machitool/claude"
                        % serveur.server_address[1], NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
             env.pop("MACHITOOL_BULLE_CLE", None)
             if cle:
-                env["MACHITOOL_BULLE_CLE"] = cle
+                env[nom] = cle
             r = subprocess.run([sys.executable, script], input=json.dumps(evenement), capture_output=True,
                                text=True, env=env, timeout=10)
             self.assertEqual((r.returncode, r.stdout), (0, ""), "il ne dit rien a Claude Code")
@@ -3852,6 +3852,53 @@ class DansMachiTool(unittest.TestCase):
         crochet({"hook_event_name": "Notification", "session_id": "c1", "notification_type": "permission_prompt",
                  "message": "Claude needs your permission to use Bash"})
         self.assertEqual(m.etat_de_claude_code(recus[-1][1]), "bloque")
+        # « \ufeffMACHITOOL_BULLE_CLE=... » : la marque d'encodage qu'un copier-coller laissait devant
+        crochet({"hook_event_name": "Stop", "session_id": "c1"}, cle=" la-cle\n", nom="\ufeffMACHITOOL_BULLE_CLE")
+        self.assertEqual(recus[-1][0], "la-cle", "la variable est trouvee quand meme")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_les_notifications_discord(self):
+        # « tu peux faire en sorte que ca detecte quand j'ai une notification en attente sur Discord ? »
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("discord", "etat")}
+        self.addCleanup(lambda: m.PANNEAU.update(sauve))
+        lis = m.notifications_discord_du_titre
+        self.assertEqual(lis("(3) Discord | #general | Mon serveur"), 3)
+        self.assertEqual(lis("(12) Discord"), 12)
+        self.assertEqual(lis("Discord"), 0)
+        self.assertEqual(lis("• Discord | #general"), 0, "des messages non lus, mais rien qui t'attende")
+        self.assertEqual(lis("Discord Updater"), 0)
+        self.assertEqual(m.lire_discord(["Discord", "(2) Discord | @ami"]), 2, "le plus grand des titres")
+        self.assertIsNone(m.lire_discord([]), "Discord n'est pas ouvert")
+        # le fil des sources : toutes les cinq secondes, panneau branche
+        vrai = m.lire_discord
+        self.addCleanup(lambda: setattr(m, "lire_discord", vrai))
+        m.lire_discord = lambda titres=None: 4
+        m.PANNEAU.update(etat="connecte", discord=None)
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance"}, tours=1, maintenant=100.0)
+        self.assertEqual(m.PANNEAU["discord"], 4)
+        m.PANNEAU["discord"] = None
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance", "panneau_discord": False}, tours=1, maintenant=200.0)
+        self.assertIsNone(m.PANNEAU["discord"], "decochee : il ne lit rien")
+        # sur le panneau : la pastille violette en haut a gauche, le nombre en blanc
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False}
+        t = 1_800_000_000.0
+        coin = lambda img: img[0:9, 0:14]
+        m.PANNEAU["discord"] = 0
+        sans = m.image_du_panneau(cfg, "horloge", t)
+        self.assertFalse(coin(sans).any())
+        m.PANNEAU["discord"] = 3
+        img = m.image_du_panneau(cfg, "horloge", t)
+        self.assertGreaterEqual(int((coin(img) == m.DISCORD_VIOLET).all(axis=2).sum()), 15)
+        self.assertGreaterEqual(int((coin(img) == (255, 255, 255)).all(axis=2).sum()), 5, "le 3")
+        self.assertTrue((img[9:] == sans[9:]).all(), "le reste ne bouge pas")
+        m.PANNEAU["discord"] = 12
+        large = m.image_du_panneau(cfg, "horloge", t)
+        self.assertGreater(int((large[0:9] == m.DISCORD_VIOLET).all(axis=2).sum()),
+                           int((img[0:9] == m.DISCORD_VIOLET).all(axis=2).sum()), "« 9+ » : plus large")
+        self.assertIn("+", m._PETITE_3X5, "le « + » s'ecrit")
+        self.assertFalse(coin(m.image_du_panneau(dict(cfg, panneau_discord=False), "horloge", t)).any())
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_discord"])
 
     def test_les_sources_du_cycle(self):
         m = self.m

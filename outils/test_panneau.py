@@ -436,6 +436,13 @@ class AL_Ecran(unittest.TestCase):
             p.aller("panneau")
             p.root.update()
             self.assertEqual(p.var_panneau_claude.get(), 1)
+            # « une notification en attente sur Discord » : sa case aussi
+            M.PANNEAU["discord"] = 2
+            p.var_panneau_discord.set(0)
+            p.regler_panneau("panneau_discord")
+            self.assertFalse(M.CFG["panneau_discord"])
+            self.assertIsNone(M.PANNEAU["discord"], "decochee : la pastille s'en va tout de suite")
+            M.CFG["panneau_discord"] = True
             p.var_panneau_claude.set(0)
             p.regler_panneau("panneau_claude")
             self.assertFalse(M.CFG["panneau_claude"])

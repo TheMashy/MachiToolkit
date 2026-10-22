@@ -42,8 +42,17 @@ def a_envoyer(e):
     return corps
 
 
+def cle_de_l_environnement():
+    """La variable MACHITOOL_BULLE_CLE -- meme collee avec une marque
+    d'encodage invisible (\ufeff) ou des espaces, dans son nom ou sa valeur."""
+    for nom, valeur in os.environ.items():
+        if nom.strip().lstrip("\ufeff") == "MACHITOOL_BULLE_CLE":
+            return valeur.strip().lstrip("\ufeff").strip()
+    return ""
+
+
 def main():
-    cle = os.environ.get("MACHITOOL_BULLE_CLE", "").strip()
+    cle = cle_de_l_environnement()
     if not cle:
         return
     try:
