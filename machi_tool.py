@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.93.0"
+VERSION = "1.94.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -8152,7 +8152,7 @@ OUTILS_SANS_CODE = {"musique", "spotify", "rechercher_google", "lien", "retenir"
                     # lui-meme, pareil pour les alarmes et les chronometres » : il
                     # manquait -- sans ses mains sur le PC, l'outil etait refuse ;
                     # avec, il passait sous code
-                    "minuteurs"}
+                    "minuteurs", "resume_du_jour"}
 # Ce qu'il retient de toi : toujours permis, meme sans ses mains sur le PC.
 OUTILS_MEMOIRE = {"retenir", "oublier"}
 ACCES_DUREE_S = 600
@@ -9380,6 +9380,8 @@ def executer_outil(outil, cfg):
             return {"id": ident, "texte": outil_application(nom, e, cfg)}
         if nom == "minuteurs":
             return {"id": ident, "texte": outil_minuteurs(e, cfg, langue_jarvis(cfg))}
+        if nom == "resume_du_jour":
+            return {"id": ident, "texte": outil_resume_du_jour(cfg)}
         # SES TACHES DE FOND ET TES PROJETS : a lui aussi, sans les mains sur le PC
         if nom == "lancer_tache":
             return {"id": ident, "texte": lancer_tache_de_fond(e, cfg)}
@@ -10838,6 +10840,7 @@ def recevoir_jarvis(texte, donnees, cfg, tour=1, conv=None, avance=None):
         avance["fini"] = True                  # la reponse est la : la premiere phrase n'attend plus
     if donnees.get("agenda_modifie"):
         JARVIS["agenda_change"] = time.time()  # la fenetre Agenda, si elle est ouverte, se relit
+        relire_agenda_au_fond(cfg)             # et le panneau, son prochain rendez-vous
     if donnees.get("detail"):
         # CE QUE CLAUDE A REPONDU EN ENTIER, quand Jarvis l'a consulte : il en
         # dit l'essentiel, le texte complet va dans le presse-papiers.
@@ -11181,11 +11184,9 @@ def veiller_resume_du_jour(cfg, maintenant=None, inactivite=None, lancer=None):
     return True
 
 
-def faire_resume_du_jour(cfg, maintenant=None):
+def programme_du_jour(cfg, maintenant=None):
     """Ce qui reste aujourd'hui, depuis BrainDebugger (sa copie locale s'il ne
-    repond pas) ; rien de prevu : il se tait. Sinon le resume rejoint ses
-    annonces -- dit des qu'il est libre et que sa voix est prete --, avec le
-    programme pour le panneau. Rend le texte, ou None."""
+    repond pas) : (texte du resume ou None, ce qui reste, toute la journee)."""
     t = time.time() if maintenant is None else maintenant
     jour = time.strftime("%Y-%m-%d", time.localtime(t))
     try:
@@ -11197,9 +11198,17 @@ def faire_resume_du_jour(cfg, maintenant=None):
         journee = _jv.rdv_du_jour(_appliquer_attente(d["rdv"], d["attente"]), jour)
     lt = time.localtime(t)
     restants = _jv.restants_du_jour(journee, lt.tm_hour * 60 + lt.tm_min)
-    L = langue_jarvis(cfg)
-    texte = _jv.resume_journee(restants, lt.tm_hour * 60 + lt.tm_min, L,
+    texte = _jv.resume_journee(restants, lt.tm_hour * 60 + lt.tm_min, langue_jarvis(cfg),
                                str(cfg.get("jarvis_appellation", "") or "").strip())
+    return texte, restants, journee
+
+
+def faire_resume_du_jour(cfg, maintenant=None):
+    """Le resume du demarrage : rien de prevu, il se tait ; sinon il rejoint
+    ses annonces -- dit des qu'il est libre et que sa voix est prete --, avec
+    le programme pour le panneau. Rend le texte, ou None."""
+    texte, restants, journee = programme_du_jour(cfg, maintenant)
+    L = langue_jarvis(cfg)
     if not texte:
         print("Jarvis : rien de prevu aujourd'hui, pas de resume")
         return None
@@ -11209,6 +11218,18 @@ def faire_resume_du_jour(cfg, maintenant=None):
         n = JARVIS_CROCHETS.get("notifier")
         if n:
             n("Jarvis", texte)
+    return texte
+
+
+def outil_resume_du_jour(cfg):
+    """« Fais en sorte de pouvoir rejouer le resume sur demande. » L'outil de
+    Jarvis : le meme resume (il le dit dans sa reponse), et le programme sur le
+    panneau pendant qu'il parle."""
+    texte, restants, journee = programme_du_jour(cfg)
+    if not texte:
+        return ("Nothing else planned today." if langue_jarvis(cfg) == "en"
+                else "Rien d'autre de prévu aujourd'hui.")
+    PANNEAU["programme"] = {"debut": time.time(), "rdv": restants, "journee": journee}
     return texte
 
 
@@ -11723,6 +11744,7 @@ def image_mire(accent=None):
 PANNEAU_PROCHAIN_S = 3600              # un rendez-vous s'affiche une heure avant...
 PANNEAU_PROCHAIN_APRES_S = 300         # ... et jusqu'a cinq minutes apres son heure
 PANNEAU_PROGRAMME_S = 20               # le programme du jour : au moins 20 s, et le temps de sa voix
+PANNEAU_PROGRAMME_MAX_S = 60           # ... jamais plus d'une minute (la conversation continue)
 PANNEAU_AGENDA_RELU_S = 60             # la copie locale, relue toutes les minutes
 PANNEAU_AGENDA_SYNCHRO_S = 600         # et resynchronisee avec BrainDebugger toutes les 10 min
 COULEURS_RDV = ((255, 170, 60), (90, 200, 255), (255, 110, 150), (140, 230, 120), (190, 140, 255),
@@ -11760,6 +11782,23 @@ def agenda_du_jour(cfg=None, jour=None, maintenant=None):
 
 def _cle_rdv(r):
     return (str(r.get("heure") or ""), str(r.get("label") or ""))
+
+
+def relire_agenda_au_fond(cfg):
+    """Jarvis vient de poser, corriger ou retirer un rendez-vous : la copie
+    locale se relit tout de suite (en fond), le panneau avec."""
+    if PANNEAU.get("agenda_synchro"):
+        return
+    PANNEAU["agenda_synchro"] = True
+
+    def synchro():
+        try:
+            lire_agenda_synchro(cfg, time.strftime("%Y-%m-%d"), 2)
+        except Exception:
+            pass
+        finally:
+            PANNEAU.update(agenda_synchro=False, agenda=None)
+    threading.Thread(target=synchro, daemon=True).start()
 
 
 def _couleurs_rdv(journee):
@@ -11886,7 +11925,8 @@ def programme_au_panneau(maintenant):
         return None
     if VOIX.parle:
         p["vu"] = maintenant
-    if maintenant < max(p["debut"] + PANNEAU_PROGRAMME_S, float(p.get("vu") or 0) + 8):
+    if maintenant < min(max(p["debut"] + PANNEAU_PROGRAMME_S, float(p.get("vu") or 0) + 8),
+                        p["debut"] + PANNEAU_PROGRAMME_MAX_S):
         return p
     PANNEAU["programme"] = None
     return None
@@ -12040,14 +12080,16 @@ def image_du_panneau(cfg, contenu, t):
         return image_panneau("eteint", t)
     if PANNEAU.get("mire"):
         return image_mire()
-    etat = etat_jarvis_pour_le_panneau(cfg, t)
-    if etat is not None:
-        return image_jarvis_du_moment(etat, t, cfg, croix=False)
     eclat = eclat_guirlande() if cfg.get("panneau_suit_eclat", True) else None
+    # le programme du jour passe devant Jarvis : demande (« resume-moi ma
+    # journee »), il est actif pendant qu'il le dit
     programme = programme_au_panneau(t)
     if programme is not None:
         img = image_programme(programme["rdv"], t, programme.get("journee"), t - programme["debut"])
         return img if eclat is None else assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
+    etat = etat_jarvis_pour_le_panneau(cfg, t)
+    if etat is not None:
+        return image_jarvis_du_moment(etat, t, cfg, croix=False)
     rdv = []
     if contenu == "horloge" and cfg.get("panneau_rdv", True):
         try:
