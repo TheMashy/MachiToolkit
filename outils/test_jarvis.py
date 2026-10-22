@@ -3830,9 +3830,13 @@ class DansMachiTool(unittest.TestCase):
         self.addCleanup(lambda: (serveur.shutdown(), serveur.server_close()))
         script = os.path.join(RACINE, ".claude", "bulle_claude.py")
 
-        def crochet(evenement, cle="la-cle", nom="MACHITOOL_BULLE_CLE"):
+        dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dossier, True)
+
+        def crochet(evenement, cle="la-cle", nom="MACHITOOL_BULLE_CLE", fichier=os.path.join(dossier, "absent")):
             env = dict(os.environ, MACHITOOL_BULLE_URL="http://127.0.0.1:%d/api/machitool/claude"
-                       % serveur.server_address[1], NO_PROXY="127.0.0.1", no_proxy="127.0.0.1")
+                       % serveur.server_address[1], NO_PROXY="127.0.0.1", no_proxy="127.0.0.1",
+                       MACHITOOL_BULLE_FICHIER=fichier)
             env.pop("MACHITOOL_BULLE_CLE", None)
             if cle:
                 env[nom] = cle
@@ -3857,6 +3861,14 @@ class DansMachiTool(unittest.TestCase):
         # « \ufeffMACHITOOL_BULLE_CLE=... » : la marque d'encodage qu'un copier-coller laissait devant
         crochet({"hook_event_name": "Stop", "session_id": "c1"}, cle=" la-cle\n", nom="\ufeffMACHITOOL_BULLE_CLE")
         self.assertEqual(recus[-1][0], "la-cle", "la variable est trouvee quand meme")
+        # une session ouverte avant la variable : la cle dans .claude/bulle_cle.local (jamais commite)
+        fichier = os.path.join(dossier, "bulle_cle.local")
+        with open(fichier, "w", encoding="utf-8-sig") as f:
+            f.write("MACHITOOL_BULLE_CLE=cle-du-fichier\n")
+        crochet({"hook_event_name": "Stop", "session_id": "c1"}, cle="", fichier=fichier)
+        self.assertEqual(recus[-1][0], "cle-du-fichier")
+        with open(os.path.join(RACINE, ".gitignore"), encoding="utf-8") as f:
+            self.assertIn(".claude/bulle_cle.local", f.read(), "un secret : jamais dans le depot")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_les_notifications_discord(self):
