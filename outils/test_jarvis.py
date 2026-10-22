@@ -3106,6 +3106,149 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("3 images abimees jetees par la carte", m.etat_panneau_lisible()[0])
         m.lire_bilan_carte(object())                  # une carte sans tampon (les faux des tests)
 
+    def test_le_resume_du_jour_attend_le_demarrage_et_une_minute_d_activite(self):
+        # « lorsque l'ordinateur est demarre et que Machi Tool s'ouvre, Jarvis resume la
+        # journee si des choses sont prevues » -- « il doit detecter un debut d'activite
+        # sur le PC (au moins 1 minute d'activite) »
+        m, J = self.m, self.m._jv
+        vrais = {k: getattr(m, k) for k in ("sauver_config", "lire_agenda_synchro")}
+        self.addCleanup(lambda: [setattr(m, k, v) for k, v in vrais.items()])
+        m.sauver_config = lambda cfg: True
+        self.addCleanup(lambda: (m.RESUME.update(attendu=False, lance=False, actif_depuis=None),
+                                 m.PANNEAU.update(programme=None, agenda=None, jarvis=None), m.ANNONCES.clear()))
+        t = time.mktime((2026, 10, 22, 9, 52, 0, 0, 0, -1))
+        cfg = dict(m.CONFIG_DEFAUT, jarvis_actif=True, jarvis_appellation="Monsieur", jarvis_langue="fr")
+        # Machi Tool relance 2 h apres le PC (une mise a jour) : pas de resume
+        self.assertFalse(m.preparer_resume_du_jour(cfg, t, demarrage_pc=t - 7200))
+        # deja fait il y a une heure (deux demarrages rapproches) : non plus
+        self.assertFalse(m.preparer_resume_du_jour(dict(cfg, jarvis_resume_dernier=t - 3600), t, demarrage_pc=t - 60))
+        self.assertFalse(m.preparer_resume_du_jour(dict(cfg, jarvis_resume_du_jour=False), t, demarrage_pc=t - 60))
+        # le PC vient de demarrer : le resume attend
+        self.assertTrue(m.preparer_resume_du_jour(cfg, t, demarrage_pc=t - 90))
+        lances = []
+        # personne au clavier : rien ; 59 s d'activite : rien ; une pause de 40 s : on repart de zero
+        self.assertFalse(m.veiller_resume_du_jour(cfg, t, inactivite=600, lancer=lances.append))
+        self.assertFalse(m.veiller_resume_du_jour(cfg, t + 1, inactivite=0, lancer=lances.append))
+        self.assertFalse(m.veiller_resume_du_jour(cfg, t + 60, inactivite=3, lancer=lances.append))
+        self.assertFalse(m.veiller_resume_du_jour(cfg, t + 61, inactivite=40, lancer=lances.append))
+        self.assertFalse(m.veiller_resume_du_jour(cfg, t + 70, inactivite=0, lancer=lances.append))
+        self.assertFalse(m.veiller_resume_du_jour(dict(cfg, jarvis_actif=False), t + 200, inactivite=0,
+                                                  lancer=lances.append), "Jarvis coupe : rien")
+        self.assertEqual(lances, [])
+        # une minute pleine : il part, une seule fois, et c'est note
+        self.assertTrue(m.veiller_resume_du_jour(cfg, t + 130, inactivite=2, lancer=lances.append))
+        self.assertFalse(m.veiller_resume_du_jour(cfg, t + 500, inactivite=0, lancer=lances.append))
+        self.assertEqual(len(lances), 1)
+        self.assertEqual(cfg["jarvis_resume_dernier"], t + 130)
+        # ce qu'il dit : ce qui reste aujourd'hui (le footing de 8 h 30 est passe)
+        journee = [{"id": 1, "date": "2026-10-22", "label": "Anniversaire-témoin"},
+                   {"id": 2, "date": "2026-10-22", "heure": "08:30", "label": "Footing-témoin"},
+                   {"id": 3, "date": "2026-10-22", "heure": "14:30", "label": "Réunion-témoin"},
+                   {"id": 4, "date": "2026-10-22", "heure": "10:15", "label": "Dentiste-témoin"},
+                   {"id": 5, "date": "2026-10-23", "heure": "09:00", "label": "Demain-témoin"}]
+        m.lire_agenda_synchro = lambda cfg, depuis, jours, bilan=False: ({"rendezVous": journee}, None)
+        m.ANNONCES.clear()
+        texte = m.faire_resume_du_jour(cfg, t)
+        self.assertEqual(texte, "Bonjour, Monsieur. Au programme aujourd'hui : Dentiste-témoin à 10 h 15, "
+                                "Réunion-témoin à 14 h 30 ; et toute la journée : Anniversaire-témoin.")
+        self.assertEqual(len(m.ANNONCES), 1, "il le dira des qu'il est libre, de sa vraie voix")
+        avec = m.ANNONCES[0][3]
+        self.assertEqual([r["id"] for r in avec["programme"]], [4, 3, 1], "a heure, puis toute la journee")
+        self.assertEqual(len(avec["journee"]), 4, "toute la journee, pour les couleurs")
+        # dit : le panneau montre le programme, pas le visage de Jarvis
+        vraie = (m.VOIX.dire, m.VOIX.peut_parler, m.charges_voix, m.voix_prete)
+        self.addCleanup(lambda: (setattr(m.VOIX, "dire", vraie[0]), setattr(m.VOIX, "peut_parler", vraie[1]),
+                                 setattr(m, "charges_voix", vraie[2]), setattr(m, "voix_prete", vraie[3])))
+        dits = []
+        m.VOIX.dire = lambda texte, fin=None, langue="fr", **k: dits.append(texte)
+        m.VOIX.peut_parler = lambda: True
+        m.charges_voix = lambda cfg: [{"cle": "fr"}]
+        m.voix_prete = lambda cle=None: True
+        m.CFG["jarvis_voix"] = True
+        m.JARVIS["etat"] = "attente"
+        m.PANNEAU.update(programme=None, jarvis=None)
+        m.dire_les_annonces()
+        self.assertEqual(dits, [texte])
+        self.assertIsNone(m.PANNEAU["jarvis"])
+        self.assertEqual([r["id"] for r in m.PANNEAU["programme"]["rdv"]], [4, 3, 1])
+        img = m.image_du_panneau({"panneau_contenu": "horloge", "panneau_suit_eclat": False}, "horloge",
+                                 m.PANNEAU["programme"]["debut"] + 1)
+        self.assertTrue((img == m.image_programme(avec["programme"], m.PANNEAU["programme"]["debut"] + 1,
+                                                  avec["journee"], 1)).all(), "le programme a l'ecran")
+        # il reste 20 s au moins, puis l'horloge revient
+        self.assertIsNone(m.programme_au_panneau(m.PANNEAU["programme"]["debut"] + 60))
+        # rien de prevu : il se tait
+        m.ANNONCES.clear()
+        m.lire_agenda_synchro = lambda cfg, depuis, jours, bilan=False: ({"rendezVous": [journee[1]]}, None)
+        self.assertIsNone(m.faire_resume_du_jour(cfg, t))
+        self.assertEqual(m.ANNONCES, [])
+
+    def test_le_resume_se_dit_bien(self):
+        J = self.m._jv
+        r = [{"label": "Dentiste", "heure": "10:15"}, {"label": "Anniversaire de Paul"}]
+        self.assertEqual(J.resume_journee(r, 9 * 60, "fr"),
+                         "Bonjour. Au programme aujourd'hui : Dentiste à 10 h 15 ; et toute la journée : "
+                         "Anniversaire de Paul.")
+        self.assertEqual(J.resume_journee(r, 19 * 60, "fr", "Madame")[:16], "Bonsoir, Madame.")
+        self.assertEqual(J.resume_journee([r[1]], 9 * 60, "fr"), "Bonjour. Aujourd'hui : Anniversaire de Paul.")
+        self.assertEqual(J.resume_journee(r, 9 * 60, "en"),
+                         "Good morning. On today's schedule: Dentiste at 10:15; and all day: Anniversaire de Paul.")
+        beaucoup = [{"label": "R%d" % k, "heure": "%02d:00" % (10 + k)} for k in range(7)]
+        self.assertTrue(J.resume_journee(beaucoup, 0, "fr").endswith("R4 à 14 h, et 2 autres."))
+        self.assertIsNone(J.resume_journee([], 0, "fr"))
+        self.assertEqual(J.restants_du_jour([{"heure": "08:00"}, {"heure": "12:00"}, {}], 9 * 60),
+                         [{"heure": "12:00"}, {}])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_prochain_rendez_vous_au_dessus_des_secondes(self):
+        # « lorsqu'un evenement arrive, le montrer a partir d'une heure avant sur le panneau
+        # (au-dessus de la ligne des secondes) »
+        m = self.m
+        jour = [{"date": "2026-10-22", "heure": "08:30", "label": "Footing"},
+                {"date": "2026-10-22", "heure": "14:30", "label": "Reunion projet LED Wall"},
+                {"date": "2026-10-22", "label": "Anniversaire"}]
+
+        def a(h, mn, sec=0):
+            return time.mktime((2026, 10, 22, h, mn, sec, 0, 0, -1))
+        self.assertIsNone(m.prochain_rdv(jour, a(13, 29)), "1 h 01 avant : pas encore")
+        r, avant, couleur = m.prochain_rdv(jour, a(13, 30))
+        self.assertEqual((r["label"], avant), ("Reunion projet LED Wall", 3600))
+        self.assertEqual(m.prochain_rdv(jour, a(14, 34))[0]["label"], "Reunion projet LED Wall", "encore 5 min apres")
+        self.assertIsNone(m.prochain_rdv(jour, a(14, 36)))
+        self.assertEqual(m.prochain_rdv(jour, a(8, 0))[0]["label"], "Footing")
+        self.assertEqual(couleur, m.COULEURS_RDV[1], "la 2e de la journee : sa couleur, partout la meme")
+        # dessine au-dessus des secondes (ligne 52 a 56), rien au-dessus sans rendez-vous proche
+        avec = m.image_panneau("horloge", a(14, 0), accent=(255, 160, 0), rdv=jour)
+        sans = m.image_panneau("horloge", a(12, 0), accent=(255, 160, 0), rdv=jour)
+        self.assertTrue((avec[52:57] == couleur).all(axis=2).any(), "son heure, dans sa couleur")
+        self.assertTrue((avec[52:57] == m.TITRE_RDV).all(axis=2).any(), "son titre")
+        self.assertFalse((sans[50:58] != 0).any())
+        # un titre long defile : il part de son debut, et s'y arrete 1,5 s
+        img0, img1 = np.zeros((64, 64, 3), np.uint8), np.zeros((64, 64, 3), np.uint8)
+        m.ecrire_tenant(img0, "REUNION PROJET LED WALL", 26, 62, 0, (255, 255, 255), 0.0)
+        m.ecrire_tenant(img1, "REUNION PROJET LED WALL", 26, 62, 0, (255, 255, 255), 1.4)
+        coupe = np.zeros((64, 64, 3), np.uint8)
+        m.ecrire_tenant(coupe, "REUNION PROJET LED WALL", 26, 62, 0, (255, 255, 255))
+        self.assertTrue((img0 == coupe).all() and (img1 == coupe).all())
+        img2 = np.zeros((64, 64, 3), np.uint8)
+        m.ecrire_tenant(img2, "REUNION PROJET LED WALL", 26, 62, 0, (255, 255, 255), 3.0)
+        self.assertFalse((img2 == coupe).all(), "puis il defile")
+        # le programme : la date, la frise, une ligne par rendez-vous ; « +N » au-dela de 7
+        prog = m.image_programme(jour, a(9, 0))
+        self.assertTrue((prog[1:6] == (150, 150, 165)).all(axis=2).any())
+        self.assertTrue((prog[8:13] == m.COULEURS_RDV[1]).all(axis=2).any(), "la reunion sur la frise")
+        self.assertTrue((prog[7:14] == (240, 240, 248)).all(axis=2).any(), "maintenant")
+        dix = [{"heure": "%02d:00" % (8 + k), "label": "R%d" % k} for k in range(10)]
+        prog = m.image_programme(dix, a(7, 0))
+        self.assertTrue((prog[58:63] != 0).any())
+        # a l'horloge, case decochee : rien
+        m.PANNEAU["agenda"] = {"jour": time.strftime("%Y-%m-%d", time.localtime(a(14, 0))), "lu": a(14, 0),
+                               "rdv": jour}
+        self.addCleanup(lambda: m.PANNEAU.update(agenda=None))
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False}
+        self.assertTrue((m.image_du_panneau(cfg, "horloge", a(14, 0))[52:57] != 0).any())
+        self.assertFalse((m.image_du_panneau(dict(cfg, panneau_rdv=False), "horloge", a(14, 0))[50:58] != 0).any())
+
     def test_jarvis_pose_minuteurs_alarmes_et_chronos_sans_permission(self):
         # « verifie bien que Jarvis puisse declencher un minuteur de lui-meme : qu'il
         # ait les droits, pareil pour les alarmes et les chronometres »
