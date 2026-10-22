@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.102.0"
+VERSION = "1.103.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -12482,68 +12482,208 @@ def chemin_de_la_journee(img, t, accent):
 # cheveux ont un reflet, et c'est le blanc de la tenue qui dessine la
 # silhouette. Tout bouge a 30 images par seconde : les jambes, les bras, la
 # jupe qui ondule, la queue, une oreille qui frissonne, les yeux qui
-# clignent, et de temps en temps un petit coeur qui s'envole.
-MAID_PAS_S = 0.9                       # de petits pas rapides (un cycle : deux pas)
+# clignent ; et ses petites envies, et sa tenue de nuit (plus bas).
+MAID_PAS_S = (0.9, 1.15, 1.5)          # un cycle (deux pas) : en forme, fatiguee, epuisee
 MAID_FOULEE, MAID_JAMBE = 3.2, 2.4     # la longueur d'un pas ; la cuisse comme le mollet
 MAID_SOL = BONHOMME_SOL                # sur le chemin de la journee
-MAID_COEUR_S = 7.0                     # un petit coeur, toutes les 7 s
 _MAID_L, _MAID_H = 18, 21
 NOIR_CHAT, REFLET_CHAT, ROSE_OREILLE = (50, 50, 74), (110, 118, 165), (255, 120, 165)
 ROBE, TABLIER, SOULIERS = (40, 38, 56), (240, 240, 245), (62, 58, 80)
-YEUX_CHAT, BOUCHE_CHAT = (35, 25, 60), (200, 90, 120)
+YEUX_CHAT, BOUCHE_CHAT, BAILLEMENT = (35, 25, 60), (200, 90, 120), (70, 20, 40)
+PYJAMA, CHAUSSONS, ETOILE_NUIT = (165, 150, 225), (255, 150, 190), (200, 200, 255)
 _COEUR = ("##.##", "#####", ".###.", "..#..")
+# « Rajoute aussi une interface de nuit lorsque je veille tard pour la maid. »
+# De 23 h a 5 h, si tu es encore devant le PC : un ciel d'etoiles qui
+# scintillent, elle passe en chemise de nuit (bonnet a pompon, chaussons).
+MAID_NUIT = (23, 5)
+_ETOILES = ((3, 40), (11, 43), (19, 39), (26, 42), (34, 40), (41, 44), (48, 39), (53, 47),
+            (8, 48), (30, 47), (45, 50), (61, 47), (15, 51), (38, 52))
+# « Rajoute plusieurs animations en fonction de la fatigue, ou des petites
+# animations random. » Toutes les 9 s, une petite envie tiree au sort (ou
+# rien), selon qu'elle est en forme, fatiguee ou epuisee. Le tirage ne
+# depend que de l'heure : le meme instant donne la meme envie. Les durees, en
+# secondes :
+MAID_ENVIE_S = 9.0
+MAID_ENVIES = {"saut": 1.2, "derriere": 2.4, "coeur": 2.2, "reverence": 2.4,
+               "baille": 2.6, "frotte": 2.0, "pique": 3.2, "zzz": 4.0}
+MAID_ENVIES_PAR_NIVEAU = (
+    ("saut", "derriere", "coeur", "reverence", "saut", "coeur", None, None),
+    ("baille", "frotte", "derriere", "coeur", "baille", None, None),
+    ("baille", "pique", "frotte", "zzz", "pique", "baille", "zzz"),
+)
 
 
-def _genou(hanche, pied, l):
-    """Le genou d'une jambe dont on connait la hanche et le pied (cuisse et
-    mollet de longueur l) : plie vers l'avant."""
-    dx, dy = pied[0] - hanche[0], pied[1] - hanche[1]
-    d = max(1e-3, min(2 * l - 1e-3, math.hypot(dx, dy)))
-    vx, vy = dx / d, dy / d
-    h = math.sqrt(max(0.0, l * l - (d / 2) ** 2))
-    return (hanche[0] + dx / 2 + h * vy, hanche[1] + dy / 2 - h * vx)
+def _hasard(n):
+    """Un nombre de 0 a 1, toujours le meme pour n."""
+    return ((n * 2654435761 + 40503) % 4294967296) / 4294967296.0
 
 
-def maid_pose(x, t):
+def fatigue_maid(t, debout_depuis=None):
+    """De 0 (en forme) a 1 (epuisee). L'heure d'abord : rien de 7 h a 21 h,
+    elle tire apres 21 h, fort apres minuit, au plus bas de 3 h a 5 h, puis
+    se reveille d'ici 7 h. Et plus de trois heures devant le PC sans pause :
+    un peu plus (jusqu'a 0,3)."""
+    lt = time.localtime(t)
+    h = lt.tm_hour + lt.tm_min / 60.0
+    if 7 <= h < 21:
+        f = 0.0
+    elif 21 <= h < 23:
+        f = 0.35 * (h - 21) / 2
+    elif h >= 23:
+        f = 0.35 + 0.25 * (h - 23)
+    elif h < 3:
+        f = 0.6 + 0.4 * h / 3
+    elif h < 5:
+        f = 1.0
+    else:
+        f = 1.0 - (h - 5) / 2
+    if debout_depuis is not None:
+        f += min(0.3, max(0.0, (t - debout_depuis) / 3600.0 - 3) * 0.1)
+    return max(0.0, min(1.0, f))
+
+
+def niveau_fatigue(f):
+    """0 en forme, 1 fatiguee, 2 epuisee."""
+    return 0 if f < 0.3 else (1 if f < 0.7 else 2)
+
+
+def maid_veille(t, present):
+    """L'interface de nuit : tard (de 23 h a 5 h), et tu es encore la."""
+    h = time.localtime(t).tm_hour
+    return bool(present) and (h >= MAID_NUIT[0] or h < MAID_NUIT[1])
+
+
+def maid_envie(t, niveau):
+    """L'envie du moment et ou elle en est (0 a 1), ou (None, 0)."""
+    n = int(t // MAID_ENVIE_S)
+    choix = MAID_ENVIES_PAR_NIVEAU[niveau]
+    envie = choix[int(_hasard(n) * len(choix)) % len(choix)]
+    dans = t - n * MAID_ENVIE_S
+    if envie is None or dans >= MAID_ENVIES[envie]:
+        return None, 0.0
+    return envie, dans / MAID_ENVIES[envie]
+
+
+def suivre_presence(t, inactivite=None):
+    """Es-tu devant le PC (moins de cinq minutes sans clavier ni souris) ?
+    Et depuis quand, sans pause ? Pour la nuit et la fatigue de la maid."""
+    i = secondes_inactivite() if inactivite is None else inactivite
+    present = i < _jv.INITIATIVE_PRESENCE_S
+    if not present:
+        PANNEAU["debout_depuis"] = None
+    elif PANNEAU.get("debout_depuis") is None:
+        PANNEAU["debout_depuis"] = t - i
+    PANNEAU["present"] = present
+    return present
+
+
+def _articulation(a, b, l1, l2, sens=1):
+    """Le genou (ou le coude) d'un membre dont on connait les deux bouts (a
+    et b, longueurs l1 puis l2) : `sens` 1 le plie vers l'avant (un genou),
+    -1 vers le bas et l'arriere (un coude)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    n = math.hypot(dx, dy) or 1e-9
+    d = max(abs(l1 - l2) + 1e-3, min(l1 + l2 - 1e-3, n))
+    vx, vy = dx / n, dy / n
+    le_long = (l1 * l1 - l2 * l2 + d * d) / (2 * d)
+    h = math.sqrt(max(0.0, l1 * l1 - le_long ** 2))
+    return (a[0] + le_long * vx + sens * h * vy, a[1] + le_long * vy - sens * h * vx)
+
+
+def maid_pose(x, t, fatigue=0.0, nuit=False):
     """Ou elle en est : sa marche (la hanche, les genoux, les bras...), sa
-    tete, sa queue, l'oreille qui frissonne, le coeur ; x est sa hanche.
-    Ses pieds d'abord : pose, un pied recule sous elle d'un pas (elle marche
-    sur place) ; leve, il repasse devant en montant un peu. Les genoux s'en
-    deduisent."""
-    phase = 2 * math.pi * t / MAID_PAS_S
+    tete, sa queue, ses oreilles, ses yeux, l'envie du moment ; x est sa
+    hanche. Ses pieds d'abord : pose, un pied recule sous elle d'un pas (elle
+    marche sur place) ; leve, il repasse devant en montant un peu. Les genoux
+    s'en deduisent. Pour la plupart des envies, elle s'arrete en douceur."""
+    niveau = niveau_fatigue(fatigue)
+    envie, u = maid_envie(t, niveau)
+    c = 0.0
+    if envie and envie != "coeur":
+        d = MAID_ENVIES[envie]
+        c = max(0.0, min(1.0, u * d / 0.3, (1 - u) * d / 0.3))
+    phase = 2 * math.pi * t / MAID_PAS_S[niveau]
     l, sol = MAID_JAMBE, MAID_SOL - 0.9
-    rebond = 0.3 * (1 - math.cos(2 * phase)) / 2         # plus haute quand un pied passe sous elle
-    hanche = (x, sol - 2 * l * 0.9 - rebond)
-    epaule = (x + 0.4, hanche[1] - 3.0)
-    pose = {"hanche": hanche, "epaule": epaule, "tete": (epaule[0] + 0.5, epaule[1] - 3.0)}
+    saut = 2.2 * math.sin(math.pi * u) if envie == "saut" else 0.0
+    rebond = 0.3 * (1 - math.cos(2 * phase)) / 2 * (1 - c)
+    hanche = (x, sol - 2 * l * 0.9 - rebond - saut)
+    tasse = 0.4 if niveau == 2 else 0.0                  # epuisee, elle se tasse
+    penche = 1.6 * c if envie == "reverence" else 0.0    # la reverence : le buste en avant
+    epaule = (x + 0.4 + tasse + penche, hanche[1] - 3.0 + tasse + 0.7 * penche)
+    tx, ty = epaule[0] + 0.5 + tasse + 0.4 * penche, epaule[1] - 3.0 + 0.5 * tasse + 0.4 * penche
+    chute = 0.0
+    if envie == "pique":                                 # la tete tombe doucement, puis se releve d'un coup
+        chute = min(1.0, u / 0.75) if u < 0.75 else max(0.0, 1 - (u - 0.75) / 0.08)
+        tx, ty = tx + 0.8 * chute, ty + 1.6 * chute
+    elif envie == "baille":
+        ty -= 0.4 * c                                    # la tete en arriere
+    pose = {"hanche": hanche, "epaule": epaule, "tete": (tx, ty), "envie": envie, "u": u, "calme": c,
+            "niveau": niveau, "nuit": nuit}
     for k in (0, 1):                                     # 0 : la jambe du fond, 1 : celle de devant
         p = (phase + k * math.pi) % (2 * math.pi)
         if p < math.pi:                                  # pose : il recule sous elle
-            pied = (x + MAID_FOULEE * (0.5 - p / math.pi), sol)
+            avance, leve = MAID_FOULEE * (0.5 - p / math.pi), 0.0
         else:                                            # leve : il revient devant
-            u = (p - math.pi) / math.pi
-            pied = (x + MAID_FOULEE * (0.5 * (1 - math.cos(math.pi * u)) - 0.5), sol - 1.2 * math.sin(math.pi * u))
-        pose["cheville%d" % k], pose["genou%d" % k] = pied, _genou(hanche, pied, l)
-        a1 = -0.5 * math.cos(p)                          # le bras du meme cote, a l'oppose de la jambe
+            v = (p - math.pi) / math.pi
+            avance, leve = MAID_FOULEE * (0.5 * (1 - math.cos(math.pi * v)) - 0.5), 1.2 * math.sin(math.pi * v)
+        replie = 0.8 * math.sin(math.pi * u) if envie == "saut" else 0.0
+        pied = (x + avance * (1 - c), sol - leve * (1 - c) - saut - replie)
+        pose["cheville%d" % k], pose["genou%d" % k] = pied, _articulation(hanche, pied, l, l, 1)
+        a1 = -0.5 * math.cos(p) * (1 - c)                # le bras du meme cote, a l'oppose de la jambe
+        if envie == "reverence":
+            a1 += 0.5 * c                                # les mains vers l'avant, sur la jupe
         pose["coude%d" % k], pose["main%d" % k] = _membre(epaule, a1, 1.9, a1 + 0.4, 1.7)
+    # la main de devant : a la bouche pour bailler, a l'oeil pour le frotter
+    cible = None
+    if envie == "baille":
+        cible = (tx + 2.4, ty + 2.2)
+    elif envie == "frotte":
+        cible = (tx + 1.9 + 0.3 * math.sin(2 * math.pi * 4 * t), ty + 0.9 + 0.3 * math.cos(2 * math.pi * 4 * t))
+    if cible and c > 0:
+        m = pose["main1"]
+        main = (m[0] * (1 - c) + cible[0] * c, m[1] * (1 - c) + cible[1] * c)
+        pose["coude1"], pose["main1"] = _articulation(epaule, main, 1.9, 1.7, -1), main
     pose["queue"] = 2 * math.pi * t / 1.6
-    pose["frisson"] = (t % 5.3) < 0.35
-    u = (t % MAID_COEUR_S) / 2.2
-    pose["coeur"] = u if u < 1 else None                 # 0 -> 1 : il monte et s'efface
+    pose["remue"] = 0.65 if envie in ("saut", "coeur") else 0.35          # contente, elle remue plus
+    pose["frisson"] = (t % 5.3) < 0.35 or envie == "saut"
+    pose["oreilles"] = 0.0 if envie == "saut" else (0.0, 0.6, 1.1)[niveau]   # elles tombent avec la fatigue
+    if envie in ("baille", "frotte", "zzz") or chute > 0.3:
+        pose["yeux"] = "fermes"
+    elif envie in ("saut", "coeur", "reverence"):
+        pose["yeux"] = "contents"
+    elif chat_cligne(t + 0.9):
+        pose["yeux"] = "fermes"
+    else:
+        pose["yeux"] = "lourds" if niveau else "ouverts"
+    pose["bouche"] = "ouverte" if envie == "baille" and 0.2 < u < 0.85 else "fermee"
+    pose["miroir"] = envie == "derriere" and c > 0.5    # elle se retourne
+    pose["coeur"] = u if envie == "coeur" else None
+    pose["zzz"] = u if envie == "zzz" else None
     return pose
 
 
-def dessiner_maid(img, x, t, accent):
-    pose = maid_pose(x, t)
+def _etoiles(img, t):
+    """La nuit : des etoiles qui scintillent, chacune a son rythme."""
+    for k, (sx, sy) in enumerate(_ETOILES):
+        if not img[sy, sx].any():
+            b = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(t * 1.7 + k * 2.3)) ** 2
+            img[sy, sx] = tuple(int(c * b) for c in ETOILE_NUIT)
+
+
+def dessiner_maid(img, x, t, accent, fatigue=0.0, nuit=False):
+    pose = maid_pose(x, t, fatigue, nuit)
     h, ep, tete = pose["hanche"], pose["epaule"], pose["tete"]
     tx, ty = tete
     toile = _Toile(int(math.floor(h[0])) - _MAID_L // 2, MAID_SOL - _MAID_H, _MAID_L, _MAID_H)
+    if pose["miroir"]:                                   # retournee : tout se dessine en miroir autour d'elle
+        toile.X = 2 * h[0] - toile.X
     X, Y = toile.X, toile.Y
+    robe = PYJAMA if nuit else ROBE
 
     # la queue, derriere tout : du bas du dos, elle part en arriere et remonte en ondulant
     p = (h[0] - 1.5, h[1] - 0.8)
     for i in range(6):
-        a = math.pi + 0.15 + 0.3 * i + 0.35 * math.sin(pose["queue"] - i * 0.7)
+        a = math.pi + 0.15 + 0.3 * i + pose["remue"] * math.sin(pose["queue"] - i * 0.7)
         q = (p[0] + 1.15 * math.cos(a), p[1] + 1.15 * math.sin(a))
         toile.trait(p, q, 0.7 if i < 5 else 0.8, NOIR_CHAT)
         if i == 3:
@@ -12557,41 +12697,53 @@ def dessiner_maid(img, x, t, accent):
         coude, main = pose["coude%d" % k], pose["main%d" % k]
         toile.trait(ep, coude, 0.45, _sombre(PEAU, f))
         toile.trait(coude, main, 0.45, _sombre(PEAU, f))
-        poignet = (coude[0] * 0.3 + main[0] * 0.7, coude[1] * 0.3 + main[1] * 0.7)
-        toile.rond(poignet, 0.5, _sombre(TABLIER, f))
-        toile.rond((ep[0], ep[1] + 0.3), 1.0, _sombre(ROBE, f) if sombre else ROBE)    # la manche bouffante
+        if not nuit:
+            poignet = (coude[0] * 0.3 + main[0] * 0.7, coude[1] * 0.3 + main[1] * 0.7)
+            toile.rond(poignet, 0.5, _sombre(TABLIER, f))
+        toile.rond((ep[0], ep[1] + 0.3), 1.0, _sombre(robe, f) if sombre else robe)    # la manche bouffante
+
+    def oreilles():
+        # celle du fond plus sombre ; celle de devant frissonne parfois ; la fatigue les couche
+        tourne = 0.9 if pose["frisson"] else 0.0
+        o = pose["oreilles"]
+        for base_a, base_b, bout, devant in (
+                ((tx - 2.5, ty - 1.8), (tx - 0.5, ty - 2.9), (tx - 1.9 - 1.2 * o, ty - 5.1 + 1.6 * o), False),
+                ((tx + 0.1, ty - 3.0), (tx + 2.2, ty - 2.1),
+                 (tx + 1.7 + 0.4 * tourne - 1.6 * o, ty - 5.2 + tourne + 1.4 * o), True)):
+            toile.polygone([base_a, base_b, bout], NOIR_CHAT if devant else _sombre(NOIR_CHAT, 0.8))
+            if devant:
+                milieu = ((base_a[0] + base_b[0]) / 2, (base_a[1] + base_b[1]) / 2)
+                vers = lambda p, f: (p[0] + (milieu[0] - p[0]) * f, p[1] + (milieu[1] - p[1]) * f)
+                toile.polygone([vers(base_a, 0.35), vers(base_b, 0.35), vers(bout, 0.3)], ROSE_OREILLE)
 
     bras(0, True)
-    # les jambes : chaussettes hautes blanches (celle du fond plus sombre), souliers
+    # les jambes : chaussettes hautes blanches (celle du fond plus sombre) et souliers ; la nuit, chaussons
     for k, f in ((0, 0.7), (1, 1.0)):
         genou, cheville = pose["genou%d" % k], pose["cheville%d" % k]
-        toile.trait(h, genou, 0.55, _sombre(TABLIER, f))
-        toile.trait(genou, cheville, 0.5, _sombre(TABLIER, f))
+        toile.trait(h, genou, 0.55, _sombre(PEAU if nuit else TABLIER, f))
+        toile.trait(genou, cheville, 0.5, _sombre(PEAU if nuit else TABLIER, f))
         toile.trait((cheville[0] - 0.2, cheville[1] + 0.4), (cheville[0] + 0.9, cheville[1] + 0.4), 0.5,
-                    _sombre(SOULIERS, f))
-    # la jupe, qui ondule un peu au rythme des pas ; la dentelle ; le tablier devant
-    ondule = 0.3 * math.sin(2 * 2 * math.pi * t / MAID_PAS_S)
-    taille, ourlet = h[1] - 1.2, h[1] + 2.3
-    toile.polygone([(h[0] - 1.5, taille), (h[0] + 1.4, taille), (h[0] + 2.8 + ondule, ourlet),
-                    (h[0] - 3.1 - ondule, ourlet)], ROBE)
-    toile.trait((h[0] - 3.0 - ondule, ourlet + 0.1), (h[0] + 2.7 + ondule, ourlet + 0.1), 0.55, TABLIER)
-    toile.polygone([(h[0] + 0.1, taille + 0.2), (h[0] + 1.5, taille + 0.2), (h[0] + 2.8 + ondule, ourlet),
-                    (h[0] + 0.8 + ondule, ourlet)], TABLIER)
-    # le buste, la bavette du tablier, le noeud blanc dans le dos
-    toile.trait((h[0], h[1] - 1.0), ep, 1.25, ROBE)
-    toile.trait((ep[0] + 0.9, ep[1] + 0.7), (h[0] + 1.0, taille + 0.2), 0.3, TABLIER)
-    toile.rond((h[0] - 2.0, taille - 0.4), 0.65, TABLIER)
-    toile.rond((h[0] - 2.5, taille + 0.6), 0.6, TABLIER)
-    # les oreilles (celle du fond plus sombre ; celle de devant frissonne parfois)
-    tourne = 0.9 if pose["frisson"] else 0.0
-    for base_a, base_b, bout, devant in (
-            ((tx - 2.5, ty - 1.8), (tx - 0.5, ty - 2.9), (tx - 1.9, ty - 5.1), False),
-            ((tx + 0.1, ty - 3.0), (tx + 2.2, ty - 2.1), (tx + 1.7 + 0.4 * tourne, ty - 5.2 + tourne), True)):
-        toile.polygone([base_a, base_b, bout], NOIR_CHAT if devant else _sombre(NOIR_CHAT, 0.8))
-        if devant:
-            milieu = ((base_a[0] + base_b[0]) / 2, (base_a[1] + base_b[1]) / 2)
-            vers = lambda p, f: (p[0] + (milieu[0] - p[0]) * f, p[1] + (milieu[1] - p[1]) * f)
-            toile.polygone([vers(base_a, 0.35), vers(base_b, 0.35), vers(bout, 0.3)], ROSE_OREILLE)
+                    _sombre(CHAUSSONS if nuit else SOULIERS, f))
+    ondule = 0.3 * math.sin(2 * 2 * math.pi * t / MAID_PAS_S[0]) * (1 - pose["calme"])
+    taille = h[1] - 1.2
+    if nuit:                                             # la chemise de nuit, plus longue, son liseré
+        ourlet = h[1] + 3.2
+        toile.polygone([(h[0] - 1.5, taille), (h[0] + 1.4, taille), (h[0] + 3.0 + ondule, ourlet),
+                        (h[0] - 3.2 - ondule, ourlet)], PYJAMA)
+        toile.trait((h[0] - 3.1 - ondule, ourlet + 0.1), (h[0] + 2.9 + ondule, ourlet + 0.1), 0.35, TABLIER)
+        toile.trait((h[0], h[1] - 1.0), ep, 1.25, PYJAMA)
+    else:                                                # la jupe, la dentelle, le tablier ; la bavette, le noeud
+        ourlet = h[1] + 2.3
+        toile.polygone([(h[0] - 1.5, taille), (h[0] + 1.4, taille), (h[0] + 2.8 + ondule, ourlet),
+                        (h[0] - 3.1 - ondule, ourlet)], ROBE)
+        toile.trait((h[0] - 3.0 - ondule, ourlet + 0.1), (h[0] + 2.7 + ondule, ourlet + 0.1), 0.55, TABLIER)
+        toile.polygone([(h[0] + 0.1, taille + 0.2), (h[0] + 1.5, taille + 0.2), (h[0] + 2.8 + ondule, ourlet),
+                        (h[0] + 0.8 + ondule, ourlet)], TABLIER)
+        toile.trait((h[0], h[1] - 1.0), ep, 1.25, ROBE)
+        toile.trait((ep[0] + 0.9, ep[1] + 0.7), (h[0] + 1.0, taille + 0.2), 0.3, TABLIER)
+        toile.rond((h[0] - 2.0, taille - 0.4), 0.65, TABLIER)
+        toile.rond((h[0] - 2.5, taille + 0.6), 0.6, TABLIER)
+        oreilles()
     # la tete ; les cheveux : le dessus, l'arriere qui tombe en carre, la frange
     toile.rond(tete, 3.1, PEAU)
     autour = toile.dans_rond(tete, 3.35)
@@ -12599,38 +12751,79 @@ def dessiner_maid(img, x, t, accent):
     toile.trait((tx - 2.0, ty + 0.5), (tx - 1.8, ty + 2.6), 1.0, NOIR_CHAT)
     toile.rond((tx + 1.7, ty - 1.0), 0.85, NOIR_CHAT)
     toile.trait((tx - 2.2, ty - 1.6), (tx - 0.9, ty - 2.5), 0.3, REFLET_CHAT)    # le reflet
-    # la coiffe : des volants blancs entre les oreilles
-    for d, hh in ((-1.0, 2.9), (0.3, 3.2)):
-        toile.rond((tx + d, ty - hh), 0.6, TABLIER)
+    if nuit:
+        # le bonnet de nuit, de la couleur de la guirlande, qui retombe en arriere ; le pompon ballotte
+        toile.peindre(toile.dans_rond(tete, 3.45) & (Y < ty - 0.9), accent)
+        bout = (tx - 5.0, ty + 0.6 + 0.5 * math.sin(2 * math.pi * t / MAID_PAS_S[pose["niveau"]]))
+        toile.polygone([(tx - 2.8, ty - 1.6), (tx + 0.6, ty - 3.4), bout], accent)
+        toile.rond(bout, 0.85, TABLIER)
+        oreilles()                                       # elles passent par-dessus le bonnet
+    else:
+        for d, hh in ((-1.0, 2.9), (0.3, 3.2)):          # la coiffe : des volants blancs entre les oreilles
+            toile.rond((tx + d, ty - hh), 0.6, TABLIER)
     bras(1, False)
     toile.poser(img)
 
-    # au pixel pres : le ruban du cou, l'oeil (grand), la joue, la bouche
-    _point(img, ep[0] + 0.9, ep[1] - 0.2, accent)
-    if chat_cligne(t + 0.9):
-        _point(img, tx + 1.6, ty + 1.2, YEUX_CHAT)
+    # au pixel pres : le ruban du cou, l'oeil (grand), la joue, la bouche -- en miroir si elle s'est retournee
+    def point(px, py, couleur):
+        if pose["miroir"]:
+            px = 2 * h[0] - (math.floor(px) + 0.5)
+        _point(img, px, py, couleur)
+
+    if not nuit:
+        point(ep[0] + 0.9, ep[1] - 0.2, accent)
+    yeux = pose["yeux"]
+    paupiere = _sombre(PEAU, 0.75)
+    if yeux == "ouverts":
+        point(tx + 1.6, ty + 0.2, YEUX_CHAT)
+        point(tx + 1.6, ty + 1.2, YEUX_CHAT)
+    elif yeux == "lourds":                               # la paupiere tombe a moitie
+        point(tx + 1.6, ty + 0.2, paupiere)
+        point(tx + 1.6, ty + 1.2, YEUX_CHAT)
+    elif yeux == "contents":                             # « ^ »
+        point(tx + 1.6, ty + 0.2, YEUX_CHAT)
     else:
-        _point(img, tx + 1.6, ty + 0.2, YEUX_CHAT)
-        _point(img, tx + 1.6, ty + 1.2, YEUX_CHAT)
-    _point(img, tx + 0.7, ty + 1.9, JOUES)
-    _point(img, tx + 2.5, ty + 2.1, BOUCHE_CHAT)
+        point(tx + 1.6, ty + 1.2, YEUX_CHAT)
+    point(tx + 0.7, ty + 1.9, JOUES)
+    if pose["bouche"] == "ouverte":
+        point(tx + 2.4, ty + 1.9, BAILLEMENT)
+        point(tx + 2.4, ty + 2.9, BAILLEMENT)
+    else:
+        point(tx + 2.5, ty + 2.1, BOUCHE_CHAT)
+
+    def motif_fondu(motif, mx, my, couleur):
+        for j, ligne in enumerate(motif):
+            for i, c in enumerate(ligne):
+                if c == "#" and 0 <= mx + i < PANNEAU_L and 39 <= my + j < 59:
+                    img[my + j, mx + i] = couleur
+
     # le petit coeur : il monte derriere elle et s'efface (devant, au petit matin : derriere, il n'y a pas la place)
     if pose["coeur"] is not None:
         u = pose["coeur"]
         f = min(1.0, u * 5) * (1 - u)
-        couleur = tuple(int(c * f) for c in (255, 90, 140))
         hx = int(round(tx - 9 - 2 * u)) if tx > 14 else int(round(tx + 5 + 2 * u))
-        hy = int(round(ty - 2 - 3 * u))
-        for j, ligne in enumerate(_COEUR):
-            for i, c in enumerate(ligne):
-                if c == "#" and 0 <= hx + i < PANNEAU_L and 39 <= hy + j < 59:
-                    img[hy + j, hx + i] = couleur
+        motif_fondu(_COEUR, hx, int(round(ty - 2 - 3 * u)), tuple(int(c * f) for c in (255, 90, 140)))
+    # endormie debout : des « z » qui montent, du cote ou il y a de la place
+    if pose["zzz"] is not None:
+        cote = 1 if tx < 46 else -1
+        for k in range(3):
+            v = (pose["zzz"] * 2 + k / 3.0) % 1.0
+            f = min(1.0, v * 4) * (1 - v)
+            zx = int(round(tx + cote * (3 + 6 * v + k))) - (2 if cote < 0 else 0)
+            motif_fondu(_PETITE_3X5["Z"], zx, int(round(ty - 2 - 5 * v)), tuple(int(c * f) for c in (190, 190, 240)))
     return pose
 
 
 def _zone_maid(img, t, accent, ecoule):
-    """La maid qui marche avec la journee, comme le bonhomme."""
-    dessiner_maid(img, chemin_de_la_journee(img, t, accent), t, accent)
+    """La maid qui marche avec la journee, comme le bonhomme ; tard le soir,
+    si tu es encore la, l'interface de nuit."""
+    present = PANNEAU.get("present", True)
+    nuit = maid_veille(t, present)
+    x = chemin_de_la_journee(img, t, accent)
+    if nuit:
+        _etoiles(img, t)
+    fatigue = fatigue_maid(t, PANNEAU.get("debout_depuis") if present else None)
+    dessiner_maid(img, x, t, accent, fatigue, nuit)
 
 
 def _prochain_chrono(minuteurs, t):
@@ -12991,6 +13184,7 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
             if cfg.get("mode") != "son":
                 arreter_audio()
         if actif:
+            suivre_presence(t)                          # la maid : veilles-tu ? depuis quand ?
             if float(AUDIO.get("brut") or 0) > 1e-3:
                 PANNEAU["musique_vue"] = t              # quelque chose sort des haut-parleurs
             if t >= meteo_t or PANNEAU.get("meteo_a_relire"):
