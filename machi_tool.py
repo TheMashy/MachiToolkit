@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.94.0"
+VERSION = "1.95.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -14123,7 +14123,10 @@ class Panneau:
         pied.pack(fill="x", padx=marge, pady=(self.px(12), self.px(16)))
         ligne = tk.Frame(pied, bg=VELOURS)
         ligne.pack(fill="x", padx=self.px(12), pady=(self.px(10), self.px(4)))
-        tk.Label(ligne, text="NOUVEAU RAPPEL", bg=VELOURS, fg=BRUME, font=(self.f_mono, 8)).pack(side="left")
+        # « rajoute une interface pour le faire directement a la main via l'agenda » :
+        # le clic sur un rendez-vous existait, sans que rien ne le dise
+        self.agenda_tete = tk.Label(ligne, text=self.AGENDA_TETE, bg=VELOURS, fg=BRUME, font=(self.f_mono, 8))
+        self.agenda_tete.pack(side="left")
         self.agenda_retour = tk.Label(ligne, text="", bg=VELOURS, fg=BRUME, font=(self.f_ui, 9))
         self.agenda_retour.pack(side="right")
         champs = tk.Frame(pied, bg=VELOURS)
@@ -14144,6 +14147,9 @@ class Panneau:
         self.agenda_bouton_ajouter = self.bouton(champs, "Ajouter", self.ajouter_rappel, principal=True,
                                                  compact=True)
         self.agenda_bouton_ajouter.pack(side="left", padx=(self.px(10), 0))
+        # en modification : le retirer, ou laisser tomber -- visibles, pas seulement au clic droit
+        self.agenda_bouton_retirer = self.bouton(champs, "Retirer", self._agenda_retirer_edite, compact=True)
+        self.agenda_bouton_annuler = self.bouton(champs, "Annuler", self._agenda_fin_edition, compact=True)
         for e in (self.agenda_titre, self.agenda_date, self.agenda_fin, self.agenda_heure):
             e.bind("<Return>", lambda _e: self.ajouter_rappel())
 
@@ -14266,7 +14272,10 @@ class Panneau:
                 champ.insert(0, str(valeur))
                 champ.configure(fg=CRAIE)
         self.agenda_bouton_ajouter.configure(text="Enregistrer")
-        self.agenda_retour.configure(text="Modification -- Echap pour annuler", fg=BRUME)
+        self.agenda_tete.configure(text="MODIFIER « %s »" % str(r.get("label") or "")[:40].upper(), fg=CRAIE)
+        self.agenda_bouton_retirer.pack(side="left", padx=(self.px(6), 0))
+        self.agenda_bouton_annuler.pack(side="left", padx=(self.px(6), 0))
+        self.agenda_retour.configure(text="Echap pour annuler", fg=BRUME)
         self.agenda_titre.focus_set()
 
     def _agenda_fin_edition(self):
@@ -14274,7 +14283,19 @@ class Panneau:
         for e in (self.agenda_titre, self.agenda_date, self.agenda_fin, self.agenda_heure):
             self._vider(e)
         self.agenda_bouton_ajouter.configure(text="Ajouter")
+        if getattr(self, "agenda_tete", None) is not None:
+            self.agenda_tete.configure(text=self.AGENDA_TETE, fg=BRUME)
+            self.agenda_bouton_retirer.pack_forget()
+            self.agenda_bouton_annuler.pack_forget()
         self.agenda_retour.configure(text="")
+
+    AGENDA_TETE = "NOUVEAU RAPPEL  ·  clic sur un rendez-vous : le modifier ou le retirer"
+
+    def _agenda_retirer_edite(self):
+        r = getattr(self, "agenda_edition", None)
+        if r:
+            self._agenda_fin_edition()
+            self._agenda_retirer(r)
 
     def _agenda_retirer(self, r):
         cfg = self.cfg
@@ -14910,8 +14931,13 @@ class Panneau:
             c.create_text(0, y + self.px(2), text=nom, fill=BRUME, font=(self.f_mono, 8), anchor="nw")
             c.create_line(gauche, y - self.px(8), W, y - self.px(8), fill=FIL)
         # les rappels
+        def rdv_de(heure, libelle, date, fin):
+            return next((x for x in d["rdv"] if str(x.get("label")) == libelle and x.get("date") == date
+                         and (x.get("fin") or None) == (fin or None) and (x.get("heure") or None) == (heure or None)),
+                        None)
         for v, i0, i1, heure, libelle, date, fin in voies:
             teinte = _jv.teinte_rendez_vous(libelle)
+            r_ = rdv_de(heure, libelle, date, fin)
             y0 = y_rdv + v * voie_h
             y1 = y0 + voie_h - self.px(6)
             passe = (fin or date) < auj
@@ -14923,13 +14949,18 @@ class Panneau:
                 court = texte if len(texte) <= place else texte[:max(1, place - 1)] + "…"
                 c.create_text(x0 + self.px(8), (y0 + y1) / 2, text=court, anchor="w",
                               fill=BRUME if passe else NUIT, font=(self.f_ui, 9, "bold"))
+                if r_:
+                    self._agenda_rdv_zone(x0, y0, x1, y1, r_)
             else:
                 cx = gauche + i0 * col + col / 2
                 r = self.px(5)
                 c.create_oval(cx - r, (y0 + y1) / 2 - r, cx + r, (y0 + y1) / 2 + r,
                               fill=FIL if passe else teinte, outline="")
-                c.create_text(cx + r + self.px(5), (y0 + y1) / 2, text=texte, anchor="w",
-                              fill=BRUME if passe else CRAIE, font=police)
+                t_ = c.create_text(cx + r + self.px(5), (y0 + y1) / 2, text=texte, anchor="w",
+                                   fill=BRUME if passe else CRAIE, font=police)
+                if r_:
+                    bx = c.bbox(t_)
+                    self._agenda_rdv_zone(cx - r, y0, bx[2] if bx else cx + r, y1, r_)
         if not voies:
             c.create_text(gauche + self.px(8), y_rdv + voie_h / 2 - self.px(3), anchor="w", fill=BRUME,
                           font=police, text=d["message"] if d["etat"] != "ok" else "Rien sur ces trois semaines.")
