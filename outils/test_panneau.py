@@ -448,6 +448,14 @@ class AL_Ecran(unittest.TestCase):
             p.regler_panneau("panneau_maj")
             self.assertFalse(M.CFG["panneau_maj"])
             M.CFG["panneau_maj"] = True
+            # « detecter quand je vais sur FL Studio » : sa case, et la vue s'en va tout de suite
+            self.assertEqual(p.var_panneau_fl.get(), 1)
+            M.PANNEAU["fl"] = {"depuis": 0.0, "vu": 0.0, "projet": ""}
+            p.var_panneau_fl.set(0)
+            p.regler_panneau("panneau_fl")
+            self.assertFalse(M.CFG["panneau_fl"])
+            self.assertIsNone(M.PANNEAU["fl"])
+            M.CFG["panneau_fl"] = True
             p.var_panneau_claude.set(0)
             p.regler_panneau("panneau_claude")
             self.assertFalse(M.CFG["panneau_claude"])
