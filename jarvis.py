@@ -5951,6 +5951,26 @@ def rdv_du_jour(rendez_vous, jour):
                                       str(r.get("label") or "")))
 
 
+# LA METEO DU PANNEAU. Les codes WMO d'Open-Meteo -> (icone, ce qu'on ecrit).
+_METEO = (((0,), "soleil", "DEGAGE", "CLEAR"), ((1,), "eclaircie", "PEU NUAGEUX", "MOSTLY CLEAR"),
+          ((2,), "eclaircie", "ECLAIRCIES", "PARTLY CLOUDY"), ((3,), "nuage", "COUVERT", "OVERCAST"),
+          ((45, 48), "brouillard", "BROUILLARD", "FOG"), ((51, 53, 55, 56, 57), "pluie", "BRUINE", "DRIZZLE"),
+          ((61, 63, 65, 66, 67), "pluie", "PLUIE", "RAIN"), ((71, 73, 75, 77, 85, 86), "neige", "NEIGE", "SNOW"),
+          ((80, 81, 82), "pluie", "AVERSES", "SHOWERS"), ((95, 96, 99), "orage", "ORAGE", "STORM"))
+
+
+def meteo_lisible(code, jour=True, langue="fr"):
+    """(icone, libelle) pour un code meteo WMO ; la nuit, le soleil devient la lune."""
+    for codes, icone, fr, en in _METEO:
+        if int(code) in codes:
+            if not jour and icone in ("soleil", "eclaircie"):
+                icone = "lune" if icone == "soleil" else "eclaircie_nuit"
+                if icone == "lune":
+                    fr, en = "NUIT CLAIRE", "CLEAR NIGHT"
+            return icone, (en if langue == "en" else fr)
+    return "nuage", ("WEATHER" if langue == "en" else "METEO")
+
+
 def restants_du_jour(rdv_jour, maintenant_min):
     """Ce qui reste aujourd'hui : les rendez-vous a heure pas encore passes, et
     ceux de toute la journee (sans heure, ou une periode qui couvre le jour)."""

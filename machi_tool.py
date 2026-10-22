@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.95.0"
+VERSION = "1.96.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -351,6 +351,10 @@ CONFIG_DEFAUT = {
     "panneau_suit_eclat": True,
     # le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes
     "panneau_rdv": True,
+    # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
+    "panneau_cycle": True,
+    "meteo_ville": "",                # vide : le lieu approximatif de la connexion
+    "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
     "jarvis_auto_etalonnage": True,   # garder seul les facons de l'appeler qu'il ratait de peu
@@ -3777,10 +3781,14 @@ AUDIO = {
     "niveau": 0.0,
     "saturation": 0.0,
     "gain": 0.0,
+    # l'egaliseur du panneau LED : 12 bandes de 40 Hz a 16 kHz (0 a 1), et
+    # l'energie brute (sans gain automatique) -- elle dit si quelque chose joue
+    "spectre": [0.0] * 12,
+    "brut": 0.0,
 }
 
 BANDES = (("graves", 30, 250), ("mediums", 250, 2000), ("aigus", 2000, 16000))
-SON = {"marche": False}
+SON = {"marche": False, "panneau": False}   # « panneau » : l'egaliseur du panneau LED en a besoin
 
 
 def fil_audio(cfg):
@@ -3803,6 +3811,8 @@ def fil_audio(cfg):
     plafonds = {nom: 1e-3 for nom, _, _ in BANDES}
     plafonds["tout"] = 1e-3
     lisses = {nom: 0.0 for nom in list(plafonds)}
+    bornes = np.geomspace(40, 16000, 13)
+    plafonds_eq, lisses_eq = np.full(12, 1e-3), np.zeros(12)
 
     while SON["marche"]:
         try:
@@ -3826,6 +3836,16 @@ def fil_audio(cfg):
                         mesures[nom] = float(np.sqrt(
                             (spectre[masque] ** 2).mean())) if masque.any() else 0.0
                     mesures["tout"] = float(np.sqrt((spectre ** 2).mean()))
+                    AUDIO["brut"] = mesures["tout"]
+                    # l'egaliseur du panneau : 12 bandes, chacune son gain
+                    # automatique, montee vive et descente douce
+                    eq = np.array([np.sqrt((spectre[(freqs >= bornes[i]) & (freqs < bornes[i + 1])] ** 2).mean())
+                                   if ((freqs >= bornes[i]) & (freqs < bornes[i + 1])).any() else 0.0
+                                   for i in range(12)])
+                    plafonds_eq = np.maximum(np.maximum(eq, plafonds_eq * 0.9992), 1e-4)
+                    v = np.minimum(1.0, eq / plafonds_eq)
+                    lisses_eq += (v - lisses_eq) * np.where(v > lisses_eq, 0.6, 0.15)
+                    AUDIO["spectre"] = [float(x) for x in lisses_eq]
 
                     # Centroide calcule sur les trois bandes plutot que sur le
                     # spectre brut : un centroide classique est tire vers le haut
@@ -3873,6 +3893,10 @@ def demarrer_audio(cfg):
 
 
 def arreter_audio():
+    """Le mode « son » de la guirlande s'arrete -- la capture continue si
+    l'egaliseur du panneau LED s'en sert."""
+    if SON.get("panneau"):
+        return
     SON["marche"] = False
 
 
@@ -11562,6 +11586,7 @@ _PETITE_3X5 = {
     "6": (".##", "#..", "###", "#.#", "###"), "7": ("###", "..#", ".#.", ".#.", ".#."),
     "8": ("###", "#.#", "###", "#.#", "###"), "9": ("###", "#.#", "###", "..#", "##."),
     ":": (".", "#", ".", "#", "."), ".": (".", ".", ".", ".", "#"), "-": ("...", "...", "###", "...", "..."),
+    "/": ("..#", "..#", ".#.", "#..", "#.."),
     " ": ("..", "..", "..", "..", ".."),
 }
 _JOURS_PANNEAU = ("LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM")
@@ -11932,6 +11957,242 @@ def programme_au_panneau(maintenant):
     return None
 
 
+# LE CYCLE SOUS LA DATE. « Rajoute des cycles en dessous de la date : un
+# cycle qui fade sur la meteo, puis un fade sur un petit egaliseur qui reagit
+# a la musique avec le nom de la musique (quand Spotify change de musique),
+# puis un petit bonhomme qui marche (de gauche a droite en fonction de l'heure
+# de la journee), puis l'heure a nouveau. » Les lignes 39 a 58, entre la date
+# et les secondes ; un fondu d'une seconde d'une vue a l'autre. La musique ne
+# vient que si quelque chose joue ; un morceau qui change y saute tout de
+# suite. Un minuteur qui va sonner, un rendez-vous qui arrive : le cycle
+# s'arrete sur l'heure.
+
+ZONE_CYCLE = slice(39, 59)
+CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme")
+CYCLE_DUREES = {"heure": 12.0, "meteo": 8.0, "musique": 10.0, "bonhomme": 8.0}
+CYCLE_FONDU_S = 1.0
+CYCLE_URGENT_MINUTEUR_S = 300          # un minuteur a moins de 5 min : l'heure reste
+CYCLE_URGENT_RDV_S = 600               # un rendez-vous a moins de 10 min : aussi
+MUSIQUE_VUE_S = 10                     # quelque chose a joue dans les 10 dernieres secondes
+METEO_S = 900                          # la meteo, relue tous les quarts d'heure
+METEO_VIEILLE_S = 3 * 3600             # au-dela, elle ne s'affiche plus
+SPOTIFY_S = 5                          # le morceau, regarde toutes les 5 s
+
+
+def cycle_disponible(maintenant):
+    """Les vues du cycle qui ont quelque chose a montrer."""
+    d = ["heure"]
+    m = PANNEAU.get("meteo")
+    if m and maintenant - float(m.get("quand") or 0) < METEO_VIEILLE_S:
+        d.append("meteo")
+    if maintenant - float(PANNEAU.get("musique_vue") or 0) < MUSIQUE_VUE_S:
+        d.append("musique")
+    d.append("bonhomme")
+    return d
+
+
+def cycle_urgent(minuteurs, rdv, maintenant):
+    """Un minuteur qui va sonner, un rendez-vous qui arrive : l'heure reste."""
+    for m in minuteurs or []:
+        if isinstance(m, dict) and m.get("genre") in ("minuteur", "alarme") \
+                and 0 <= float(m.get("fin") or 0) - maintenant <= CYCLE_URGENT_MINUTEUR_S:
+            return True
+    p = prochain_rdv(rdv or [], maintenant)
+    return bool(p and p[1] <= CYCLE_URGENT_RDV_S)
+
+
+def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None):
+    """Ou en est le cycle : {actuel, precedent, fondu (0 a 1), ecoule}."""
+    c = PANNEAU.get("cycle")
+    if not c or maintenant < c["depuis"] or maintenant - c["depuis"] > 3600:
+        c = PANNEAU["cycle"] = {"actuel": "heure", "precedent": None, "depuis": maintenant}
+
+    def passer(vers):
+        c.update(precedent=c["actuel"], actuel=vers, depuis=maintenant)
+    if urgent:
+        if c["actuel"] != "heure":
+            passer("heure")
+    elif saut and saut in disponibles and c["actuel"] != saut:
+        passer(saut)
+    elif c["actuel"] not in disponibles or maintenant - c["depuis"] >= CYCLE_DUREES[c["actuel"]]:
+        i = CYCLE_ORDRE.index(c["actuel"])
+        for k in range(1, len(CYCLE_ORDRE) + 1):
+            suivante = CYCLE_ORDRE[(i + k) % len(CYCLE_ORDRE)]
+            if suivante in disponibles:
+                if suivante != c["actuel"]:
+                    passer(suivante)
+                break
+    ecoule = maintenant - c["depuis"]
+    fondu = min(1.0, ecoule / CYCLE_FONDU_S) if c["precedent"] else 1.0
+    return {"actuel": c["actuel"], "precedent": c["precedent"], "fondu": fondu, "ecoule": ecoule}
+
+
+def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule):
+    import numpy as np
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    if nom == "meteo":
+        _zone_meteo(img, PANNEAU.get("meteo"))
+    elif nom == "musique":
+        _zone_musique(img, t, accent, PANNEAU.get("morceau"), ecoule)
+    elif nom == "bonhomme":
+        _zone_bonhomme(img, t, accent)
+    else:
+        _zone_heure(img, t, minuteurs, rdv)
+    return img
+
+
+def _zone_heure(img, t, minuteurs, rdv):
+    # le minuteur de Jarvis, s'il y en a un
+    suivant = _prochain_chrono(minuteurs, t)
+    if suivant:
+        genre, texte = suivant
+        couleur = {"minuteur": (255, 150, 40), "alarme": (255, 90, 70), "chrono": (110, 170, 255)}[genre]
+        ecrire_petit(img, texte, None, 44, couleur)
+    # le prochain rendez-vous, une heure avant : son heure (qui bat les cinq
+    # dernieres minutes) dans sa couleur, son titre qui defile s'il est long
+    prochain = prochain_rdv(rdv or [], t)
+    if prochain:
+        r, avant, couleur = prochain
+        if 0 < avant <= 300:
+            couleur = tuple(int(c * (0.55 + 0.45 * abs(math.cos(t * math.pi)))) for c in couleur)
+        heure = str(r["heure"])[:5]
+        ecrire_petit(img, heure, 2, 52, couleur)
+        ecrire_tenant(img, str(r.get("label") or ""), 4 + largeur_petit(heure) + 2, 62, 52, TITRE_RDV,
+                      PANNEAU_PROCHAIN_S - avant)
+
+
+def ecrire_5x7(img, texte, x, y, couleur):
+    """Du texte en 5 x 7 (la police du panneau de Jarvis) ; rend la largeur."""
+    x0 = x
+    for c in str(texte):
+        g = _jv._glyphe(c)
+        _motif(img, g, x, y, couleur)
+        x += len(g[0]) + 1
+    return x - x0 - 1
+
+
+def _disque(img, cx, cy, r, couleur, sauf=None):
+    import numpy as np
+    yy, xx = np.mgrid[0:PANNEAU_H, 0:PANNEAU_L]
+    m = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+    if sauf is not None:
+        m &= ~sauf
+    img[m] = couleur
+    return m
+
+
+SOLEIL, LUNE, NUAGE, GOUTTE, FLOCON, ECLAIR = ((255, 200, 60), (225, 225, 200), (175, 182, 200),
+                                               (90, 160, 255), (235, 240, 255), (255, 225, 80))
+
+
+def _nuage(img, x0, y0, couleur=NUAGE):
+    _disque(img, x0 + 3, y0 + 5, 2.4, couleur)
+    _disque(img, x0 + 6, y0 + 4, 3.0, couleur)
+    _disque(img, x0 + 8.5, y0 + 5.5, 2.0, couleur)
+    img[y0 + 5:y0 + 8, x0 + 2:x0 + 10] = couleur
+
+
+def icone_meteo(img, icone, x0, y0):
+    """Une icone 11 x 11 : soleil, lune, nuage, eclaircie, pluie, neige, orage, brouillard."""
+    if icone in ("soleil", "eclaircie"):
+        cx, cy = (x0 + 5, y0 + 5) if icone == "soleil" else (x0 + 3, y0 + 3)
+        r = 2.6 if icone == "soleil" else 1.8
+        _disque(img, cx, cy, r, SOLEIL)
+        d = r + 2
+        for k in range(8):
+            a = k * math.pi / 4
+            x, y = int(round(cx + math.cos(a) * d)), int(round(cy + math.sin(a) * d))
+            if 0 <= x < PANNEAU_L and 0 <= y < PANNEAU_H:
+                img[y, x] = SOLEIL
+    if icone in ("lune", "eclaircie_nuit"):
+        cx, cy, r = (x0 + 5, y0 + 5, 3.5) if icone == "lune" else (x0 + 3, y0 + 3, 2.3)
+        creux = _disque(img.copy(), cx + 1.6, cy - 1.2, r * 0.85, (0, 0, 0))
+        _disque(img, cx, cy, r, LUNE, sauf=creux)
+    if icone in ("nuage", "eclaircie", "eclaircie_nuit"):
+        _nuage(img, x0 + (1 if icone != "nuage" else 0), y0 + (2 if icone != "nuage" else 1))
+    if icone in ("pluie", "neige", "orage"):
+        _nuage(img, x0, y0 - 1)
+        for k, x in enumerate((x0 + 3, x0 + 6, x0 + 9)):
+            if icone == "pluie":
+                img[y0 + 8 + k % 2:y0 + 10 + k % 2, x] = GOUTTE
+            elif icone == "neige":
+                img[y0 + 9 + k % 2, x] = FLOCON
+        if icone == "orage":
+            for dx, dy in ((5, 7), (4, 8), (5, 8), (6, 8), (5, 9), (4, 10)):
+                img[y0 + dy, x0 + dx] = ECLAIR
+    if icone == "brouillard":
+        for k, y in enumerate((y0 + 3, y0 + 6, y0 + 9)):
+            img[y, x0 + 1 + k % 2:x0 + 10:1] = NUAGE
+            img[y, x0 + 1 + (k + 1) % 2:x0 + 10:3] = 0
+
+
+def _zone_meteo(img, m):
+    """La temperature en grand, l'icone, ce qu'il fait ; le mini / maxi du jour."""
+    if not m:
+        return
+    icone, libelle = _jv.meteo_lisible(m.get("code", 3), m.get("jour", True), langue_jarvis(CFG))
+    icone_meteo(img, icone, 3, 41)
+    temp = "%d°" % int(round(float(m.get("temp") or 0)))
+    ecrire_5x7(img, temp, 18, 42, (235, 235, 245))
+    if m.get("min") is not None and m.get("max") is not None:
+        bornes = "%d/%d" % (int(round(m["min"])), int(round(m["max"])))
+        ecrire_petit(img, bornes, 62 - largeur_petit(bornes), 43, (150, 150, 165))
+    ecrire_tenant(img, libelle, 18, 62, 52, (150, 150, 165))
+
+
+def _zone_musique(img, t, accent, morceau, ecoule):
+    """Douze barres qui suivent le son (le spectre de ce qui sort des
+    haut-parleurs), un point qui retombe au-dessus de chacune ; dessous, le
+    morceau, qui defile depuis qu'il a commence."""
+    titre = ""
+    if morceau:
+        titre = str(morceau.get("titre") or "")
+        if morceau.get("artistes"):
+            titre += " - " + str(morceau["artistes"])
+    haut = 10 if titre else 14
+    bas = 50 if titre else 56
+    spectre = list(AUDIO.get("spectre") or [])
+    if not AUDIO.get("actif") or len(spectre) != 12:
+        spectre = [0.25 + 0.2 * math.sin(t * 3 + i * 0.7) for i in range(12)]
+    cretes = PANNEAU.setdefault("cretes", [0.0] * 12)
+    for i, v in enumerate(spectre):
+        h = max(1, int(round(max(0.0, min(1.0, v)) * haut)))
+        cretes[i] = max(float(h), cretes[i] - 0.35)
+        x = 3 + i * 5
+        for k in range(h):
+            img[bas - k, x:x + 3] = tuple(int(c * (0.45 + 0.55 * k / max(1, haut - 1))) for c in accent)
+        img[max(bas - haut, bas - int(round(cretes[i]))), x:x + 3] = (235, 235, 245)   # juste au-dessus
+    if titre:
+        ecrire_tenant(img, titre, 2, 62, 53, TITRE_RDV, ecoule if ecoule is not None else 0.0)
+
+
+# le petit bonhomme, 5 x 9, deux pas
+_BONHOMME = (
+    ("..#..", ".###.", "..#..", ".###.", "#.#.#", "..#..", ".#.#.", ".#.#.", "#...#"),
+    ("..#..", ".###.", "..#..", "..#..", ".###.", "..#..", "..#..", ".#.#.", ".#.#."),
+)
+
+
+def _zone_bonhomme(img, t, accent):
+    """Un bonhomme qui marche avec la journee : minuit a gauche, minuit a
+    droite. Le chemin deja fait s'eclaire ; un trait tous les six heures ; le
+    soleil le jour, la lune la nuit."""
+    lt = time.localtime(t)
+    jour = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (t % 1.0)) / 86400.0
+    x = 2 + int(round(jour * (61 - 2 - 5)))
+    img[56, 2:62] = (40, 40, 50)
+    img[56, 2:x + 3] = tuple(int(c * 0.35) for c in accent)
+    for h in (0, 6, 12, 18, 24):
+        img[57, 2 + int(round(h / 24.0 * 59))] = (90, 90, 105)
+    pas = _BONHOMME[int(t * 4) % 2]
+    _motif(img, pas[:2], x, 47, tuple(min(255, int(c * 1.0 + 30)) for c in accent))
+    _motif(img, pas[2:], x, 49, accent)
+    if 7 <= lt.tm_hour < 20:
+        _disque(img, 57, 43, 2.3, SOLEIL)
+    else:
+        _motif(img, (".##..", "##...", "##...", "##...", ".##.."), 56, 41, LUNE)   # un croissant, dessine
+
+
 def _prochain_chrono(minuteurs, t):
     """Le minuteur (ou l'alarme, ou le chrono) a montrer : celui qui sonne en
     premier. (genre, texte) ou None."""
@@ -11948,12 +12209,15 @@ def _prochain_chrono(minuteurs, t):
     return None
 
 
-def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None, eclat=None, rdv=None):
+def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=None, eclat=None, rdv=None,
+                  cycle=None):
     """L'image de 64 x 64 (numpy, RGB) que le panneau doit montrer : ce que
     l'ecran en montre (voir `rgb565` pour ce que la carte en recoit).
     `eclat` (0 a 1) : l'horloge suit la lumiere de la guirlande, jamais sous
     PANNEAU_ECLAT_MIN ; None : pleine lumiere. `rdv` : ceux du jour -- celui
-    qui arrive dans l'heure s'ecrit au-dessus des secondes."""
+    qui arrive dans l'heure s'ecrit au-dessus des secondes. `cycle` (voir
+    cycle_du_panneau) : sous la date, la meteo, la musique, le bonhomme --
+    sans lui, l'heure seule (le minuteur, le prochain rendez-vous)."""
     import numpy as np
     img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
     t = time.time() if maintenant is None else maintenant
@@ -11976,23 +12240,18 @@ def image_panneau(contenu="horloge", maintenant=None, accent=None, minuteurs=Non
     # la date
     date = "%s %d %s" % (_JOURS_PANNEAU[lt.tm_wday], lt.tm_mday, _MOIS_PANNEAU[lt.tm_mon - 1])
     ecrire_petit(img, date, None, 32, (150, 150, 165))
-    # le minuteur de Jarvis, s'il y en a un
-    suivant = _prochain_chrono(minuteurs, t)
-    if suivant:
-        genre, texte = suivant
-        couleur = {"minuteur": (255, 150, 40), "alarme": (255, 90, 70), "chrono": (110, 170, 255)}[genre]
-        ecrire_petit(img, texte, None, 44, couleur)
-    # le prochain rendez-vous, une heure avant : son heure (qui bat les cinq
-    # dernieres minutes) dans sa couleur, son titre qui defile s'il est long
-    prochain = prochain_rdv(rdv or [], t)
-    if prochain:
-        r, avant, couleur = prochain
-        if 0 < avant <= 300:
-            couleur = tuple(int(c * (0.55 + 0.45 * abs(math.cos(t * math.pi)))) for c in couleur)
-        heure = str(r["heure"])[:5]
-        ecrire_petit(img, heure, 2, 52, couleur)
-        ecrire_tenant(img, str(r.get("label") or ""), 4 + largeur_petit(heure) + 2, 62, 52, TITRE_RDV,
-                      PANNEAU_PROCHAIN_S - avant)
+    # sous la date : l'heure (son minuteur, son prochain rendez-vous), ou le
+    # cycle -- meteo, musique, bonhomme --, en fondu de l'une a l'autre
+    zone = lambda nom, ecoule: _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule)
+    if not cycle:
+        img[ZONE_CYCLE] = zone("heure", None)[ZONE_CYCLE]
+    else:
+        b = zone(cycle["actuel"], cycle.get("ecoule"))[ZONE_CYCLE].astype(np.float32)
+        w = float(cycle.get("fondu", 1.0))
+        if cycle.get("precedent") and w < 1.0:
+            a = zone(cycle["precedent"], None)[ZONE_CYCLE].astype(np.float32)
+            b = a * (1.0 - w) + b * w
+        img[ZONE_CYCLE] = np.clip(np.round(b), 0, 255).astype(np.uint8)
     # les secondes : une ligne qui se remplit en bas, un pixel par seconde ;
     # celui du bout s'allume progressivement (a 30 i/s, elle glisse)
     s = min(59, lt.tm_sec) + (t % 1.0)
@@ -12096,7 +12355,13 @@ def image_du_panneau(cfg, contenu, t):
             rdv = agenda_du_jour(cfg, maintenant=t)
         except Exception:
             rdv = []
-    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv)
+    cycle = None
+    if contenu == "horloge" and cfg.get("panneau_cycle", True):
+        saut = None
+        if PANNEAU.get("musique_saut"):                  # un morceau vient de changer
+            saut, PANNEAU["musique_saut"] = "musique", None
+        cycle = cycle_du_panneau(t, cycle_disponible(t), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut)
+    return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
 
 
 def fletcher16(donnees):
@@ -12154,6 +12419,148 @@ def version_croquis(lien, attente=0.5, calme=0.3):
         return int(v.group(1)) if v else 1
     except Exception:
         return 1
+
+
+# LES SOURCES DU CYCLE, dans leur propre fil : le reseau (la meteo, Spotify)
+# et le son ne font jamais attendre le panneau. Elles ne tournent que panneau
+# branche, en horloge, cycle coche.
+
+def _lire_url_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": "MachiTool/%s" % VERSION})
+    with urllib.request.urlopen(req, timeout=timeout, context=_contexte_ssl()) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def lieu_meteo(cfg, lire=None):
+    """Ou prendre la meteo : la ville tapee (Open-Meteo la situe), sinon le lieu
+    approximatif de la connexion (ipapi.co). Garde dans la config."""
+    lire = lire or _lire_url_json
+    ville = str(cfg.get("meteo_ville") or "").strip()
+    lieu = cfg.get("meteo_lieu") or {}
+    if lieu.get("ville", "") == ville and lieu.get("lat") is not None:
+        return lieu
+    if ville:
+        r = lire("https://geocoding-api.open-meteo.com/v1/search?count=1&language=fr&format=json&name="
+                 + urllib.parse.quote(ville))
+        trouve = (r.get("results") or [None])[0]
+        if not trouve:
+            raise LookupError("ville introuvable : %s" % ville)
+        lieu = {"ville": ville, "nom": trouve.get("name") or ville, "lat": trouve["latitude"],
+                "lon": trouve["longitude"]}
+    else:
+        r = lire("https://ipapi.co/json/")
+        lieu = {"ville": "", "nom": r.get("city") or "", "lat": r["latitude"], "lon": r["longitude"]}
+    cfg["meteo_lieu"] = lieu
+    try:
+        sauver_config(cfg)
+    except Exception:
+        pass
+    return lieu
+
+
+def rafraichir_meteo(cfg, lire=None, maintenant=None):
+    """La meteo du moment (Open-Meteo, gratuit, sans cle) : temperature, ciel,
+    jour ou nuit, mini et maxi du jour."""
+    lire = lire or _lire_url_json
+    lieu = lieu_meteo(cfg, lire)
+    r = lire("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,weather_code,is_day&daily=temperature_2m_max,temperature_2m_min"
+             "&timezone=auto&forecast_days=1" % (float(lieu["lat"]), float(lieu["lon"])))
+    c, d = r.get("current") or {}, r.get("daily") or {}
+    premier = lambda k: (d.get(k) or [None])[0]
+    PANNEAU["meteo"] = {"temp": float(c["temperature_2m"]), "code": int(c.get("weather_code") or 0),
+                        "jour": bool(c.get("is_day", 1)), "min": premier("temperature_2m_min"),
+                        "max": premier("temperature_2m_max"), "lieu": lieu.get("nom") or "",
+                        "quand": time.time() if maintenant is None else maintenant}
+    return PANNEAU["meteo"]
+
+
+def morceau_fenetre_spotify():
+    """Sans Spotify relie : le titre de sa fenetre (« Artiste - Titre » quand
+    il joue, « Spotify » en pause). Windows seulement."""
+    if os.name != "nt":
+        return None
+    import win32gui
+    import win32process
+    trouves = []
+
+    def voir(h, _):
+        try:
+            titre = win32gui.GetWindowText(h)
+            if win32gui.IsWindowVisible(h) and " - " in titre:
+                _, pid = win32process.GetWindowThreadProcessId(h)
+                if (_nom_du_processus(pid) or "").lower() == "spotify.exe":
+                    trouves.append(titre)
+        except Exception:
+            pass
+        return True
+    win32gui.EnumWindows(voir, None)
+    if not trouves:
+        return None
+    artistes, _, titre = trouves[0].partition(" - ")
+    return {"titre": titre.strip(), "artistes": artistes.strip()}
+
+
+def morceau_en_cours(cfg):
+    """Ce que Spotify joue : son API s'il est relie, sinon sa fenetre."""
+    if spotify_connecte(cfg):
+        try:
+            c = spotify_de(cfg).en_cours()
+            return {"titre": c["titre"], "artistes": c.get("artistes") or ""} if c and c.get("lecture") else None
+        except Exception:
+            pass
+    try:
+        return morceau_fenetre_spotify()
+    except Exception:
+        return None
+
+
+def suivre_musique(cfg, maintenant=None, morceau=None):
+    """Un morceau joue : la musique entre dans le cycle ; il vient de changer :
+    le cycle y saute, son titre avec."""
+    t = time.time() if maintenant is None else maintenant
+    m = morceau_en_cours(cfg) if morceau is None else morceau
+    if m and m.get("titre"):
+        PANNEAU["musique_vue"] = t
+        cle = (m["titre"], m.get("artistes") or "")
+        if cle != PANNEAU.get("morceau_cle"):
+            PANNEAU.update(morceau_cle=cle, morceau=dict(m), musique_saut=t)
+    return m
+
+
+def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
+    """Le fil des sources : la capture du son pour l'egaliseur, la meteo tous
+    les quarts d'heure, le morceau toutes les 5 s. `tours` : pour les tests."""
+    cfg = CFG if cfg is None else cfg
+    n, meteo_t, spotify_t = 0, 0.0, 0.0
+    while ETAT["en_marche"] and (tours is None or n < tours):
+        n += 1
+        t = time.time() if maintenant is None else maintenant
+        actif = bool(cfg.get("panneau_actif", True) and cfg.get("panneau_cycle", True)
+                     and cfg.get("panneau_contenu", "horloge") == "horloge" and PANNEAU.get("etat") == "connecte")
+        if actif and not SON.get("panneau"):
+            SON["panneau"] = True
+            demarrer_audio(cfg)
+        elif not actif and SON.get("panneau"):
+            SON["panneau"] = False
+            if cfg.get("mode") != "son":
+                arreter_audio()
+        if actif:
+            if float(AUDIO.get("brut") or 0) > 1e-3:
+                PANNEAU["musique_vue"] = t              # quelque chose sort des haut-parleurs
+            if t >= meteo_t or PANNEAU.get("meteo_a_relire"):
+                PANNEAU["meteo_a_relire"] = False
+                try:
+                    rafraichir_meteo(cfg, maintenant=maintenant)
+                    meteo_t = t + METEO_S
+                except Exception as e:
+                    print("Panneau LED : meteo indisponible (%s)" % type(e).__name__)
+                    meteo_t = t + 120
+            if t >= spotify_t:
+                spotify_t = t + SPOTIFY_S
+                suivre_musique(cfg, t)
+        if tours is None:
+            time.sleep(1.0)
 
 
 def piloter_panneau(cfg=None, tours=None):
@@ -15986,7 +16393,7 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv"):
+                    "panneau_rdv", "panneau_cycle", "meteo_ville"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -16026,6 +16433,22 @@ class Panneau:
                       lambda: self.regler_panneau("panneau_suit_eclat"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        self.var_panneau_cycle = tk.IntVar(value=1 if self.cfg.get("panneau_cycle", True) else 0)
+        c = self.case(col, "Sous la date, en boucle et en fondu : la meteo, la musique (un egaliseur et le titre "
+                           "du morceau), un petit bonhomme qui marche avec la journee", self.var_panneau_cycle,
+                      lambda: self.regler_panneau("panneau_cycle"))
+        c.configure(wraplength=self.px(380))
+        c.pack(fill="x", pady=(10, 0))
+        ligne_meteo = tk.Frame(col, bg=NUIT)
+        ligne_meteo.pack(fill="x", pady=(4, 0))
+        self.texte(ligne_meteo, "Meteo de", BRUME, 8).pack(side="left", padx=(self.px(22), 0))
+        self.champ_meteo_ville = self.champ(ligne_meteo, self.cfg.get("meteo_ville", ""), 16)
+        self.champ_meteo_ville.pack(side="left", padx=(self.px(6), 0))
+        self.champ_meteo_ville.bind("<Return>", lambda _e: self.regler_panneau("meteo_ville"))
+        self.champ_meteo_ville.bind("<FocusOut>", lambda _e: self.regler_panneau("meteo_ville"))
+        lieu = (self.cfg.get("meteo_lieu") or {}).get("nom")
+        self.texte(ligne_meteo, "vide : estimee d'apres ta connexion" + (" (%s)" % lieu if lieu else ""),
+                   BRUME, 8, largeur=220).pack(side="left", padx=(self.px(6), 0))
         self.var_panneau_rdv = tk.IntVar(value=1 if self.cfg.get("panneau_rdv", True) else 0)
         c = self.case(col, "Le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes",
                       self.var_panneau_rdv, lambda: self.regler_panneau("panneau_rdv"))
@@ -16079,6 +16502,14 @@ class Panneau:
             self.cfg[cle] = bool(self.var_panneau_actif.get())
         elif cle == "panneau_jarvis":
             self.cfg[cle] = bool(self.var_panneau_jarvis.get())
+        elif cle == "panneau_cycle":
+            self.cfg[cle] = bool(self.var_panneau_cycle.get())
+        elif cle == "meteo_ville":
+            ville = self.champ_meteo_ville.get().strip()[:60]
+            if ville == str(self.cfg.get("meteo_ville") or ""):
+                return
+            self.cfg[cle] = ville
+            PANNEAU["meteo_a_relire"] = True           # le fil la relit tout de suite, pour cette ville
         elif cle == "panneau_rdv":
             self.cfg[cle] = bool(self.var_panneau_rdv.get())
         elif cle == "panneau_suit_eclat":
@@ -19187,6 +19618,8 @@ def lancer():
     # le panneau LED : trouve seul, des qu'il est branche
     threading.Thread(target=sans_faute, args=("Panneau LED", piloter_panneau, CFG), daemon=True,
                      name="panneau").start()
+    threading.Thread(target=sans_faute, args=("Sources du panneau", veiller_sources_panneau, CFG), daemon=True,
+                     name="panneau-sources").start()
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)
     # Ctrl+J : il se reveille et t'ecoute ; Ctrl+Maj+Espace : il prend une
     # note pour le carnet (hors du fil de Tk). Un second appui le congedie.
@@ -19451,6 +19884,7 @@ def lancer():
                 eteindre_guirlande()
             arreter_activite()
             arreter_api()
+            SON["panneau"] = False             # on quitte : la capture s'arrete, panneau ou non
             arreter_audio()
             arreter_oreille()
             # Un StretchBlt en vol retarderait la fermeture : l'interpreteur
