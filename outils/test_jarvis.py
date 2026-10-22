@@ -3376,6 +3376,14 @@ class DansMachiTool(unittest.TestCase):
         self.assertLess(abs((pose.min() + pose.max()) / 2 - 31.5), 2, "puis se pose au milieu")
         ouvert = m.image_panneau("horloge", t, accent=acc, cycle=c("chat", 3.0))
         ferme = m.image_panneau("horloge", t - 1.45, accent=acc, cycle=c("chat", 3.0))
+        # « le :3 doit etre a l'endroit » : deux yeux cote a cote, la bouche dessous
+        yeux = (ouvert[43:46] == acc).all(axis=2).any(axis=0)
+        blocs = int(np.sum(yeux[1:] & ~yeux[:-1]) + yeux[0])
+        self.assertEqual(blocs, 2, "deux yeux sur la meme ligne")
+        bouche = (ouvert[49:55] == acc).all(axis=2)
+        self.assertTrue(bouche.any() and not (ouvert[46:49] != 0).any(), "la bouche sous les yeux, un vide entre")
+        self.assertEqual(int((ferme[43] == acc).all(axis=1).sum()), 0, "fermes : un trait au milieu, pas de haut")
+        self.assertGreater(int((ferme[44] == acc).all(axis=1).sum()), 0)
         self.assertGreater(int((ouvert[39:59] != 0).any(axis=2).sum()), int((ferme[39:59] != 0).any(axis=2).sum()),
                            "yeux fermes : moins de points allumes")
         # la sensibilite : le meme son, des barres plus ou moins hautes

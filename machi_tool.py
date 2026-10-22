@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.98.0"
+VERSION = "1.99.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -12071,9 +12071,10 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYC
 
 
 # LE PETIT :3. « Rajoute un petit :3 qui arrive (qui cligne des yeux de temps
-# en temps). » Les deux points et le 3 en grand, couches comme l'emoticone ;
-# il glisse depuis la droite et se pose au milieu, puis cligne toutes les
-# quatre secondes environ -- parfois deux fois de suite.
+# en temps). » -- « le :3 doit etre a l'endroit » : un visage debout, les
+# deux yeux cote a cote et la bouche en « ω » dessous (le 3 tourne d'un
+# quart). Il glisse depuis la droite et se pose au milieu, puis cligne
+# toutes les quatre secondes environ -- parfois deux fois de suite.
 CHAT_ARRIVEE_S = 1.2
 
 
@@ -12083,21 +12084,23 @@ def chat_cligne(t):
     return phase < 0.14 or (int(t // 4.0) % 3 == 0 and 0.32 < phase < 0.46)
 
 
+CHAT_BOUCHE = ("#..#..#", "#..#..#", ".##.##.")      # le « ω », double
+
+
 def _zone_chat(img, t, accent, ecoule):
-    larg = 3 + 3 + 10                                   # les yeux, un ecart, le 3 double
+    larg = len(CHAT_BOUCHE[0]) * 2                      # 14 : la bouche fait la largeur
     cible = (PANNEAU_L - larg) // 2
     a = 1.0 if ecoule is None else min(1.0, max(0.0, ecoule / CHAT_ARRIVEE_S))
     a = 1 - (1 - a) ** 3                                # il ralentit en arrivant
     x = int(round(cible + (PANNEAU_L - cible) * (1 - a)))
-    y = 42
-    yeux = (y + 2, y + 9)                               # les deux points, l'un au-dessus de l'autre
-    for yo in yeux:
+    y = 43
+    for xo in (x + 2, x + 9):                           # les deux yeux, cote a cote
+        x0, x1 = max(0, xo), max(0, min(PANNEAU_L, xo + 3))
         if chat_cligne(t):
-            if 0 <= x + 1 < PANNEAU_L:
-                img[yo:yo + 3, x + 1] = accent             # ferme : un trait
+            img[y + 1, x0:x1] = accent                  # fermes : un trait
         else:
-            img[yo:yo + 3, max(0, x):max(0, min(PANNEAU_L, x + 3))] = accent
-    _motif(img, _CHIFFRES_5X7["3"], x + 6, y, accent, 2)
+            img[y:y + 3, x0:x1] = accent
+    _motif(img, CHAT_BOUCHE, x, y + 6, accent, 2)
 
 
 def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule, sensibilite=1.0):
