@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.101.0"
+VERSION = "1.102.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -12445,9 +12445,14 @@ def dessiner_bonhomme(img, x, t, accent, ecoule=None):
 
 
 def _zone_bonhomme(img, t, accent, ecoule=None):
-    """Un bonhomme qui marche avec la journee : minuit a gauche, minuit a
-    droite. Le chemin deja fait s'eclaire ; un trait tous les six heures ; le
-    soleil le jour, la lune la nuit."""
+    """Un bonhomme qui marche avec la journee."""
+    dessiner_bonhomme(img, chemin_de_la_journee(img, t, accent), t, accent, ecoule)   # devant le ciel
+
+
+def chemin_de_la_journee(img, t, accent):
+    """Le chemin de la journee, minuit a gauche, minuit a droite : la partie
+    deja faite s'eclaire ; un trait toutes les six heures ; le soleil le jour,
+    la lune la nuit. Rend x, ou en est la journee sur le chemin."""
     lt = time.localtime(t)
     jour = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec + (t % 1.0)) / 86400.0
     x = 5 + jour * 53
@@ -12459,17 +12464,19 @@ def _zone_bonhomme(img, t, accent, ecoule=None):
         _disque(img, 57, 43, 2.3, SOLEIL)
     else:
         _motif(img, (".##..", "##...", "##...", "##...", ".##.."), 56, 41, LUNE)   # un croissant, dessine
-    dessiner_bonhomme(img, x, t, accent, ecoule)        # devant le ciel
+    return x
 
 
 # LE CHATON MAID. « Tu peux faire un petit chat ? En maid ? Genre femboy ? »
 # -- « avec des cheveux noirs et un costume de maid noir et blanc » -- « la
-# maid ne tient rien dans la main, elle marche vers la droite ». De profil,
-# elle traverse le panneau a petits pas rapides (la marche du bonhomme, plus
-# menue), et revient par la gauche. Cheveux, oreilles et queue noirs, la
-# coiffe a volants, un grand oeil, la joue rose ; la robe noire, le tablier
-# blanc, la dentelle de l'ourlet, le noeud blanc dans le dos, le col et les
-# poignets blancs, le ruban du cou et de la queue de la couleur de la
+# maid ne tient rien dans la main, elle marche vers la droite » -- « fais
+# marcher la maid sur place en fonction de l'avancement de la journee, comme
+# avec le bonhomme ». De profil, a petits pas rapides, elle marche sur place
+# sur le chemin de la journee : sa place, c'est l'heure (minuit a gauche,
+# minuit a droite), devant le soleil ou la lune. Cheveux, oreilles et queue
+# noirs, la coiffe a volants, un grand oeil, la joue rose ; la robe noire, le
+# tablier blanc, la dentelle de l'ourlet, le noeud blanc dans le dos, le col
+# et les poignets blancs, le ruban du cou et de la queue de la couleur de la
 # guirlande, des chaussettes hautes blanches. Le noir pur, sur le panneau,
 # c'est une LED eteinte : ce noir-la est un bleu nuit tres sombre, les
 # cheveux ont un reflet, et c'est le blanc de la tenue qui dessine la
@@ -12478,12 +12485,9 @@ def _zone_bonhomme(img, t, accent, ecoule=None):
 # clignent, et de temps en temps un petit coeur qui s'envole.
 MAID_PAS_S = 0.9                       # de petits pas rapides (un cycle : deux pas)
 MAID_FOULEE, MAID_JAMBE = 3.2, 2.4     # la longueur d'un pas ; la cuisse comme le mollet
-MAID_SOL = 59                          # ses souliers remplissent la derniere ligne de la zone
+MAID_SOL = BONHOMME_SOL                # sur le chemin de la journee
 MAID_COEUR_S = 7.0                     # un petit coeur, toutes les 7 s
 _MAID_L, _MAID_H = 18, 21
-# le pied pose recule d'un pas pendant un demi-cycle, et elle avance d'autant : elle ne glisse pas
-MAID_VITESSE = MAID_FOULEE / (MAID_PAS_S / 2)
-MAID_TOUR = PANNEAU_L + 7              # sortie a droite, elle rentre aussitot a gauche
 NOIR_CHAT, REFLET_CHAT, ROSE_OREILLE = (50, 50, 74), (110, 118, 165), (255, 120, 165)
 ROBE, TABLIER, SOULIERS = (40, 38, 56), (240, 240, 245), (62, 58, 80)
 YEUX_CHAT, BOUCHE_CHAT = (35, 25, 60), (200, 90, 120)
@@ -12500,15 +12504,12 @@ def _genou(hanche, pied, l):
     return (hanche[0] + dx / 2 + h * vy, hanche[1] + dy / 2 - h * vx)
 
 
-def maid_pose(t, ecoule=None):
+def maid_pose(x, t):
     """Ou elle en est : sa marche (la hanche, les genoux, les bras...), sa
-    tete, sa queue, l'oreille qui frissonne, le coeur. Elle entre par la
-    gauche quand sa vue arrive et traverse ; sortie a droite, elle revient.
-    Ses pieds d'abord : pose, un pied reste ou il est pendant qu'elle avance
-    (il recule sous elle d'un pas) ; leve, il repasse devant en montant un
-    peu. Les genoux s'en deduisent."""
-    e = t if ecoule is None else ecoule
-    x = -3.5 + (MAID_VITESSE * e) % MAID_TOUR
+    tete, sa queue, l'oreille qui frissonne, le coeur ; x est sa hanche.
+    Ses pieds d'abord : pose, un pied recule sous elle d'un pas (elle marche
+    sur place) ; leve, il repasse devant en montant un peu. Les genoux s'en
+    deduisent."""
     phase = 2 * math.pi * t / MAID_PAS_S
     l, sol = MAID_JAMBE, MAID_SOL - 0.9
     rebond = 0.3 * (1 - math.cos(2 * phase)) / 2         # plus haute quand un pied passe sous elle
@@ -12517,7 +12518,7 @@ def maid_pose(t, ecoule=None):
     pose = {"hanche": hanche, "epaule": epaule, "tete": (epaule[0] + 0.5, epaule[1] - 3.0)}
     for k in (0, 1):                                     # 0 : la jambe du fond, 1 : celle de devant
         p = (phase + k * math.pi) % (2 * math.pi)
-        if p < math.pi:                                  # pose : il recule, a la vitesse ou elle avance
+        if p < math.pi:                                  # pose : il recule sous elle
             pied = (x + MAID_FOULEE * (0.5 - p / math.pi), sol)
         else:                                            # leve : il revient devant
             u = (p - math.pi) / math.pi
@@ -12532,8 +12533,8 @@ def maid_pose(t, ecoule=None):
     return pose
 
 
-def dessiner_maid(img, t, accent, ecoule=None):
-    pose = maid_pose(t, ecoule)
+def dessiner_maid(img, x, t, accent):
+    pose = maid_pose(x, t)
     h, ep, tete = pose["hanche"], pose["epaule"], pose["tete"]
     tx, ty = tete
     toile = _Toile(int(math.floor(h[0])) - _MAID_L // 2, MAID_SOL - _MAID_H, _MAID_L, _MAID_H)
@@ -12613,12 +12614,13 @@ def dessiner_maid(img, t, accent, ecoule=None):
         _point(img, tx + 1.6, ty + 1.2, YEUX_CHAT)
     _point(img, tx + 0.7, ty + 1.9, JOUES)
     _point(img, tx + 2.5, ty + 2.1, BOUCHE_CHAT)
-    # le petit coeur : il monte derriere elle et s'efface
+    # le petit coeur : il monte derriere elle et s'efface (devant, au petit matin : derriere, il n'y a pas la place)
     if pose["coeur"] is not None:
         u = pose["coeur"]
         f = min(1.0, u * 5) * (1 - u)
         couleur = tuple(int(c * f) for c in (255, 90, 140))
-        hx, hy = int(round(tx - 9 - 2 * u)), int(round(ty - 2 - 3 * u))
+        hx = int(round(tx - 9 - 2 * u)) if tx > 14 else int(round(tx + 5 + 2 * u))
+        hy = int(round(ty - 2 - 3 * u))
         for j, ligne in enumerate(_COEUR):
             for i, c in enumerate(ligne):
                 if c == "#" and 0 <= hx + i < PANNEAU_L and 39 <= hy + j < 59:
@@ -12627,7 +12629,8 @@ def dessiner_maid(img, t, accent, ecoule=None):
 
 
 def _zone_maid(img, t, accent, ecoule):
-    dessiner_maid(img, t, accent, ecoule)
+    """La maid qui marche avec la journee, comme le bonhomme."""
+    dessiner_maid(img, chemin_de_la_journee(img, t, accent), t, accent)
 
 
 def _prochain_chrono(minuteurs, t):
