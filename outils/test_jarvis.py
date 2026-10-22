@@ -3276,10 +3276,11 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(vu(t0 + 400, tous, urgent=True)["actuel"], "heure", "fige tant que ca presse")
         # qui est disponible
         m.PANNEAU.update(meteo=None, musique_vue=0)
-        self.assertEqual(m.cycle_disponible(t0), ["heure", "bonhomme"])
+        self.assertEqual(m.cycle_disponible(t0), ["heure", "bonhomme", "chat"])
         m.PANNEAU.update(meteo={"temp": 12, "code": 3, "quand": t0 - 60}, musique_vue=t0 - 3)
-        self.assertEqual(m.cycle_disponible(t0), tous)
-        self.assertEqual(m.cycle_disponible(t0 + 4 * 3600), ["heure", "bonhomme"], "une vieille meteo, la musique tue")
+        self.assertEqual(m.cycle_disponible(t0), tous + ["chat"])
+        self.assertEqual(m.cycle_disponible(t0 + 4 * 3600), ["heure", "bonhomme", "chat"],
+                         "une vieille meteo, la musique tue")
         self.assertTrue(m.cycle_urgent([{"genre": "minuteur", "fin": t0 + 200}], [], t0))
         self.assertFalse(m.cycle_urgent([{"genre": "minuteur", "fin": t0 + 900}], [], t0))
 
@@ -3331,7 +3332,8 @@ class DansMachiTool(unittest.TestCase):
             self.assertIn(cle, m.CONFIG_DEFAUT)
         t0 = 1_800_000_000.0
         m.PANNEAU.update(meteo={"temp": 12, "code": 3, "quand": t0}, musique_vue=t0)
-        self.assertEqual(m.cycle_disponible(t0, {"panneau_cycle_meteo": False, "panneau_cycle_bonhomme": False}),
+        self.assertEqual(m.cycle_disponible(t0, {"panneau_cycle_meteo": False, "panneau_cycle_bonhomme": False,
+                                                 "panneau_cycle_chat": False}),
                          ["heure", "musique"], "des vues decochees : sautees ; l'heure reste")
         # 10 s par vue, sans fondu : un changement net a 10 s
         m.PANNEAU["cycle"] = None
@@ -3351,6 +3353,52 @@ class DansMachiTool(unittest.TestCase):
         m.image_du_panneau(dict(cfg, panneau_cycle_saut=False), "horloge", t0 + 16)
         self.assertEqual(m.PANNEAU["cycle"]["actuel"], "heure", "saut coupe : le cycle suit son cours")
         self.assertIsNone(m.PANNEAU["musique_saut"])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_petit_3_et_la_sensibilite_de_l_egaliseur(self):
+        # « rajoute un petit :3 qui arrive (qui cligne des yeux de temps en temps) » --
+        # « aussi rajoute une sensibilite pour l'egaliseur »
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("cycle", "cretes", "morceau")}
+        sauve_audio = {k: m.AUDIO.get(k) for k in ("actif", "spectre")}
+        self.addCleanup(lambda: (m.PANNEAU.update(sauve), m.AUDIO.update(sauve_audio)))
+        acc = (255, 170, 40)
+        t = time.mktime((2026, 10, 22, 9, 41, 1, 0, 0, -1)) + 0.5     # yeux ouverts
+        self.assertFalse(m.chat_cligne(t))
+        self.assertTrue(m.chat_cligne(t - 1.45), "un clin toutes les 4 s")
+        fermes = sum(m.chat_cligne(t + k * 0.05) for k in range(2400))     # deux minutes
+        self.assertTrue(30 <= fermes <= 160, "les yeux clignent un peu, pas tout le temps : %d" % fermes)
+        c = lambda nom, ecoule, **k: dict({"actuel": nom, "precedent": None, "fondu": 1.0, "ecoule": ecoule}, **k)
+        colonnes = lambda img: np.nonzero((img[39:59] != 0).any(axis=2).any(axis=0))[0]
+        arrive = colonnes(m.image_panneau("horloge", t, accent=acc, cycle=c("chat", 0.3)))
+        pose = colonnes(m.image_panneau("horloge", t, accent=acc, cycle=c("chat", 3.0)))
+        self.assertGreater(arrive.min(), pose.min() + 8, "il arrive de la droite")
+        self.assertLess(abs((pose.min() + pose.max()) / 2 - 31.5), 2, "puis se pose au milieu")
+        ouvert = m.image_panneau("horloge", t, accent=acc, cycle=c("chat", 3.0))
+        ferme = m.image_panneau("horloge", t - 1.45, accent=acc, cycle=c("chat", 3.0))
+        self.assertGreater(int((ouvert[39:59] != 0).any(axis=2).sum()), int((ferme[39:59] != 0).any(axis=2).sum()),
+                           "yeux fermes : moins de points allumes")
+        # la sensibilite : le meme son, des barres plus ou moins hautes
+        m.AUDIO.update(actif=True, spectre=[0.5] * 12)
+        m.PANNEAU["morceau"] = None
+        def hauteur(sens):
+            m.PANNEAU["cretes"] = [0.0] * 12
+            img = m.image_panneau("horloge", t, accent=acc, cycle=c("musique", 0.0, sensibilite=sens))
+            return int((img[39:57, 4] == 0).all(axis=1).__invert__().sum())
+        self.assertLess(hauteur(0.5), hauteur(1.0))
+        self.assertLess(hauteur(1.0), hauteur(2.0))
+        self.assertEqual(m.sensibilite_eq({}), 1.0)
+        self.assertEqual(m.sensibilite_eq({"panneau_eq_sensibilite": 9}), 3.0)
+        self.assertEqual(m.sensibilite_eq({"panneau_eq_sensibilite": "abime"}), 1.0)
+        # par la boucle : la sensibilite reglee arrive jusqu'au dessin
+        vrai = m.image_panneau
+        self.addCleanup(lambda: setattr(m, "image_panneau", vrai))
+        vus = []
+        m.image_panneau = lambda *a, **k: (vus.append(k.get("cycle")), vrai(*a, **k))[1]
+        m.PANNEAU["cycle"] = None
+        m.image_du_panneau({"panneau_contenu": "horloge", "panneau_eq_sensibilite": 2.5, "panneau_rdv": False}, "horloge", t)
+        self.assertEqual(vus[-1]["sensibilite"], 2.5)
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_cycle_chat"])
 
     def test_les_sources_du_cycle(self):
         m = self.m
