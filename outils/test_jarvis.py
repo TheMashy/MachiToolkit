@@ -3973,36 +3973,70 @@ class DansMachiTool(unittest.TestCase):
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_la_pastille_de_discord_sur_la_barre_des_taches(self):
-        # « tu peux link autrement Discord ? j'ai une notif en attente qui ne s'affiche pas » -- la
-        # capture : la pastille rouge « 1 » sur l'icone de Discord, dans la barre des taches
+        # « tu peux link autrement Discord ? j'ai une notif en attente qui ne s'affiche pas » -- puis
+        # « fais en sorte que Machi Tool lise les pastilles actuelles » : la pastille rouge « 1 » sur
+        # l'icone de Discord, dans la barre des taches
         import numpy as np
+        import types
         m = self.m
         sauve = {k: m.PANNEAU.get(k) for k in ("discord", "discord_vu")}
         self.addCleanup(lambda: m.PANNEAU.update(sauve))
-        self.addCleanup(lambda: m._DISCORD_CENTRE.update(signature=None, lu=0.0, arrivees=None, dit=None, barre=None))
-        # l'icone de Discord : violette, et la pastille rouge en bas a droite (comme la capture)
-        icone = np.zeros((48, 44, 3), np.uint8)
-        icone[10:38, 8:36] = (88, 101, 242)
-        avec = icone.copy()
-        yy, xx = np.mgrid[0:48, 0:44]
-        avec[(yy - 31) ** 2 + (xx - 31) ** 2 <= 49] = (242, 63, 66)
-        avec[28:35, 30:32] = (255, 255, 255)                   # le « 1 »
-        self.assertEqual(m.rouge_de_pastille(icone), 0, "le violet de l'icone n'est pas la pastille")
-        self.assertGreater(m.rouge_de_pastille(avec), m.DISCORD_ROUGE_MIN)
-        rect = (100, 1000, 144, 1048)
+        self.addCleanup(lambda: m._DISCORD_CENTRE.update(signature=None, lu=0.0, arrivees=None, dit=None, barre=None,
+                                                         lisible=None))
+
+        def barre_des_taches(chiffre=None, autre_violet=False):
+            """Une barre : un fond sombre, une icone verte, l'icone violette de Discord, et sa
+            pastille rouge (avec un « 1 », ou un chiffre large) comme sur la capture."""
+            img = np.full((48, 300, 3), (32, 36, 48), np.uint8)
+            yy, xx = np.mgrid[0:48, 0:300]
+            img[(yy - 24) ** 2 + (xx - 40) ** 2 <= 144] = (30, 215, 96)          # une autre appli
+            img[(yy - 24) ** 2 + (xx - 120) ** 2 <= 144] = (88, 101, 242)        # Discord
+            img[20:26, 116:124] = (255, 255, 255)                                # son logo
+            if chiffre is not None:
+                img[(yy - 31) ** 2 + (xx - 128) ** 2 <= 36] = (237, 87, 89)      # la pastille
+                if chiffre == 1:
+                    img[28:35, 128] = (255, 255, 255)                            # « 1 » : un trait
+                else:
+                    img[28:35, 125:132:2] = (255, 255, 255)                      # un chiffre large
+            if autre_violet:
+                img[(yy - 24) ** 2 + (xx - 200) ** 2 <= 144] = (100, 90, 230)
+            return img
+        sans = barre_des_taches()
+        un = barre_des_taches(1)
+        large = barre_des_taches(2)
+        self.assertEqual(m.rouge_de_pastille(sans), 0, "le violet de l'icone n'est pas la pastille")
+        self.assertGreaterEqual(m.rouge_de_pastille(un), m.DISCORD_ROUGE_MIN)
+        dans = m.pastille_dans_la_barre
+        self.assertEqual(dans(un), 1, "la pastille et son « 1 »")
+        self.assertEqual(dans(large), -1, "un chiffre qu'on ne lit pas : un point")
+        self.assertEqual(dans(sans), 0)
+        self.assertEqual(dans(barre_des_taches(None, autre_violet=True)), 0)
+        rouge_seul = sans.copy()
+        rouge_seul[5:12, 250:260] = (240, 60, 60)                                # du rouge loin de Discord
+        self.assertEqual(dans(rouge_seul), 0, "un rouge ailleurs sur la barre n'est pas la pastille")
+        # les deux lectures : l'ecran, puis l'accessibilite (la description de la pastille)
         barre = m.pastille_discord_barre
-        # la description de la pastille (le texte que lit le Narrateur) dit le nombre
-        self.assertEqual(barre(boutons=[("1 unread message", rect)], capture=lambda r: icone), 1)
-        self.assertEqual(barre(boutons=[("12 notifications", rect)], capture=lambda r: icone), 12)
-        # sans nombre lisible : la pastille se voit
-        self.assertEqual(barre(boutons=[("", rect)], capture=lambda r: avec), -1)
-        self.assertEqual(barre(boutons=[("", rect)], capture=lambda r: icone), 0)
-        self.assertEqual(barre(boutons=[("", rect)], capture=lambda r: None), 0, "la barre ne se voit pas")
-        self.assertEqual(barre(boutons=[], capture=lambda r: avec), 0, "Discord n'est pas sur la barre")
-        self.assertIsNone(barre(boutons=None) if m.os.name != "nt" else None, "hors de Windows")
-        # la requete a UI Automation : les boutons de chaque barre, nom, aide et place en cache
-        import types
-        demandes = []
+        self.assertEqual(barre(boutons=[], barres=[un]), 1)
+        self.assertEqual(m._DISCORD_CENTRE["barre"], ["ecran : pastille « 1 »", "accessibilite : pas de bouton Discord"])
+        self.assertEqual(barre(boutons=[("3 unread messages", (0, 0, 1, 1))], barres=[un]), 3, "un nombre dit l'emporte")
+        self.assertEqual(barre(boutons=[("", (0, 0, 1, 1))], barres=[sans, large]), -1, "deux ecrans")
+        self.assertEqual(barre(boutons=[], barres=[sans]), 0)
+        self.assertEqual(barre(boutons=[], barres=[]), 0, "aucune barre visible")
+
+        def casse():
+            raise OSError("UIA indisponible")
+        vrais = (m.boutons_discord_barre, m.capture_barres)
+        self.addCleanup(lambda: (setattr(m, "boutons_discord_barre", vrais[0]), setattr(m, "capture_barres", vrais[1])))
+        m.boutons_discord_barre = casse
+        self.assertEqual(barre(barres=[un]), 1, "l'accessibilite en panne : l'ecran suffit")
+        m.capture_barres = casse
+        self.assertIsNone(barre(), "rien ne se lit : on ne sait pas")
+        m.boutons_discord_barre, m.capture_barres = vrais
+        if m.os.name != "nt":
+            self.assertIsNone(barre(), "hors de Windows")
+        # la requete a UI Automation : tous les elements de chaque barre, nom, aide et place en cache
+        demandes, demandes_cache = [], []
+        rect = (100, 1000, 144, 1048)
 
         class Rect:
             left, top, right, bottom = rect
@@ -4026,37 +4060,30 @@ class DansMachiTool(unittest.TestCase):
                 demandes.append((self.h, portee, condition))
                 return Tableau([Element("Demarrer", ""), Element("Discord - 1 running window", "1 unread"),
                                 Element("Spotify - 1 running window", "")] if self.h == 1 else
-                               [Element("discord", "")])
+                               [Element("Discord", "")])
 
         class Auto:
             def CreateCacheRequest(self):
                 return types.SimpleNamespace(AddProperty=lambda p: demandes_cache.append(p))
 
-            def CreatePropertyCondition(self, propriete, valeur):
-                return ("condition", propriete, valeur)
+            def CreateTrueCondition(self):
+                return "tout"
 
             def ElementFromHandle(self, h):
                 return Barre(h)
-        demandes_cache = []
         trouves = m.boutons_discord_barre(uia=(Auto(), types.SimpleNamespace(TreeScope_Descendants=4)), barres=[1, 2])
         self.assertEqual(trouves, [("1 unread", rect), ("", rect)], "la barre principale et la secondaire")
         self.assertEqual(sorted(demandes_cache), [30001, 30005, 30013], "nom, aide, place : une requete")
-        self.assertEqual([d[:3] for d in demandes], [(1, 4, ("condition", 30003, 50000)),
-                                                     (2, 4, ("condition", 30003, 50000))], "les boutons seulement")
-
-        def casse():
-            raise OSError("UIA indisponible")
-        vrai = m.boutons_discord_barre
-        self.addCleanup(lambda: setattr(m, "boutons_discord_barre", vrai))
-        m.boutons_discord_barre = casse
-        self.assertIsNone(barre(), "une barre illisible ne casse rien")
+        self.assertEqual(demandes, [(1, 4, "tout"), (2, 4, "tout")])
         # avec les autres sources : un nombre l'emporte, sinon « il y a quelque chose »
         t = 1_800_000_000.0
         rien = lambda: None
         self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=lambda: [], barre=lambda: -1, maintenant=t), -1)
         self.assertEqual(m.suivre_discord(lire=lambda: 3, centre=rien, barre=lambda: -1, maintenant=t), 3)
-        self.assertEqual(m.suivre_discord(lire=rien, centre=rien, barre=lambda: 2, maintenant=t), 2)
+        self.assertEqual(m.suivre_discord(lire=rien, centre=rien, barre=lambda: 1, maintenant=t), 1)
+        self.assertIn("la pastille montre 1", m._DISCORD_CENTRE["lisible"], "la page le dit")
         self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=rien, barre=lambda: 0, maintenant=t), 0)
+        self.assertIn("rien", m._DISCORD_CENTRE["lisible"])
         # sur le panneau : la pastille violette, un point blanc au lieu du nombre
         cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
                "panneau_claude": False}

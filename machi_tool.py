@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.112.1"
+VERSION = "1.112.2"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -13801,11 +13801,15 @@ def toasts_discord(chemin=None, maintenant=None):
 
 # « J'ai une notif en attente qui ne s'affiche pas » -- et la capture : la
 # pastille rouge « 1 » sur l'icone de Discord, dans la barre des taches.
-# Discord la pose avec une description pour les lecteurs d'ecran ; Windows
-# la donne a l'accessibilite (UI Automation) comme « texte d'aide » du
-# bouton -- celui que le Narrateur lit. Si elle ne dit pas de nombre, la
-# pastille se voit : son rouge, dans le bouton, tel qu'il est affiche.
+# Deux lectures. L'ecran d'abord : chaque barre des taches telle qu'elle est
+# affichee, l'icone violette de Discord et, dessus, le rouge de la pastille
+# -- et son « 1 », un trait etroit au milieu (au-dela, un point sur le
+# panneau). Puis l'accessibilite de Windows (UI Automation) : Discord pose sa
+# pastille avec une description pour les lecteurs d'ecran, donnee comme
+# « texte d'aide » du bouton ; si elle dit un nombre, c'est lui.
 DISCORD_ROUGE_MIN = 12                 # pixels du rouge de la pastille (a 100 %, elle en fait ~150)
+DISCORD_PAS_ENCORE = "Pas encore lu : toutes les cinq secondes, une fois le panneau branche."
+DISCORD_ICONE_MIN = 40                 # pixels du violet de l'icone (a 100 %, ~400)
 _BARRES = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
 _UIA = threading.local()
 
@@ -13825,94 +13829,176 @@ def _automatisation():
     return a
 
 
+def _fenetres_des_barres():
+    import win32gui
+    barres = []
+
+    def voir(h, _):
+        if win32gui.GetClassName(h) in _BARRES:
+            barres.append(h)
+        return True
+    win32gui.EnumWindows(voir, None)
+    return barres
+
+
 def boutons_discord_barre(uia=None, barres=None):
-    """Les boutons de Discord sur les barres des taches (zone de notification
-    comprise) : [(texte d'aide, (gauche, haut, droite, bas))] ; None hors de
-    Windows. Une seule requete par barre : nom, aide et place en cache.
-    `uia` (objet, module) et `barres` (leurs fenetres) : pour les tests."""
+    """Les elements de Discord sur les barres des taches (bouton, icone de la
+    zone de notification) : [(texte d'aide, (gauche, haut, droite, bas))] ;
+    None hors de Windows. Une seule requete par barre, nom, aide et place en
+    cache. `uia` (objet, module) et `barres` (leurs fenetres) : pour les tests."""
     if uia is None:
         if os.name != "nt":
             return None
         uia = _automatisation()
     auto, mod = uia
-    if barres is None:
-        import win32gui
-        barres = []
-
-        def voir(h, _):
-            if win32gui.GetClassName(h) in _BARRES:
-                barres.append(h)
-            return True
-        win32gui.EnumWindows(voir, None)
+    barres = _fenetres_des_barres() if barres is None else barres
     cache = auto.CreateCacheRequest()
     for propriete in (30005, 30013, 30001):           # Name, HelpText, BoundingRectangle
         cache.AddProperty(propriete)
-    boutons = auto.CreatePropertyCondition(30003, 50000)     # ControlType : Button
+    tout = auto.CreateTrueCondition()
     trouves = []
     for h in barres:
-        tous = auto.ElementFromHandle(h).FindAllBuildCache(mod.TreeScope_Descendants, boutons, cache)
+        tous = auto.ElementFromHandle(h).FindAllBuildCache(mod.TreeScope_Descendants, tout, cache)
         for i in range(tous.Length if tous else 0):
             e = tous.GetElement(i)
-            if re.match(r"(?i)\s*discord\b", str(e.CachedName or "")):
+            if re.search(r"(?i)\bdiscord\b", str(e.CachedName or "")):
                 r = e.CachedBoundingRectangle
                 trouves.append((str(e.CachedHelpText or ""), (r.left, r.top, r.right, r.bottom)))
     return trouves
 
 
+def _masques_discord(img):
+    """(le violet de l'icone de Discord #5865F2, le rouge de sa pastille #F23F42)."""
+    import numpy as np
+    p = np.asarray(img, dtype=np.int32)
+    r, g, b = p[..., 0], p[..., 1], p[..., 2]
+    violet = (np.abs(r - 88) <= 40) & (np.abs(g - 101) <= 40) & (b >= 200)
+    rouge = (r >= 190) & (g <= 110) & (b <= 110) & (r - g >= 100)
+    return violet, rouge
+
+
 def rouge_de_pastille(pixels):
-    """Combien de pixels du rouge de la pastille de Discord (#F23F42) : un
-    rouge franc -- ni l'icone (violette), ni un survol (gris)."""
+    """Combien de pixels du rouge de la pastille de Discord : un rouge franc
+    -- ni l'icone (violette), ni un survol (gris)."""
+    return int(_masques_discord(pixels)[1].sum())
+
+
+def chiffre_de_pastille(pixels):
+    """Le nombre que porte une pastille (l'image juste autour d'elle) : 1 --
+    un trait blanc etroit au milieu --, sinon -1 (on ne le lit pas)."""
     import numpy as np
     p = np.asarray(pixels, dtype=np.int32)
-    r, g, b = p[..., 0], p[..., 1], p[..., 2]
-    return int(((r >= 190) & (g <= 110) & (b <= 110) & (r - g >= 100)).sum())
+    _, rouge = _masques_discord(p)
+    ys, xs = np.nonzero(rouge)
+    if not len(ys):
+        return -1
+    h0, h1, g0, g1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    dy, dx = (h1 - h0) // 5, (g1 - g0) // 5                 # le coeur de la pastille, sans son bord
+    coeur = p[h0 + dy:h1 - dy, g0 + dx:g1 - dx]
+    by, bx = np.nonzero(coeur.min(axis=2) >= 200)
+    if len(bx) < 3:
+        return -1
+    return 1 if (bx.max() - bx.min() + 1) <= 0.3 * (g1 - g0) else -1
 
 
-def capture_bouton(rect):
-    """Les pixels d'un bouton de la barre, tels qu'affiches ; None s'il ne se
-    voit pas (barre masquee, un jeu en plein ecran devant)."""
+def pastille_dans_la_barre(img):
+    """La pastille de Discord dans l'image d'une barre des taches : 1, -1 (son
+    nombre ne se lit pas), ou 0 (pas de pastille, ou pas de Discord). Chaque
+    icone violette, et le rouge juste autour d'elle."""
+    import numpy as np
+    violet, rouge = _masques_discord(img)
+    colonnes = violet.sum(axis=0) >= 2
+    n, x, largeur = 0, 0, len(colonnes)
+    while x < largeur:
+        if not colonnes[x]:
+            x += 1
+            continue
+        debut, trou = x, 0
+        while x < largeur and trou <= 2:                    # une icone : des colonnes violettes, a 2 px pres
+            trou = 0 if colonnes[x] else trou + 1
+            x += 1
+        fin = x - trou
+        icone = violet[:, debut:fin]
+        if icone.sum() < DISCORD_ICONE_MIN:
+            continue
+        ys = np.nonzero(icone.any(axis=1))[0]
+        marge = max(4, (fin - debut) // 2)
+        h0, g0 = max(0, int(ys.min()) - marge), max(0, debut - marge)
+        autour = rouge[h0:int(ys.max()) + 1 + marge, g0:fin + marge]
+        if autour.sum() < DISCORD_ROUGE_MIN:
+            continue
+        ry, rx = np.nonzero(autour)
+        m = 2
+        pastille = np.asarray(img)[max(0, h0 + ry.min() - m):h0 + ry.max() + 1 + m,
+                                   max(0, g0 + rx.min() - m):g0 + rx.max() + 1 + m]
+        lu = chiffre_de_pastille(pastille)
+        n = max(n, lu) if lu > 0 else (n or -1)
+    return n
+
+
+def capture_barres():
+    """Les barres des taches telles qu'elles sont affichees : [image] ; None
+    hors de Windows. Une barre masquee, ou couverte (un jeu en plein ecran),
+    n'en fait pas partie."""
+    if os.name != "nt":
+        return None
     import numpy as np
     import win32gui
-    g, h, d, b = (int(v) for v in rect)
-    if d - g < 4 or b - h < 4:
-        return None
-    devant = win32gui.GetAncestor(win32gui.WindowFromPoint(((g + d) // 2, (h + b) // 2)), 2)   # GA_ROOT
-    if win32gui.GetClassName(devant) not in _BARRES:
-        return None
-    brut = _capteur().grab({"left": g, "top": h, "width": d - g, "height": b - h})
-    return np.frombuffer(brut.rgb, np.uint8).reshape(brut.height, brut.width, 3)
+    images = []
+    for h in _fenetres_des_barres():
+        if not win32gui.IsWindowVisible(h):
+            continue
+        g, ht, d, b = win32gui.GetWindowRect(h)
+        if d - g < 8 or b - ht < 8:
+            continue
+        if win32gui.GetAncestor(win32gui.WindowFromPoint(((g + d) // 2, (ht + b) // 2)), 2) != h:   # GA_ROOT
+            continue
+        brut = _capteur().grab({"left": g, "top": ht, "width": d - g, "height": b - ht})
+        images.append(np.frombuffer(brut.rgb, np.uint8).reshape(brut.height, brut.width, 3))
+    return images
 
 
-def pastille_discord_barre(boutons=None, capture=None):
-    """La pastille de Discord sur la barre des taches : son nombre (lu dans
-    sa description), -1 si elle se voit sans nombre lisible, 0 sans pastille ;
-    None si la barre ne se lit pas."""
+def _signaler_discord(cle, e):
+    if _DISCORD_CENTRE.get(cle) != type(e).__name__:
+        _DISCORD_CENTRE[cle] = type(e).__name__
+        print("Discord : %s illisible (%s: %s)" % (cle.replace("_", " "), type(e).__name__, str(e)[:100]))
+
+
+def pastille_discord_barre(boutons=None, barres=None):
+    """La pastille de Discord sur la barre des taches : son nombre, -1 si elle
+    est la sans nombre lisible, 0 sans pastille ; None si rien ne se lit.
+    `boutons` (voir boutons_discord_barre) et `barres` (leurs images) : pour
+    les tests."""
+    n, lisible, vu = 0, False, []
+    try:
+        images = capture_barres() if barres is None else barres
+    except Exception as e:
+        images = None
+        _signaler_discord("ecran", e)
+        vu.append("ecran : %s" % type(e).__name__)
+    if images is not None:
+        lisible = True
+        lus = [pastille_dans_la_barre(img) for img in images]
+        for lu in lus:
+            n = max(n, lu) if lu > 0 else (n or lu)
+        vu.append("ecran : " + (", ".join({1: "pastille « 1 »", -1: "pastille", 0: "rien"}[lu] for lu in lus)
+                                or "aucune barre visible"))
     try:
         trouves = boutons_discord_barre() if boutons is None else boutons
     except Exception as e:
-        if _DISCORD_CENTRE.get("erreur_barre") != type(e).__name__:
-            _DISCORD_CENTRE["erreur_barre"] = type(e).__name__
-            print("Discord : barre des taches illisible (%s: %s)" % (type(e).__name__, str(e)[:100]))
-        return None
-    if trouves is None:
-        return None
-    n, vu = 0, []
-    for aide, rect in trouves:
-        chiffres = re.findall(r"\d+", aide)
-        rouge = None
-        if chiffres:
-            n = max(n, int(chiffres[0]))
-        else:
-            try:
-                pixels = (capture or capture_bouton)(rect)
-            except Exception:
-                pixels = None
-            rouge = None if pixels is None else rouge_de_pastille(pixels)
-            if rouge is not None and rouge >= DISCORD_ROUGE_MIN:
-                n = n or -1
-        vu.append("« %s » rouge %s" % (aide[:40], "?" if rouge is None else rouge))
+        trouves = None
+        _signaler_discord("accessibilite", e)
+        vu.append("accessibilite : %s" % type(e).__name__)
+    if trouves is not None:
+        lisible = True
+        for aide, _ in trouves:
+            chiffres = re.findall(r"\d+", aide)
+            if chiffres:
+                n = max(n, int(chiffres[0]))
+        vu.append("accessibilite : " + (" / ".join("« %s »" % aide[:40] for aide, _ in trouves)
+                                         or "pas de bouton Discord"))
     _DISCORD_CENTRE["barre"] = vu
-    return n
+    return n if lisible else None
 
 
 def lire_discord(titres=None):
@@ -13970,13 +14056,16 @@ def suivre_discord(lire=None, centre=None, maintenant=None, barre=None):
     # du titre (sans les mots), la barre des taches, le centre ; a chaque changement
     dit = (tuple(_DISCORD_CENTRE.get("titres") or ()), titre, tuple(_DISCORD_CENTRE.get("barre") or ()),
            pastille, attente)
+    lisible = lambda v: "illisible" if v is None else "un point" if v < 0 else str(v)
+    _DISCORD_CENTRE["lisible"] = "Lu a %s : %s. Barre des taches %s (%s) ; titre %s ; notifications Windows %s." % (
+        time.strftime("%H:%M:%S", time.localtime(t)), "rien" if not PANNEAU["discord"] else
+        "la pastille montre %s" % lisible(PANNEAU["discord"]), lisible(pastille), " ; ".join(dit[2]) or "-",
+        lisible(titre), lisible(attente))
     if dit != _DISCORD_CENTRE.get("dit"):
         _DISCORD_CENTRE["dit"] = dit
         print("Discord : titre %s -> %s ; barre des taches %s -> %s ; centre de notifications : %s" % (
-            " / ".join("« %s »" % f for f in dit[0]) or "(aucune fenetre)",
-            "illisible" if titre is None else titre,
-            " / ".join(dit[2]) or "(aucun bouton)", "illisible" if pastille is None else pastille,
-            "illisible" if attente is None else "%d en attente" % attente))
+            " / ".join("« %s »" % f for f in dit[0]) or "(aucune fenetre)", lisible(titre),
+            " / ".join(dit[2]) or "-", lisible(pastille), lisible(attente)))
     return PANNEAU["discord"]
 
 
@@ -18258,10 +18347,15 @@ class Panneau:
         # « qu'il detecte quand j'ai une notification en attente sur Discord »
         self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
         c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
-                           "leur nombre (lu dans le titre de la fenetre de Discord)", self.var_panneau_discord,
+                           "leur nombre (la pastille rouge de Discord sur la barre des taches, le titre de sa "
+                           "fenetre, ses notifications Windows)", self.var_panneau_discord,
                       lambda: self.regler_panneau("panneau_discord"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « j'ai encore une notif mais il ne la detecte pas » : ce qu'il lit, source par source
+        self.txt_discord = self.texte(col, _DISCORD_CENTRE.get("lisible") or DISCORD_PAS_ENCORE, BRUME, 8,
+                                      largeur=360)
+        self.txt_discord.pack(fill="x", pady=(2, 0), padx=(self.px(22), 0))
         # « une bulle de statut quand Claude est en train de reflechir »
         self.var_panneau_claude = tk.IntVar(value=1 if self.cfg.get("panneau_claude", True) else 0)
         c = self.case(col, "La bulle de Claude Code, en haut a droite : rouge, il attend ton accord ; jaune, il "
@@ -18470,6 +18564,11 @@ class Panneau:
         if getattr(self, "txt_claude_cloud", None) is not None and CLAUDE_CODE.get("vu_cloud"):
             try:
                 self.txt_claude_cloud.configure(text=etat_cloud_lisible(self.cfg))
+            except Exception:
+                pass
+        if getattr(self, "txt_discord", None) is not None:
+            try:
+                self.txt_discord.configure(text=_DISCORD_CENTRE.get("lisible") or DISCORD_PAS_ENCORE)
             except Exception:
                 pass
         texte, couleur = etat_panneau_lisible()
