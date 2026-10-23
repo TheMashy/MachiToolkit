@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.111.1"
+VERSION = "1.112.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -371,6 +371,7 @@ CONFIG_DEFAUT = {
     "panneau_cycle_saut": True,       # un morceau qui change : la musique tout de suite
     "panneau_cycle_chat": True,       # « un petit :3 qui arrive, qui cligne des yeux »
     "panneau_cycle_maid": True,       # « un petit chat en maid », cheveux noirs, tenue noire et blanche
+    "panneau_cycle_notes": True,      # « quand des notes ne sont pas encore posees sur des journees »
     "panneau_eq_sensibilite": 1.0,    # l'egaliseur : 0,2 (calme) a 3 (tout monte)
     "meteo_ville": "",                # vide : le lieu approximatif de la connexion
     "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
@@ -564,6 +565,7 @@ PONT = {
     "jours": [],              # [{"date", "note", "humeur", "couleur"}]
     "reperes": [],            # [{"date", "titre", "couleur"}]
     "rappels": [],            # [{"id", "titre", "texte", "recu"}]
+    "a_noter": None,          # les journees pas encore notees (voir recevoir_a_noter)
 }
 
 CFG = {}
@@ -12065,7 +12067,7 @@ def programme_au_panneau(maintenant):
 # s'arrete sur l'heure.
 
 ZONE_CYCLE = slice(39, 59)
-CYCLE_ORDRE = ("heure", "meteo", "musique", "bonhomme", "chat", "maid")
+CYCLE_ORDRE = ("heure", "notes", "meteo", "musique", "bonhomme", "chat", "maid")
 # « ralentis le fade, fais un fade toutes les 30 s » -- puis « rajoute tout ca
 # en settings » : panneau_cycle_duree et panneau_cycle_fondu, bornes ici
 CYCLE_DUREE_S = 30.0
@@ -12119,6 +12121,8 @@ def cycle_disponible(maintenant, cfg=None):
         d.append("chat")
     if cfg.get("panneau_cycle_maid", True):
         d.append("maid")
+    if cfg.get("panneau_cycle_notes", True) and journees_a_noter(maintenant):
+        d.append("notes")
     return d
 
 
@@ -12160,6 +12164,66 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYC
     avant = c.get("precedent_depuis")
     return {"actuel": c["actuel"], "precedent": c["precedent"], "fondu": fondu, "ecoule": ecoule,
             "ecoule_precedent": None if avant is None else maintenant - avant}
+
+
+# LES JOURNEES A NOTER. « Rajoute une interface sur le panneau quand des
+# notes ne sont pas encore posees sur des journees. » BrainDebugger dit
+# lesquelles (sa passerelle : les sept jours d'avant la journee vecue, sans
+# note) ; une vue du cycle, juste apres l'heure, les montre : « A NOTER », et
+# les huit derniers jours en cases -- celles qui attendent leur note battent
+# en ambre, les autres restent sombres ; le soir, celle d'aujourd'hui aussi.
+# Ni la note des autres jours, ni un mot du journal : des cases et les
+# initiales des jours.
+NOTES_AMBRE = (255, 170, 40)
+NOTES_SOIR_H = 20                      # aujourd'hui se note a partir de 20 h...
+NOTES_NUIT_H = 5                       # ... et jusqu'au coucher
+NOTES_VIEILLES_S = 6 * 3600            # un releve plus vieux : on ne sait plus, la vue se tait
+_INITIALES = "LMMJVSD"
+
+
+def journees_a_noter(maintenant=None):
+    """Ce que la vue montre : {"jours" (les dates passees sans note),
+    "aujourdhui", "aujourdhui_notee", "aujourdhui_du" (le soir, pas notee)} --
+    ou None s'il n'y a rien a noter, ou plus de releve frais."""
+    t = time.time() if maintenant is None else maintenant
+    a = PONT.get("a_noter")
+    if not a or not 0 <= t - float(a.get("recu") or 0) <= NOTES_VIEILLES_S:
+        return None
+    h = time.localtime(t).tm_hour
+    du = bool(a.get("aujourdhui") and not a.get("aujourdhui_notee") and (h >= NOTES_SOIR_H or h < NOTES_NUIT_H))
+    if not a.get("jours") and not du:
+        return None
+    return {"jours": list(a["jours"]), "aujourdhui": a.get("aujourdhui"),
+            "aujourdhui_notee": bool(a.get("aujourdhui_notee")), "aujourdhui_du": du}
+
+
+def _zone_notes(img, t, ecoule):
+    n = journees_a_noter(t)
+    if not n:
+        return
+    ecrire_petit(img, "A NOTER", None, 40, NOTES_AMBRE)
+    aujourdhui = n["aujourdhui"] or time.strftime("%Y-%m-%d", time.localtime(t))
+    midi = time.mktime(time.strptime(aujourdhui, "%Y-%m-%d")) + 12 * 3600
+    a_noter = set(n["jours"])
+    for i in range(8):                                  # sept jours passes, puis aujourd'hui
+        if ecoule is not None and ecoule < 0.07 * i:    # elles arrivent l'une apres l'autre
+            break
+        lt = time.localtime(midi - (7 - i) * 86400)
+        date = time.strftime("%Y-%m-%d", lt)
+        x, y = 4 + 7 * i, 47
+        if (date in a_noter) if i < 7 else n["aujourdhui_du"]:
+            f = 0.5 + 0.5 * abs(math.cos((t - 0.12 * i) * math.pi * 0.8))     # une vague qui bat
+            couleur = tuple(int(c * f) for c in NOTES_AMBRE)
+            img[y, x:x + 6] = img[y + 5, x:x + 6] = couleur
+            img[y:y + 6, x] = img[y:y + 6, x + 5] = couleur
+            initiale = NOTES_AMBRE
+        elif i < 7 or n["aujourdhui_notee"]:
+            img[y + 1:y + 5, x + 1:x + 5] = (55, 58, 72)                       # notee
+            initiale = (90, 90, 105)
+        else:
+            img[y, x:x + 6:2] = img[y + 5, x:x + 6:2] = (70, 70, 85)         # aujourd'hui, pas encore l'heure
+            initiale = (150, 150, 165)
+        ecrire_petit(img, _INITIALES[lt.tm_wday], x + 1, 54, initiale)
 
 
 # LE PETIT :3. « Rajoute un petit :3 qui arrive (qui cligne des yeux de temps
@@ -12206,6 +12270,8 @@ def _zone_du_cycle(nom, t, accent, minuteurs, rdv, ecoule, sensibilite=1.0):
         _zone_chat(img, t, accent, ecoule)
     elif nom == "maid":
         _zone_maid(img, t, accent, ecoule)
+    elif nom == "notes":
+        _zone_notes(img, t, ecoule)
     elif nom == "bonhomme":
         _zone_bonhomme(img, t, accent, ecoule)
     else:
@@ -13644,16 +13710,93 @@ def image_fl_studio(t, fl, eclat=None):
 # secondes (meme Discord range dans la barre : sa fenetre existe toujours),
 # et le panneau montre une pastille violette, en haut a gauche, avec le
 # nombre. Rien d'autre du titre ne sort de Machi Tool.
+#
+# « Le panneau n'affiche pas les notifs Discord. » L'appli de bureau ne met
+# pas toujours le compte dans son titre (elle le peint en pastille sur son
+# icone, que personne d'autre ne peut lire). Seconde source, celle de
+# Windows : les notifications de Discord encore dans le centre de
+# notifications, arrivees depuis la derniere fois que Discord etait au
+# premier plan -- tu les as vues en l'ouvrant. On ne lit que leur heure
+# d'arrivee, jamais ce qu'elles disent.
 DISCORD_PROCESSUS = ("discord.exe", "discordptb.exe", "discordcanary.exe")
 DISCORD_RELEVE_S = 5
 DISCORD_VIOLET = (88, 101, 242)
+DISCORD_CENTRE_S = 12 * 3600           # une notification de plus de douze heures n'attend plus
+DISCORD_CENTRE_RELU_S = 60             # le centre, relu au moins chaque minute (sinon a chaque changement)
+_DISCORD_CENTRE = {"signature": None, "lu": 0.0, "arrivees": None, "dit": None}
 
 
 def notifications_discord_du_titre(titre):
     """Combien de notifications t'attendent, d'apres un titre de fenetre de
-    Discord : « (3) Discord | #general » -> 3 ; « Discord » -> 0."""
-    m = re.match(r"^\s*\((\d+)\)", str(titre or ""))
+    Discord : « (3) Discord | #general » -> 3 ; « • (2) Discord » -> 2 ;
+    « Discord » -> 0."""
+    m = re.match(r"^[\s•·*]*\((\d+)\)", str(titre or ""))
     return int(m.group(1)) if m else 0
+
+
+def forme_du_titre(titre):
+    """Un titre de Discord sans ce qu'il dit, pour le journal : « (3) Discord
+    | #general | Amis » -> « (3) Discord | #… | … »."""
+    def masque(m):
+        mot = m.group(0)
+        return mot if mot.lower() == "discord" or re.fullmatch(r"\(\d+\)", mot) else "…"
+    forme = re.sub(r"\(\d+\)|[^\s|•·#@\-–()]+", masque, str(titre or ""))
+    return re.sub(r"…(\s*…)+", "…", forme)[:80]
+
+
+def centre_de_notifications():
+    """La base du centre de notifications de Windows (celle de la session)."""
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Notifications",
+                        "wpndatabase.db")
+
+
+def toasts_discord(chemin=None, maintenant=None):
+    """Les heures d'arrivee (secondes) des notifications de Discord encore dans
+    le centre de notifications de Windows ; None s'il ne se lit pas. La base
+    est tenue ouverte par Windows : on la lit sur une copie, jetee aussitot
+    (elle contient les notifications de toutes les applis)."""
+    t = time.time() if maintenant is None else maintenant
+    if chemin is None and os.name != "nt":
+        return None
+    base = chemin or centre_de_notifications()
+    try:
+        signature = tuple((os.path.getmtime(f), os.path.getsize(f)) if os.path.exists(f) else None
+                          for f in (base, base + "-wal"))
+    except OSError:
+        return None
+    if signature[0] is None:
+        return None
+    c = _DISCORD_CENTRE
+    if signature == c["signature"] and 0 <= t - c["lu"] < DISCORD_CENTRE_RELU_S:
+        return c["arrivees"]
+    import sqlite3
+    import tempfile
+    dossier = tempfile.mkdtemp(prefix="machitool-")
+    try:
+        copie = os.path.join(dossier, "n.db")
+        for suffixe in ("", "-wal", "-shm"):
+            if os.path.exists(base + suffixe):
+                shutil.copyfile(base + suffixe, copie + suffixe)
+        con = sqlite3.connect(copie)
+        try:
+            # ArrivalTime, ExpiryTime : des FILETIME (centaines de ns depuis 1601)
+            lignes = con.execute(
+                "SELECT n.ArrivalTime FROM Notification n JOIN NotificationHandler h ON h.RecordId = n.HandlerId "
+                "WHERE n.Type = 'toast' AND lower(h.PrimaryId) LIKE '%discord%' "
+                "AND (n.ExpiryTime IS NULL OR n.ExpiryTime = 0 OR n.ExpiryTime > ?)",
+                (int((t + 11644473600) * 10_000_000),)).fetchall()
+        finally:
+            con.close()
+        arrivees = [float(a) / 10_000_000 - 11644473600 for (a,) in lignes if a]
+    except Exception as e:
+        arrivees = None
+        if c.get("erreur") != type(e).__name__:
+            c["erreur"] = type(e).__name__
+            print("Discord : centre de notifications illisible (%s: %s)" % (type(e).__name__, str(e)[:100]))
+    finally:
+        shutil.rmtree(dossier, ignore_errors=True)
+    c.update(signature=signature, lu=t, arrivees=arrivees)
+    return arrivees
 
 
 def lire_discord(titres=None):
@@ -13678,17 +13821,38 @@ def lire_discord(titres=None):
                 pass
             return True
         win32gui.EnumWindows(voir, None)
+        _DISCORD_CENTRE["titres"] = sorted({forme_du_titre(t) for t in titres})[:4]
     if not titres:
         return None
     return max(notifications_discord_du_titre(t) for t in titres)
 
 
-def suivre_discord(lire=None):
-    """Depuis le fil des sources : ce que Discord montre, dans PANNEAU."""
+def suivre_discord(lire=None, centre=None, maintenant=None):
+    """Depuis le fil des sources : ce que Discord montre, dans PANNEAU -- le
+    plus grand de son titre et de ses notifications arrivees depuis que tu
+    l'as regarde (voir toasts_discord). None : ni l'un ni l'autre ne se lit."""
+    t = time.time() if maintenant is None else maintenant
     try:
-        PANNEAU["discord"] = (lire or lire_discord)()
+        titre = (lire or lire_discord)()
     except Exception:
-        PANNEAU["discord"] = None
+        titre = None
+    try:
+        arrivees = (centre or toasts_discord)()
+    except Exception:
+        arrivees = None
+    vu = max(float(PANNEAU.get("discord_vu") or 0.0), t - DISCORD_CENTRE_S)
+    attente = None if arrivees is None else sum(1 for a in arrivees if a > vu)
+    lus = [n for n in (titre, attente) if n is not None]
+    PANNEAU["discord"] = max(lus) if lus else None
+    # le journal : de quoi comprendre une pastille qui ne vient pas -- la forme
+    # du titre (sans les mots), et ce que dit le centre ; a chaque changement
+    dit = (tuple(_DISCORD_CENTRE.get("titres") or ()), titre, attente)
+    if dit != _DISCORD_CENTRE.get("dit"):
+        _DISCORD_CENTRE["dit"] = dit
+        print("Discord : titre %s -> %s ; centre de notifications : %s" % (
+            " / ".join("« %s »" % f for f in dit[0]) or "(aucune fenetre)",
+            "illisible" if titre is None else titre,
+            "illisible" if attente is None else "%d en attente" % attente))
     return PANNEAU["discord"]
 
 
@@ -13946,9 +14110,12 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
         t = time.time() if maintenant is None else maintenant
         connecte = bool(cfg.get("panneau_actif", True) and PANNEAU.get("etat") == "connecte")
         actif = bool(connecte and cfg.get("panneau_cycle", True) and cfg.get("panneau_contenu", "horloge") == "horloge")
+        fenetre = fenetre_active() if connecte else ""
+        if fenetre.partition(" | ")[0].strip() in DISCORD_PROCESSUS:
+            PANNEAU["discord_vu"] = t                   # Discord ouvert devant toi : ses notifications sont vues
         studio = False                                  # FL Studio au premier plan : sa vue ecoute le son
         if connecte and cfg.get("panneau_fl", True) and cfg.get("panneau_contenu", "horloge") != "eteint":
-            suivre_fl_studio(t)
+            suivre_fl_studio(t, fenetre)
             studio = fl_au_premier_plan(t) is not None
         ecoute = actif or studio
         if ecoute and not SON.get("panneau"):
@@ -13976,7 +14143,7 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
         if cfg.get("panneau_actif", True) and cfg.get("panneau_discord", True) \
                 and PANNEAU.get("etat") == "connecte" and t >= discord_t:
             discord_t = t + DISCORD_RELEVE_S
-            suivre_discord()
+            suivre_discord(maintenant=t)
         if tours is None:
             time.sleep(1.0)
 
@@ -14600,6 +14767,18 @@ class Passerelle(http.server.BaseHTTPRequestHandler):
         return self.repondre(404, {"erreur": "route inconnue"})
 
 
+def recevoir_a_noter(a_noter, maintenant=None):
+    """Les journees pas encore notees, telles que BrainDebugger les donne
+    (des dates seulement) : gardees dans PONT, avec l'heure du releve."""
+    t = time.time() if maintenant is None else maintenant
+    date = lambda d: isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) is not None
+    jours = [d for d in (a_noter.get("jours") or []) if date(d)][:31]
+    aujourdhui = a_noter.get("aujourdhui") if date(a_noter.get("aujourdhui")) else None
+    PONT["a_noter"] = {"jours": jours, "aujourdhui": aujourdhui,
+                       "aujourdhui_notee": bool(a_noter.get("aujourdhui_notee")), "recu": t}
+    return PONT["a_noter"]
+
+
 def deposer_rappel(identifiant, titre, texte):
     """Range un rappel et le signale. Les doublons sont ignores : le site
     peut reemettre le meme tant qu'il n'a pas ete acquitte."""
@@ -14700,6 +14879,8 @@ def relever_le_site(cfg):
         PONT["jours"] = [j for j in donnees["jours"] if isinstance(j, dict)][:400]
     if isinstance(donnees.get("reperes"), list):
         PONT["reperes"] = [r for r in donnees["reperes"] if isinstance(r, dict)][:400]
+    if isinstance(donnees.get("a_noter"), dict):
+        recevoir_a_noter(donnees["a_noter"])
 
     # LA DEMANDE DE SYNCHRO. Le site ne peut rien pousser vers cette machine :
     # c'est ici, au releve, qu'on apprend qu'on la lui doit. Deux raisons de
@@ -17835,6 +18016,7 @@ class Panneau:
                     "meteo_ville",
                     "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
+                    "panneau_cycle_notes",
                     "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
@@ -17897,7 +18079,7 @@ class Panneau:
         self.texte(vues, "Vues", BRUME, 8).pack(side="left")
         for cle, nom in (("panneau_cycle_meteo", "Meteo"), ("panneau_cycle_musique", "Musique"),
                          ("panneau_cycle_bonhomme", "Bonhomme"), ("panneau_cycle_chat", ":3"),
-                         ("panneau_cycle_maid", "Chaton maid")):
+                         ("panneau_cycle_maid", "Chaton maid"), ("panneau_cycle_notes", "A noter")):
             v = tk.IntVar(value=1 if self.cfg.get(cle, True) else 0)
             setattr(self, "var_" + cle, v)
             self.case(vues, nom, v, lambda cle=cle: self.regler_panneau(cle)).pack(side="left", padx=(self.px(8), 0))
@@ -18028,7 +18210,7 @@ class Panneau:
             if not self.cfg[cle]:
                 PANNEAU["discord"] = None
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
-                     "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid"):
+                     "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "meteo_ville":
             ville = self.champ_meteo_ville.get().strip()[:60]

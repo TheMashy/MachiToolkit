@@ -536,12 +536,17 @@ class AL_Ecran(unittest.TestCase):
             p.var_panneau_cycle_maid.set(0)
             p.regler_panneau("panneau_cycle_maid")
             self.assertFalse(M.CFG["panneau_cycle_maid"])
+            # « quand des notes ne sont pas encore posees sur des journees » : sa case
+            self.assertEqual(p.var_panneau_cycle_notes.get(), 1)
+            p.var_panneau_cycle_notes.set(0)
+            p.regler_panneau("panneau_cycle_notes")
+            self.assertFalse(M.CFG["panneau_cycle_notes"])
             self.assertAlmostEqual(float(p.var_panneau_eq_sensibilite.get()), 1.0)
             p.var_panneau_eq_sensibilite.set(1.8)
             self.assertEqual(M.CFG["panneau_eq_sensibilite"], 1.8)
         finally:
             for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_saut",
-                        "panneau_cycle_chat", "panneau_cycle_maid", "panneau_eq_sensibilite"):
+                        "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes", "panneau_eq_sensibilite"):
                 M.CFG[cle] = M.CONFIG_DEFAUT[cle]
             p.root.destroy()
 
