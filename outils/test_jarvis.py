@@ -3914,102 +3914,27 @@ class DansMachiTool(unittest.TestCase):
         self.assertFalse(coin(m.image_du_panneau(dict(cfg, panneau_discord=False), "horloge", t)).any())
         self.assertTrue(m.CONFIG_DEFAUT["panneau_discord"])
 
-    def test_les_notifications_discord_par_windows(self):
-        # « le panneau n'affiche pas les notifs Discord » : l'appli ne met pas toujours le compte dans
-        # son titre -- les notifications de Discord du centre de Windows, arrivees depuis qu'on l'a vu
-        import sqlite3
-        import tempfile
-        m = self.m
-        sauve = {k: m.PANNEAU.get(k) for k in ("discord", "discord_vu", "etat")}
-        vraie_fenetre = m.fenetre_active
-        self.addCleanup(lambda: (m.PANNEAU.update(sauve), setattr(m, "fenetre_active", vraie_fenetre)))
-        self.addCleanup(lambda: m._DISCORD_CENTRE.update(signature=None, lu=0.0, arrivees=None, dit=None))
-        lis = m.notifications_discord_du_titre
-        self.assertEqual(lis("• (2) Discord | #general"), 2, "non lus ET mentions")
-        self.assertEqual(m.forme_du_titre("(3) Discord | #general | Mon serveur - Discord"),
-                         "(3) Discord | #… | … - Discord", "le journal : la forme, pas les noms")
-        # une base comme celle de Windows : Discord, une autre appli, une notification expiree
-        t = 1_800_000_000.0
-        ft = lambda s: int((s + 11644473600) * 10_000_000)
-        dossier = tempfile.mkdtemp()
-        base = os.path.join(dossier, "wpndatabase.db")
-        con = sqlite3.connect(base)
-        con.executescript("CREATE TABLE NotificationHandler (RecordId INTEGER PRIMARY KEY, PrimaryId TEXT);"
-                          "CREATE TABLE Notification (Id INTEGER PRIMARY KEY, HandlerId INTEGER, Type TEXT,"
-                          " Payload BLOB, ArrivalTime INTEGER, ExpiryTime INTEGER);")
-        con.executemany("INSERT INTO NotificationHandler VALUES (?, ?)",
-                        [(7, "com.squirrel.Discord.Discord"), (8, "Microsoft.WindowsStore_8wekyb3d8bbwe!App")])
-        con.executemany("INSERT INTO Notification (HandlerId, Type, Payload, ArrivalTime, ExpiryTime) VALUES (?,?,?,?,?)",
-                        [(7, "toast", b"<toast>secret</toast>", ft(t - 600), ft(t + 86400)),
-                         (7, "toast", b"<toast>secret</toast>", ft(t - 60), ft(t + 86400)),
-                         (7, "toast", b"<toast>vieux</toast>", ft(t - 4 * 86400), ft(t - 3600)),   # expiree
-                         (7, "tile", b"", ft(t - 30), ft(t + 86400)),
-                         (8, "toast", b"<toast>store</toast>", ft(t - 30), ft(t + 86400))])
-        con.commit()
-        con.close()
-        avant = set(os.listdir(tempfile.gettempdir()))
-        arrivees = m.toasts_discord(base, maintenant=t)
-        self.assertEqual(sorted(round(a) for a in arrivees), [round(t - 600), round(t - 60)])
-        self.assertEqual(set(os.listdir(tempfile.gettempdir())) - avant, set(), "la copie est jetee aussitot")
-        self.assertIsNone(m.toasts_discord(os.path.join(dossier, "absente.db"), maintenant=t))
-        # ce qui attend : arrive depuis la derniere fois que Discord etait devant toi
-        m.PANNEAU["discord_vu"] = None
-        centre = lambda: [t - 600, t - 60, t - 13 * 3600]
-        self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=centre, maintenant=t), 2,
-                         "deux recentes ; celle d'il y a 13 h n'attend plus")
-        m.PANNEAU["discord_vu"] = t - 300
-        self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=centre, maintenant=t), 1, "tu l'as ouvert depuis")
-        self.assertEqual(m.suivre_discord(lire=lambda: 5, centre=centre, maintenant=t), 5, "le titre, s'il en dit plus")
-        self.assertEqual(m.suivre_discord(lire=lambda: None, centre=centre, maintenant=t), 1, "Discord ferme")
-        self.assertIsNone(m.suivre_discord(lire=lambda: None, centre=lambda: None, maintenant=t))
-        # le fil des sources voit quand Discord est devant toi
-        m.fenetre_active = lambda: "discord.exe | (2) discord | #general"
-        m.PANNEAU.update(etat="connecte", discord_vu=None)
-        m.veiller_sources_panneau({"panneau_contenu": "ambiance", "panneau_discord": False}, tours=1, maintenant=t)
-        self.assertEqual(m.PANNEAU["discord_vu"], t)
-        m.fenetre_active = lambda: "chrome.exe | youtube"
-        m.veiller_sources_panneau({"panneau_contenu": "ambiance", "panneau_discord": False}, tours=1, maintenant=t + 9)
-        self.assertEqual(m.PANNEAU["discord_vu"], t)
-
     @unittest.skipUnless(NUMPY, "numpy absent")
-    def test_la_pastille_de_discord_sur_la_barre_des_taches(self):
-        # « tu peux link autrement Discord ? j'ai une notif en attente qui ne s'affiche pas » -- la
-        # capture : la pastille rouge « 1 » sur l'icone de Discord, dans la barre des taches
-        import numpy as np
-        m = self.m
-        sauve = {k: m.PANNEAU.get(k) for k in ("discord", "discord_vu")}
-        self.addCleanup(lambda: m.PANNEAU.update(sauve))
-        self.addCleanup(lambda: m._DISCORD_CENTRE.update(signature=None, lu=0.0, arrivees=None, dit=None, barre=None))
-        # l'icone de Discord : violette, et la pastille rouge en bas a droite (comme la capture)
-        icone = np.zeros((48, 44, 3), np.uint8)
-        icone[10:38, 8:36] = (88, 101, 242)
-        avec = icone.copy()
-        yy, xx = np.mgrid[0:48, 0:44]
-        avec[(yy - 31) ** 2 + (xx - 31) ** 2 <= 49] = (242, 63, 66)
-        avec[28:35, 30:32] = (255, 255, 255)                   # le « 1 »
-        self.assertEqual(m.rouge_de_pastille(icone), 0, "le violet de l'icone n'est pas la pastille")
-        self.assertGreater(m.rouge_de_pastille(avec), m.DISCORD_ROUGE_MIN)
-        rect = (100, 1000, 144, 1048)
-        barre = m.pastille_discord_barre
-        # la description de la pastille (le texte que lit le Narrateur) dit le nombre
-        self.assertEqual(barre(boutons=[("1 unread message", rect)], capture=lambda r: icone), 1)
-        self.assertEqual(barre(boutons=[("12 notifications", rect)], capture=lambda r: icone), 12)
-        # sans nombre lisible : la pastille se voit
-        self.assertEqual(barre(boutons=[("", rect)], capture=lambda r: avec), -1)
-        self.assertEqual(barre(boutons=[("", rect)], capture=lambda r: icone), 0)
-        self.assertEqual(barre(boutons=[("", rect)], capture=lambda r: None), 0, "la barre ne se voit pas")
-        self.assertEqual(barre(boutons=[], capture=lambda r: avec), 0, "Discord n'est pas sur la barre")
-        self.assertIsNone(barre(boutons=None) if m.os.name != "nt" else None, "hors de Windows")
-        # la requete a UI Automation : les boutons de chaque barre, nom, aide et place en cache
+    def test_discord_lu_dans_sa_colonne_des_serveurs(self):
+        # « ne passe pas par les pastilles » -- « ca detecte mal, j'ai parfois une pastille quand j'ai
+        # 0 notifs, la pastille ne part pas quand je lis les messages » : Discord lui-meme, sa colonne
+        # des serveurs, lue comme un lecteur d'ecran
         import types
-        demandes = []
-
-        class Rect:
-            left, top, right, bottom = rect
-
-        class Element:
-            def __init__(self, nom, aide):
-                self.CachedName, self.CachedHelpText, self.CachedBoundingRectangle = nom, aide, Rect()
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("discord",)}
+        self.addCleanup(lambda: m.PANNEAU.update(sauve))
+        self.addCleanup(lambda: m._DISCORD.update(colonne=None, cherche=0.0, dit=None, lisible=None))
+        compte = m.mentions_discord
+        # chaque serveur et chaque message prive dit ses mentions ; l'accueil les additionne deja
+        noms = ["Messages privés, 2 mentions", "2 mentions, Pseudo", "Mon serveur", "non lu, Autre serveur",
+                "1 mention, Serveur B", "1 mention, Serveur B", "Ajouter un serveur"]
+        self.assertEqual(compte(noms), (3, ["2 mentions (accueil)", "2 mentions", "1 mention"]))
+        self.assertEqual(compte(["Direct Messages, 1 mention"])[0], 1, "l'accueil seul : les messages prives")
+        self.assertEqual(compte(["Messages privés", "Mon serveur", "non lu, Autre serveur"])[0], 0,
+                         "des messages non lus, mais rien qui t'attende")
+        self.assertEqual(compte([])[0], 0)
+        # la colonne, trouvee une fois dans l'interface de Discord, puis relue toutes les cinq secondes
+        lectures = {"cherche": 0, "lue": 0, "noms": noms, "casse": False}
 
         class Tableau:
             def __init__(self, elements):
@@ -4018,53 +3943,83 @@ class DansMachiTool(unittest.TestCase):
             def GetElement(self, i):
                 return self.elements[i]
 
-        class Barre:
-            def __init__(self, h):
-                self.h = h
+        class Colonne:
+            CurrentName = "Serveurs"
 
             def FindAllBuildCache(self, portee, condition, cache):
-                demandes.append((self.h, portee, condition))
-                return Tableau([Element("Demarrer", ""), Element("Discord - 1 running window", "1 unread"),
-                                Element("Spotify - 1 running window", "")] if self.h == 1 else
-                               [Element("discord", "")])
+                lectures["lue"] += 1
+                if lectures["casse"]:
+                    raise OSError("element plus disponible")
+                return Tableau([types.SimpleNamespace(CachedName=n) for n in lectures["noms"]])
+
+        class Fenetre:
+            def FindAll(self, portee, condition):
+                lectures["cherche"] += 1
+                self.condition = condition
+                return Tableau([types.SimpleNamespace(CurrentName="Canaux"), Colonne()])
 
         class Auto:
-            def CreateCacheRequest(self):
-                return types.SimpleNamespace(AddProperty=lambda p: demandes_cache.append(p))
+            def ElementFromHandle(self, h):
+                return Fenetre()
 
             def CreatePropertyCondition(self, propriete, valeur):
-                return ("condition", propriete, valeur)
+                return (propriete, valeur)
 
-            def ElementFromHandle(self, h):
-                return Barre(h)
-        demandes_cache = []
-        trouves = m.boutons_discord_barre(uia=(Auto(), types.SimpleNamespace(TreeScope_Descendants=4)), barres=[1, 2])
-        self.assertEqual(trouves, [("1 unread", rect), ("", rect)], "la barre principale et la secondaire")
-        self.assertEqual(sorted(demandes_cache), [30001, 30005, 30013], "nom, aide, place : une requete")
-        self.assertEqual([d[:3] for d in demandes], [(1, 4, ("condition", 30003, 50000)),
-                                                     (2, 4, ("condition", 30003, 50000))], "les boutons seulement")
+            def CreateCacheRequest(self):
+                return types.SimpleNamespace(AddProperty=lambda p: None)
+
+            def CreateTrueCondition(self):
+                return "tout"
+        uia = (Auto(), types.SimpleNamespace(TreeScope_Descendants=4))
+        lire = lambda t: m.noms_discord(uia=uia, fenetre=42, maintenant=t)
+        self.assertEqual(lire(1000.0), noms)
+        self.assertEqual(lire(1005.0), noms)
+        self.assertEqual((lectures["cherche"], lectures["lue"]), (1, 2), "cherchee une fois, relue a chaque fois")
+        lire(1000.0 + m.DISCORD_COLONNE_S)
+        self.assertEqual(lectures["cherche"], 2, "recherchee toutes les cinq minutes")
+        lectures["casse"] = True
+        with self.assertRaises(OSError):
+            lire(1310.0)
+        self.assertIsNone(m._DISCORD["colonne"], "Discord recharge : la colonne sera recherchee")
+        lectures["casse"] = False
+        self.assertEqual(lire(1315.0), noms)
+        # introuvable : on reessaie dans 30 s, pas a chaque fois
+        m._DISCORD.update(colonne=None, cherche=0.0)
+        Fenetre.FindAll = lambda self, portee, condition: (lectures.__setitem__("cherche", lectures["cherche"] + 1)
+                                                           or Tableau([]))
+        avant = lectures["cherche"]
+        self.assertIsNone(lire(2000.0))
+        self.assertIsNone(lire(2005.0))
+        self.assertEqual(lectures["cherche"], avant + 1)
+        lire(2000.0 + m.DISCORD_COLONNE_ABSENTE_S)
+        self.assertEqual(lectures["cherche"], avant + 2)
+        if m.os.name != "nt":
+            self.assertIsNone(m.noms_discord(maintenant=3000.0), "hors de Windows")
+        # le fil : la colonne fait foi ; le titre, seulement si elle ne se lit pas
+        t = 1_800_000_000.0
+        suivre = m.suivre_discord
+        self.assertEqual(suivre(lire=lambda: 0, colonne=lambda: noms, maintenant=t), 3)
+        self.assertIn("3 en attente", m._DISCORD["lisible"])
+        self.assertNotIn("Pseudo", m._DISCORD["lisible"], "ni un nom")
+        self.assertNotIn("Serveur B", m._DISCORD["lisible"])
+        self.assertEqual(suivre(lire=lambda: 5, colonne=lambda: ["Messages privés", "Mon serveur"], maintenant=t), 0,
+                         "lus : la pastille s'en va, quoi que dise le titre")
+        self.assertIn("rien en attente", m._DISCORD["lisible"])
+        self.assertEqual(suivre(lire=lambda: 2, colonne=lambda: None, maintenant=t), 2, "la colonne ne se lit pas")
 
         def casse():
             raise OSError("UIA indisponible")
-        vrai = m.boutons_discord_barre
-        self.addCleanup(lambda: setattr(m, "boutons_discord_barre", vrai))
-        m.boutons_discord_barre = casse
-        self.assertIsNone(barre(), "une barre illisible ne casse rien")
-        # avec les autres sources : un nombre l'emporte, sinon « il y a quelque chose »
-        t = 1_800_000_000.0
-        rien = lambda: None
-        self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=lambda: [], barre=lambda: -1, maintenant=t), -1)
-        self.assertEqual(m.suivre_discord(lire=lambda: 3, centre=rien, barre=lambda: -1, maintenant=t), 3)
-        self.assertEqual(m.suivre_discord(lire=rien, centre=rien, barre=lambda: 2, maintenant=t), 2)
-        self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=rien, barre=lambda: 0, maintenant=t), 0)
-        # sur le panneau : la pastille violette, un point blanc au lieu du nombre
+        self.assertEqual(suivre(lire=lambda: 0, colonne=casse, maintenant=t), 0)
+        self.assertIn("OSError", m._DISCORD["lisible"])
+        self.assertIsNone(suivre(lire=lambda: None, colonne=lambda: None, maintenant=t), "Discord n'est pas ouvert")
+        # sur le panneau
         cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
                "panneau_claude": False}
-        m.PANNEAU["discord"] = -1
-        img = m.image_du_panneau(cfg, "horloge", t)
-        coin = img[0:9, 0:14]
-        self.assertGreaterEqual(int((coin == m.DISCORD_VIOLET).all(axis=2).sum()), 20)
-        self.assertEqual(int((coin == (255, 255, 255)).all(axis=2).sum()), 6, "un point, pas un chiffre")
+        suivre(lire=lambda: 0, colonne=lambda: noms, maintenant=t)
+        coin = m.image_du_panneau(cfg, "horloge", t)[0:9, 0:14]
+        self.assertGreaterEqual(int((coin == m.DISCORD_VIOLET).all(axis=2).sum()), 15, "la pastille, avec son 3")
+        suivre(lire=lambda: 0, colonne=lambda: ["Mon serveur"], maintenant=t)
+        self.assertFalse(m.image_du_panneau(cfg, "horloge", t)[0:9, 0:14].any(), "tout est lu : plus rien")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_les_journees_a_noter(self):

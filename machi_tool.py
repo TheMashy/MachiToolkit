@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.112.1"
+VERSION = "1.113.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -13704,26 +13704,28 @@ def image_fl_studio(t, fl, eclat=None):
 
 
 # DISCORD. « Tu peux faire en sorte que ca detecte quand j'ai une
-# notification en attente sur Discord ? » Discord ecrit ce qui t'attend dans
-# le titre de sa fenetre, comme un onglet : « (3) Discord | ... » -- trois
-# mentions ou messages prives non lus. Machi Tool le lit toutes les cinq
-# secondes (meme Discord range dans la barre : sa fenetre existe toujours),
-# et le panneau montre une pastille violette, en haut a gauche, avec le
-# nombre. Rien d'autre du titre ne sort de Machi Tool.
-#
-# « Le panneau n'affiche pas les notifs Discord. » L'appli de bureau ne met
-# pas toujours le compte dans son titre (elle le peint en pastille sur son
-# icone, que personne d'autre ne peut lire). Seconde source, celle de
-# Windows : les notifications de Discord encore dans le centre de
-# notifications, arrivees depuis la derniere fois que Discord etait au
-# premier plan -- tu les as vues en l'ouvrant. On ne lit que leur heure
-# d'arrivee, jamais ce qu'elles disent.
+# notification en attente sur Discord ? » -- puis « ne passe pas par les
+# pastilles » : « ca detecte mal, j'ai parfois une pastille quand j'ai 0
+# notifs, elle ne part pas quand je lis les messages ». Les notifications de
+# Windows restent dans son centre une fois les messages lus, et la pastille
+# de la barre des taches n'en est qu'un reflet. Machi Tool lit donc Discord
+# lui-meme, comme un lecteur d'ecran (l'accessibilite de Windows, UI
+# Automation) : sa colonne des serveurs, ou chaque serveur et chaque message
+# prive non lu dit ses mentions (« 2 mentions, ... »). Elle se vide des que
+# tu lis ; Machi Tool la relit toutes les cinq secondes, et le panneau montre
+# une pastille violette, en haut a gauche, avec le total. Il n'en garde que
+# ces nombres -- ni un nom, ni un message. Le titre de la fenetre (« (3)
+# Discord | ... ») ne sert que si la colonne ne se lit pas.
 DISCORD_PROCESSUS = ("discord.exe", "discordptb.exe", "discordcanary.exe")
 DISCORD_RELEVE_S = 5
 DISCORD_VIOLET = (88, 101, 242)
-DISCORD_CENTRE_S = 12 * 3600           # une notification de plus de douze heures n'attend plus
-DISCORD_CENTRE_RELU_S = 60             # le centre, relu au moins chaque minute (sinon a chaque changement)
-_DISCORD_CENTRE = {"signature": None, "lu": 0.0, "arrivees": None, "dit": None}
+DISCORD_COLONNE_S = 300                # la colonne des serveurs, recherchee de nouveau toutes les 5 min
+DISCORD_COLONNE_ABSENTE_S = 30         # introuvable : on reessaie dans 30 s (l'accessibilite s'eveille)
+DISCORD_PAS_ENCORE = "Pas encore lu : toutes les cinq secondes, une fois le panneau branche."
+_MENTIONS = re.compile(r"(?i)\b(\d+)\s*(?:mentions?|notifications?)\b")
+_ACCUEIL = re.compile(r"(?i)messages priv|direct messages|accueil|\bhome\b")
+_DISCORD = {"colonne": None, "cherche": 0.0, "dit": None, "lisible": None}
+_UIA = threading.local()
 
 
 def notifications_discord_du_titre(titre):
@@ -13734,80 +13736,39 @@ def notifications_discord_du_titre(titre):
     return int(m.group(1)) if m else 0
 
 
-def forme_du_titre(titre):
-    """Un titre de Discord sans ce qu'il dit, pour le journal : « (3) Discord
-    | #general | Amis » -> « (3) Discord | #… | … »."""
-    def masque(m):
-        mot = m.group(0)
-        return mot if mot.lower() == "discord" or re.fullmatch(r"\(\d+\)", mot) else "…"
-    forme = re.sub(r"\(\d+\)|[^\s|•·#@\-–()]+", masque, str(titre or ""))
-    return re.sub(r"…(\s*…)+", "…", forme)[:80]
-
-
-def centre_de_notifications():
-    """La base du centre de notifications de Windows (celle de la session)."""
-    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Notifications",
-                        "wpndatabase.db")
-
-
-def toasts_discord(chemin=None, maintenant=None):
-    """Les heures d'arrivee (secondes) des notifications de Discord encore dans
-    le centre de notifications de Windows ; None s'il ne se lit pas. La base
-    est tenue ouverte par Windows : on la lit sur une copie, jetee aussitot
-    (elle contient les notifications de toutes les applis)."""
-    t = time.time() if maintenant is None else maintenant
-    if chemin is None and os.name != "nt":
+def lire_discord(titres=None):
+    """Le plus grand nombre de notifications que montrent les titres des
+    fenetres de Discord ; 0 s'il n'y en a pas ; None si Discord n'est pas
+    ouvert. `titres` : pour les tests."""
+    if titres is None:
+        if os.name != "nt":
+            return None
+        titres = [titre for _, titre, _ in fenetres_discord()]
+    if not titres:
         return None
-    base = chemin or centre_de_notifications()
-    try:
-        signature = tuple((os.path.getmtime(f), os.path.getsize(f)) if os.path.exists(f) else None
-                          for f in (base, base + "-wal"))
-    except OSError:
-        return None
-    if signature[0] is None:
-        return None
-    c = _DISCORD_CENTRE
-    if signature == c["signature"] and 0 <= t - c["lu"] < DISCORD_CENTRE_RELU_S:
-        return c["arrivees"]
-    import sqlite3
-    import tempfile
-    dossier = tempfile.mkdtemp(prefix="machitool-")
-    try:
-        copie = os.path.join(dossier, "n.db")
-        for suffixe in ("", "-wal", "-shm"):
-            if os.path.exists(base + suffixe):
-                shutil.copyfile(base + suffixe, copie + suffixe)
-        con = sqlite3.connect(copie)
+    return max(notifications_discord_du_titre(t) for t in titres)
+
+
+def fenetres_discord():
+    """Les fenetres de Discord qui ont un titre : [(fenetre, titre, aire)] --
+    meme rangees dans la zone de notification (elles existent toujours)."""
+    import win32gui
+    import win32process
+    trouvees = []
+
+    def voir(h, _):
         try:
-            # ArrivalTime, ExpiryTime : des FILETIME (centaines de ns depuis 1601)
-            lignes = con.execute(
-                "SELECT n.ArrivalTime FROM Notification n JOIN NotificationHandler h ON h.RecordId = n.HandlerId "
-                "WHERE n.Type = 'toast' AND lower(h.PrimaryId) LIKE '%discord%' "
-                "AND (n.ExpiryTime IS NULL OR n.ExpiryTime = 0 OR n.ExpiryTime > ?)",
-                (int((t + 11644473600) * 10_000_000),)).fetchall()
-        finally:
-            con.close()
-        arrivees = [float(a) / 10_000_000 - 11644473600 for (a,) in lignes if a]
-    except Exception as e:
-        arrivees = None
-        if c.get("erreur") != type(e).__name__:
-            c["erreur"] = type(e).__name__
-            print("Discord : centre de notifications illisible (%s: %s)" % (type(e).__name__, str(e)[:100]))
-    finally:
-        shutil.rmtree(dossier, ignore_errors=True)
-    c.update(signature=signature, lu=t, arrivees=arrivees)
-    return arrivees
-
-
-# « J'ai une notif en attente qui ne s'affiche pas » -- et la capture : la
-# pastille rouge « 1 » sur l'icone de Discord, dans la barre des taches.
-# Discord la pose avec une description pour les lecteurs d'ecran ; Windows
-# la donne a l'accessibilite (UI Automation) comme « texte d'aide » du
-# bouton -- celui que le Narrateur lit. Si elle ne dit pas de nombre, la
-# pastille se voit : son rouge, dans le bouton, tel qu'il est affiche.
-DISCORD_ROUGE_MIN = 12                 # pixels du rouge de la pastille (a 100 %, elle en fait ~150)
-_BARRES = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
-_UIA = threading.local()
+            titre = win32gui.GetWindowText(h)
+            if titre:
+                _, pid = win32process.GetWindowThreadProcessId(h)
+                if (_nom_du_processus(pid) or "").lower() in DISCORD_PROCESSUS:
+                    g, ht, d, b = win32gui.GetWindowRect(h)
+                    trouvees.append((h, titre, max(0, d - g) * max(0, b - ht)))
+        except Exception:
+            pass
+        return True
+    win32gui.EnumWindows(voir, None)
+    return trouvees
 
 
 def _automatisation():
@@ -13825,167 +13786,112 @@ def _automatisation():
     return a
 
 
-def boutons_discord_barre(uia=None, barres=None):
-    """Les boutons de Discord sur les barres des taches (zone de notification
-    comprise) : [(texte d'aide, (gauche, haut, droite, bas))] ; None hors de
-    Windows. Une seule requete par barre : nom, aide et place en cache.
-    `uia` (objet, module) et `barres` (leurs fenetres) : pour les tests."""
+def colonne_discord(uia, fenetre):
+    """La colonne des serveurs de Discord (un arbre « Serveurs » dans son
+    interface), ou None. Cherchee dans toute la fenetre : c'est long, d'ou le
+    cache (voir noms_discord)."""
+    auto, mod = uia
+    arbres = auto.ElementFromHandle(fenetre).FindAll(mod.TreeScope_Descendants,
+                                                    auto.CreatePropertyCondition(30003, 50023))   # Tree
+    for i in range(arbres.Length if arbres else 0):
+        e = arbres.GetElement(i)
+        if re.search(r"(?i)serveur|server", str(e.CurrentName or "")):
+            return e
+    return None
+
+
+def noms_discord(uia=None, fenetre=None, maintenant=None):
+    """Ce que dit la colonne des serveurs de Discord, element par element (ce
+    que lirait un lecteur d'ecran) ; None si Discord n'est pas ouvert, ou si
+    sa colonne ne se lit pas (encore). `uia` et `fenetre` : pour les tests."""
+    t = time.time() if maintenant is None else maintenant
     if uia is None:
         if os.name != "nt":
             return None
         uia = _automatisation()
     auto, mod = uia
-    if barres is None:
-        import win32gui
-        barres = []
-
-        def voir(h, _):
-            if win32gui.GetClassName(h) in _BARRES:
-                barres.append(h)
-            return True
-        win32gui.EnumWindows(voir, None)
-    cache = auto.CreateCacheRequest()
-    for propriete in (30005, 30013, 30001):           # Name, HelpText, BoundingRectangle
-        cache.AddProperty(propriete)
-    boutons = auto.CreatePropertyCondition(30003, 50000)     # ControlType : Button
-    trouves = []
-    for h in barres:
-        tous = auto.ElementFromHandle(h).FindAllBuildCache(mod.TreeScope_Descendants, boutons, cache)
-        for i in range(tous.Length if tous else 0):
-            e = tous.GetElement(i)
-            if re.match(r"(?i)\s*discord\b", str(e.CachedName or "")):
-                r = e.CachedBoundingRectangle
-                trouves.append((str(e.CachedHelpText or ""), (r.left, r.top, r.right, r.bottom)))
-    return trouves
-
-
-def rouge_de_pastille(pixels):
-    """Combien de pixels du rouge de la pastille de Discord (#F23F42) : un
-    rouge franc -- ni l'icone (violette), ni un survol (gris)."""
-    import numpy as np
-    p = np.asarray(pixels, dtype=np.int32)
-    r, g, b = p[..., 0], p[..., 1], p[..., 2]
-    return int(((r >= 190) & (g <= 110) & (b <= 110) & (r - g >= 100)).sum())
-
-
-def capture_bouton(rect):
-    """Les pixels d'un bouton de la barre, tels qu'affiches ; None s'il ne se
-    voit pas (barre masquee, un jeu en plein ecran devant)."""
-    import numpy as np
-    import win32gui
-    g, h, d, b = (int(v) for v in rect)
-    if d - g < 4 or b - h < 4:
-        return None
-    devant = win32gui.GetAncestor(win32gui.WindowFromPoint(((g + d) // 2, (h + b) // 2)), 2)   # GA_ROOT
-    if win32gui.GetClassName(devant) not in _BARRES:
-        return None
-    brut = _capteur().grab({"left": g, "top": h, "width": d - g, "height": b - h})
-    return np.frombuffer(brut.rgb, np.uint8).reshape(brut.height, brut.width, 3)
-
-
-def pastille_discord_barre(boutons=None, capture=None):
-    """La pastille de Discord sur la barre des taches : son nombre (lu dans
-    sa description), -1 si elle se voit sans nombre lisible, 0 sans pastille ;
-    None si la barre ne se lit pas."""
-    try:
-        trouves = boutons_discord_barre() if boutons is None else boutons
-    except Exception as e:
-        if _DISCORD_CENTRE.get("erreur_barre") != type(e).__name__:
-            _DISCORD_CENTRE["erreur_barre"] = type(e).__name__
-            print("Discord : barre des taches illisible (%s: %s)" % (type(e).__name__, str(e)[:100]))
-        return None
-    if trouves is None:
-        return None
-    n, vu = 0, []
-    for aide, rect in trouves:
-        chiffres = re.findall(r"\d+", aide)
-        rouge = None
-        if chiffres:
-            n = max(n, int(chiffres[0]))
-        else:
-            try:
-                pixels = (capture or capture_bouton)(rect)
-            except Exception:
-                pixels = None
-            rouge = None if pixels is None else rouge_de_pastille(pixels)
-            if rouge is not None and rouge >= DISCORD_ROUGE_MIN:
-                n = n or -1
-        vu.append("« %s » rouge %s" % (aide[:40], "?" if rouge is None else rouge))
-    _DISCORD_CENTRE["barre"] = vu
-    return n
-
-
-def lire_discord(titres=None):
-    """Le plus grand nombre de notifications que montrent les fenetres de
-    Discord ; 0 s'il n'y en a pas ; None si Discord n'est pas ouvert.
-    `titres` : pour les tests, les titres de ses fenetres."""
-    if titres is None:
-        if os.name != "nt":
+    colonne = _DISCORD.get("colonne")
+    if colonne is None or t - _DISCORD["cherche"] >= DISCORD_COLONNE_S:
+        if colonne is None and 0 <= t - _DISCORD["cherche"] < DISCORD_COLONNE_ABSENTE_S:
             return None
-        import win32gui
-        import win32process
-        titres = []
-
-        def voir(h, _):
-            try:
-                titre = win32gui.GetWindowText(h)
-                if titre:
-                    _, pid = win32process.GetWindowThreadProcessId(h)
-                    if (_nom_du_processus(pid) or "").lower() in DISCORD_PROCESSUS:
-                        titres.append(titre)
-            except Exception:
-                pass
-            return True
-        win32gui.EnumWindows(voir, None)
-        _DISCORD_CENTRE["titres"] = sorted({forme_du_titre(t) for t in titres})[:4]
-    if not titres:
-        return None
-    return max(notifications_discord_du_titre(t) for t in titres)
+        if fenetre is None:
+            fenetres = sorted(fenetres_discord(), key=lambda f: -f[2])
+            fenetre = fenetres[0][0] if fenetres else None
+        _DISCORD.update(cherche=t, colonne=None)
+        if not fenetre:
+            return None
+        colonne = _DISCORD["colonne"] = colonne_discord(uia, fenetre)
+        if colonne is None:
+            return None
+    cache = auto.CreateCacheRequest()
+    cache.AddProperty(30005)                            # Name
+    try:
+        tous = colonne.FindAllBuildCache(mod.TreeScope_Descendants, auto.CreateTrueCondition(), cache)
+    except Exception:
+        _DISCORD.update(colonne=None, cherche=0.0)      # Discord recharge : on la recherche au tour suivant
+        raise
+    return [str(tous.GetElement(i).CachedName or "") for i in range(tous.Length if tous else 0)]
 
 
-def suivre_discord(lire=None, centre=None, maintenant=None, barre=None):
-    """Depuis le fil des sources : ce que Discord montre, dans PANNEAU -- le
-    plus grand de son titre, de la pastille de sa barre des taches (voir
-    pastille_discord_barre) et de ses notifications arrivees depuis que tu
-    l'as regarde (voir toasts_discord) ; -1 : une pastille sans nombre
-    lisible. None : rien ne se lit."""
+def mentions_discord(noms):
+    """Ce qui t'attend, d'apres la colonne des serveurs : (total, [ce qui a
+    compte, sans les noms]). Chaque serveur et chaque message prive dit ses
+    mentions ; l'accueil (les messages prives) les additionne deja -- il ne
+    compte que si rien d'autre ne dit rien."""
+    total, accueil, vu = 0, 0, []
+    for nom in dict.fromkeys(noms):                     # un meme element lu deux fois ne compte qu'une
+        m = _MENTIONS.search(nom)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if _ACCUEIL.search(nom):
+            accueil = max(accueil, n)
+            vu.append("%s (accueil)" % m.group(0).lower())
+        else:
+            total += n
+            vu.append(m.group(0).lower())
+    return (total or accueil), vu
+
+
+def suivre_discord(lire=None, colonne=None, maintenant=None):
+    """Depuis le fil des sources : ce qui t'attend sur Discord, dans PANNEAU
+    -- sa colonne des serveurs, sinon le titre de sa fenetre ; None si
+    Discord n'est pas ouvert ou ne se lit pas. `lire` et `colonne` : pour
+    les tests."""
     t = time.time() if maintenant is None else maintenant
+    souci = None
+    try:
+        noms = (colonne or noms_discord)()
+    except Exception as e:
+        noms, souci = None, "%s: %s" % (type(e).__name__, str(e)[:80])
     try:
         titre = (lire or lire_discord)()
     except Exception:
         titre = None
-    try:
-        arrivees = (centre or toasts_discord)()
-    except Exception:
-        arrivees = None
-    try:
-        pastille = (barre or pastille_discord_barre)()
-    except Exception:
-        pastille = None
-    vu = max(float(PANNEAU.get("discord_vu") or 0.0), t - DISCORD_CENTRE_S)
-    attente = None if arrivees is None else sum(1 for a in arrivees if a > vu)
-    lus = [n for n in (titre, attente, pastille) if n is not None]
-    PANNEAU["discord"] = (max(lus) if max(lus) > 0 else min(lus)) if lus else None
-    # le journal : de quoi comprendre une pastille qui ne vient pas -- la forme
-    # du titre (sans les mots), la barre des taches, le centre ; a chaque changement
-    dit = (tuple(_DISCORD_CENTRE.get("titres") or ()), titre, tuple(_DISCORD_CENTRE.get("barre") or ()),
-           pastille, attente)
-    if dit != _DISCORD_CENTRE.get("dit"):
-        _DISCORD_CENTRE["dit"] = dit
-        print("Discord : titre %s -> %s ; barre des taches %s -> %s ; centre de notifications : %s" % (
-            " / ".join("« %s »" % f for f in dit[0]) or "(aucune fenetre)",
-            "illisible" if titre is None else titre,
-            " / ".join(dit[2]) or "(aucun bouton)", "illisible" if pastille is None else pastille,
-            "illisible" if attente is None else "%d en attente" % attente))
-    return PANNEAU["discord"]
+    if noms is not None:
+        n, vu = mentions_discord(noms)
+        source = "sa colonne des serveurs (%d elements lus%s)" % (len(noms), " : " + ", ".join(vu) if vu else "")
+    else:
+        n, source = titre, "le titre de sa fenetre%s" % (
+            " (Discord n'est pas ouvert)" if titre is None else
+            " (sa colonne ne se lit pas%s)" % (" : " + souci if souci else ""))
+    PANNEAU["discord"] = n
+    _DISCORD["lisible"] = "Lu a %s : %s, d'apres %s." % (
+        time.strftime("%H:%M:%S", time.localtime(t)),
+        "rien a lire" if n is None else "rien en attente" if not n else "%d en attente" % n, source)
+    # le journal, a chaque changement : de quoi comprendre une pastille qui ne vient pas (sans les noms)
+    dit = (n, source)
+    if dit != _DISCORD.get("dit"):
+        _DISCORD["dit"] = dit
+        print("Discord : %s" % _DISCORD["lisible"].split(" : ", 1)[1])
+    return n
 
 
 def dessiner_pastille_discord(img, n, eclat=None):
     """La pastille, en haut a gauche : violette (la couleur de Discord), le
-    nombre en blanc, « 9+ » au-dela ; un point blanc si on ne sait pas
-    combien (n < 0 : la pastille de la barre des taches, sans nombre lisible)."""
-    texte = "" if n < 0 else str(n) if n <= 9 else "9+"
-    larg = largeur_petit(texte) + 4 if texte else 6
+    nombre en blanc, « 9+ » au-dela."""
+    texte = str(n) if n <= 9 else "9+"
+    larg = largeur_petit(texte) + 4
     fond, blanc = DISCORD_VIOLET, (255, 255, 255)
     if eclat is not None:
         f = max(PANNEAU_ECLAT_MIN, eclat)
@@ -13993,10 +13899,7 @@ def dessiner_pastille_discord(img, n, eclat=None):
     img[1:8, 1:1 + larg] = fond
     for y, x in ((1, 1), (1, larg), (7, 1), (7, larg)):     # les coins arrondis
         img[y, x] = 0
-    if texte:
-        ecrire_petit(img, texte, 3, 2, blanc)
-    else:
-        img[3:6, 3:5] = blanc
+    ecrire_petit(img, texte, 3, 2, blanc)
 
 
 def _image_du_contenu(cfg, contenu, t, eclat):
@@ -14239,8 +14142,6 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
         connecte = bool(cfg.get("panneau_actif", True) and PANNEAU.get("etat") == "connecte")
         actif = bool(connecte and cfg.get("panneau_cycle", True) and cfg.get("panneau_contenu", "horloge") == "horloge")
         fenetre = fenetre_active() if connecte else ""
-        if fenetre.partition(" | ")[0].strip() in DISCORD_PROCESSUS:
-            PANNEAU["discord_vu"] = t                   # Discord ouvert devant toi : ses notifications sont vues
         studio = False                                  # FL Studio au premier plan : sa vue ecoute le son
         if connecte and cfg.get("panneau_fl", True) and cfg.get("panneau_contenu", "horloge") != "eteint":
             suivre_fl_studio(t, fenetre)
@@ -18258,10 +18159,15 @@ class Panneau:
         # « qu'il detecte quand j'ai une notification en attente sur Discord »
         self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
         c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
-                           "leur nombre (lu dans le titre de la fenetre de Discord)", self.var_panneau_discord,
+                           "leur nombre (les mentions et messages prives que montre Discord, lus dans sa "
+                           "colonne des serveurs)", self.var_panneau_discord,
                       lambda: self.regler_panneau("panneau_discord"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « j'ai encore une notif mais il ne la detecte pas » : ce qu'il lit, source par source
+        self.txt_discord = self.texte(col, _DISCORD.get("lisible") or DISCORD_PAS_ENCORE, BRUME, 8,
+                                      largeur=360)
+        self.txt_discord.pack(fill="x", pady=(2, 0), padx=(self.px(22), 0))
         # « une bulle de statut quand Claude est en train de reflechir »
         self.var_panneau_claude = tk.IntVar(value=1 if self.cfg.get("panneau_claude", True) else 0)
         c = self.case(col, "La bulle de Claude Code, en haut a droite : rouge, il attend ton accord ; jaune, il "
@@ -18470,6 +18376,11 @@ class Panneau:
         if getattr(self, "txt_claude_cloud", None) is not None and CLAUDE_CODE.get("vu_cloud"):
             try:
                 self.txt_claude_cloud.configure(text=etat_cloud_lisible(self.cfg))
+            except Exception:
+                pass
+        if getattr(self, "txt_discord", None) is not None:
+            try:
+                self.txt_discord.configure(text=_DISCORD.get("lisible") or DISCORD_PAS_ENCORE)
             except Exception:
                 pass
         texte, couleur = etat_panneau_lisible()
