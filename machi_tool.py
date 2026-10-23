@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.111.0"
+VERSION = "1.111.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -388,6 +388,9 @@ CONFIG_DEFAUT = {
     # francais, avec la voix du dessus. "fr" remet Jarvis en francais.
     "jarvis_langue": "en",
     "jarvis_micro": "",
+    # son nom, retenu avec lui : un pilote mis a jour ou un autre port USB lui
+    # donne un autre identifiant, et l'oreille le retrouve par son nom
+    "jarvis_micro_nom": "",
     # SES MAINS SUR LE PC (dossiers, fichiers, Spotify) et SES YEUX (un ecran,
     # sur demande) : fermes tant qu'on ne les ouvre pas, et derriere un code
     # d'acces dit a voix haute. Du code, on ne garde qu'une empreinte.
@@ -3177,10 +3180,20 @@ def _vignette_gdi(zone, colonnes, lignes):
             return None
 
     try:
-        try:
-            garde["memoire"].SetStretchBltMode(win32con.HALFTONE)
-        except Exception:
-            garde["memoire"].SetStretchBltMode(win32con.COLORONCOLOR)
+        if not garde.get("mode"):
+            # Le mode de reduction, par GDI lui-meme : le PyCDC de pywin32 n'a
+            # pas SetStretchBltMode. L'appel levait a CHAQUE image (« Capture
+            # GDI perdue », 5 lignes par seconde dans le journal) et tout
+            # passait par le repli, l'ecran entier recopie. Le mode reste au
+            # contexte : une fois suffit. Refuse, StretchBlt marche quand meme.
+            gdi, _ = _apis_ecran()
+            if gdi is not None:
+                hdc = garde["memoire"].GetSafeHdc()
+                if gdi.SetStretchBltMode(hdc, win32con.HALFTONE):
+                    gdi.SetBrushOrgEx(hdc, 0, 0, None)   # ce que HALFTONE demande apres lui
+                else:
+                    gdi.SetStretchBltMode(hdc, win32con.COLORONCOLOR)
+            garde["mode"] = True
         garde["memoire"].StretchBlt(
             (0, 0), (colonnes, lignes),
             garde["source"], (zone["left"], zone["top"]),
@@ -3278,6 +3291,10 @@ def _apis_ecran():
         gdi.DeleteDC.argtypes = [ctypes.c_void_p]
         gdi.GetDeviceGammaRamp.restype = ctypes.c_int
         gdi.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi.SetStretchBltMode.restype = ctypes.c_int
+        gdi.SetStretchBltMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        gdi.SetBrushOrgEx.restype = ctypes.c_int
+        gdi.SetBrushOrgEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         user.GetDC.restype = ctypes.c_void_p
         user.GetDC.argtypes = [ctypes.c_void_p]
         user.ReleaseDC.restype = ctypes.c_int
@@ -3850,7 +3867,13 @@ def fil_audio(cfg):
             haut_parleur = sc.default_speaker()
             micro = sc.get_microphone(haut_parleur.name, include_loopback=True)
             AUDIO["message"] = f"ecoute {haut_parleur.name[:28]}"
-            with micro.recorder(samplerate=48000, blocksize=taille) as source:
+            _jv.calmer_soundcard()
+            # Le tampon de Windows (blocksize) etait de la taille d'une lecture,
+            # 43 ms : le moindre retard du fil (le panneau a 30 images/s, la
+            # capture de l'ecran) le faisait deborder -- du son jete, dix fois
+            # par seconde dans le journal (« data discontinuity »). Huit
+            # lectures d'avance ; on lit toujours `taille` a la fois.
+            with micro.recorder(samplerate=48000, blocksize=taille * 8) as source:
                 AUDIO["actif"] = True
                 while SON["marche"]:
                     bloc = source.record(numframes=taille)
@@ -5949,7 +5972,25 @@ def config_oreille(cfg):
             "ma_voix": bool(cfg.get("jarvis_ma_voix", True)),
             "son": bool(cfg.get("jarvis_son", True)),
             "couper": bool(cfg.get("jarvis_couper", True)),
-            "micro": str(cfg.get("jarvis_micro", "") or "")}
+            "micro": str(cfg.get("jarvis_micro", "") or ""),
+            "micro_nom": str(cfg.get("jarvis_micro_nom", "") or "")}
+
+
+def retenir_micro(cfg, ident, nom):
+    """L'oreille a ouvert le micro choisi : on retient son nom (pour le
+    retrouver s'il change d'identifiant), et son nouvel identifiant s'il l'a
+    retrouve par son nom -- la page Jarvis le montre alors coche, pas
+    « debranche ». Rend True si les reglages ont change."""
+    avant = (cfg.get("jarvis_micro"), cfg.get("jarvis_micro_nom"))
+    if ident:
+        print("Jarvis : le micro choisi a change d'identifiant, retrouve par son nom")
+        cfg["jarvis_micro"] = str(ident)
+    if nom:
+        cfg["jarvis_micro_nom"] = str(nom)[:200]
+    if (cfg.get("jarvis_micro"), cfg.get("jarvis_micro_nom")) == avant:
+        return False
+    sauver_config(cfg)
+    return True
 
 
 def liste_micros():
@@ -6126,6 +6167,9 @@ def traiter_evenement(ev):
             JARVIS["micro_absent"] = not ev.get("trouve", True)
             if JARVIS["micro_absent"]:
                 print("Jarvis : le micro choisi est introuvable, j'ecoute celui de Windows")
+            elif CFG.get("jarvis_micro") and retenir_micro(CFG, ev.get("micro_id"), JARVIS["micro"]) \
+                    and ev.get("micro_id"):
+                envoyer_oreille(config_oreille(CFG))     # son nouvel identifiant : il le rouvre sous ce nom-la
     elif quoi == "essai" and ev.get("maj"):
         # ce qu'est devenu l'appel pas net en attente de lecture : « lent » (le
         # moteur de transcription demarre), ou tranche au score sans lecture
@@ -6386,10 +6430,14 @@ MICRO_MUET_DB = -90.0
 MICRO_MUET_S = 30.0
 MICRO_MUET_MESSAGE = ("Le micro ne rend que du silence : coupe, ou acces refuse "
                       "(Parametres > Confidentialite > Microphone).")
+# « Jarvis n'est plus detecte, et le micro non plus » : le micro choisi
+# introuvable, il ecoutait celui de Windows -- muet. Le dire tel quel.
+MICRO_ABSENT_MESSAGE = ("Le micro choisi est introuvable, et celui de Windows ne rend que du silence : "
+                        "choisis-le de nouveau dans « le micro », plus bas.")
 
 
 def micro_muet_signale():
-    return (JARVIS.get("souci") or ("",))[0] == MICRO_MUET_MESSAGE
+    return (JARVIS.get("souci") or ("",))[0] in (MICRO_MUET_MESSAGE, MICRO_ABSENT_MESSAGE)
 
 
 def suivre_micro_muet(db, maintenant):
@@ -6403,7 +6451,7 @@ def suivre_micro_muet(db, maintenant):
         debut = JARVIS.get("muet_depuis") or maintenant
         JARVIS["muet_depuis"] = debut
         if maintenant - debut >= MICRO_MUET_S and not micro_muet_signale():
-            souci(MICRO_MUET_MESSAGE)
+            souci(MICRO_ABSENT_MESSAGE if JARVIS.get("micro_absent") else MICRO_MUET_MESSAGE)
     else:
         JARVIS["muet_depuis"] = None
         if micro_muet_signale():
@@ -19260,6 +19308,10 @@ class Panneau:
         for w in self.boite_micros.winfo_children():
             w.destroy()
         micros = liste_micros()
+        self.noms_micros = dict(micros)
+        if self.var_jarvis_micro.get() != str(self.cfg.get("jarvis_micro", "") or ""):
+            # l'oreille l'a retrouve sous un autre identifiant (voir retenir_micro)
+            self.var_jarvis_micro.set(str(self.cfg.get("jarvis_micro", "") or ""))
         choisi = self.var_jarvis_micro.get()
         self.radio(self.boite_micros, "Celui de Windows (par defaut)", self.var_jarvis_micro,
                    "").pack(fill="x")
@@ -19273,7 +19325,10 @@ class Panneau:
                        BRUME, 8, largeur=500).pack(fill="x")
 
     def choisir_micro(self):
-        self.cfg["jarvis_micro"] = self.var_jarvis_micro.get()
+        ident = self.var_jarvis_micro.get()
+        if ident != self.cfg.get("jarvis_micro"):         # le micro choisi debranche, recoche : son nom reste
+            self.cfg["jarvis_micro_nom"] = getattr(self, "noms_micros", {}).get(ident, "") if ident else ""
+        self.cfg["jarvis_micro"] = ident
         sauver_config(self.cfg)
         envoyer_oreille(config_oreille(self.cfg))
 

@@ -5967,6 +5967,95 @@ class DansMachiTool(unittest.TestCase):
         m.traiter_evenement({"evt": "pret", "micro": "Webcam", "trouve": True})
         self.assertFalse(m.JARVIS["micro_absent"])
 
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_capture_de_l_egaliseur_a_de_la_marge(self):
+        # le journal : « data discontinuity in recording », 31 785 fois en 53 minutes -- le
+        # tampon de Windows faisait la taille d'une lecture, le moindre retard jetait du son
+        import types
+        import warnings
+        m = self.m
+        ouverts, lus = [], []
+
+        class Enregistreur:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def record(self, numframes):
+                lus.append(numframes)
+                m.SON["marche"] = False
+                return np.zeros((numframes, 2), dtype=np.float32)
+
+        class Boucle:
+            def recorder(self, samplerate, blocksize=None, **k):
+                ouverts.append(blocksize)
+                return Enregistreur()
+        faux = types.SimpleNamespace(default_speaker=lambda: types.SimpleNamespace(name="Haut-parleurs"),
+                                     get_microphone=lambda nom, include_loopback=False: Boucle())
+        vrai = sys.modules.get("soundcard")
+        sys.modules["soundcard"] = faux
+        self.addCleanup(lambda: sys.modules.__setitem__("soundcard", vrai) if vrai else sys.modules.pop("soundcard"))
+        sauve = (m.SON.get("marche"), dict(m.AUDIO))
+        self.addCleanup(lambda: (m.SON.__setitem__("marche", sauve[0]), m.AUDIO.update(sauve[1])))
+        m.SON["marche"] = True
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")          # ce que soundcard pose en s'important
+            m.fil_audio({})
+            filtre = warnings.filters[0]
+        self.assertEqual(lus, [2048])
+        self.assertGreaterEqual(ouverts[0], 8 * lus[0], "huit lectures d'avance")
+        self.assertEqual(filtre[0], "once", "une fois par processus, pas a chaque paquet")
+        self.assertTrue(filtre[1].match("data discontinuity in recording"))
+
+    def test_le_micro_choisi_se_retrouve_par_son_nom(self):
+        # « Jarvis n'est plus detecte, et le micro peut-etre non plus » : au redemarrage du PC,
+        # le micro choisi avait un autre identifiant, et celui de Windows ne rendait que du silence
+        m = self.m
+        sauve = {k: m.CFG.get(k) for k in ("jarvis_micro", "jarvis_micro_nom")}
+        sauve_j = {k: m.JARVIS.get(k) for k in ("micro", "micro_absent", "souci", "muet_depuis")}
+        ecrits = []
+        vrai = m.sauver_config
+        m.sauver_config = lambda cfg: ecrits.append(dict(cfg)) or True
+        self.addCleanup(lambda: (setattr(m, "sauver_config", vrai), m.CFG.update(sauve), m.JARVIS.update(sauve_j)))
+        self.assertEqual(m.CONFIG_DEFAUT["jarvis_micro_nom"], "")
+        m.CFG.update(jarvis_micro="{A}", jarvis_micro_nom="")
+        self.assertEqual(m.config_oreille(m.CFG)["micro_nom"], "")
+        # le micro choisi s'ouvre : son nom est retenu (une config d'avant ne l'avait pas)
+        m.traiter_evenement({"evt": "pret", "micro": "Microphone (Blue Yeti)", "trouve": True})
+        self.assertEqual(m.CFG["jarvis_micro_nom"], "Microphone (Blue Yeti)")
+        self.assertEqual(m.config_oreille(m.CFG)["micro_nom"], "Microphone (Blue Yeti)", "l'oreille le recoit")
+        self.assertEqual(len(ecrits), 1)
+        m.traiter_evenement({"evt": "pret", "micro": "Microphone (Blue Yeti)", "trouve": True})
+        self.assertEqual(len(ecrits), 1, "rien de neuf : rien d'ecrit")
+        # retrouve par son nom sous un autre identifiant : le nouveau est retenu, et l'oreille le recoit
+        envois = []
+        vrai_envoi = m.envoyer_oreille
+        m.envoyer_oreille = lambda c: envois.append(c) or True
+        self.addCleanup(lambda: setattr(m, "envoyer_oreille", vrai_envoi))
+        m.traiter_evenement({"evt": "pret", "micro": "Microphone (2- Blue Yeti)", "trouve": True, "micro_id": "{B}"})
+        self.assertEqual(m.CFG["jarvis_micro"], "{B}")
+        self.assertEqual([c.get("micro") for c in envois if c.get("cmd") == "config"], ["{B}"])
+        self.assertEqual(m.CFG["jarvis_micro_nom"], "Microphone (2- Blue Yeti)")
+        self.assertFalse(m.JARVIS["micro_absent"])
+        # celui de Windows (aucun choisi) : rien a retenir
+        m.CFG.update(jarvis_micro="", jarvis_micro_nom="")
+        m.traiter_evenement({"evt": "pret", "micro": "Realtek", "trouve": True})
+        self.assertEqual(m.CFG["jarvis_micro_nom"], "")
+        # introuvable, et celui de Windows muet : la page dit quoi faire
+        m.CFG["jarvis_micro"] = "{Z}"
+        m.JARVIS.update(souci=None, muet_depuis=None)
+        m.traiter_evenement({"evt": "pret", "micro": "Realtek", "trouve": False})
+        self.assertEqual(m.CFG["jarvis_micro"], "{Z}", "absent : on garde le choix")
+        m.suivre_micro_muet(-120.0, 1000.0)
+        m.suivre_micro_muet(-120.0, 1000.0 + m.MICRO_MUET_S + 1)
+        self.assertEqual(m.JARVIS["souci"][0], m.MICRO_ABSENT_MESSAGE)
+        self.assertIn("choisis-le de nouveau", m.MICRO_ABSENT_MESSAGE)
+        self.assertTrue(m.micro_muet_signale())
+        m.suivre_micro_muet(-30.0, 1000.0 + m.MICRO_MUET_S + 2)
+        self.assertIsNone(m.JARVIS["souci"], "un vrai son l'efface")
+
     def test_jarvis_est_eteint_par_defaut(self):
         self.assertFalse(self.m.CONFIG_DEFAUT["jarvis_actif"],
                          "un micro ouvert en permanence se decide, il ne s'impose pas")
@@ -9120,13 +9209,31 @@ class LeMicroChoisi(unittest.TestCase):
         self.assertEqual(J.choisir_micro(tous, "Webcam", defaut), (b, True))
         self.assertEqual(J.choisir_micro(tous, "{Z}", defaut), (a, False),
                          "debranche : celui de Windows, et on le sait")
+        # « Jarvis n'est plus detecte, et le micro non plus » : au redemarrage du PC, un autre
+        # identifiant (pilote mis a jour, autre port USB) -- son nom, retenu, le retrouve
+        self.assertEqual(J.choisir_micro(tous, "{Z}", defaut, "Micro casque"), (a, True))
+        yeti = self.Micro("{Y2}", "Microphone (2- Blue Yeti)")
+        avec = lambda: [a, b, yeti]
+        self.assertEqual(J.choisir_micro(avec, "{Y1}", defaut, "Microphone (Blue Yeti)"), (yeti, True),
+                         "Windows l'a renumerote : « 2- » devant son nom")
+        self.assertEqual(J.choisir_micro(avec, "{Y1}", defaut, "microphone ( 3-  blue yeti)"), (yeti, True))
+        self.assertEqual(J.choisir_micro(avec, "{Y1}", defaut, "Micro USB"), (a, False), "un autre nom : absent")
+        self.assertEqual(J.choisir_micro(avec, "{Y1}", defaut, ""), (a, False), "sans nom retenu : comme avant")
+        self.assertEqual(J.choisir_micro(avec, "{C}", defaut, "Microphone (Blue Yeti)"), (yeti, True))
+        self.assertEqual(J.choisir_micro(lambda: [a, c], "{C}", defaut, "Micro casque"), (c, True),
+                         "l'identifiant passe avant le nom")
 
     def test_l_oreille_change_de_micro_sans_redemarrer(self):
         ouverts = []
 
-        def faux_micro(nom="", annoncer=None):
+        retenus = []
+
+        def faux_micro(nom="", annoncer=None, nom_retenu=""):
             ouverts.append(nom)
-            if annoncer:
+            retenus.append(nom_retenu)
+            if annoncer and nom == "{VIEUX}":        # retrouve par son nom, sous un autre identifiant
+                annoncer(nom_retenu, True, "{NEUF}")
+            elif annoncer:
                 annoncer("Micro " + (nom or "Windows"), nom != "absent")
             while True:                   # un micro ne s'arrete pas tout seul
                 time.sleep(0.002)
@@ -9172,10 +9279,16 @@ class LeMicroChoisi(unittest.TestCase):
             self.assertEqual(attendre_pret()["micro"], "Micro {B}")
             J.envoyer(conn, {"cmd": "config", "micro": "absent"})
             self.assertFalse(attendre_pret()["trouve"])
+            # « Jarvis n'est plus detecte » : un nouvel identifiant au redemarrage, le nom le retrouve
+            J.envoyer(conn, {"cmd": "config", "micro": "{VIEUX}", "micro_nom": "Micro casque"})
+            ev = attendre_pret()
+            self.assertTrue(ev["trouve"])
+            self.assertEqual(ev["micro_id"], "{NEUF}", "Machi Tool apprend son nouvel identifiant")
+            self.assertEqual(retenus[-1], "Micro casque")
             conn.close()
             fil.join(10)
             self.assertFalse(fil.is_alive())
-            self.assertEqual(ouverts, ["{A}", "{B}", "absent"], "jamais le mauvais micro d'abord")
+            self.assertEqual(ouverts, ["{A}", "{B}", "absent", "{VIEUX}"], "jamais le mauvais micro d'abord")
         finally:
             J.micro_windows, J.Oreille, J.Empreintes = origines
             serveur.close()
