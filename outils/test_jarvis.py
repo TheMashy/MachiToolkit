@@ -3914,6 +3914,142 @@ class DansMachiTool(unittest.TestCase):
         self.assertFalse(coin(m.image_du_panneau(dict(cfg, panneau_discord=False), "horloge", t)).any())
         self.assertTrue(m.CONFIG_DEFAUT["panneau_discord"])
 
+    def test_les_notifications_discord_par_windows(self):
+        # « le panneau n'affiche pas les notifs Discord » : l'appli ne met pas toujours le compte dans
+        # son titre -- les notifications de Discord du centre de Windows, arrivees depuis qu'on l'a vu
+        import sqlite3
+        import tempfile
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("discord", "discord_vu", "etat")}
+        vraie_fenetre = m.fenetre_active
+        self.addCleanup(lambda: (m.PANNEAU.update(sauve), setattr(m, "fenetre_active", vraie_fenetre)))
+        self.addCleanup(lambda: m._DISCORD_CENTRE.update(signature=None, lu=0.0, arrivees=None, dit=None))
+        lis = m.notifications_discord_du_titre
+        self.assertEqual(lis("• (2) Discord | #general"), 2, "non lus ET mentions")
+        self.assertEqual(m.forme_du_titre("(3) Discord | #general | Mon serveur - Discord"),
+                         "(3) Discord | #… | … - Discord", "le journal : la forme, pas les noms")
+        # une base comme celle de Windows : Discord, une autre appli, une notification expiree
+        t = 1_800_000_000.0
+        ft = lambda s: int((s + 11644473600) * 10_000_000)
+        dossier = tempfile.mkdtemp()
+        base = os.path.join(dossier, "wpndatabase.db")
+        con = sqlite3.connect(base)
+        con.executescript("CREATE TABLE NotificationHandler (RecordId INTEGER PRIMARY KEY, PrimaryId TEXT);"
+                          "CREATE TABLE Notification (Id INTEGER PRIMARY KEY, HandlerId INTEGER, Type TEXT,"
+                          " Payload BLOB, ArrivalTime INTEGER, ExpiryTime INTEGER);")
+        con.executemany("INSERT INTO NotificationHandler VALUES (?, ?)",
+                        [(7, "com.squirrel.Discord.Discord"), (8, "Microsoft.WindowsStore_8wekyb3d8bbwe!App")])
+        con.executemany("INSERT INTO Notification (HandlerId, Type, Payload, ArrivalTime, ExpiryTime) VALUES (?,?,?,?,?)",
+                        [(7, "toast", b"<toast>secret</toast>", ft(t - 600), ft(t + 86400)),
+                         (7, "toast", b"<toast>secret</toast>", ft(t - 60), ft(t + 86400)),
+                         (7, "toast", b"<toast>vieux</toast>", ft(t - 4 * 86400), ft(t - 3600)),   # expiree
+                         (7, "tile", b"", ft(t - 30), ft(t + 86400)),
+                         (8, "toast", b"<toast>store</toast>", ft(t - 30), ft(t + 86400))])
+        con.commit()
+        con.close()
+        avant = set(os.listdir(tempfile.gettempdir()))
+        arrivees = m.toasts_discord(base, maintenant=t)
+        self.assertEqual(sorted(round(a) for a in arrivees), [round(t - 600), round(t - 60)])
+        self.assertEqual(set(os.listdir(tempfile.gettempdir())) - avant, set(), "la copie est jetee aussitot")
+        self.assertIsNone(m.toasts_discord(os.path.join(dossier, "absente.db"), maintenant=t))
+        # ce qui attend : arrive depuis la derniere fois que Discord etait devant toi
+        m.PANNEAU["discord_vu"] = None
+        centre = lambda: [t - 600, t - 60, t - 13 * 3600]
+        self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=centre, maintenant=t), 2,
+                         "deux recentes ; celle d'il y a 13 h n'attend plus")
+        m.PANNEAU["discord_vu"] = t - 300
+        self.assertEqual(m.suivre_discord(lire=lambda: 0, centre=centre, maintenant=t), 1, "tu l'as ouvert depuis")
+        self.assertEqual(m.suivre_discord(lire=lambda: 5, centre=centre, maintenant=t), 5, "le titre, s'il en dit plus")
+        self.assertEqual(m.suivre_discord(lire=lambda: None, centre=centre, maintenant=t), 1, "Discord ferme")
+        self.assertIsNone(m.suivre_discord(lire=lambda: None, centre=lambda: None, maintenant=t))
+        # le fil des sources voit quand Discord est devant toi
+        m.fenetre_active = lambda: "discord.exe | (2) discord | #general"
+        m.PANNEAU.update(etat="connecte", discord_vu=None)
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance", "panneau_discord": False}, tours=1, maintenant=t)
+        self.assertEqual(m.PANNEAU["discord_vu"], t)
+        m.fenetre_active = lambda: "chrome.exe | youtube"
+        m.veiller_sources_panneau({"panneau_contenu": "ambiance", "panneau_discord": False}, tours=1, maintenant=t + 9)
+        self.assertEqual(m.PANNEAU["discord_vu"], t)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_les_journees_a_noter(self):
+        # « rajoute une interface sur le panneau quand des notes ne sont pas encore posees sur des journees »
+        m = self.m
+        sauve_pont = m.PONT.get("a_noter")
+        sauve = {k: m.PANNEAU.get(k) for k in ("cycle",)}
+        self.addCleanup(lambda: (m.PONT.__setitem__("a_noter", sauve_pont), m.PANNEAU.update(sauve)))
+        midi = time.mktime(time.strptime("2026-10-23 15:00:00", "%Y-%m-%d %H:%M:%S"))
+        soir = midi + 6 * 3600                              # 21 h
+        # ce que BrainDebugger envoie : des dates, filtrees
+        r = m.recevoir_a_noter({"aujourdhui": "2026-10-23", "aujourdhui_notee": False,
+                                "jours": ["2026-10-22", "2026-10-18", "pas une date", 3, "2026-10-21"]}, maintenant=midi)
+        self.assertEqual(r["jours"], ["2026-10-22", "2026-10-18", "2026-10-21"])
+        n = m.journees_a_noter(midi)
+        self.assertFalse(n["aujourdhui_du"], "l'apres-midi, aujourd'hui n'est pas encore a noter")
+        self.assertTrue(m.journees_a_noter(soir)["aujourdhui_du"], "le soir, si")
+        nuit = midi + 12 * 3600 - 60                        # 2 h 59 : la journee vecue n'est pas finie
+        m.recevoir_a_noter({"aujourdhui": "2026-10-23", "aujourdhui_notee": False, "jours": []}, maintenant=nuit)
+        self.assertTrue(m.journees_a_noter(nuit)["aujourdhui_du"], "et la nuit, jusqu'au coucher")
+        m.recevoir_a_noter({"aujourdhui": "2026-10-23", "aujourdhui_notee": False, "jours": ["2026-10-22"]},
+                           maintenant=midi)
+        self.assertIsNone(m.journees_a_noter(midi + m.NOTES_VIEILLES_S + 1), "un vieux releve : on ne sait plus")
+        m.recevoir_a_noter({"aujourdhui": "2026-10-23", "aujourdhui_notee": True, "jours": []}, maintenant=midi)
+        self.assertIsNone(m.journees_a_noter(soir), "tout est note : rien a montrer")
+        m.recevoir_a_noter({"aujourdhui": "2026-10-23", "aujourdhui_notee": False, "jours": []}, maintenant=midi)
+        self.assertIsNone(m.journees_a_noter(midi))
+        self.assertIsNotNone(m.journees_a_noter(soir), "seulement aujourd'hui, le soir")
+        # une vue du cycle, juste apres l'heure -- seulement s'il y a quelque chose a noter
+        self.assertEqual(m.CYCLE_ORDRE[:2], ("heure", "notes"))
+        self.assertIn("notes", m.cycle_disponible(soir, {}))
+        self.assertNotIn("notes", m.cycle_disponible(midi, {}))
+        self.assertNotIn("notes", m.cycle_disponible(soir, {"panneau_cycle_notes": False}), "decochee")
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_cycle_notes"])
+        # la vue : « A NOTER », et une case ambre par journee qui attend
+        m.recevoir_a_noter({"aujourdhui": "2026-10-23", "aujourdhui_notee": False,
+                            "jours": ["2026-10-22", "2026-10-18"]}, maintenant=midi)
+        ambre = lambda img: (img == m.NOTES_AMBRE).all(axis=2)
+        cases = lambda img: sum(1 for i in range(8) if img[47:53, 4 + 7 * i:10 + 7 * i].any(axis=2).sum() >= 18
+                                and not img[48:52, 5 + 7 * i:9 + 7 * i].any())
+        vue = m._zone_du_cycle("notes", soir, (120, 200, 255), [], [], 5.0)
+        self.assertGreater(int(ambre(vue[39:46]).sum()), 15, "« A NOTER »")
+        self.assertEqual(cases(vue), 3, "le 18, le 22, et ce soir le 23")
+        self.assertEqual(cases(m._zone_du_cycle("notes", midi, (120, 200, 255), [], [], 5.0)), 2, "l'apres-midi")
+        self.assertFalse(vue[:39].any() or vue[59:].any(), "rien hors de sa zone")
+        # elles arrivent l'une apres l'autre
+        debut = m._zone_du_cycle("notes", soir, (120, 200, 255), [], [], 0.0)
+        self.assertLess(int(debut[47:59].any(axis=2).sum()), int(vue[47:59].any(axis=2).sum()))
+        # sur le panneau, quand le cycle en est la
+        img = m.image_panneau("horloge", soir, cycle={"actuel": "notes", "precedent": None, "fondu": 1.0,
+                                                       "ecoule": 5.0})
+        self.assertTrue((img[m.ZONE_CYCLE] == vue[m.ZONE_CYCLE]).all())
+
+    def test_le_releve_du_site_apporte_les_journees_a_noter(self):
+        import io
+        m = self.m
+        sauve = {k: m.PONT.get(k) for k in ("a_noter", "etat", "message", "vu_le")}
+        vrais = (m.urllib.request.urlopen, m.synchroniser_activite)
+        self.addCleanup(lambda: (m.PONT.update(sauve), setattr(m.urllib.request, "urlopen", vrais[0]),
+                                 setattr(m, "synchroniser_activite", vrais[1])))
+        m.synchroniser_activite = lambda cfg, minimum=0: None
+        reponse = {"rappels": [], "jours": [], "reperes": [],
+                   "a_noter": {"aujourdhui": "2026-10-23", "aujourdhui_notee": False, "jours": ["2026-10-21"]}}
+
+        class Reponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        m.urllib.request.urlopen = lambda requete, timeout=None, context=None: Reponse(json.dumps(reponse).encode())
+        self.assertTrue(m.relever_le_site({"pont_site": "https://exemple.test", "pont_cle": "cle"}))
+        self.assertEqual(m.PONT["a_noter"]["jours"], ["2026-10-21"])
+        self.assertEqual(m.PONT["a_noter"]["aujourdhui"], "2026-10-23")
+        # un BrainDebugger d'avant ne l'envoie pas : rien ne casse, rien ne s'invente
+        m.PONT["a_noter"] = None
+        del reponse["a_noter"]
+        self.assertTrue(m.relever_le_site({"pont_site": "https://exemple.test", "pont_cle": "cle"}))
+        self.assertIsNone(m.PONT["a_noter"])
+
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_la_vue_fl_studio(self):
         # « tu peux detecter quand je vais sur FL Studio et me faire une interface dediee ? »
