@@ -445,10 +445,10 @@ class AL_Ecran(unittest.TestCase):
             M.CFG["panneau_discord"] = True
             # « il ne la detecte pas » : ce qu'il lit, source par source, sous la case
             self.assertIn("cinq secondes", p.txt_discord.cget("text"))
-            garde = M._DISCORD_CENTRE.get("lisible")
-            M._DISCORD_CENTRE["lisible"] = "Lu a 12:00:00 : la pastille montre 1."
+            garde = M._DISCORD.get("lisible")
+            M._DISCORD["lisible"] = "Lu a 12:00:00 : la pastille montre 1."
             p._peindre_panneau()
-            M._DISCORD_CENTRE["lisible"] = garde
+            M._DISCORD["lisible"] = garde
             self.assertEqual(p.txt_discord.cget("text"), "Lu a 12:00:00 : la pastille montre 1.")
             # « un effet sur le panneau lorsqu'une maj est en cours » : sa case
             p.var_panneau_maj.set(0)
