@@ -3037,10 +3037,20 @@ class Coupure:
         return coupe
 
 
+def calmer_soundcard():
+    """« data discontinuity in recording » : soundcard le dit a CHAQUE paquet
+    de son perdu (son filtre « always ») -- 31 785 lignes en 53 minutes dans
+    le journal de Machi Tool. Une fois par processus suffit. Apres
+    `import soundcard` : il pose son filtre en l'important."""
+    import warnings
+    warnings.filterwarnings("once", message="data discontinuity in recording")
+
+
 def haut_parleurs_windows():
     """Ce que jouent les haut-parleurs par defaut (le loopback de WASAPI),
     en 16 kHz mono, par blocs de 20 ms."""
     import soundcard as sc
+    calmer_soundcard()
     hp = sc.default_speaker()
     return sc.get_microphone(id=str(hp.name), include_loopback=True).recorder(
         samplerate=FREQ, channels=1, blocksize=COUPURE_SF)
@@ -3119,19 +3129,36 @@ def recevoir(s, plafond=8 * 1024 * 1024):
     return json.loads(exactement(n).decode("utf-8")) if n else None
 
 
-def choisir_micro(micros, voulu, defaut):
+def nom_de_micro(nom):
+    """Le nom d'un micro, tel qu'on le compare : « Microphone (2- Blue Yeti) »
+    et « Microphone (Blue Yeti) » sont le meme -- Windows le renumerote quand
+    il change de port USB ou de pilote."""
+    return re.sub(r"\s+", " ", re.sub(r"\(\s*(\d+-\s*)?", "(", str(nom or ""))).strip().lower()
+
+
+def choisir_micro(micros, voulu, defaut, nom=""):
     """LE MICRO CHOISI DANS LES REGLAGES, par son identifiant Windows (stable,
     et deux micros peuvent porter le meme nom), a defaut par son nom -- ou
     celui de Windows. Rend (micro, trouve) : `trouve` est faux quand le micro
     choisi n'est plus branche, pour que Machi Tool le dise au lieu d'ecouter
-    ailleurs en silence."""
+    ailleurs en silence.
+
+    « JARVIS N'EST PLUS DETECTE, ET LE MICRO NON PLUS » : au redemarrage du PC,
+    le micro choisi n'avait plus le meme identifiant (un pilote mis a jour, un
+    autre port USB), et Jarvis ecoutait celui de Windows -- muet. `nom`, le nom
+    retenu avec l'identifiant, le retrouve alors (voir nom_de_micro)."""
     voulu = str(voulu or "")
     if not voulu:
         return defaut(), True
+    tous = list(micros())
     for cle in ("id", "name"):
-        for m in micros():
+        for m in tous:
             if str(getattr(m, cle, "")) == voulu:
                 return m, True
+    cible = nom_de_micro(nom)
+    for m in tous if cible else ():
+        if nom_de_micro(getattr(m, "name", "")) == cible:
+            return m, True
     return defaut(), False
 
 
@@ -3139,12 +3166,15 @@ MICRO_MUET_S = 30.0          # que du silence numerique si longtemps : le micro 
 MICRO_VERIFIE_S = 10.0       # toutes les dix secondes : est-ce toujours le bon micro ?
 
 
-def micro_windows(nom="", annoncer=None):
+def micro_windows(nom="", annoncer=None, nom_retenu=""):
     """Les trames du micro, 1280 echantillons int16 a 16 kHz. WASAPI convertit
-    lui-meme la frequence (soundcard ouvre le flux avec AUTOCONVERTPCM)."""
+    lui-meme la frequence (soundcard ouvre le flux avec AUTOCONVERTPCM).
+    `nom` : l'identifiant du micro choisi ; `nom_retenu` : son nom, s'il a
+    change d'identifiant (voir choisir_micro). `annoncer(nom, trouve, ident)`."""
     import numpy as np
     import soundcard as sc
-    micro, trouve = choisir_micro(sc.all_microphones, nom, sc.default_microphone)
+    calmer_soundcard()
+    micro, trouve = choisir_micro(sc.all_microphones, nom, sc.default_microphone, nom_retenu)
     ident = getattr(micro, "id", None)
     # un tampon de 640 ms : la verification du micro (toutes les 10 s) peut
     # prendre plus que les 80 ms d'une trame sans couper ce qu'on dit
@@ -3152,7 +3182,7 @@ def micro_windows(nom="", annoncer=None):
         # « pret » seulement une fois le micro OUVERT : annonce avant, il
         # effacait l'erreur d'un micro refuse, toutes les trois secondes
         if annoncer:
-            annoncer(str(getattr(micro, "name", "")), trouve)
+            annoncer(str(getattr(micro, "name", "")), trouve, ident)
         vu, muet = time.monotonic(), None
         while True:
             b = r.record(numframes=TRAME)
@@ -3169,7 +3199,7 @@ def micro_windows(nom="", annoncer=None):
             if t - vu > MICRO_VERIFIE_S:
                 vu = t
                 try:
-                    if getattr(choisir_micro(sc.all_microphones, nom, sc.default_microphone)[0], "id",
+                    if getattr(choisir_micro(sc.all_microphones, nom, sc.default_microphone, nom_retenu)[0], "id",
                                ident) != ident:
                         return
                 except Exception:
@@ -3890,6 +3920,12 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
         except queue.Empty:
             continue
     micro_voulu = lambda: str(oreille.reglages.get("micro") or "")
+
+    def annoncer(n, ok, ident=None):
+        ev = {"evt": "pret", "micro": n, "trouve": ok, "vad": avec_vad()}
+        if ok and ident and nom and str(ident) != nom:
+            ev["micro_id"] = str(ident)               # retrouve par son nom : son nouvel identifiant
+        sortie(ev)
     while vivant.is_set():
         flux = None
         try:
@@ -3898,8 +3934,7 @@ def oreille_enfant(port, secret, dossier, source=None, jouer_son=None, loopback=
                 flux = source()
                 sortie({"evt": "pret", "vad": avec_vad()})
             else:
-                flux = micro_windows(nom, lambda n, ok: sortie({"evt": "pret", "micro": n, "trouve": ok,
-                                                                "vad": avec_vad()}))
+                flux = micro_windows(nom, annoncer, str(oreille.reglages.get("micro_nom") or ""))
             for x in flux:
                 while True:
                     try:

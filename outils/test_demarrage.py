@@ -2032,8 +2032,10 @@ class AtelierGDI:
             def SelectObject(self, _):
                 atelier.etape("SelectObject")
 
-            def SetStretchBltMode(self, _):
-                pass
+            # pas de SetStretchBltMode : le PyCDC de pywin32 ne l'a pas (le faux
+            # l'avait, et « Capture GDI perdue » remplissait le journal)
+            def GetSafeHdc(self):
+                return self.numero
 
             def StretchBlt(self, *_):
                 atelier.etape("StretchBlt")
@@ -2153,6 +2155,32 @@ class FuiteDeHandles(unittest.TestCase):
         a = self.atelier(casse_a="CreateDCFromHandle")
         self.assertIsNone(self.mt._vignette_gdi(ZONE, 4, 2))
         self.assertEqual(a.vivants, {})
+
+    def test_le_mode_de_reduction_passe_par_gdi(self):
+        """« Capture GDI perdue : 'PyCDC' object has no attribute
+        'SetStretchBltMode' », cinq fois par seconde dans le journal : le mode
+        se regle par GDI lui-meme, une fois par contexte, et la vignette sort."""
+        a = self.atelier()
+        appels = []
+
+        class FauxGdi:
+            @staticmethod
+            def SetStretchBltMode(hdc, mode):
+                appels.append(("mode", hdc, mode))
+                return 3
+
+            @staticmethod
+            def SetBrushOrgEx(hdc, x, y, avant):
+                appels.append(("brosse", hdc, x, y))
+                return 1
+        vrai = self.mt._apis_ecran
+        self.mt._apis_ecran = lambda: (FauxGdi, None)
+        self.addCleanup(lambda: setattr(self.mt, "_apis_ecran", vrai))
+        self.assertEqual(len(self.mt._vignette_gdi(ZONE, 4, 2)), 8)
+        self.assertEqual(len(self.mt._vignette_gdi(ZONE, 4, 2)), 8)
+        memoire = [n for n, quoi in a.vivants.items() if quoi == "dc memoire"]
+        self.assertEqual(appels, [("mode", memoire[0], 4), ("brosse", memoire[0], 0, 0)],
+                         "HALFTONE sur le contexte memoire, une seule fois")
 
     def test_changer_la_finesse_rend_l_ancienne_garde(self):
         """Le curseur « Finesse » change la taille de la vignette, donc jette

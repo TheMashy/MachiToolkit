@@ -476,6 +476,36 @@ class AL_Ecran(unittest.TestCase):
             M.CFG["panneau_claude"] = True
             p.root.destroy()
 
+    def test_le_micro_choisi_garde_son_nom(self):
+        """« Jarvis n'est plus detecte » : le micro choisi est retenu avec son
+        nom (l'oreille le retrouve s'il change d'identifiant), et la liste suit
+        l'identifiant que l'oreille a retrouve."""
+        vrais = (M.sauver_config, M.liste_micros, M.envoyer_oreille)
+        sauve = {k: M.CFG.get(k) for k in ("jarvis_micro", "jarvis_micro_nom")}
+        self.addCleanup(lambda: (setattr(M, "sauver_config", vrais[0]), setattr(M, "liste_micros", vrais[1]),
+                                 setattr(M, "envoyer_oreille", vrais[2]), M.CFG.update(sauve)))
+        M.sauver_config = lambda cfg: True
+        M.envoyer_oreille = lambda c: True
+        M.liste_micros = lambda: [("{A}", "Microphone (Blue Yeti)"), ("{B}", "Webcam")]
+        M.CFG.update(jarvis_micro="", jarvis_micro_nom="")
+        p = M.Panneau(M.CFG, lambda: None)
+        try:
+            p.aller("jarvis")
+            p.root.update()
+            p.var_jarvis_micro.set("{A}")
+            self.assertEqual((M.CFG["jarvis_micro"], M.CFG["jarvis_micro_nom"]), ("{A}", "Microphone (Blue Yeti)"))
+            p.var_jarvis_micro.set("")
+            self.assertEqual((M.CFG["jarvis_micro"], M.CFG["jarvis_micro_nom"]), ("", ""), "celui de Windows")
+            p.var_jarvis_micro.set("{B}")
+            # l'oreille le retrouve sous un autre identifiant : la liste le montre coche
+            M.liste_micros = lambda: [("{A}", "Microphone (Blue Yeti)"), ("{B2}", "Webcam")]
+            M.CFG["jarvis_micro"] = "{B2}"
+            p.remplir_micros()
+            self.assertEqual(p.var_jarvis_micro.get(), "{B2}")
+            self.assertEqual(M.CFG["jarvis_micro_nom"], "Webcam", "son nom reste")
+        finally:
+            p.root.destroy()
+
     def test_le_cycle_se_regle_sur_la_page_du_panneau(self):
         """« Rajoute tout ca en settings dans le tab panel » : les reglettes et
         les cases du cycle ecrivent la config, le panneau les suit."""
