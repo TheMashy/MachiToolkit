@@ -548,12 +548,26 @@ class AL_Ecran(unittest.TestCase):
             p.var_panneau_cycle_notes.set(0)
             p.regler_panneau("panneau_cycle_notes")
             self.assertFalse(M.CFG["panneau_cycle_notes"])
+            # « des effets de transition prenant tout le panneau, comme des screen savers » : la case,
+            # le rythme, la duree, et « Montrer un ecran »
+            self.assertEqual(p.var_panneau_ecrans.get(), 1)
+            p.var_panneau_ecrans.set(0)
+            p.regler_panneau("panneau_ecrans")
+            self.assertFalse(M.CFG["panneau_ecrans"])
+            p.var_panneau_ecrans_intervalle.set(12)
+            p.var_panneau_ecrans_duree.set(30)
+            self.assertEqual((M.CFG["panneau_ecrans_intervalle"], M.CFG["panneau_ecrans_duree"]), (12, 30))
+            self.assertEqual(M.reglages_ecrans(M.CFG), (720.0, 30.0))
+            M.PANNEAU.pop("ecran_demande", None)
+            p.montrer_ecran()
+            self.assertTrue(M.PANNEAU.pop("ecran_demande"))
             self.assertAlmostEqual(float(p.var_panneau_eq_sensibilite.get()), 1.0)
             p.var_panneau_eq_sensibilite.set(1.8)
             self.assertEqual(M.CFG["panneau_eq_sensibilite"], 1.8)
         finally:
             for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_saut",
-                        "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes", "panneau_eq_sensibilite"):
+                        "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes", "panneau_eq_sensibilite",
+                        "panneau_ecrans", "panneau_ecrans_intervalle", "panneau_ecrans_duree"):
                 M.CFG[cle] = M.CONFIG_DEFAUT[cle]
             p.root.destroy()
 

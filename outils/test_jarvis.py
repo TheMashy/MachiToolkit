@@ -4022,6 +4022,104 @@ class DansMachiTool(unittest.TestCase):
         self.assertFalse(m.image_du_panneau(cfg, "horloge", t)[0:9, 0:14].any(), "tout est lu : plus rien")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_les_ecrans_plein_panneau(self):
+        # « rajoute des effets de transition prenant tout le panneau (sans l'heure), un peu comme des
+        # screen savers (au moins 10 differents) »
+        import numpy as np
+        m = self.m
+        cles = ("ecran", "ecran_fin", "ecran_demande", "ecrans_sac", "ecran_dernier", "cycle", "discord")
+        sauve = {k: m.PANNEAU.get(k) for k in cles}
+
+        def remettre():
+            for k in cles:
+                m.PANNEAU.pop(k, None)
+            m.PANNEAU.update({k: v for k, v in sauve.items() if v is not None})
+        self.addCleanup(remettre)
+        self.assertGreaterEqual(len(m.ECRANS), 10)
+        # chacun : 64 x 64, allume, qui bouge, le meme pour la meme graine, et a 30 images/s sans peine
+        t0 = 1_800_000_000.0
+        for nom, (titre, f) in m.ECRANS.items():
+            with self.subTest(ecran=nom):
+                self.assertTrue(titre)
+                images = []
+                for essai in range(2):
+                    e = {"rng": np.random.default_rng(5)}
+                    debut = time.perf_counter()
+                    vues = [f(e, t0 + i / 30, i / 30, 0.0 if i == 0 else 1 / 30) for i in range(91)]
+                    cout = (time.perf_counter() - debut) / 91
+                    images.append(vues)
+                img = images[0][-1]
+                self.assertEqual((img.shape, img.dtype), ((64, 64, 3), np.uint8))
+                self.assertGreater(int(img.any(axis=2).sum()), 40, "il se voit")
+                self.assertFalse((images[0][45] == images[0][90]).all(), "il bouge")
+                self.assertTrue((images[0][-1] == images[1][-1]).all(), "la meme graine, le meme ecran")
+                self.assertLess(cout, 0.02, "%.1f ms par image" % (cout * 1000))
+        # chacun son tour, dans un ordre melange, jamais deux fois de suite
+        import random
+        m.PANNEAU.pop("ecrans_sac", None)
+        m.PANNEAU.pop("ecran_dernier", None)
+        rng = random.Random(4)
+        suite = [m.prochain_ecran(rng) for _ in range(3 * len(m.ECRANS))]
+        for k in range(3):
+            self.assertEqual(sorted(suite[k * len(m.ECRANS):(k + 1) * len(m.ECRANS)]), sorted(m.ECRANS))
+        self.assertTrue(all(a != b for a, b in zip(suite, suite[1:])), "jamais deux fois le meme de suite")
+        # les reglages, bornes
+        self.assertEqual(m.reglages_ecrans({}), (300.0, 15.0))
+        self.assertEqual(m.reglages_ecrans({"panneau_ecrans_intervalle": 0, "panneau_ecrans_duree": 999}),
+                         (60.0, 120.0))
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_ecrans"])
+        # quand : l'intervalle passe, au moment ou le cycle change de vue ; la duree ; puis l'heure revient
+        for k in cles:
+            m.PANNEAU.pop(k, None)
+        cfg = {"panneau_ecrans_intervalle": 5, "panneau_ecrans_duree": 15}
+        du = m.ecran_du_moment
+        self.assertIsNone(du(cfg, t0))
+        self.assertIsNone(du(cfg, t0 + 299))
+        m.PANNEAU["cycle"] = {"actuel": "meteo", "depuis": t0 + 280}
+        self.assertIsNone(du(cfg, t0 + 301), "on attend que le cycle change de vue")
+        m.PANNEAU["cycle"]["depuis"] = t0 + 310
+        e = du(cfg, t0 + 310.2)
+        self.assertIsNotNone(e)
+        self.assertIn(e["nom"], m.ECRANS)
+        self.assertIs(du(cfg, t0 + 320), e, "quinze secondes")
+        self.assertIsNone(du(cfg, t0 + 325.3), "fini : l'heure revient")
+        self.assertEqual(m.PANNEAU["ecran_fin"], t0 + 325.3)
+        self.assertIsNone(du(cfg, t0 + 400))
+        # un cycle qui ne change jamais (l'heure seule) ne le retient pas plus de 35 s
+        m.PANNEAU["cycle"] = {"actuel": "heure", "depuis": t0}
+        self.assertIsNone(du(cfg, t0 + 325.3 + 310))
+        self.assertIsNotNone(du(cfg, t0 + 325.3 + 336))
+        m.PANNEAU.update(ecran=None, ecran_fin=t0, cycle=None)
+        self.assertIsNone(du(cfg, t0 + 301, urgent=lambda: True), "un minuteur qui va sonner : l'heure reste")
+        self.assertIsNotNone(du(cfg, t0 + 302, urgent=lambda: False))
+        m.PANNEAU.update(ecran=None, ecran_fin=t0)
+        self.assertIsNone(du(dict(cfg, panneau_ecrans=False), t0 + 400), "decoche")
+        m.demander_ecran("feu")
+        self.assertEqual(du(dict(cfg, panneau_ecrans=False), t0 + 401)["nom"], "feu", "« Montrer un ecran » : tout de suite")
+        m.PANNEAU.update(ecran=None, ecran_fin=t0 + 10_000_000)
+        self.assertIsNone(du(cfg, t0 + 500), "l'horloge a recule : on repart d'ici")
+        self.assertEqual(m.PANNEAU["ecran_fin"], t0 + 500)
+        # sur le panneau : tout le panneau, sans l'heure ; en fondu ; les pastilles par-dessus
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
+               "panneau_claude": False, "panneau_ecrans_duree": 15}
+        m.PANNEAU.update(ecran=None, ecran_fin=t0, discord=None)
+        horloge = m.image_du_panneau(dict(cfg, panneau_ecrans=False), "horloge", t0 + 5)
+        m.demander_ecran("plasma")
+        entree = m.image_du_panneau(cfg, "horloge", t0 + 5)
+        self.assertTrue((entree == horloge).all(), "il entre en fondu : d'abord l'horloge")
+        plein = m.image_du_panneau(cfg, "horloge", t0 + 10)
+        self.assertGreater(int(plein.any(axis=2).sum()), 4000, "tout le panneau")
+        self.assertFalse((plein[10:25] == horloge[10:25]).all(), "sans l'heure")
+        m.PANNEAU["discord"] = 2
+        dessus = m.image_du_panneau(cfg, "horloge", t0 + 10.1)
+        self.assertTrue((dessus[1:8, 2:6] == m.DISCORD_VIOLET).all(axis=2).any(), "la pastille Discord reste")
+        m.PANNEAU["discord"] = None
+        self.assertFalse(m.image_du_panneau(cfg, "eteint", t0 + 11).any(), "eteint reste eteint")
+        fin = m.image_du_panneau(cfg, "horloge", t0 + 5 + 15.5)
+        self.assertTrue((fin == m.image_du_panneau(dict(cfg, panneau_ecrans=False), "horloge", t0 + 5 + 15.5)).all(),
+                        "fini : l'horloge")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
     def test_les_journees_a_noter(self):
         # « rajoute une interface sur le panneau quand des notes ne sont pas encore posees sur des journees »
         m = self.m

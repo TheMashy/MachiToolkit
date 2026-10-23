@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.113.0"
+VERSION = "1.114.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -372,6 +372,10 @@ CONFIG_DEFAUT = {
     "panneau_cycle_chat": True,       # « un petit :3 qui arrive, qui cligne des yeux »
     "panneau_cycle_maid": True,       # « un petit chat en maid », cheveux noirs, tenue noire et blanche
     "panneau_cycle_notes": True,      # « quand des notes ne sont pas encore posees sur des journees »
+    # « des effets de transition prenant tout le panneau (sans l'heure), comme des screen savers »
+    "panneau_ecrans": True,
+    "panneau_ecrans_intervalle": 5,   # minutes entre deux ecrans
+    "panneau_ecrans_duree": 15,       # secondes, chaque ecran
     "panneau_eq_sensibilite": 1.0,    # l'egaliseur : 0,2 (calme) a 3 (tout monte)
     "meteo_ville": "",                # vide : le lieu approximatif de la connexion
     "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
@@ -13902,6 +13906,507 @@ def dessiner_pastille_discord(img, n, eclat=None):
     ecrire_petit(img, texte, 3, 2, blanc)
 
 
+# LES ECRANS. « Rajoute des effets de transition prenant tout le panneau
+# (sans l'heure), un peu comme des screen savers (au moins 10 differents). »
+# Toutes les cinq minutes (panneau_ecrans_intervalle), au moment ou le cycle
+# change de vue, un ecran prend tout le panneau pendant quinze secondes
+# (panneau_ecrans_duree), en fondu d'une seconde a l'entree et a la sortie,
+# puis l'horloge revient. Treize ecrans, chacun son tour, dans un ordre
+# melange : aucun ne revient avant que les autres soient passes. Jarvis, le
+# programme du jour et FL Studio passent devant ; un minuteur ou un
+# rendez-vous qui arrive le retient ; la bulle de Claude et la pastille de
+# Discord restent par-dessus. Tout est calcule a 30 images/s, en numpy.
+ECRAN_FONDU_S = 1.0
+ECRAN_INTERVALLE_BORNES = (1, 60)       # minutes entre deux ecrans
+ECRAN_DUREE_BORNES = (5, 120)           # secondes, chaque ecran
+_GRILLE = {}
+
+
+def _xy():
+    """Les coordonnees de chaque pixel du panneau (Y, X), en flottants."""
+    if "xy" not in _GRILLE:
+        import numpy as np
+        _GRILLE["xy"] = tuple(a.astype(float) for a in np.mgrid[0:PANNEAU_H, 0:PANNEAU_L])
+    return _GRILLE["xy"]
+
+
+def _teintes(h, s=1.0, v=1.0):
+    """HSV -> RGB (0-255) pour des tableaux : h, s, v entre 0 et 1."""
+    import numpy as np
+    h = np.mod(np.asarray(h, float), 1.0) * 6.0
+    s, v = np.broadcast_to(s, h.shape), np.broadcast_to(v, h.shape)
+    i = np.floor(h).astype(int) % 6
+    f = h - np.floor(h)
+    p, q, u = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    r = np.choose(i, [v, q, p, p, u, v])
+    g = np.choose(i, [u, v, v, q, p, p])
+    b = np.choose(i, [p, p, u, v, v, q])
+    return np.clip(np.stack([r, g, b], -1) * 255, 0, 255).astype(np.uint8)
+
+
+def _pointer(img, ys, xs, couleurs):
+    """Allume des points (le plus clair l'emporte), hors du panneau ignores."""
+    import numpy as np
+    ys, xs = np.asarray(ys).astype(int), np.asarray(xs).astype(int)
+    ok = (ys >= 0) & (ys < PANNEAU_H) & (xs >= 0) & (xs < PANNEAU_L)
+    couleurs = np.broadcast_to(np.asarray(couleurs), (len(ys), 3))[ok]
+    for c in range(3):
+        np.maximum.at(img[..., c], (ys[ok], xs[ok]), couleurs[:, c].astype(img.dtype))
+
+
+def _ecran_etoiles(e, t, ecoule, dt):
+    """Un champ d'etoiles : on fonce dedans, de plus en plus vite."""
+    import numpy as np
+    rng = e["rng"]
+    if "z" not in e:
+        n = 110
+        e.update(x=rng.uniform(-1, 1, n), y=rng.uniform(-1, 1, n), z=rng.uniform(0.05, 1.0, n))
+    vitesse = 0.2 + 0.4 * min(1.0, ecoule / 5.0)
+    e["z"] = e["z"] - vitesse * dt
+    sx, sy = 32 + e["x"] / e["z"] * 20, 32 + e["y"] / e["z"] * 20
+    hors = (e["z"] <= 0.04) | (sx < 0) | (sx >= 64) | (sy < 0) | (sy >= 64)
+    k = int(hors.sum())
+    if k:
+        e["x"][hors], e["y"][hors], e["z"][hors] = rng.uniform(-1, 1, k), rng.uniform(-1, 1, k), rng.uniform(0.7, 1, k)
+        sx, sy = 32 + e["x"] / e["z"] * 20, 32 + e["y"] / e["z"] * 20
+    img = np.zeros((PANNEAU_H, PANNEAU_L, 3), np.uint8)
+    lum = np.clip(1.25 - e["z"], 0.15, 1.0)[:, None]
+    z2 = e["z"] + 0.06                                  # la trainee : la meme etoile, un peu plus loin
+    _pointer(img, 32 + e["y"] / z2 * 20, 32 + e["x"] / z2 * 20, lum * 0.45 * np.array([160, 180, 255]))
+    _pointer(img, sy, sx, lum * np.array([235, 240, 255]))
+    return img
+
+
+def _ecran_matrice(e, t, ecoule, dt):
+    """Une pluie de code verte : des colonnes qui tombent, leur tete blanche."""
+    import numpy as np
+    rng = e["rng"]
+    if "tete" not in e:
+        e.update(tete=rng.uniform(-64, 0, 32), vit=rng.uniform(12, 30, 32), trace=np.zeros((64, 64)),
+                 glyphes=rng.uniform(0.3, 1.0, (64, 64)), change=0.0)
+    e["trace"] *= np.exp(-dt * 2.6)
+    cols = np.arange(32) * 2
+    avant = e["tete"].copy()
+    e["tete"] += e["vit"] * dt
+    for c in range(32):
+        for y in range(max(0, int(avant[c])), min(64, int(e["tete"][c]) + 1)):
+            e["trace"][y, cols[c]] = 1.0
+    fini = e["tete"] > 64 + 20
+    if fini.any():
+        e["tete"][fini], e["vit"][fini] = rng.uniform(-24, 0, int(fini.sum())), rng.uniform(12, 30, int(fini.sum()))
+    if t - e["change"] > 0.08:                          # les caracteres changent
+        e["change"] = t
+        m = rng.random((64, 64)) < 0.06
+        e["glyphes"][m] = rng.uniform(0.3, 1.0, int(m.sum()))
+    v = e["trace"] * e["glyphes"]
+    img = (v[..., None] * np.array([30, 255, 80])).astype(np.uint8)
+    ty, tc = e["tete"].astype(int), np.arange(32)
+    ok = (ty >= 0) & (ty < 64)
+    img[ty[ok], cols[tc[ok]]] = (200, 255, 210)
+    return img
+
+
+def _ecran_plasma(e, t, ecoule, dt):
+    """Un plasma : des ondes de couleur qui se melangent."""
+    import numpy as np
+    Y, X = _xy()
+    v = (np.sin(X * 0.13 + t * 1.1) + np.sin(Y * 0.11 - t * 0.9) + np.sin((X + Y) * 0.09 + t * 0.7)
+         + np.sin(np.hypot(X - 32 - 18 * np.sin(t * 0.5), Y - 32 - 18 * np.cos(t * 0.4)) * 0.17 - t))
+    return _teintes(v / 8 + t * 0.05, 0.85, 0.85)
+
+
+def _palette_feu():
+    if "feu" not in _GRILLE:
+        import numpy as np
+        x = np.linspace(0, 1, 256)
+        r = np.clip(x * 3.0, 0, 1)
+        g = np.clip(x * 3.0 - 1.0, 0, 1)
+        b = np.clip(x * 3.0 - 2.0, 0, 1)
+        _GRILLE["feu"] = (np.stack([r, g * 0.9, b * 0.8], -1) * 255).astype(np.uint8)
+    return _GRILLE["feu"]
+
+
+def _ecran_feu(e, t, ecoule, dt):
+    """Un feu de cheminee, qui monte du bas du panneau."""
+    import numpy as np
+    rng = e["rng"]
+    if "chaleur" not in e:
+        e.update(chaleur=np.zeros((72, 64)), acc=0.0)
+    e["acc"] += dt
+    pas = 0
+    while e["acc"] >= 1 / 30 and pas < 3:
+        e["acc"] -= 1 / 30
+        pas += 1
+        c = e["chaleur"]
+        c[-2:] = (rng.random((2, 64)) < 0.6) * rng.uniform(0.8, 1.0, (2, 64))     # le foyer : des braises
+        # chaque case, la moyenne des trois d'en dessous et de celle d'encore en dessous, qui refroidit :
+        # ca monte en se melangeant, en langues
+        c[:-2] = np.clip((np.roll(c[1:-1], 1, 1) + c[1:-1] + np.roll(c[1:-1], -1, 1) + c[2:]) / 4.0 * 0.962
+                         - 0.007, 0, 1)
+    return _palette_feu()[(e["chaleur"][-66:-2] * 255).astype(int)]          # sans les braises brutes
+
+
+def _ecran_vie(e, t, ecoule, dt):
+    """Le jeu de la vie : des cellules qui naissent, vivent et meurent ;
+    les jeunes cyan, les vieilles violettes, un fantome bleu ou elles etaient."""
+    import numpy as np
+    rng = e["rng"]
+    if "g" not in e:
+        e.update(g=rng.random((64, 64)) < 0.3, age=np.zeros((64, 64)), fantome=np.zeros((64, 64)),
+                 acc=0.0, pops=[])
+    e["acc"] += dt
+    while e["acc"] >= 0.11:
+        e["acc"] -= 0.11
+        g = e["g"]
+        n = sum(np.roll(np.roll(g, dy, 0), dx, 1).astype(int)
+                for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx)
+        neuve = (n == 3) | (g & (n == 2))
+        e["fantome"] = np.maximum(e["fantome"] * 0.8, g & ~neuve)
+        e["age"] = np.where(neuve, e["age"] + 1, 0)
+        e["g"] = neuve
+        e["pops"] = (e["pops"] + [int(neuve.sum())])[-24:]
+        if e["pops"][-1] < 60 or (len(e["pops"]) == 24 and len(set(e["pops"])) <= 3):
+            e["g"] = e["g"] | (rng.random((64, 64)) < 0.18)       # elle s'eteint ou se fige : on resseme
+            e["pops"] = []
+    img = (e["fantome"][..., None] * np.array([10, 30, 90])).astype(np.uint8)
+    vivant = e["g"]
+    couleur = _teintes(0.5 + np.minimum(e["age"], 30) / 30 * 0.33, 0.8, 1.0)
+    img[vivant] = couleur[vivant]
+    return img
+
+
+def _ecran_tunnel(e, t, ecoule, dt):
+    """Un tunnel en damier qui tourne, ou l'on s'enfonce."""
+    import numpy as np
+    Y, X = _xy()
+    dx, dy = X - 32 + 6 * np.sin(t * 0.7), Y - 32 + 6 * np.cos(t * 0.5)
+    d = np.hypot(dx, dy) + 0.5
+    a = np.arctan2(dy, dx)
+    u, v = a / np.pi * 4 + t * 0.4, 40.0 / d + t * 2.0
+    damier = (np.floor(u * 2) + np.floor(v)) % 2
+    ombre = np.clip(d / 30, 0, 1)
+    return _teintes(v * 0.05 + t * 0.03, 0.8, (0.3 + 0.7 * damier) * ombre)
+
+
+def _ecran_lave(e, t, ecoule, dt):
+    """Une lampe a lave : des boules qui montent, se touchent et se fondent."""
+    import numpy as np
+    Y, X = _xy()
+    champ = np.zeros((64, 64))
+    for i, (r, w1, w2, p) in enumerate(((9, 0.31, 0.21, 0.0), (7, 0.23, 0.17, 1.7), (8, 0.37, 0.13, 3.1),
+                                        (6, 0.29, 0.27, 4.4), (7, 0.19, 0.11, 5.6))):
+        bx = 32 + 18 * np.sin(t * w1 + p)
+        by = 32 + 26 * np.sin(t * w2 + p * 1.3)
+        champ += r * r / ((X - bx) ** 2 + (Y - by) ** 2 + 1.0)
+    fond = np.stack([25 + Y * 0.4, 5 + Y * 0.1, 40 + Y * 0.3], -1)
+    halo = np.clip((champ - 0.55) / 0.45, 0, 1)[..., None]
+    dedans = np.clip((champ - 1.0) / 1.6, 0, 1)[..., None]
+    lave = np.array([255, 70, 30]) * (1 - dedans) + np.array([255, 210, 60]) * dedans
+    img = fond * (1 - halo) + lave * halo
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _ecran_artifice(e, t, ecoule, dt):
+    """Un feu d'artifice : des fusees qui montent et eclatent en couleurs."""
+    import numpy as np
+    rng = e["rng"]
+    if "lueur" not in e:
+        e.update(lueur=np.zeros((64, 64, 3)), fusees=[], suivante=0.0,
+                 p=np.zeros((0, 7)))                     # x, y, vx, vy, vie, vie0, teinte
+    e["lueur"] *= np.exp(-dt * 3.5)
+    if ecoule >= e["suivante"]:
+        e["suivante"] = ecoule + rng.uniform(0.45, 1.0)
+        e["fusees"].append([rng.uniform(10, 54), 63.0, rng.uniform(-5, 5), -rng.uniform(40, 52),
+                            rng.uniform(10, 26)])
+    vivantes = []
+    for f in e["fusees"]:
+        f[0] += f[2] * dt
+        f[1] += f[3] * dt
+        f[3] += 30 * dt
+        if f[3] >= -4 or f[1] <= f[4]:                  # au plus haut : elle eclate
+            n = int(rng.integers(50, 80))
+            a, v = rng.uniform(0, 2 * np.pi, n), rng.uniform(10, 26, n) * rng.uniform(0.6, 1.0)
+            vie = rng.uniform(1.2, 2.0, n)
+            teinte = np.full(n, rng.random()) + rng.uniform(-0.04, 0.04, n)
+            e["p"] = np.vstack([e["p"], np.stack([np.full(n, f[0]), np.full(n, f[1]), np.cos(a) * v,
+                                                  np.sin(a) * v, vie, vie, teinte], 1)])
+        else:
+            vivantes.append(f)
+            _pointer(e["lueur"], [f[1]], [f[0]], [[255, 220, 150]])
+    e["fusees"] = vivantes
+    p = e["p"]
+    if len(p):
+        p[:, 0] += p[:, 2] * dt
+        p[:, 1] += p[:, 3] * dt
+        p[:, 3] += 18 * dt
+        p[:, 2] *= np.exp(-dt * 1.2)
+        p[:, 4] -= dt
+        p = e["p"] = p[p[:, 4] > 0]
+        reste = np.clip(p[:, 4] / p[:, 5] * 1.6, 0, 1)[:, None]          # vives, puis elles s'eteignent
+        couleurs = _teintes(p[:, 6], 0.6, 1.0).astype(float) * reste
+        _pointer(e["lueur"], p[:, 1], p[:, 0], couleurs)
+    return np.clip(e["lueur"], 0, 255).astype(np.uint8)
+
+
+def _ecran_neige(e, t, ecoule, dt):
+    """Il neige, la nuit, sous la lune ; la neige s'amasse au sol."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "fx" not in e:
+        n = 120
+        e.update(fx=rng.uniform(0, 64, n), fy=rng.uniform(-64, 64, n), fv=rng.uniform(5, 16, n),
+                 fp=rng.uniform(0, 2 * np.pi, n), sol=np.zeros(64))
+    e["fy"] += e["fv"] * dt
+    e["fx"] = (e["fx"] + np.sin(t * 1.3 + e["fp"]) * 6 * dt) % 64
+    cols = e["fx"].astype(int) % 64
+    pose = e["fy"] >= 63 - e["sol"][cols]
+    for c in cols[pose]:
+        e["sol"][c] = min(14.0, e["sol"][c] + 0.35)
+    if pose.any():
+        k = int(pose.sum())
+        e["fy"][pose], e["fx"][pose] = rng.uniform(-8, 0, k), rng.uniform(0, 64, k)
+    img = np.stack([4 + Y * 0.15, 6 + Y * 0.2, 26 + Y * 0.45], -1)
+    lune = np.hypot(X - 50, Y - 11)
+    img += np.clip(1 - (lune - 4) / 6, 0, 1)[..., None] * np.array([40, 40, 30])
+    img[lune <= 4] = (230, 230, 200)
+    sol = e["sol"] + np.sin(np.arange(64) * 0.7) * 0.6
+    img[Y >= 64 - sol[None, :]] = (215, 225, 245)
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    lum = (0.5 + 0.5 * (e["fv"] - 5) / 11)[:, None]
+    _pointer(img, e["fy"], e["fx"], lum * np.array([255, 255, 255]))
+    return img
+
+
+def _ecran_aurore(e, t, ecoule, dt):
+    """Une aurore boreale : des rideaux verts et violets qui ondulent sur les etoiles."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "etoiles" not in e:
+        e["etoiles"] = (rng.integers(0, 64, 45), rng.integers(0, 64, 45), rng.uniform(0, 2 * np.pi, 45))
+    img = np.zeros((64, 64, 3))
+    img[...] = (2, 4, 14)
+    ey, ex, ep = e["etoiles"]
+    img[ey, ex] = (0.5 + 0.5 * np.sin(t * 2 + ep))[:, None] * np.array([150, 150, 170])
+    for decal, couleur, haut in ((0.0, np.array([60, 255, 140]), 0.0), (2.1, np.array([150, 70, 255]), -9.0)):
+        base = 30 + haut + 7 * np.sin(X * 0.08 + t * 0.5 + decal) + 4 * np.sin(X * 0.21 - t * 0.8 + decal)
+        rideau = 0.55 + 0.45 * np.sin(X * 0.5 + t * 1.7 + np.sin(X * 0.1 + t + decal) * 3)
+        profil = np.where(Y <= base, np.exp(-(base - Y) / 9.0), np.exp(-((Y - base) / 2.5) ** 2))
+        img += (profil * rideau)[..., None] * couleur * 0.9
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _ecran_tuyaux(e, t, ecoule, dt):
+    """Les tuyaux : ils poussent, tournent, se croisent, puis on recommence."""
+    import numpy as np
+    rng = e["rng"]
+    if "img" not in e:
+        e.update(img=np.zeros((64, 64, 3)), pris=np.zeros((16, 16), bool), tuyaux=[], acc=0.0)
+    directions = ((1, 0), (0, 1), (-1, 0), (0, -1))
+
+    def nouveau():
+        libres = np.argwhere(~e["pris"])
+        if not len(libres) or e["pris"].mean() > 0.6:
+            e["img"][:] = 0
+            e["pris"][:] = False
+            libres = np.argwhere(~e["pris"])
+        cy, cx = libres[rng.integers(len(libres))]
+        e["pris"][cy, cx] = True
+        couleur = _teintes(np.array(rng.random()), 0.75, 1.0).astype(float)
+        e["tuyaux"].append({"c": (int(cx), int(cy)), "d": int(rng.integers(4)), "couleur": couleur})
+    while len(e["tuyaux"]) < 3:
+        nouveau()
+    e["acc"] += dt
+    while e["acc"] >= 0.06:
+        e["acc"] -= 0.06
+        for p in list(e["tuyaux"]):
+            essais = [p["d"]] if rng.random() < 0.7 else []
+            essais += [d for d in rng.permutation(4).tolist() if d != (p["d"] + 2) % 4 and d not in essais]
+            x, y = p["c"]
+            for d in essais:
+                nx, ny = x + directions[d][0], y + directions[d][1]
+                if 0 <= nx < 16 and 0 <= ny < 16 and not e["pris"][ny, nx]:
+                    break
+            else:
+                e["tuyaux"].remove(p)                  # coince : il s'arrete la, un autre commence
+                continue
+            px0, py0, px1, py1 = x * 4 + 1, y * 4 + 1, nx * 4 + 1, ny * 4 + 1
+            g, h = min(px0, px1), min(py0, py1)
+            e["img"][h:max(py0, py1) + 2, g:max(px0, px1) + 2] = p["couleur"] * 0.75
+            e["img"][h:max(py0, py1) + 1, g:max(px0, px1) + 1] = np.minimum(255, p["couleur"] * 1.1)
+            if d != p["d"]:                             # un coude
+                e["img"][py0 - 1:py0 + 3, px0 - 1:px0 + 3] = np.minimum(255, p["couleur"] * 0.9 + 40)
+            e["pris"][ny, nx] = True
+            p["c"], p["d"] = (nx, ny), d
+    return np.clip(e["img"], 0, 255).astype(np.uint8)
+
+
+def _ecran_rebond(e, t, ecoule, dt):
+    """« MACHI » qui rebondit d'un bord a l'autre, et change de couleur a chaque
+    bord -- un coin, et ca petille."""
+    import numpy as np
+    rng = e["rng"]
+    texte = "MACHI"
+    larg = largeur_5x7(texte)
+    if "x" not in e:
+        e.update(x=rng.uniform(0, 64 - larg), y=rng.uniform(0, 57), vx=13.0, vy=9.0, teinte=rng.random(),
+                 etincelles=np.zeros((0, 5)))
+    e["x"] += e["vx"] * dt
+    e["y"] += e["vy"] * dt
+    bords = 0
+    if not 0 <= e["x"] <= 64 - larg:
+        e["vx"], e["x"], bords = -e["vx"], min(max(e["x"], 0.0), 64.0 - larg), bords + 1
+    if not 0 <= e["y"] <= 57:
+        e["vy"], e["y"], bords = -e["vy"], min(max(e["y"], 0.0), 57.0), bords + 1
+    if bords:
+        e["teinte"] = (e["teinte"] + 0.17 + rng.uniform(0, 0.2)) % 1.0
+    if bords == 2:                                      # le coin !
+        n = 40
+        a, v = rng.uniform(0, 2 * np.pi, n), rng.uniform(8, 24, n)
+        e["etincelles"] = np.stack([np.full(n, e["x"] + larg / 2), np.full(n, e["y"] + 3), np.cos(a) * v,
+                                    np.sin(a) * v, np.full(n, 1.2)], 1)
+    img = np.zeros((64, 64, 3), np.uint8)
+    s = e["etincelles"]
+    if len(s):
+        s[:, 0] += s[:, 2] * dt
+        s[:, 1] += s[:, 3] * dt
+        s[:, 4] -= dt
+        s = e["etincelles"] = s[s[:, 4] > 0]
+        _pointer(img, s[:, 1], s[:, 0], (s[:, 4] / 1.2)[:, None] * np.array([255, 240, 180]))
+    couleur = tuple(int(c) for c in _teintes(np.array(e["teinte"]), 0.8, 1.0))
+    ecrire_5x7(img, texte, int(round(e["x"])), int(round(e["y"])), couleur)
+    return img
+
+
+def _ecran_ondes(e, t, ecoule, dt):
+    """Des gouttes sur l'eau : des ronds qui s'elargissent et se croisent."""
+    import numpy as np
+    rng = e["rng"]
+    if "a" not in e:
+        e.update(a=np.zeros((64, 64)), b=np.zeros((64, 64)), goutte=0.0, acc=0.0)
+    if ecoule >= e["goutte"]:
+        e["goutte"] = ecoule + rng.uniform(0.35, 0.9)
+        Y, X = _xy()
+        y, x = rng.uniform(6, 58), rng.uniform(6, 58)
+        e["a"] -= 5.0 * np.exp(-((X - x) ** 2 + (Y - y) ** 2) / 3.0)      # une goutte ronde, sans aretes
+    e["acc"] += dt
+    while e["acc"] >= 1 / 30:
+        e["acc"] -= 1 / 30
+        a, b = e["a"], e["b"]
+        n = (np.roll(a, 1, 0) + np.roll(a, -1, 0) + np.roll(a, 1, 1) + np.roll(a, -1, 1)) / 2 - b
+        e["b"], e["a"] = a, n * 0.975
+    a = e["a"]
+    a = (4 * a + np.roll(a, 1, 0) + np.roll(a, -1, 0) + np.roll(a, 1, 1) + np.roll(a, -1, 1)) / 8   # sans le grain
+    pente = np.roll(a, -1, 1) - a + np.roll(a, -1, 0) - a
+    lumiere = np.clip(pente * 0.35, -1, 1)[..., None]
+    img = np.array([5, 45, 95]) + np.where(lumiere > 0, lumiere * np.array([170, 210, 160]),
+                                           lumiere * np.array([5, 30, 60]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+ECRANS = {
+    "etoiles": ("Etoiles", _ecran_etoiles),
+    "matrice": ("Pluie de code", _ecran_matrice),
+    "plasma": ("Plasma", _ecran_plasma),
+    "feu": ("Feu", _ecran_feu),
+    "vie": ("Jeu de la vie", _ecran_vie),
+    "tunnel": ("Tunnel", _ecran_tunnel),
+    "lave": ("Lampe a lave", _ecran_lave),
+    "artifice": ("Feu d'artifice", _ecran_artifice),
+    "neige": ("Neige", _ecran_neige),
+    "aurore": ("Aurore boreale", _ecran_aurore),
+    "tuyaux": ("Tuyaux", _ecran_tuyaux),
+    "rebond": ("MACHI qui rebondit", _ecran_rebond),
+    "ondes": ("Gouttes sur l'eau", _ecran_ondes),
+}
+
+
+def reglages_ecrans(cfg):
+    """(secondes entre deux ecrans, duree d'un ecran), lues dans la config et bornees."""
+    def lire(cle, defaut, bornes):
+        try:
+            v = float(cfg.get(cle, defaut))
+        except (TypeError, ValueError):
+            v = defaut
+        return max(bornes[0], min(bornes[1], v))
+    return (lire("panneau_ecrans_intervalle", 5, ECRAN_INTERVALLE_BORNES) * 60,
+            lire("panneau_ecrans_duree", 15, ECRAN_DUREE_BORNES))
+
+
+def prochain_ecran(rng=None):
+    """Le suivant dans le sac : chacun son tour, dans un ordre melange."""
+    import random
+    sac = [n for n in PANNEAU.get("ecrans_sac") or [] if n in ECRANS]
+    if not sac:
+        sac = list(ECRANS)
+        (rng or random).shuffle(sac)
+        if len(sac) > 1 and sac[0] == PANNEAU.get("ecran_dernier"):
+            sac.append(sac.pop(0))                     # jamais deux fois le meme de suite
+    PANNEAU["ecrans_sac"] = sac[1:]
+    PANNEAU["ecran_dernier"] = sac[0]
+    return sac[0]
+
+
+def demander_ecran(nom=None):
+    """« Montrer un ecran » (la page Panneau LED) : le suivant, ou celui-la, tout de suite."""
+    PANNEAU["ecran_demande"] = nom if nom in ECRANS else True
+
+
+def ecran_du_moment(cfg, t, urgent=None):
+    """L'ecran qui prend le panneau a l'instant t ({nom, debut, etat}), ou None.
+    Il commence quand l'intervalle est passe et que le cycle change de vue
+    (ou quand on le demande) ; `urgent` (un minuteur, un rendez-vous) le retient."""
+    import numpy as np
+    intervalle, duree = reglages_ecrans(cfg)
+    e = PANNEAU.get("ecran")
+    if e is not None:
+        if 0 <= t - e["debut"] < duree:
+            return e
+        PANNEAU["ecran"] = None
+        PANNEAU["ecran_fin"] = t
+    fin = PANNEAU.setdefault("ecran_fin", t)
+    if not 0 <= t - fin <= intervalle + 3600:          # l'horloge a recule, ou bondi (une veille) : on repart d'ici
+        fin = PANNEAU["ecran_fin"] = t
+    demande = PANNEAU.pop("ecran_demande", None)
+    if not demande:
+        if not cfg.get("panneau_ecrans", True) or t - fin < intervalle:
+            return None
+        cycle = PANNEAU.get("cycle") if cfg.get("panneau_cycle", True) else None
+        if cycle and not 0 <= t - float(cycle.get("depuis") or 0) < 1.0 and t - fin - intervalle < 35:
+            return None                                 # on attend que le cycle change de vue (35 s au plus)
+        if (urgent() if callable(urgent) else urgent):
+            return None
+    nom = demande if demande in ECRANS else prochain_ecran()
+    e = PANNEAU["ecran"] = {"nom": nom, "debut": t, "t": t,
+                            "etat": {"rng": np.random.default_rng(int(t * 1000) % (2 ** 32))}}
+    return e
+
+
+def image_de_l_ecran(e, t, duree, dessous=None):
+    """L'image de l'ecran `e` a l'instant t ; en fondu sur `dessous` (une
+    fonction qui rend l'image d'en dessous) a l'entree et a la sortie."""
+    import numpy as np
+    ecoule = t - e["debut"]
+    dt = min(0.2, max(0.0, t - e["t"]))
+    e["t"] = t
+    img = ECRANS[e["nom"]][1](e["etat"], t, ecoule, dt)
+    k = min(1.0, ecoule / ECRAN_FONDU_S, (duree - ecoule) / ECRAN_FONDU_S)
+    if k < 1.0 and dessous is not None:
+        k = max(0.0, k)
+        img = np.clip(np.round(img * k + dessous() * (1 - k)), 0, 255).astype(np.uint8)
+    return img
+
+
+def _ecran_retenu(cfg, t):
+    """Un minuteur qui va sonner, un rendez-vous qui arrive : pas d'ecran, l'heure reste."""
+    try:
+        rdv = agenda_du_jour(cfg, maintenant=t) if cfg.get("panneau_rdv", True) else []
+    except Exception:
+        rdv = []
+    return cycle_urgent(JARVIS.get("minuteurs"), rdv, t)
+
+
 def _image_du_contenu(cfg, contenu, t, eclat):
     """Le contenu choisi (l'horloge, son cycle, l'agenda du jour), sans ce qui
     passe par-dessus."""
@@ -13954,7 +14459,18 @@ def image_du_panneau(cfg, contenu, t):
         return image_jarvis_du_moment(etat, t, cfg, croix=False)
     # FL Studio au premier plan : son studio passe devant l'horloge
     fl = fl_au_premier_plan(t) if cfg.get("panneau_fl", True) else None
-    img = image_fl_studio(t, fl, eclat) if fl is not None else _image_du_contenu(cfg, contenu, t, eclat)
+    # un ecran plein panneau, de temps en temps, entre deux vues de l'horloge
+    ecran = None
+    if fl is None and contenu == "horloge":
+        ecran = ecran_du_moment(cfg, t, urgent=lambda: _ecran_retenu(cfg, t))
+    if fl is not None:
+        img = image_fl_studio(t, fl, eclat)
+    elif ecran is not None:
+        img = image_de_l_ecran(ecran, t, reglages_ecrans(cfg)[1], lambda: _image_du_contenu(cfg, contenu, t, None))
+        if eclat is not None:
+            img = assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
+    else:
+        img = _image_du_contenu(cfg, contenu, t, eclat)
     etat_cc = etat_claude(t) if cfg.get("panneau_claude", True) else None
     if etat_cc is not None:
         dessiner_bulle_claude(img, etat_cc, t, eclat)   # par-dessus, en haut a droite
@@ -18045,7 +18561,7 @@ class Panneau:
                     "meteo_ville",
                     "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
-                    "panneau_cycle_notes",
+                    "panneau_cycle_notes", "panneau_ecrans", "panneau_ecrans_intervalle", "panneau_ecrans_duree",
                     "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
@@ -18131,6 +18647,25 @@ class Panneau:
             v.trace_add("write", lambda *_, cle=cle, v=v, entiere=entiere: self._panneau_reglage_bientot(
                 cle, int(v.get()) if entiere else round(float(v.get()), 1)))
             setattr(self, "var_" + cle, v)
+        # « des effets de transition prenant tout le panneau (sans l'heure), comme des screen savers »
+        self.var_panneau_ecrans = tk.IntVar(value=1 if self.cfg.get("panneau_ecrans", True) else 0)
+        c = self.case(col, "Des ecrans plein panneau entre deux vues, sans l'heure, comme des economiseurs "
+                           "d'ecran (%d : %s)" % (len(ECRANS), ", ".join(n.lower() if n[1:].islower() else n
+                                                                         for n, _ in ECRANS.values())),
+                      self.var_panneau_ecrans, lambda: self.regler_panneau("panneau_ecrans"))
+        c.configure(wraplength=self.px(360))
+        c.pack(fill="x", pady=(8, 0), padx=(self.px(22), 0))
+        ecrans = tk.Frame(col, bg=NUIT)
+        ecrans.pack(fill="x", pady=(6, 0), padx=(self.px(22), 0))
+        for cle, nom, bornes, pas, aide in (
+                ("panneau_ecrans_intervalle", "Un ecran toutes les (min)", ECRAN_INTERVALLE_BORNES, 1,
+                 "Le temps entre deux ecrans ; il arrive quand le cycle change de vue."),
+                ("panneau_ecrans_duree", "Chaque ecran (s)", ECRAN_DUREE_BORNES, 5,
+                 "Le temps qu'il reste, fondus compris ; puis l'horloge revient.")):
+            v = self.reglette(ecrans, cle, nom, bornes[0], bornes[1], pas, aide, entier=True)
+            v.trace_add("write", lambda *_, cle=cle, v=v: self._panneau_reglage_bientot(cle, int(v.get())))
+            setattr(self, "var_" + cle, v)
+        self.bouton(ecrans, "Montrer un ecran", self.montrer_ecran, compact=True).pack(anchor="w")
         self.var_panneau_rdv = tk.IntVar(value=1 if self.cfg.get("panneau_rdv", True) else 0)
         c = self.case(col, "Le prochain rendez-vous de l'agenda, une heure avant, au-dessus des secondes",
                       self.var_panneau_rdv, lambda: self.regler_panneau("panneau_rdv"))
@@ -18244,7 +18779,8 @@ class Panneau:
             if not self.cfg[cle]:
                 PANNEAU["discord"] = None
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
-                     "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes"):
+                     "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes",
+                     "panneau_ecrans"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "meteo_ville":
             ville = self.champ_meteo_ville.get().strip()[:60]
@@ -18313,6 +18849,11 @@ class Panneau:
             except Exception:
                 pass
         self._peindre_panneau()
+
+    def montrer_ecran(self):
+        """« Montrer un ecran » : le suivant, tout de suite, sur le panneau (et l'apercu)."""
+        demander_ecran()
+        ETAT["message"] = "Un ecran arrive sur le panneau."
 
     def _panneau_reglage_bientot(self, cle, valeur):
         """Une reglette du cycle : le panneau la suit tout de suite, la config
