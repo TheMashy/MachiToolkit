@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.112.0"
+VERSION = "1.112.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -13799,6 +13799,122 @@ def toasts_discord(chemin=None, maintenant=None):
     return arrivees
 
 
+# « J'ai une notif en attente qui ne s'affiche pas » -- et la capture : la
+# pastille rouge « 1 » sur l'icone de Discord, dans la barre des taches.
+# Discord la pose avec une description pour les lecteurs d'ecran ; Windows
+# la donne a l'accessibilite (UI Automation) comme « texte d'aide » du
+# bouton -- celui que le Narrateur lit. Si elle ne dit pas de nombre, la
+# pastille se voit : son rouge, dans le bouton, tel qu'il est affiche.
+DISCORD_ROUGE_MIN = 12                 # pixels du rouge de la pastille (a 100 %, elle en fait ~150)
+_BARRES = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+_UIA = threading.local()
+
+
+def _automatisation():
+    """UI Automation (l'accessibilite de Windows), une par fil : (objet, module)."""
+    a = getattr(_UIA, "a", None)
+    if a is None:
+        import comtypes
+        import comtypes.client
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except OSError:
+            pass                                       # deja initialise dans ce fil
+        mod = comtypes.client.GetModule("UIAutomationCore.dll")
+        a = _UIA.a = (comtypes.client.CreateObject(mod.CUIAutomation, interface=mod.IUIAutomation), mod)
+    return a
+
+
+def boutons_discord_barre(uia=None, barres=None):
+    """Les boutons de Discord sur les barres des taches (zone de notification
+    comprise) : [(texte d'aide, (gauche, haut, droite, bas))] ; None hors de
+    Windows. Une seule requete par barre : nom, aide et place en cache.
+    `uia` (objet, module) et `barres` (leurs fenetres) : pour les tests."""
+    if uia is None:
+        if os.name != "nt":
+            return None
+        uia = _automatisation()
+    auto, mod = uia
+    if barres is None:
+        import win32gui
+        barres = []
+
+        def voir(h, _):
+            if win32gui.GetClassName(h) in _BARRES:
+                barres.append(h)
+            return True
+        win32gui.EnumWindows(voir, None)
+    cache = auto.CreateCacheRequest()
+    for propriete in (30005, 30013, 30001):           # Name, HelpText, BoundingRectangle
+        cache.AddProperty(propriete)
+    boutons = auto.CreatePropertyCondition(30003, 50000)     # ControlType : Button
+    trouves = []
+    for h in barres:
+        tous = auto.ElementFromHandle(h).FindAllBuildCache(mod.TreeScope_Descendants, boutons, cache)
+        for i in range(tous.Length if tous else 0):
+            e = tous.GetElement(i)
+            if re.match(r"(?i)\s*discord\b", str(e.CachedName or "")):
+                r = e.CachedBoundingRectangle
+                trouves.append((str(e.CachedHelpText or ""), (r.left, r.top, r.right, r.bottom)))
+    return trouves
+
+
+def rouge_de_pastille(pixels):
+    """Combien de pixels du rouge de la pastille de Discord (#F23F42) : un
+    rouge franc -- ni l'icone (violette), ni un survol (gris)."""
+    import numpy as np
+    p = np.asarray(pixels, dtype=np.int32)
+    r, g, b = p[..., 0], p[..., 1], p[..., 2]
+    return int(((r >= 190) & (g <= 110) & (b <= 110) & (r - g >= 100)).sum())
+
+
+def capture_bouton(rect):
+    """Les pixels d'un bouton de la barre, tels qu'affiches ; None s'il ne se
+    voit pas (barre masquee, un jeu en plein ecran devant)."""
+    import numpy as np
+    import win32gui
+    g, h, d, b = (int(v) for v in rect)
+    if d - g < 4 or b - h < 4:
+        return None
+    devant = win32gui.GetAncestor(win32gui.WindowFromPoint(((g + d) // 2, (h + b) // 2)), 2)   # GA_ROOT
+    if win32gui.GetClassName(devant) not in _BARRES:
+        return None
+    brut = _capteur().grab({"left": g, "top": h, "width": d - g, "height": b - h})
+    return np.frombuffer(brut.rgb, np.uint8).reshape(brut.height, brut.width, 3)
+
+
+def pastille_discord_barre(boutons=None, capture=None):
+    """La pastille de Discord sur la barre des taches : son nombre (lu dans
+    sa description), -1 si elle se voit sans nombre lisible, 0 sans pastille ;
+    None si la barre ne se lit pas."""
+    try:
+        trouves = boutons_discord_barre() if boutons is None else boutons
+    except Exception as e:
+        if _DISCORD_CENTRE.get("erreur_barre") != type(e).__name__:
+            _DISCORD_CENTRE["erreur_barre"] = type(e).__name__
+            print("Discord : barre des taches illisible (%s: %s)" % (type(e).__name__, str(e)[:100]))
+        return None
+    if trouves is None:
+        return None
+    n, vu = 0, []
+    for aide, rect in trouves:
+        chiffres = re.findall(r"\d+", aide)
+        rouge = None
+        if chiffres:
+            n = max(n, int(chiffres[0]))
+        else:
+            try:
+                pixels = (capture or capture_bouton)(rect)
+            except Exception:
+                pixels = None
+            rouge = None if pixels is None else rouge_de_pastille(pixels)
+            if rouge is not None and rouge >= DISCORD_ROUGE_MIN:
+                n = n or -1
+        vu.append("« %s » rouge %s" % (aide[:40], "?" if rouge is None else rouge))
+    _DISCORD_CENTRE["barre"] = vu
+    return n
+
+
 def lire_discord(titres=None):
     """Le plus grand nombre de notifications que montrent les fenetres de
     Discord ; 0 s'il n'y en a pas ; None si Discord n'est pas ouvert.
@@ -13827,10 +13943,12 @@ def lire_discord(titres=None):
     return max(notifications_discord_du_titre(t) for t in titres)
 
 
-def suivre_discord(lire=None, centre=None, maintenant=None):
+def suivre_discord(lire=None, centre=None, maintenant=None, barre=None):
     """Depuis le fil des sources : ce que Discord montre, dans PANNEAU -- le
-    plus grand de son titre et de ses notifications arrivees depuis que tu
-    l'as regarde (voir toasts_discord). None : ni l'un ni l'autre ne se lit."""
+    plus grand de son titre, de la pastille de sa barre des taches (voir
+    pastille_discord_barre) et de ses notifications arrivees depuis que tu
+    l'as regarde (voir toasts_discord) ; -1 : une pastille sans nombre
+    lisible. None : rien ne se lit."""
     t = time.time() if maintenant is None else maintenant
     try:
         titre = (lire or lire_discord)()
@@ -13840,27 +13958,34 @@ def suivre_discord(lire=None, centre=None, maintenant=None):
         arrivees = (centre or toasts_discord)()
     except Exception:
         arrivees = None
+    try:
+        pastille = (barre or pastille_discord_barre)()
+    except Exception:
+        pastille = None
     vu = max(float(PANNEAU.get("discord_vu") or 0.0), t - DISCORD_CENTRE_S)
     attente = None if arrivees is None else sum(1 for a in arrivees if a > vu)
-    lus = [n for n in (titre, attente) if n is not None]
-    PANNEAU["discord"] = max(lus) if lus else None
+    lus = [n for n in (titre, attente, pastille) if n is not None]
+    PANNEAU["discord"] = (max(lus) if max(lus) > 0 else min(lus)) if lus else None
     # le journal : de quoi comprendre une pastille qui ne vient pas -- la forme
-    # du titre (sans les mots), et ce que dit le centre ; a chaque changement
-    dit = (tuple(_DISCORD_CENTRE.get("titres") or ()), titre, attente)
+    # du titre (sans les mots), la barre des taches, le centre ; a chaque changement
+    dit = (tuple(_DISCORD_CENTRE.get("titres") or ()), titre, tuple(_DISCORD_CENTRE.get("barre") or ()),
+           pastille, attente)
     if dit != _DISCORD_CENTRE.get("dit"):
         _DISCORD_CENTRE["dit"] = dit
-        print("Discord : titre %s -> %s ; centre de notifications : %s" % (
+        print("Discord : titre %s -> %s ; barre des taches %s -> %s ; centre de notifications : %s" % (
             " / ".join("« %s »" % f for f in dit[0]) or "(aucune fenetre)",
             "illisible" if titre is None else titre,
+            " / ".join(dit[2]) or "(aucun bouton)", "illisible" if pastille is None else pastille,
             "illisible" if attente is None else "%d en attente" % attente))
     return PANNEAU["discord"]
 
 
 def dessiner_pastille_discord(img, n, eclat=None):
     """La pastille, en haut a gauche : violette (la couleur de Discord), le
-    nombre en blanc, « 9+ » au-dela."""
-    texte = str(n) if n <= 9 else "9+"
-    larg = largeur_petit(texte) + 4
+    nombre en blanc, « 9+ » au-dela ; un point blanc si on ne sait pas
+    combien (n < 0 : la pastille de la barre des taches, sans nombre lisible)."""
+    texte = "" if n < 0 else str(n) if n <= 9 else "9+"
+    larg = largeur_petit(texte) + 4 if texte else 6
     fond, blanc = DISCORD_VIOLET, (255, 255, 255)
     if eclat is not None:
         f = max(PANNEAU_ECLAT_MIN, eclat)
@@ -13868,7 +13993,10 @@ def dessiner_pastille_discord(img, n, eclat=None):
     img[1:8, 1:1 + larg] = fond
     for y, x in ((1, 1), (1, larg), (7, 1), (7, larg)):     # les coins arrondis
         img[y, x] = 0
-    ecrire_petit(img, texte, 3, 2, blanc)
+    if texte:
+        ecrire_petit(img, texte, 3, 2, blanc)
+    else:
+        img[3:6, 3:5] = blanc
 
 
 def _image_du_contenu(cfg, contenu, t, eclat):
