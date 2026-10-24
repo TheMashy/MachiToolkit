@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.117.0"
+VERSION = "1.118.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -359,6 +359,9 @@ CONFIG_DEFAUT = {
     "panneau_maj": True,
     # « detecte quand je vais sur FL Studio, et fais-moi une interface dediee » (voir FL_PROCESSUS)
     "panneau_fl": True,
+    # « a screen replication mode, especially when playing » : "jeux", "plein_ecran", "toujours", "jamais"
+    "panneau_miroir": "jeux",
+    "panneau_miroir_style": "image",  # ou "couleurs" : tout en couleurs floues
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -3140,7 +3143,7 @@ def _ecran_actif(sct):
     return 1
 
 
-def _vignette_gdi(zone, colonnes, lignes):
+def _vignette_gdi(zone, colonnes, lignes, brut=False):
     """Reduit une zone de l'ecran a colonnes x lignes pixels, cote Windows.
 
     C'est ce qui separe 30 images par seconde de 5. Recopier un ecran 4K,
@@ -3214,6 +3217,8 @@ def _vignette_gdi(zone, colonnes, lignes):
         _local.gdi = None
         return None
 
+    if brut:
+        return octets                                   # BGRA, tel quel (le miroir du panneau en fait du numpy)
     # GetBitmapBits rend du BGRA, ligne par ligne.
     return [(octets[i + 2], octets[i + 1], octets[i])
             for i in range(0, len(octets), 4)]
@@ -14725,6 +14730,227 @@ def image_de_l_ecran(e, t, duree, dessous=None):
     return img
 
 
+# LE MIROIR DE L'ECRAN. « Add a screen replication mode, especially when
+# playing : the board can replicate the colors of the game. » Pendant un jeu
+# (ou toujours, ou aussi pour une video en plein ecran : panneau_miroir), le
+# panneau recopie l'ecran ou il se joue : reduit a 64 de large, a sa
+# proportion (64 x 36 pour du 16/9), au milieu, et au-dessus et en dessous
+# ses propres couleurs, floues et assombries -- ou tout en couleurs floues
+# (panneau_miroir_style). Un fil a lui capture 30 fois par seconde, GDI
+# reduisant l'image lui-meme : le fil du panneau ne fait que la poser.
+# Un jeu : son .exe dans un dossier de jeux (Steam, Epic, Riot, GOG...), ou
+# une appli en plein ecran qui n'est ni un navigateur ni un lecteur video.
+# Trois secondes ailleurs (un Alt+Tab) ne l'arretent pas. Un jeu en plein
+# ecran EXCLUSIF peut se derober a la capture : le mode fenetre sans bordure
+# (le reglage par defaut de la plupart des jeux) se recopie.
+MIROIR_MODES = ("jeux", "plein_ecran", "toujours", "jamais")
+MIROIR_IPS = 30
+MIROIR_GRACE_S = 3.0
+MIROIR_FRAIS_S = 1.0                    # une capture plus vieille : le miroir s'efface
+JEUX_DOSSIERS = ("\\steamapps\\common\\", "\\epic games\\", "\\riot games\\", "\\gog galaxy\\games\\",
+                 "\\gog games\\", "\\ubisoft game launcher\\games\\", "\\ea games\\", "\\origin games\\",
+                 "\\xboxgames\\", "\\itch\\apps\\", "\\games\\", "\\jeux\\")
+# Des noms d'exe entiers (sans .exe ni chiffres de fin : obs64 est obs) --
+# pas des morceaux : « edge » ne doit pas ecarter Mirror's Edge.
+PAS_DES_JEUX = NAVIGATEURS + (
+    # les lecteurs (le mode plein_ecran les recopie, le mode jeux non)
+    "vlc", "mpc-hc", "mpc-be", "potplayer", "potplayermini", "wmplayer", "mpv", "kmplayer", "smplayer", "plex",
+    "video.ui", "microsoft.media.player", "photos", "microsoft.photos",
+    # les lanceurs : dans les dossiers de jeux, mais pas des jeux
+    "steam", "steamwebhelper", "epicgameslauncher", "riotclientux", "riotclientservices", "galaxyclient", "upc",
+    "ubisoftconnect", "eadesktop", "origin", "battle.net",
+    # Windows, Machi Tool, et ce qu'on met en plein ecran sans jouer
+    "explorer", "applicationframehost", "lockapp", "logonui", "searchhost", "searchapp", "startmenuexperiencehost",
+    "shellexperiencehost", "machitool", "obs", "discord", "spotify", "code", "powerpnt", "zoom", "teams", "ms-teams",
+    "slack")
+
+
+def chemin_du_processus(pid):
+    """Le chemin complet de l'exe d'un PID, ou "" -- par psutil, sinon par
+    QueryFullProcessImageName (un jeu protege refuse souvent le premier)."""
+    try:
+        import psutil
+        return psutil.Process(pid).exe() or ""
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        h = k.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            n = wintypes.DWORD(len(buf))
+            k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                     ctypes.POINTER(wintypes.DWORD)]
+            return buf.value if k.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) else ""
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def premier_plan():
+    """(processus, chemin de son exe, plein ecran ?) de la fenetre au premier
+    plan, en minuscules ; None hors de Windows ou sans fenetre."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import win32api
+        import win32gui
+        import win32process
+        h = win32gui.GetForegroundWindow()
+        if not h or win32gui.GetClassName(h) in ("Progman", "WorkerW", "Shell_TrayWnd"):
+            return None
+        _, pid = win32process.GetWindowThreadProcessId(h)
+        chemin = chemin_du_processus(pid).lower()
+        nom = os.path.basename(chemin) or str(_nom_du_processus(pid) or "").lower()
+        g, ht, d, b = win32gui.GetWindowRect(h)
+        m = win32api.GetMonitorInfo(win32api.MonitorFromWindow(h, 2))["Monitor"]     # le plus proche
+        # agrandie, une fenetre deborde de l'ecran de ses bordures : pas du plein ecran
+        plein = g <= m[0] and ht <= m[1] and d >= m[2] and b >= m[3] and not ctypes.windll.user32.IsZoomed(h)
+        return nom, chemin, bool(plein)
+    except Exception:
+        return None
+
+
+def est_un_jeu(processus, chemin, plein_ecran):
+    """Un jeu : son exe dans un dossier de jeux, ou une appli en plein ecran
+    qui n'est ni un navigateur, ni un lecteur video, ni Machi Tool. Un
+    processus qui ne se laisse pas lire (un anti-triche) : en plein ecran, un jeu."""
+    nom = str(processus or "").strip().lower()
+    nom = nom[:-4] if nom.endswith(".exe") else nom
+    if nom in PAS_DES_JEUX or nom.rstrip("0123456789") in PAS_DES_JEUX:
+        return False
+    if not nom:
+        return bool(plein_ecran)
+    chemin = str(chemin or "").lower().replace("/", "\\")
+    return any(d in chemin for d in JEUX_DOSSIERS) or bool(plein_ecran)
+
+
+def suivre_jeu(t, info=None):
+    """Depuis le fil des sources : un jeu au premier plan ? une fenetre en
+    plein ecran ? (PANNEAU["jeu_vu"], ["plein_ecran_vu"]). `info` : pour les tests."""
+    info = premier_plan() if info is None else info
+    if not info:
+        return False
+    processus, chemin, plein = info
+    if plein:
+        PANNEAU["plein_ecran_vu"] = t
+    if est_un_jeu(processus, chemin, plein):
+        PANNEAU.update(jeu_vu=t, jeu=processus)
+        return True
+    return False
+
+
+def miroir_voulu(cfg, t):
+    """Le panneau doit-il recopier l'ecran a l'instant t ? (panneau_miroir)"""
+    mode = cfg.get("panneau_miroir", "jeux")
+    if mode == "toujours":
+        return True
+    recent = lambda cle: 0 <= t - float(PANNEAU.get(cle) or 0) <= MIROIR_GRACE_S
+    if mode == "jeux":
+        return recent("jeu_vu")
+    if mode == "plein_ecran":
+        return recent("jeu_vu") or recent("plein_ecran_vu")
+    return False
+
+
+def capturer_miroir():
+    """L'ecran de la fenetre au premier plan, reduit a 64 de large et a sa
+    proportion (64 x 36 pour du 16/9), en RGB ; GDI le reduit lui-meme --
+    sinon, mss et une moyenne par blocs. None si rien ne se capture."""
+    import numpy as np
+    sct = _capteur()
+    zone = sct.monitors[max(1, min(_ecran_actif(sct), len(sct.monitors) - 1))]
+    lignes = max(8, min(64, int(round(64 * zone["height"] / max(1, zone["width"])))))
+    octets = _vignette_gdi(zone, 64, lignes, brut=True)
+    if octets and len(octets) >= 64 * lignes * 4:
+        return np.frombuffer(octets, np.uint8)[:64 * lignes * 4].reshape(lignes, 64, 4)[..., 2::-1].copy()
+    from PIL import Image
+    brut = sct.grab(zone)
+    return np.asarray(Image.frombytes("RGB", brut.size, brut.rgb).resize((64, lignes), Image.BOX))
+
+
+def fil_miroir(cfg=None, tours=None):
+    """Le fil du miroir : tant que le panneau recopie l'ecran (branche, et
+    miroir_voulu), une capture toutes les 1/30 s dans PANNEAU["miroir"]."""
+    cfg = CFG if cfg is None else cfg
+    n = 0
+    while ETAT["en_marche"] and (tours is None or n < tours):
+        n += 1
+        t = time.time()
+        if not (cfg.get("panneau_actif", True) and PANNEAU.get("etat") == "connecte" and miroir_voulu(cfg, t)
+                and cfg.get("panneau_contenu", "horloge") != "eteint"):
+            if tours is None:
+                time.sleep(0.25)
+            continue
+        debut = time.monotonic()
+        try:
+            petite = capturer_miroir()
+        except Exception as e:
+            signaler_capture("Miroir du panneau", e)
+            petite = None
+        if petite is not None:
+            PANNEAU["miroir"] = {"img": petite, "t": time.time()}
+        if tours is None:
+            time.sleep(max(0.0, 1.0 / MIROIR_IPS - (time.monotonic() - debut)))
+
+
+def _flou(img, passes):
+    """Un flou doux (moyenne avec les quatre voisins, les bords prolonges)."""
+    import numpy as np
+    f = np.asarray(img, float)
+    for _ in range(passes):
+        p = np.pad(f, ((1, 1), (1, 1), (0, 0)), mode="edge")
+        f = (p[1:-1, 1:-1] + p[:-2, 1:-1] + p[2:, 1:-1] + p[1:-1, :-2] + p[1:-1, 2:]) / 5
+    return f
+
+
+def image_miroir(petite, style="image"):
+    """Le panneau a partir de la capture reduite : l'image au milieu, ses
+    couleurs floues et assombries au-dessus et en dessous ; ou, en style
+    « couleurs », tout en couleurs floues et un peu plus vives."""
+    import numpy as np
+    h = petite.shape[0]
+    etiree = np.asarray(petite, float)[np.clip((np.arange(64) * h / 64).astype(int), 0, h - 1)]
+    if style == "couleurs":
+        f = _flou(etiree, 10)
+        gris = f.mean(axis=2, keepdims=True)
+        return np.clip(gris + (f - gris) * 1.4, 0, 255).astype(np.uint8)
+    img = _flou(etiree, 6) * 0.35
+    y0 = (64 - h) // 2
+    img[y0:y0 + h] = petite
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def miroir_du_moment(cfg, t):
+    """La derniere capture, si le miroir est voulu et qu'elle est fraiche ; sinon None."""
+    m = PANNEAU.get("miroir")
+    if m is None or not miroir_voulu(cfg, t) or not -0.2 <= t - m["t"] <= MIROIR_FRAIS_S:
+        return None
+    return m
+
+
+def etat_miroir_lisible(cfg, maintenant=None):
+    """Une ligne pour la page : ce que fait le miroir en ce moment."""
+    t = time.time() if maintenant is None else maintenant
+    mode = cfg.get("panneau_miroir", "jeux")
+    if mode == "jamais":
+        return "Le miroir est coupe."
+    if miroir_du_moment(cfg, t) is not None:
+        jeu = PANNEAU.get("jeu") if 0 <= t - float(PANNEAU.get("jeu_vu") or 0) <= MIROIR_GRACE_S else None
+        return "Le panneau recopie l'ecran%s." % (" (%s)" % jeu if jeu else "")
+    return {"jeux": "Pas de jeu au premier plan : le panneau garde son contenu.",
+            "plein_ecran": "Ni jeu, ni plein ecran : le panneau garde son contenu.",
+            "toujours": "Pas encore de capture (le panneau doit etre branche)."}.get(mode, "")
+
+
 def _ecran_retenu(cfg, t):
     """Un minuteur qui va sonner, un rendez-vous qui arrive : pas d'ecran, l'heure reste."""
     try:
@@ -14786,12 +15012,18 @@ def image_du_panneau(cfg, contenu, t):
         return image_jarvis_du_moment(etat, t, cfg, croix=False)
     # FL Studio au premier plan : son studio passe devant l'horloge
     fl = fl_au_premier_plan(t) if cfg.get("panneau_fl", True) else None
+    # le miroir de l'ecran (un jeu au premier plan, par defaut)
+    miroir = miroir_du_moment(cfg, t) if fl is None else None
     # un ecran plein panneau, de temps en temps, entre deux vues de l'horloge
     ecran = None
-    if fl is None and contenu == "horloge":
+    if fl is None and miroir is None and contenu == "horloge":
         ecran = ecran_du_moment(cfg, t, urgent=lambda: _ecran_retenu(cfg, t))
     if fl is not None:
         img = image_fl_studio(t, fl, eclat)
+    elif miroir is not None:
+        img = image_miroir(miroir["img"], cfg.get("panneau_miroir_style", "image"))
+        if eclat is not None:
+            img = assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
     elif ecran is not None:
         img = image_de_l_ecran(ecran, t, reglages_ecrans(cfg)[1], lambda: _image_du_contenu(cfg, contenu, t, None))
         if eclat is not None:
@@ -14985,6 +15217,8 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
         connecte = bool(cfg.get("panneau_actif", True) and PANNEAU.get("etat") == "connecte")
         actif = bool(connecte and cfg.get("panneau_cycle", True) and cfg.get("panneau_contenu", "horloge") == "horloge")
         fenetre = fenetre_active() if connecte else ""
+        if connecte and cfg.get("panneau_miroir", "jeux") in ("jeux", "plein_ecran"):
+            suivre_jeu(t)                               # le miroir : un jeu ? du plein ecran ?
         studio = False                                  # FL Studio au premier plan : sa vue ecoute le son
         if connecte and cfg.get("panneau_fl", True) and cfg.get("panneau_contenu", "horloge") != "eteint":
             suivre_fl_studio(t, fenetre)
@@ -18998,7 +19232,8 @@ class Panneau:
         tk = self.tk
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
-                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_maj", "panneau_fl", "panneau_cycle",
+                    "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_maj", "panneau_fl", "panneau_miroir",
+                    "panneau_miroir_style", "panneau_cycle",
                     "meteo_ville",
                     "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
@@ -19148,6 +19383,26 @@ class Panneau:
                       self.var_panneau_fl, lambda: self.regler_panneau("panneau_fl"))
         c.configure(wraplength=self.px(380))
         c.pack(fill="x", pady=(10, 0))
+        # « a screen replication mode, especially when playing »
+        self.titre(col, "Le miroir de l'ecran").pack(fill="x", pady=(14, 4))
+        self.texte(col, "Le panneau recopie l'ecran : l'image au milieu, ses couleurs autour. Un jeu en plein ecran "
+                        "exclusif peut se derober a la capture ; en fenetre sans bordure, il se recopie.",
+                   BRUME, 8, largeur=380).pack(fill="x")
+        self.var_panneau_miroir = tk.StringVar(value=str(self.cfg.get("panneau_miroir", "jeux")))
+        for valeur, texte in (("jeux", "Pendant les jeux"), ("plein_ecran", "Jeux et videos en plein ecran"),
+                              ("toujours", "Toujours"), ("jamais", "Jamais")):
+            r = self.radio(col, texte, self.var_panneau_miroir, valeur)
+            r.configure(command=lambda: self.regler_panneau("panneau_miroir"))
+            r.pack(fill="x", padx=(self.px(22), 0))
+        rangee = tk.Frame(col, bg=NUIT)
+        rangee.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
+        self.var_panneau_miroir_style = tk.StringVar(value=str(self.cfg.get("panneau_miroir_style", "image")))
+        for valeur, texte in (("image", "L'image"), ("couleurs", "Les couleurs, floues")):
+            r = self.radio(rangee, texte, self.var_panneau_miroir_style, valeur)
+            r.configure(command=lambda: self.regler_panneau("panneau_miroir_style"))
+            r.pack(side="left", padx=(0, self.px(14)))
+        self.txt_miroir = self.texte(col, etat_miroir_lisible(self.cfg), BRUME, 8, largeur=360)
+        self.txt_miroir.pack(fill="x", pady=(2, 0), padx=(self.px(22), 0))
         # « qu'il detecte quand j'ai une notification en attente sur Discord »
         self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
         c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
@@ -19253,6 +19508,10 @@ class Panneau:
             self.cfg[cle] = int(self.var_panneau_rotation.get())
         elif cle == "panneau_contenu":
             self.cfg[cle] = self.var_panneau_contenu.get()
+        elif cle in ("panneau_miroir", "panneau_miroir_style"):
+            self.cfg[cle] = getattr(self, "var_" + cle).get()
+            if cle == "panneau_miroir" and self.cfg[cle] == "jamais":
+                PANNEAU["miroir"] = None                # coupe : il s'efface tout de suite
         sauver_config(self.cfg)
         self._peindre_panneau()
 
@@ -19384,6 +19643,11 @@ class Panneau:
         if getattr(self, "txt_claude_cloud", None) is not None and CLAUDE_CODE.get("vu_cloud"):
             try:
                 self.txt_claude_cloud.configure(text=etat_cloud_lisible(self.cfg))
+            except Exception:
+                pass
+        if getattr(self, "txt_miroir", None) is not None:
+            try:
+                self.txt_miroir.configure(text=etat_miroir_lisible(self.cfg))
             except Exception:
                 pass
         if getattr(self, "txt_discord", None) is not None:
@@ -22464,6 +22728,8 @@ def lancer():
                      name="panneau").start()
     threading.Thread(target=sans_faute, args=("Sources du panneau", veiller_sources_panneau, CFG), daemon=True,
                      name="panneau-sources").start()
+    threading.Thread(target=sans_faute, args=("Miroir de l'ecran", fil_miroir, CFG), daemon=True,
+                     name="panneau-miroir").start()
     threading.Thread(target=sans_faute, args=("Bulle de Claude (cloud)", veiller_bulle_distante, CFG), daemon=True,
                      name="bulle-claude").start()
     # Ctrl+J : un raccourci global, tenu par Machi Tool (RegisterHotKey)

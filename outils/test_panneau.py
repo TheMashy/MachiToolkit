@@ -463,6 +463,21 @@ class AL_Ecran(unittest.TestCase):
             self.assertFalse(M.CFG["panneau_fl"])
             self.assertIsNone(M.PANNEAU["fl"])
             M.CFG["panneau_fl"] = True
+            # « a screen replication mode, especially when playing » : quand, et comment
+            self.assertEqual((p.var_panneau_miroir.get(), p.var_panneau_miroir_style.get()), ("jeux", "image"))
+            self.assertIn("garde son contenu", p.txt_miroir.cget("text"))
+            p.var_panneau_miroir.set("toujours")
+            p.regler_panneau("panneau_miroir")
+            p.var_panneau_miroir_style.set("couleurs")
+            p.regler_panneau("panneau_miroir_style")
+            self.assertEqual((M.CFG["panneau_miroir"], M.CFG["panneau_miroir_style"]), ("toujours", "couleurs"))
+            M.PANNEAU["miroir"] = {"img": None, "t": time.time()}
+            p.var_panneau_miroir.set("jamais")
+            p.regler_panneau("panneau_miroir")
+            self.assertIsNone(M.PANNEAU["miroir"], "jamais : le miroir s'en va tout de suite")
+            p._peindre_panneau()
+            self.assertEqual(p.txt_miroir.cget("text"), "Le miroir est coupe.")
+            M.CFG.update(panneau_miroir="jeux", panneau_miroir_style="image")
             p.var_panneau_claude.set(0)
             p.regler_panneau("panneau_claude")
             self.assertFalse(M.CFG["panneau_claude"])
