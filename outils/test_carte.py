@@ -14,7 +14,9 @@ Tenu ici :
   - une image abimee est jetee (et comptee) : le panneau garde la precedente ;
   - un envoi coupe ou decale se rattrape, sans pixel faux a la fin ;
   - deux lignes redessinees d'office par image : tout le panneau en 32 images ;
-  - « MF » (Machi Tool d'avant) reste accepte.
+  - « MF » (Machi Tool d'avant) reste accepte ;
+  - v7 : PC eteint, la carte dessine elle-meme les ambiances (« MA », gardes
+    dans sa memoire ; « MW », « MO »), et reste noire apres une baisse de tension.
 
     python outils/test_carte.py        (sans g++ ou sans numpy, il se saute)
 """
@@ -129,6 +131,60 @@ struct FauxSerial {
 extern FauxSerial Serial;
 '''
 
+# La memoire de la carte (NVS) : un fichier par cle (NVS=chemin), pour qu'elle
+# survive a un « redemarrage » -- un second lancement du programme.
+PREFERENCES = r'''
+#pragma once
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+struct Preferences {
+  std::map<std::string, std::vector<uint8_t>> cles;
+  std::string dossier;
+  long ecritures = 0;
+  bool begin(const char *, bool = false) { const char *f = getenv("NVS"); if (f) dossier = f; return true; }
+  size_t getBytes(const char *cle, void *d, size_t n) {
+    std::vector<uint8_t> v;
+    if (!dossier.empty()) {
+      FILE *h = fopen((dossier + "." + cle).c_str(), "rb");
+      if (!h) return 0;
+      int c;
+      while ((c = fgetc(h)) != EOF) v.push_back((uint8_t)c);
+      fclose(h);
+    } else if (cles.count(cle)) {
+      v = cles[cle];
+    }
+    if (v.size() > n) return 0;
+    memcpy(d, v.data(), v.size());
+    return v.size();
+  }
+  size_t putBytes(const char *cle, const void *d, size_t n) {
+    ecritures++;
+    cles[cle].assign((const uint8_t *)d, (const uint8_t *)d + n);
+    if (!dossier.empty()) {
+      FILE *h = fopen((dossier + "." + cle).c_str(), "wb");
+      fwrite(d, 1, n, h);
+      fclose(h);
+    }
+    return n;
+  }
+};
+'''
+
+# Pourquoi la carte a (re)demarre : RESET=9, une baisse de tension.
+ESP_SYSTEM = r'''
+#pragma once
+#include <cstdlib>
+enum esp_reset_reason_t { ESP_RST_UNKNOWN = 0, ESP_RST_POWERON = 1, ESP_RST_BROWNOUT = 9 };
+inline esp_reset_reason_t esp_reset_reason() {
+  const char *r = getenv("RESET");
+  return r ? (esp_reset_reason_t)atoi(r) : ESP_RST_POWERON;
+}
+'''
+
 PRINCIPAL = r'''
 #include "ESP32-HUB75-MatrixPanel-I2S-DMA.h"
 #include <cstdlib>
@@ -154,7 +210,8 @@ int main(int argc, char **argv) {
   FILE *o = fopen(argv[2], "wb");
   for (int i = 0; i < 64 * 64; i++) { fputc(panneau->px[i] >> 8, o); fputc(panneau->px[i] & 0xFF, o); }
   fclose(o);
-  printf("%sUNITAIRES %ld\nDESSINS %ld\n", Serial.sortie.c_str(), Serial.unitaires, panneau->dessins - avant);
+  printf("%sUNITAIRES %ld\nDESSINS %ld\nLUM %d\nECRITURES %ld\n", Serial.sortie.c_str(), Serial.unitaires,
+         panneau->dessins - avant, (int)panneau->lum, memoire.ecritures);
   return 0;
 }
 '''
@@ -175,8 +232,10 @@ class LaCarte(unittest.TestCase):
     def setUpClass(cls):
         cls.M = charger_module(tempfile.mkdtemp())
         cls.dossier = tempfile.mkdtemp()
-        with open(os.path.join(cls.dossier, "ESP32-HUB75-MatrixPanel-I2S-DMA.h"), "w") as f:
-            f.write(ENTETE)
+        for nom, texte in (("ESP32-HUB75-MatrixPanel-I2S-DMA.h", ENTETE), ("Preferences.h", PREFERENCES),
+                           ("esp_system.h", ESP_SYSTEM)):
+            with open(os.path.join(cls.dossier, nom), "w") as f:
+                f.write(texte)
         source = os.path.join(cls.dossier, "principal.cpp")
         with open(source, "w") as f:
             f.write(PRINCIPAL)
@@ -187,19 +246,26 @@ class LaCarte(unittest.TestCase):
             raise AssertionError("le croquis ne compile pas :\n" + r.stderr)
         cls.avertissements = r.stderr
 
-    def envoyer(self, flux, pauses=()):
+    def envoyer(self, flux, pauses=(), nvs=None, reset=None):
         """Le flux a la carte ; rend (ce que le panneau montre, en RGB565 64 x 64,
-        ce qu'elle a repondu, le nombre de pixels dessines apres la mire)."""
+        ce qu'elle a repondu, le nombre de pixels dessines apres la mire).
+        `nvs` : le fichier de sa memoire ; `reset` : pourquoi elle a demarre."""
         entree = os.path.join(self.dossier, "entree.bin")
         sortie = os.path.join(self.dossier, "panneau.bin")
         with open(entree, "wb") as f:
             f.write(flux)
+        env = dict(os.environ)
+        env.pop("NVS", None)
+        if nvs:
+            env["NVS"] = nvs
+        if reset is not None:
+            env["RESET"] = str(reset)
         r = subprocess.run([self.carte, entree, sortie] + [str(p) for p in pauses],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=120, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(sortie, "rb") as f:
             panneau = np.frombuffer(f.read(), ">u2").reshape(64, 64)
-        dessins = int(r.stdout.rsplit("DESSINS ", 1)[1])
+        dessins = int(r.stdout.rsplit("DESSINS ", 1)[1].split()[0])
         return panneau, r.stdout, dessins
 
     def image(self, graine):
@@ -232,7 +298,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 6", reponses)
+        self.assertIn("MACHI 7", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -342,6 +408,122 @@ class LaCarte(unittest.TestCase):
     def test_la_luminosite_reste_sous_le_plafond(self):
         _, reponses, _ = self.envoyer(b"MB\xff" + self.M.trame_image(self.image(6), 3) + b"MS")
         self.assertIn("STATS 1 0", reponses, "« MB » ne derange pas les images qui suivent")
+
+
+    # ---------------- v7 : les ecrans de veille, PC eteint ----------------
+
+    def veille(self, **reglages):
+        cfg = {"panneau_veille": True, "panneau_veille_luminosite": 30, "panneau_rouge": 100, "panneau_vert": 100,
+               "panneau_bleu": 100}
+        cfg.update(reglages)
+        return self.M.trame_veille(cfg)
+
+    @staticmethod
+    def chiffre(reponses, nom):
+        return int(reponses.rsplit(nom + " ", 1)[1].split()[0])
+
+    def test_pc_eteint_la_carte_montre_ses_ambiances(self):
+        # « c'est possible que tu laisses les screen savers meme a l'arret du PC ? »
+        d = self.image(7)
+        flux = self.veille() + self.M.trame_image(d, 3)
+        tient, reponses, _ = self.envoyer(flux, ["+4000"])
+        self.assertIn("VEILLE 1 1023", reponses, "les reglages recus : actif, les dix ambiances")
+        self.assertTrue((tient == self.attendu(d)).all(), "4 s sans image : il garde l'image (un a-coup du PC)")
+        veille, reponses, _ = self.envoyer(flux, ["+9000"])
+        self.assertGreater(int((veille != 0).sum()), 2000, "PC eteint : une ambiance, tout le panneau")
+        self.assertFalse((veille == self.attendu(d)).all())
+        self.assertEqual(self.chiffre(reponses, "LUM"), 30, "a sa luminosite a elle")
+
+    def test_decochee_ou_sans_ambiance_elle_reste_noire(self):
+        d = self.M.trame_image(self.image(7), 3)
+        for reglage in ({"panneau_veille": False}, {"panneau_veille_sans": list(self.M.ECRANS_AMBIANCES)}):
+            with self.subTest(**{k: str(v)[:20] for k, v in reglage.items()}):
+                noir, _, _ = self.envoyer(self.veille(**reglage) + d, ["+9000"])
+                self.assertFalse(noir.any())
+
+    def test_quitter_machi_tool_laisse_le_noir(self):
+        # « quand Machi Tool s'eteint, eteins le panneau » : « MO », et pas d'ambiance au silence
+        noir = bytes(8192)
+        flux = self.veille() + self.M.trame_image(self.image(7), 3) + b"MB\x00" + b"MF" + noir + b"MO"
+        panneau, _, _ = self.envoyer(flux, ["+9000"])
+        self.assertFalse(panneau.any())
+
+    def test_windows_qui_s_arrete_passe_la_main_tout_de_suite(self):
+        d = self.image(7)
+        panneau, _, _ = self.envoyer(self.veille() + self.M.trame_image(d, 3) + b"MW", ["+600"])
+        self.assertFalse((panneau == self.attendu(d)).all(), "« MW » : l'ambiance, sans attendre 5 s")
+        self.assertGreater(int((panneau != 0).sum()), 2000, "en fondu, deja la")
+
+    def test_le_pc_revient_et_reprend_le_panneau(self):
+        a, b = self.image(1), self.image(2)
+        flux = b"MB\x50" + self.veille() + self.M.trame_image(a, 3) + b"MW"
+        pause = len(flux)
+        flux += self.M.trame_image(b, 3) + b"MS"
+        panneau, reponses, _ = self.envoyer(flux, ["%d:3000" % pause])
+        self.assertTrue((panneau == self.attendu(b)).all(), "son image, exacte")
+        self.assertEqual(self.chiffre(reponses, "LUM"), 0x50, "a la luminosite du PC")
+
+    def test_l_arret_programme(self):
+        flux = self.veille(panneau_veille_arret_h=1) + b"MW"
+        allume, _, _ = self.envoyer(flux, ["+3500000"])
+        self.assertTrue(allume.any(), "58 min : encore la")
+        noir, _, _ = self.envoyer(flux, ["+3700000"])
+        self.assertFalse(noir.any(), "une heure : noir, jusqu'au retour du PC")
+
+    def test_ses_reglages_survivent_a_une_coupure_mais_pas_une_baisse_de_tension(self):
+        nvs = os.path.join(tempfile.mkdtemp(), "nvs")
+        _, reponses, _ = self.envoyer(self.veille(), nvs=nvs)
+        self.assertIn("VEILLE 1", reponses)
+        noir, _, _ = self.envoyer(b"", ["+9000"], nvs=nvs, reset=9)
+        self.assertFalse(noir.any(), "redemarree faute de tension : noire (plus jamais la boucle de la v5)")
+        veille, _, _ = self.envoyer(b"", ["+9000"], nvs=nvs, reset=1)
+        self.assertTrue(veille.any(), "rebranchee : ses ambiances, sans le PC")
+        neuve, _, _ = self.envoyer(b"", ["+9000"])
+        self.assertFalse(neuve.any(), "une carte sans reglages : noire, comme la v6")
+
+    def test_des_reglages_abimes_sont_ignores(self):
+        abimee = bytearray(self.veille())
+        abimee[5] ^= 0x01
+        noir, reponses, _ = self.envoyer(bytes(abimee) + self.M.trame_image(self.image(3), 3), ["+9000"])
+        self.assertNotIn("VEILLE", reponses)
+        self.assertFalse(noir.any())
+
+    def test_la_memoire_ne_s_ecrit_que_si_ca_change(self):
+        _, reponses, _ = self.envoyer(self.veille() * 3)
+        self.assertEqual(self.chiffre(reponses, "ECRITURES"), 1, "la flash s'use : une fois")
+        _, reponses, _ = self.envoyer(self.veille() + self.veille(panneau_veille_luminosite=20))
+        self.assertEqual(self.chiffre(reponses, "ECRITURES"), 2)
+
+    def test_jamais_au_dessus_du_plafond(self):
+        d = bytes([1, 1, 255, 3, 255, 0, 120, 0, 0, 100, 100, 100])
+        _, reponses, _ = self.envoyer(b"MA" + d + self.M.fletcher16(d).to_bytes(2, "big") + b"MW", ["+500"])
+        self.assertEqual(self.chiffre(reponses, "LUM"), 96, "PLAFOND, meme si on lui demande 255")
+
+    def test_la_balance_du_panneau_vaut_aussi_pour_elles(self):
+        def rouge(r):
+            panneau, _, _ = self.envoyer(self.veille(panneau_rouge=r, panneau_veille_sans=["aurore_lac"] + [
+                n for n in self.M.ECRANS_AMBIANCES if n not in ("coucher", "aurore_lac")]) + b"MW", ["+2000"])
+            return int((panneau >> 11).sum()), int(((panneau >> 5) & 0x3F).sum())
+        (r100, v100), (r50, v50) = rouge(100), rouge(50)
+        self.assertLess(r50, r100 * 0.85, "le rouge baisse, comme sur les images du PC")
+        self.assertEqual(v50, v100, "le vert ne bouge pas")
+
+    def test_chaque_ambiance_se_dessine_et_bouge(self):
+        # « keep only atmospheric effects » : les dix ambiances de Machi Tool, et elles seules
+        self.assertEqual(len(self.M.ECRANS_AMBIANCES), 10)
+        for i, nom in enumerate(self.M.ECRANS_AMBIANCES):
+            with self.subTest(ambiance=nom):
+                flux = self.veille(panneau_veille_sans=[n for n in self.M.ECRANS_AMBIANCES if n != nom]) + b"MW"
+                _, reponses, _ = self.envoyer(flux)
+                self.assertIn("VEILLE 1 %d" % (1 << i), reponses)
+                a, _, _ = self.envoyer(flux, ["+3000"])
+                b, _, _ = self.envoyer(flux, ["+4500"])
+                self.assertGreater(int((a != 0).sum()), 1500, "elle se voit")
+                self.assertFalse((a == b).all(), "elle bouge")
+        with open(os.path.join(CROQUIS, "machi_panneau.ino"), encoding="utf-8") as f:
+            croquis = f.read()
+        for absent in ("matrice", "feu", "plasma", "tunnel"):
+            self.assertNotIn("ecran_" + absent, croquis, "pas de jeux de lumiere a l'arret")
 
 
 if __name__ == "__main__":
