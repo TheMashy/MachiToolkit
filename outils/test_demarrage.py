@@ -2203,6 +2203,18 @@ class FuiteDeHandles(unittest.TestCase):
         self.assertEqual(len(a.vivants), 3, "une seule garde a la fois")
 
 
+    def test_une_definition_qui_change_refait_la_garde(self):
+        """« En 4K ca ne montre que le quart en haut a gauche » : un jeu en plein
+        ecran exclusif change la definition de l'ecran. Les contextes faits
+        pour l'ancienne sont rendus et refaits -- une garde a la fois."""
+        a = self.atelier()
+        self.mt._vignette_gdi(ZONE, 64, 36)
+        self.mt._vignette_gdi(ZONE, 64, 36)
+        self.assertEqual(a.faits.count("GetWindowDC"), 1, "le meme ecran : la garde sert")
+        self.mt._vignette_gdi(dict(ZONE, width=3840, height=2160), 64, 36)
+        self.assertEqual(a.faits.count("GetWindowDC"), 2, "passe en 4K : refaite")
+        self.assertEqual(len(a.vivants), 3, "une seule garde a la fois")
+
 class CoupeCircuitEcran(unittest.TestCase):
     """RIEN NE COMPTAIT LES ECHECS DE CAPTURE.
 
