@@ -4357,6 +4357,189 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue(m.CONFIG_DEFAUT["panneau_fl"])
 
     @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_miroir_de_l_ecran(self):
+        # « add a screen replication mode, especially when playing, the board can
+        # replicate the colors of the game on the board »
+        import numpy as np
+        m = self.m
+        cles = ("miroir", "jeu", "jeu_vu", "plein_ecran_vu", "etat", "fl", "discord", "ecran")
+        sauve = {k: m.PANNEAU.get(k) for k in cles}
+        vrais = {n: getattr(m, n) for n in ("_capteur", "_ecran_actif", "_vignette_gdi", "capturer_miroir",
+                                            "premier_plan", "fenetre_active", "lire_discord", "demarrer_audio",
+                                            "arreter_audio")}
+        en_marche = m.ETAT.get("en_marche")
+        def remettre():
+            for n, f in vrais.items():
+                setattr(m, n, f)
+            for k in cles:
+                m.PANNEAU.pop(k, None)
+            m.PANNEAU.update({k: v for k, v in sauve.items() if v is not None})
+            m.ETAT["en_marche"] = en_marche
+        self.addCleanup(remettre)
+        # qui est un jeu : son dossier, ou le plein ecran -- ni un navigateur, ni un lecteur, ni un lanceur
+        jeu = m.est_un_jeu
+        self.assertTrue(jeu("eldenring.exe", "c:\\program files (x86)\\steam\\steamapps\\common\\elden ring\\game\\eldenring.exe", False))
+        self.assertTrue(jeu("valorant-win64-shipping.exe", "c:\\riot games\\valorant\\live\\shootergame\\valorant-win64-shipping.exe", False))
+        self.assertTrue(jeu("hades.exe", "d:/games/hades/x64/hades.exe", False), "les barres a l'endroit aussi")
+        self.assertTrue(jeu("mirrorsedge.exe", "c:\\outils\\mirrorsedge.exe", True), "« edge » n'est pas un morceau de nom")
+        self.assertTrue(jeu("inconnu.exe", "c:\\outils\\inconnu.exe", True), "en plein ecran, ni lecteur ni navigateur")
+        self.assertFalse(jeu("inconnu.exe", "c:\\outils\\inconnu.exe", False), "une appli en fenetre")
+        self.assertFalse(jeu("chrome.exe", "c:\\program files\\google\\chrome\\application\\chrome.exe", True),
+                         "une video en plein ecran dans le navigateur")
+        self.assertFalse(jeu("vlc.exe", "d:\\games\\vlc\\vlc.exe", True))
+        self.assertFalse(jeu("mpc-hc64.exe", "c:\\program files\\mpc-hc\\mpc-hc64.exe", True), "obs64, mpc-hc64 : sans les chiffres")
+        self.assertFalse(jeu("epicgameslauncher.exe", "c:\\program files (x86)\\epic games\\launcher\\epicgameslauncher.exe", False),
+                         "le lanceur est dans le dossier, mais ce n'est pas un jeu")
+        self.assertFalse(jeu("riotclientux.exe", "c:\\riot games\\riot client\\riotclientux.exe", False))
+        self.assertFalse(jeu("machitool.exe", "d:\\jeux\\machitool\\machitool.exe", True))
+        self.assertTrue(jeu("", "", True), "illisible (un anti-triche), en plein ecran : un jeu")
+        self.assertFalse(jeu("", "", False), "illisible, en fenetre : rien")
+        # le suivi, depuis le fil des sources
+        m.PANNEAU.update(jeu=None, jeu_vu=0, plein_ecran_vu=0, miroir=None)
+        self.assertTrue(m.suivre_jeu(1000.0, ("eldenring.exe", "c:\\steamapps\\common\\elden ring\\eldenring.exe", True)))
+        self.assertEqual((m.PANNEAU["jeu"], m.PANNEAU["jeu_vu"], m.PANNEAU["plein_ecran_vu"]), ("eldenring.exe", 1000.0, 1000.0))
+        self.assertFalse(m.suivre_jeu(1001.0, ("chrome.exe", "c:\\chrome\\chrome.exe", True)))
+        self.assertEqual(m.PANNEAU["plein_ecran_vu"], 1001.0, "du plein ecran, pas un jeu")
+        self.assertEqual(m.PANNEAU["jeu_vu"], 1000.0)
+        self.assertFalse(m.suivre_jeu(1002.0, None), "hors de Windows : rien ne bouge")
+        self.assertEqual(m.PANNEAU["jeu_vu"], 1000.0)
+        # qui le veut : jeux (par defaut), plein ecran, toujours, jamais -- et trois secondes de grace (un Alt+Tab)
+        voulu = lambda mode, t: m.miroir_voulu({"panneau_miroir": mode}, t)
+        self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir"], "jeux")
+        self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir_style"], "image")
+        self.assertTrue(voulu("jeux", 1000.5))
+        self.assertTrue(voulu("jeux", 1000.0 + m.MIROIR_GRACE_S - 0.1), "un Alt+Tab ne l'arrete pas")
+        self.assertFalse(voulu("jeux", 1000.0 + m.MIROIR_GRACE_S + 0.5), "le jeu quitte : le miroir aussi")
+        self.assertTrue(voulu("plein_ecran", 1001.0 + m.MIROIR_GRACE_S - 0.1), "la video en plein ecran")
+        self.assertFalse(voulu("plein_ecran", 1001.0 + m.MIROIR_GRACE_S + 0.5))
+        self.assertTrue(voulu("toujours", 99999.0))
+        self.assertFalse(voulu("jamais", 1000.5))
+        self.assertFalse(m.miroir_voulu({}, 50000.0), "par defaut, sans jeu : non")
+        # la capture : GDI reduit l'ecran a 64 de large, a sa proportion ; le BGRA devient du RGB
+        class FauxCapteur:
+            monitors = [{"left": 0, "top": 0, "width": 320, "height": 180},
+                        {"left": 0, "top": 0, "width": 320, "height": 180}]
+            def grab(self, zone):
+                class Brut:
+                    size = (zone["width"], zone["height"])
+                    rgb = bytes((200, 100, 50)) * (zone["width"] * zone["height"])
+                return Brut()
+        demandes = []
+        def gdi(zone, colonnes, lignes, brut=False):
+            demandes.append((colonnes, lignes, brut))
+            px = np.zeros((lignes, colonnes, 4), np.uint8)
+            px[..., 0], px[..., 1], px[..., 2], px[..., 3] = 10, 20, 30, 255   # B, V, R, A
+            px[0, 0, :3] = (0, 0, 255)                                         # un pixel rouge en haut a gauche
+            return px.tobytes()
+        m._capteur = lambda: FauxCapteur()
+        m._ecran_actif = lambda sct: 1
+        m._vignette_gdi = gdi
+        petite = m.capturer_miroir()
+        self.assertEqual(demandes, [(64, 36, True)], "16/9 : 64 x 36, les octets bruts")
+        self.assertEqual(petite.shape, (36, 64, 3))
+        self.assertEqual(tuple(petite[5, 5]), (30, 20, 10), "le rouge d'abord")
+        self.assertEqual(tuple(petite[0, 0]), (255, 0, 0))
+        FauxCapteur.monitors = [FauxCapteur.monitors[0], {"left": 0, "top": 0, "width": 340, "height": 1000}]
+        self.assertEqual(m.capturer_miroir().shape, (64, 64, 3), "un ecran en hauteur : jamais plus de 64 lignes")
+        FauxCapteur.monitors = [FauxCapteur.monitors[0], {"left": 0, "top": 0, "width": 320, "height": 180}]
+        try:
+            import PIL  # noqa: F401
+            m._vignette_gdi = lambda *a, **k: None
+            repli = m.capturer_miroir()
+            self.assertEqual(repli.shape, (36, 64, 3), "sans GDI : mss, puis une moyenne par blocs")
+            self.assertEqual(tuple(repli[10, 10]), (200, 100, 50))
+        except ImportError:
+            pass
+        # l'image : la capture au milieu, telle quelle ; au-dessus et en dessous ses couleurs, floues et sombres
+        petite = np.zeros((36, 64, 3), np.uint8)
+        petite[:, :32] = (240, 40, 40)
+        petite[:, 32:] = (40, 40, 240)
+        img = m.image_miroir(petite, "image")
+        self.assertEqual(img.shape, (64, 64, 3))
+        self.assertEqual(img.dtype, np.uint8)
+        self.assertTrue((img[14:50] == petite).all(), "l'image du jeu, au milieu, nette")
+        self.assertTrue(img[0:14].any() and img[50:].any(), "les bandes ne sont pas noires")
+        self.assertLess(int(img[0:14].max()), 120, "elles sont sombres : le jeu reste devant")
+        self.assertGreater(int(img[3, 4, 0]), int(img[3, 4, 2]), "elles prolongent les couleurs : rouge a gauche")
+        self.assertGreater(int(img[60, 60, 2]), int(img[60, 60, 0]), "bleu a droite")
+        couleurs = m.image_miroir(petite, "couleurs")
+        self.assertEqual(couleurs.shape, (64, 64, 3))
+        saut = np.abs(np.diff(couleurs.astype(int), axis=1)).max()
+        self.assertLess(int(saut), 90, "en couleurs : floues, pas de frontiere nette")
+        self.assertGreater(int(couleurs[32, 2, 0]), int(couleurs[32, 2, 2]))
+        self.assertGreater(int(couleurs[32, 61, 2]), int(couleurs[32, 61, 0]))
+        large = m.image_miroir(np.full((27, 64, 3), 90, np.uint8))
+        self.assertTrue((large[18:45] == 90).all(), "21/9 : 27 lignes, au milieu aussi")
+        # sur le panneau : devant l'horloge et les ecrans, sous les pastilles ; une capture vieille s'efface
+        t = 1_800_000_000.0
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
+               "panneau_claude": False, "panneau_ecrans": False}
+        m.PANNEAU.update(fl=None, discord=None, ecran=None, jeu_vu=0, plein_ecran_vu=0,
+                         miroir={"img": petite, "t": t - 0.05})
+        horloge = m.image_du_panneau(cfg, "horloge", t)
+        self.assertFalse((horloge[14:50] == petite).all(), "pas de jeu : l'horloge")
+        toujours = dict(cfg, panneau_miroir="toujours")
+        self.assertTrue((m.image_du_panneau(toujours, "horloge", t)[14:50] == petite).all(), "le miroir")
+        self.assertTrue((m.image_du_panneau(toujours, "ambiance", t)[14:50] == petite).all(), "quel que soit le contenu")
+        self.assertFalse(m.image_du_panneau(toujours, "eteint", t).any(), "eteint reste eteint")
+        m.PANNEAU.update(jeu_vu=t - 1, jeu="eldenring.exe")
+        self.assertTrue((m.image_du_panneau(cfg, "horloge", t)[14:50] == petite).all(), "un jeu au premier plan : le miroir")
+        self.assertIn("eldenring.exe", m.etat_miroir_lisible(cfg, t))
+        m.PANNEAU["discord"] = 2
+        self.assertTrue((m.image_du_panneau(cfg, "horloge", t)[0:9, 0:14] == m.DISCORD_VIOLET).all(axis=2).any(),
+                        "la pastille Discord reste par-dessus")
+        m.PANNEAU["discord"] = None
+        self.assertEqual(m.image_du_panneau(dict(cfg, panneau_miroir="jamais"), "horloge", t).tolist(), horloge.tolist(),
+                         "jamais : l'horloge, meme en jouant")
+        m.PANNEAU["miroir"]["t"] = t - m.MIROIR_FRAIS_S - 0.5
+        self.assertFalse((m.image_du_panneau(cfg, "horloge", t)[14:50] == petite).all(), "une capture figee ne reste pas")
+        self.assertIn("garde son contenu", m.etat_miroir_lisible(cfg, t + 10))
+        self.assertEqual(m.etat_miroir_lisible(dict(cfg, panneau_miroir="jamais"), t), "Le miroir est coupe.")
+        # le fil : il ne capture que panneau branche, miroir voulu, panneau allume
+        captures = []
+        m.capturer_miroir = lambda: captures.append(1) or petite
+        m.ETAT["en_marche"] = True
+        m.PANNEAU.update(etat="absent", miroir=None)
+        m.fil_miroir({"panneau_miroir": "toujours"}, tours=2)
+        self.assertEqual(captures, [], "pas de panneau : rien a recopier")
+        m.PANNEAU["etat"] = "connecte"
+        m.fil_miroir({"panneau_miroir": "toujours", "panneau_contenu": "eteint"}, tours=2)
+        self.assertEqual(captures, [], "panneau eteint : rien")
+        m.fil_miroir({"panneau_miroir": "jamais"}, tours=2)
+        self.assertEqual(captures, [])
+        m.fil_miroir({"panneau_miroir": "toujours"}, tours=2)
+        self.assertEqual(len(captures), 2)
+        self.assertIs(m.PANNEAU["miroir"]["img"], petite)
+        self.assertAlmostEqual(m.PANNEAU["miroir"]["t"], time.time(), delta=5)
+        def rate():
+            raise OSError("ecran verrouille")
+        m.capturer_miroir = rate
+        m.PANNEAU["miroir"] = None
+        m.fil_miroir({"panneau_miroir": "toujours"}, tours=1)
+        self.assertIsNone(m.PANNEAU["miroir"], "une capture ratee ne casse rien")
+        # le fil des sources regarde le premier plan en mode jeux et plein ecran, pas en toujours ni jamais
+        vus = []
+        m.premier_plan = lambda: vus.append(1) or ("eldenring.exe", "c:\\steamapps\\common\\er\\eldenring.exe", True)
+        m.fenetre_active = lambda: "eldenring.exe | elden ring"
+        m.lire_discord = lambda titres=None: None
+        m.demarrer_audio = lambda cfg: None
+        m.arreter_audio = lambda: None
+        sources = {"panneau_contenu": "ambiance", "panneau_fl": False, "panneau_discord": False}
+        m.PANNEAU.update(etat="connecte", jeu_vu=0)
+        m.veiller_sources_panneau(sources, tours=1, maintenant=7000.0)
+        self.assertEqual((len(vus), m.PANNEAU["jeu_vu"]), (1, 7000.0))
+        m.veiller_sources_panneau(dict(sources, panneau_miroir="plein_ecran"), tours=1, maintenant=7001.0)
+        self.assertEqual(len(vus), 2)
+        m.veiller_sources_panneau(dict(sources, panneau_miroir="toujours"), tours=1, maintenant=7002.0)
+        m.veiller_sources_panneau(dict(sources, panneau_miroir="jamais"), tours=1, maintenant=7003.0)
+        self.assertEqual(len(vus), 2, "toujours ou jamais : rien a regarder")
+        m.PANNEAU["etat"] = "absent"
+        m.veiller_sources_panneau(sources, tours=1, maintenant=7004.0)
+        self.assertEqual(len(vus), 2, "pas de panneau : il ne regarde rien")
+        if os.name != "nt":
+            self.assertIsNone(vrais["premier_plan"](), "hors de Windows : rien")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
     def test_les_mises_a_jour_sur_le_panneau(self):
         # « rajoute un effet sur le panneau lorsqu'une maj est en cours sur Machi Tool »
         m = self.m
