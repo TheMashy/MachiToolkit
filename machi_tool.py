@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.114.0"
+VERSION = "1.115.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -14693,23 +14693,105 @@ def veiller_sources_panneau(cfg=None, tours=None, maintenant=None):
             time.sleep(1.0)
 
 
+PANNEAU_SACCADE_S = 1.5 * PANNEAU_PAS_S   # deux images trop espacees : l'oeil voit l'a-coup
+PANNEAU_RAPPORT_S = 300                  # le journal dit les saccades au plus toutes les 5 min
+FIGER_APRES_S = 60                       # la memoire du demarrage, figee une minute apres le lancement
+_RAMASSE = {"debut": 0.0, "max_ms": 0.0}
+
+
+def _mesurer_ramasse_miettes(phase, info):
+    """Les passages complets du ramasse-miettes de Python : ils arretent TOUS
+    les fils le temps de parcourir la memoire -- une saccade, s'ils sont longs."""
+    if info.get("generation") != 2:
+        return
+    if phase == "start":
+        _RAMASSE["debut"] = time.perf_counter()
+    else:
+        _RAMASSE["max_ms"] = max(_RAMASSE["max_ms"], (time.perf_counter() - _RAMASSE["debut"]) * 1000)
+
+
+def figer_la_memoire():
+    """Une minute apres le lancement, tout ce que le demarrage a construit
+    (l'interface, Jarvis, les reglages...) ne bougera plus guere : le
+    ramasse-miettes cesse de le reparcourir a chaque passage complet. Ses
+    pauses -- qui figeaient le panneau -- ne portent plus que sur le neuf.
+    Rend le nombre d'objets figes."""
+    import gc
+    gc.collect()
+    gc.freeze()
+    n = gc.get_freeze_count()
+    print("Memoire du demarrage figee : %d objets que le ramasse-miettes ne reparcourt plus." % n)
+    return n
+
+
+def presser_ce_fil():
+    """Le fil du panneau passe devant les autres fils de Windows : reveille a
+    l'heure, il n'attend pas qu'un autre ait fini son tour. True si c'est fait."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentThread.restype = ctypes.c_void_p
+        k.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        return bool(k.SetThreadPriority(k.GetCurrentThread(), 2))      # THREAD_PRIORITY_HIGHEST
+    except Exception:
+        return False
+
+
+def compter_saccades(envois, maintenant, fenetre_s=60.0):
+    """Les saccades de la derniere minute : deux images envoyees a plus d'une
+    image et demie d'intervalle (`envois` : leurs heures de depart)."""
+    recents = [x for x in envois if x > maintenant - fenetre_s]
+    return sum(1 for a, b in zip(recents, recents[1:]) if b - a > PANNEAU_SACCADE_S)
+
+
 def piloter_panneau(cfg=None, tours=None):
     """Le fil du panneau : l'image du moment (l'apercu la montre, branche ou
     non), et, une carte trouvee, la luminosite puis une image toutes les
     1/30 s -- toutes, meme identiques : « j'ai l'impression que c'est pas a
     30 fps » ; le debit tenu s'affiche. Une liaison perdue (debranchee,
     reprise par Arduino) se recherche seule ; une image qui ne passe pas a
-    temps (la carte deborde), elle, ne coupe rien. `tours` : pour les tests."""
+    temps (la carte deborde), elle, ne coupe rien. `tours` : pour les tests.
+
+    « Il y a toujours un probleme de stutter, ce n'est pas a 30 fps constant. »
+    Le debit moyen y etait, pas la regularite : l'image se calculait a
+    l'echeance, puis partait -- quelques millisecondes plus tard, ou bien plus
+    quand un autre fil de Machi Tool tenait la main. Maintenant chaque image
+    se calcule AVANT son echeance, pour l'instant ou elle sera montree ; a
+    l'heure dite, il ne reste qu'a l'envoyer. Le fil passe devant les autres
+    (Windows), et Python lui rend la main plus vite. Les saccades qui restent
+    se comptent : la page les affiche, le journal dit d'ou elles viennent."""
     cfg = CFG if cfg is None else cfg
     lien, lum, recherche, bilan = None, None, 0.0, 0.0
     n, prochaine, envois = 0, time.monotonic(), deque(maxlen=PANNEAU_IPS * 3)
-    durees = deque(maxlen=PANNEAU_IPS * 2)      # (calcul, envoi) en s : qui ralentit ?
+    durees = deque(maxlen=PANNEAU_IPS * 2)      # (calcul, envoi, retard au reveil) en s : qui ralentit ?
+    departs = deque(maxlen=PANNEAU_IPS * 70)    # les heures de depart de la derniere minute : les saccades
+    rapport = time.monotonic() + 60.0
+    if tours is None:
+        import gc
+        presser_ce_fil()
+        sys.setswitchinterval(min(sys.getswitchinterval(), 0.002))     # un fil qui attend la main l'a vite
+        if _mesurer_ramasse_miettes not in gc.callbacks:
+            gc.callbacks.append(_mesurer_ramasse_miettes)
+
+    def jusqu_a_l_echeance():
+        """Dort jusqu'a l'echeance de cette image ; rend le retard au reveil (s)."""
+        if tours is not None:
+            return 0.0
+        reste = prochaine - time.monotonic()
+        if reste > 0:
+            time.sleep(reste)
+        return max(0.0, time.monotonic() - prochaine)
     while ETAT["en_marche"] and (tours is None or n < tours):
         n += 1
         contenu = cfg.get("panneau_contenu", "horloge")
         contenu = contenu if contenu in PANNEAU_CONTENUS else "horloge"
+        attendu = False
         try:
-            t, debut = time.time(), time.perf_counter()
+            debut = time.perf_counter()
+            # l'image de l'echeance qui vient, calculee avant elle, pour son instant a elle
+            t = time.time() + max(0.0, prochaine - time.monotonic())
             img = image_du_panneau(cfg, contenu, t)
             PANNEAU["image"] = img
             if not cfg.get("panneau_actif", True):
@@ -14726,8 +14808,10 @@ def piloter_panneau(cfg=None, tours=None):
                         lum = None
                         envois.clear()
                         durees.clear()
+                        departs.clear()
                         PANNEAU.update(etat="connecte", port=port, envoyees=0, ips=0.0, _recu=b"",
-                                       carte_recues=None, carte_jetees=None, croquis=version_croquis(lien))
+                                       carte_recues=None, carte_jetees=None, croquis=version_croquis(lien),
+                                       saccades=0)
                         bilan = time.monotonic() + PANNEAU_BILAN_S
                         print("Panneau LED : connecte sur %s" % port)
                     except Exception:
@@ -14739,32 +14823,47 @@ def piloter_panneau(cfg=None, tours=None):
                 pass                               # Machi Tool s'en va : le panneau reste noir
             elif lien is not None:
                 voulue = 0 if contenu == "eteint" else int(max(0, min(255, cfg.get("panneau_luminosite", 64))))
+                donnees = trame_image(rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)),
+                                             balance_panneau(cfg)), PANNEAU.get("croquis"))
+                calcul = time.perf_counter()
+                retard = jusqu_a_l_echeance()      # l'heure dite : il ne reste qu'a l'envoyer
+                attendu = True
+                depart = time.perf_counter()
                 if voulue != lum:
                     with PANNEAU_VERROU:
                         lien.write(b"MB" + bytes([voulue]))
                     lum = voulue
-                donnees = rgb565(tourner_panneau(img, cfg.get("panneau_rotation", 0)), balance_panneau(cfg))
-                calcul = time.perf_counter()
                 try:
                     with PANNEAU_VERROU:
-                        lien.write(trame_image(donnees, PANNEAU.get("croquis")))
+                        lien.write(donnees)
                         if (PANNEAU.get("croquis") or 1) >= 3 and time.monotonic() >= bilan:
                             lien.write(b"MS")
                             bilan = time.monotonic() + PANNEAU_BILAN_S
                     lire_bilan_carte(lien)
                     PANNEAU["envoyees"] += 1
                     envois.append(time.monotonic())
+                    departs.append(time.monotonic())
                 except Exception as e:
                     if type(e).__name__ != "SerialTimeoutException":
                         raise
                     PANNEAU["perdues"] = PANNEAU.get("perdues", 0) + 1   # la carte suit moins vite
-                durees.append((calcul - debut, time.perf_counter() - calcul))
+                durees.append((calcul - debut, time.perf_counter() - depart, retard))
                 PANNEAU["calcul_ms"] = 1000 * max(d[0] for d in durees)
                 PANNEAU["envoi_ms"] = 1000 * max(d[1] for d in durees)
+                PANNEAU["reveil_ms"] = 1000 * max(d[2] for d in durees)
                 if len(envois) >= 2 and envois[-1] > envois[0]:
                     recentes = [x for x in envois if x > time.monotonic() - 2.0]
                     PANNEAU["ips"] = (len(recentes) - 1) / max(1e-3, recentes[-1] - recentes[0]) \
                         if len(recentes) >= 2 else 0.0
+                PANNEAU["saccades"] = compter_saccades(departs, time.monotonic())
+                if tours is None and time.monotonic() >= rapport:
+                    rapport = time.monotonic() + PANNEAU_RAPPORT_S
+                    if PANNEAU["saccades"]:
+                        print("Panneau LED : %d saccade(s) la derniere minute -- reveil en retard jusqu'a %.0f ms, "
+                              "calcul jusqu'a %.0f ms, envoi jusqu'a %.0f ms, ramasse-miettes jusqu'a %.0f ms"
+                              % (PANNEAU["saccades"], PANNEAU["reveil_ms"], PANNEAU["calcul_ms"],
+                                 PANNEAU["envoi_ms"], _RAMASSE["max_ms"]))
+                    _RAMASSE["max_ms"] = 0.0
         except Exception as e:
             print("Panneau LED : liaison perdue (%s)" % type(e).__name__)
             try:
@@ -14779,11 +14878,10 @@ def piloter_panneau(cfg=None, tours=None):
             # un rendez-vous fixe toutes les 1/30 s, pas « 1/30 s apres le
             # travail » : sinon 30 i/s deviendraient 27. En retard (une
             # recherche de port), on repart de maintenant sans rattraper.
+            if not attendu:
+                jusqu_a_l_echeance()
             prochaine += PANNEAU_PAS_S
-            reste = prochaine - time.monotonic()
-            if reste > 0:
-                time.sleep(reste)
-            else:
+            if prochaine < time.monotonic():
                 prochaine = time.monotonic()
     PANNEAU["lien"] = None
     if lien is not None:
@@ -14831,6 +14929,11 @@ def etat_panneau_lisible():
         ips = float(PANNEAU.get("ips") or 0.0)
         texte = ("Branche sur %s  ·  %.0f im/s (reglee %d)" % (port, ips, PANNEAU_IPS) if ips
                  else "Branche sur %s" % port)
+        saccades = PANNEAU.get("saccades")
+        if ips and saccades is not None:
+            # « ce n'est pas a 30 fps constant » : le debit moyen ne dit pas la regularite
+            texte += "  ·  %s" % ("aucune saccade" if not saccades else
+                                  "%d saccade%s la derniere minute" % (saccades, "s" if saccades > 1 else ""))
         jetees = PANNEAU.get("carte_jetees")
         if jetees:
             # depuis que la carte a demarre : le transfert USB abime-t-il des images ?
@@ -14840,12 +14943,17 @@ def etat_panneau_lisible():
             texte += ("\nLa carte a un ancien croquis (version %d) : televerse carte/machi_panneau/"
                       "machi_panneau.ino (version %d) : images controlees, et noir quand le PC s'eteint."
                       % (PANNEAU["croquis"], PANNEAU_CROQUIS))
-        elif ips and ips < PANNEAU_IPS * 0.8:
+        elif ips and (ips < PANNEAU_IPS * 0.8 or (saccades or 0) >= 10):
             # « ca tombe a 5 fps parfois » : qui ralentit, la carte ou le PC ?
             calcul, envoi = float(PANNEAU.get("calcul_ms") or 0), float(PANNEAU.get("envoi_ms") or 0)
-            texte += ("\nC'est la carte qui suit mal : une image met jusqu'a %.0f ms a partir." % envoi
-                      if envoi >= calcul else
-                      "\nC'est le PC qui ralentit : une image met jusqu'a %.0f ms a se faire." % calcul)
+            reveil = float(PANNEAU.get("reveil_ms") or 0)
+            if reveil > max(calcul, envoi):
+                texte += ("\nC'est Windows qui le reveille en retard : jusqu'a %.0f ms apres l'heure "
+                          "(un programme qui prend tout le processeur ?)." % reveil)
+            else:
+                texte += ("\nC'est la carte qui suit mal : une image met jusqu'a %.0f ms a partir." % envoi
+                          if envoi >= calcul else
+                          "\nC'est le PC qui ralentit : une image met jusqu'a %.0f ms a se faire." % calcul)
         return texte, VIF
     if e == "occupe":
         return ("%s est pris par un autre programme (le Serial Monitor d'Arduino, ou test_panneau.py) : "
@@ -21981,6 +22089,10 @@ def lancer():
     JARVIS_CROCHETS["ouvrir_panneau"] = lambda: demande_ouverture.set()
     sans_faute("Jarvis", demarrer_jarvis, CFG)
     sans_faute("Taches de Jarvis", reprendre_taches, CFG)
+    # le panneau a 30 images/s : la memoire du demarrage, figee (voir figer_la_memoire)
+    figer = threading.Timer(FIGER_APRES_S, sans_faute, args=("Memoire figee", figer_la_memoire))
+    figer.daemon = True                    # quitter dans la minute ne l'attend pas
+    figer.start()
     # le raccourci Ctrl+Maj+J : pose a chaque lancement (il n'etait pose qu'a
     # l'installation, et une mise a jour ne repasse pas par la)
     sans_faute("Raccourci de Jarvis", poser_raccourci_jarvis)

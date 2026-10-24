@@ -3088,7 +3088,8 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("version 1", m.etat_panneau_lisible()[0])
         m.PANNEAU.update(croquis=2)
         self.assertIn("ancien croquis (version 2)", m.etat_panneau_lisible()[0], "la v2 : passer a la v3")
-        m.PANNEAU.update(croquis=m.PANNEAU_CROQUIS, ips=5.0, calcul_ms=3.0, envoi_ms=180.0, carte_jetees=None)
+        m.PANNEAU.update(croquis=m.PANNEAU_CROQUIS, ips=5.0, calcul_ms=3.0, envoi_ms=180.0, carte_jetees=None,
+                         saccades=None, reveil_ms=0.0)
         self.assertIn("la carte qui suit mal", m.etat_panneau_lisible()[0])
         m.PANNEAU.update(calcul_ms=190.0, envoi_ms=4.0)
         self.assertIn("le PC qui ralentit", m.etat_panneau_lisible()[0])
@@ -4842,6 +4843,68 @@ class DansMachiTool(unittest.TestCase):
         m.piloter_panneau(cfg, tours=1)
         self.assertEqual(m.PANNEAU["etat"], "absent")
         self.assertIn("Je la cherche", m.etat_panneau_lisible()[0])
+
+    def test_les_saccades_du_panneau(self):
+        # « il y a toujours un probleme de stutter, ce n'est pas a 30 fps constant, beaucoup de stutters »
+        m = self.m
+        sauve = {k: m.PANNEAU.get(k) for k in ("etat", "port", "ips", "croquis", "saccades", "calcul_ms", "envoi_ms",
+                                                "reveil_ms", "carte_jetees")}
+        self.addCleanup(lambda: m.PANNEAU.update(sauve))
+        pas = m.PANNEAU_PAS_S
+        regulier = [k * pas for k in range(60)]
+        self.assertEqual(m.compter_saccades(regulier, 60 * pas), 0)
+        accroche = regulier[:20] + [x + 0.03 for x in regulier[20:]]          # une image partie 30 ms trop tard
+        self.assertEqual(m.compter_saccades(accroche, 60 * pas), 1)
+        self.assertEqual(m.compter_saccades(accroche, 100.0), 0, "plus d'une minute : oubliee")
+        self.assertFalse(m.presser_ce_fil() if m.os.name != "nt" else False, "hors de Windows : rien a faire")
+        # la page : le debit ET la regularite ; et, s'il y en a beaucoup, d'ou elles viennent
+        m.PANNEAU.update(etat="connecte", port="COM4", ips=30.0, croquis=m.PANNEAU_CROQUIS, carte_jetees=None,
+                         saccades=0, calcul_ms=4.0, envoi_ms=9.0, reveil_ms=1.0)
+        self.assertEqual(m.etat_panneau_lisible()[0], "Branche sur COM4  ·  30 im/s (reglee 30)  ·  aucune saccade")
+        m.PANNEAU["saccades"] = 3
+        self.assertIn("3 saccades la derniere minute", m.etat_panneau_lisible()[0])
+        self.assertNotIn("\n", m.etat_panneau_lisible()[0], "quelques-unes : pas d'explication")
+        m.PANNEAU.update(saccades=25, reveil_ms=40.0)
+        self.assertIn("Windows qui le reveille en retard", m.etat_panneau_lisible()[0])
+        m.PANNEAU.update(reveil_ms=1.0, envoi_ms=60.0)
+        self.assertIn("la carte qui suit mal", m.etat_panneau_lisible()[0])
+        # le ramasse-miettes : ses passages complets se mesurent, et la memoire du demarrage se fige
+        import gc
+        m._RAMASSE["max_ms"] = 0.0
+        m._mesurer_ramasse_miettes("start", {"generation": 2})
+        time.sleep(0.01)
+        m._mesurer_ramasse_miettes("stop", {"generation": 2})
+        m._mesurer_ramasse_miettes("start", {"generation": 0})
+        self.assertGreaterEqual(m._RAMASSE["max_ms"], 9, "un passage complet de 10 ms, compte")
+        self.assertGreater(m.figer_la_memoire(), 1000)
+        self.addCleanup(gc.unfreeze)
+        self.assertGreater(gc.get_freeze_count(), 1000)
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_le_panneau_calcule_l_image_pour_son_echeance(self):
+        # l'image se calcule avant l'heure, pour l'instant ou elle sera montree ; a l'heure, elle part
+        import numpy as np
+        m = self.m
+        vrais = (m.trouver_panneau, m.ouvrir_panneau, m.image_du_panneau)
+        self.addCleanup(lambda: (setattr(m, "trouver_panneau", vrais[0]), setattr(m, "ouvrir_panneau", vrais[1]),
+                                 setattr(m, "image_du_panneau", vrais[2])))
+        ordre = []
+
+        class Carte:
+            def write(self, octets):
+                ordre.append(("envoi", octets[:2]))
+
+            def close(self):
+                pass
+        m.trouver_panneau = lambda: "COM9"
+        m.ouvrir_panneau = lambda p: Carte()
+        m.image_du_panneau = lambda cfg, contenu, t: ordre.append(("calcul", t)) or np.zeros((64, 64, 3), np.uint8)
+        m.PANNEAU.update(etat="absent", port=None, envoyees=0)
+        m.piloter_panneau({"panneau_actif": True, "panneau_contenu": "horloge"}, tours=3)
+        quoi = [o[0] for o in ordre if o[0] == "calcul" or o[1] != b"MB"]
+        self.assertEqual(quoi, ["calcul", "envoi", "calcul", "envoi", "calcul", "envoi"],
+                         "chaque image : calculee, puis envoyee")
+        self.assertIn("saccades", m.PANNEAU)
 
     def test_l_agenda_synchro_meme_hors_ligne(self):
         # « fait en sorte que l'agenda soit synchro sur brain debugger »
