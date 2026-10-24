@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.118.0"
+VERSION = "1.119.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -361,7 +361,7 @@ CONFIG_DEFAUT = {
     "panneau_fl": True,
     # « a screen replication mode, especially when playing » : "jeux", "plein_ecran", "toujours", "jamais"
     "panneau_miroir": "jeux",
-    "panneau_miroir_style": "image",  # ou "couleurs" : tout en couleurs floues
+    "panneau_miroir_style": "couleurs",  # tout en couleurs fondues ; ou "image" : l'image au milieu
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -500,7 +500,7 @@ CONFIG_DEFAUT = {
     "routines_lumiere": [],
 
     # Mises a jour depuis les publications GitHub du depot.
-    "config_version": 6,              # sert aux migrations, voir charger_config
+    "config_version": 7,              # sert aux migrations, voir charger_config
     "derniere_version": "",           # la version du dernier demarrage : dit au
                                       # retour qu'une mise a jour est passee, et
                                       # qu'il ne s'agissait pas d'un plantage
@@ -759,7 +759,13 @@ def charger_config():
     # panneau etait coche par defaut, donc ecrit dans chaque fichier. Une fois.
     if enregistre and entier(enregistre.get("config_version", 1), 1) < 6:
         cfg["jarvis_panneau"] = False
-    cfg["config_version"] = 6
+    # Version 7 : « make sure my game is not stuttering [...] it can be a blend
+    # of colors » -- le miroir passe aux couleurs fondues. « image » etait le
+    # defaut de la veille, ecrit dans chaque fichier : on ne change que lui.
+    if enregistre and entier(enregistre.get("config_version", 1), 1) < 7 \
+            and cfg.get("panneau_miroir_style") == "image":
+        cfg["panneau_miroir_style"] = "couleurs"
+    cfg["config_version"] = 7
     """
     ET ON SE SOUVIENT DE LA VERSION QU'ON ETAIT LA FOIS D'AVANT.
 
@@ -14736,17 +14742,29 @@ def image_de_l_ecran(e, t, duree, dessous=None):
 # panneau recopie l'ecran ou il se joue : reduit a 64 de large, a sa
 # proportion (64 x 36 pour du 16/9), au milieu, et au-dessus et en dessous
 # ses propres couleurs, floues et assombries -- ou tout en couleurs floues
-# (panneau_miroir_style). Un fil a lui capture 30 fois par seconde, GDI
-# reduisant l'image lui-meme : le fil du panneau ne fait que la poser.
+# (panneau_miroir_style). Un fil a lui capture, GDI reduisant l'image lui-meme :
+# le fil du panneau ne fait que la poser.
 # Un jeu : son .exe dans un dossier de jeux (Steam, Epic, Riot, GOG...), ou
 # une appli en plein ecran qui n'est ni un navigateur ni un lecteur video.
 # Trois secondes ailleurs (un Alt+Tab) ne l'arretent pas. Un jeu en plein
 # ecran EXCLUSIF peut se derober a la capture : le mode fenetre sans bordure
 # (le reglage par defaut de la plupart des jeux) se recopie.
+#
+# LE JEU D'ABORD. « Make sure my game is not stuttering, you don't have to
+# replicate every frame every time, it can be a blend of colors. » Lire
+# l'ecran fait attendre le compositeur de Windows le temps de la copie : 30
+# captures par seconde, c'etait 30 occasions par seconde de retarder une
+# image du jeu. Le miroir capture donc peu -- 8 fois par seconde au plus,
+# et jamais plus de 3 % du temps (une capture qui coute 20 ms : une toutes
+# les 0,67 s) --, depuis un fil de basse priorite, et le panneau FOND d'une
+# capture a l'autre a sa cadence : les couleurs glissent au lieu de sauter.
 MIROIR_MODES = ("jeux", "plein_ecran", "toujours", "jamais")
-MIROIR_IPS = 30
+MIROIR_CAPTURES_S = 8                   # au plus 8 captures par seconde...
+MIROIR_PART = 0.03                      # ...et jamais plus de 3 % du temps a capturer
+MIROIR_PAUSE_MAX_S = 1.0                # une capture par seconde au moins, quoi qu'elle coute
 MIROIR_GRACE_S = 3.0
-MIROIR_FRAIS_S = 1.0                    # une capture plus vieille : le miroir s'efface
+MIROIR_FRAIS_S = 2.5                    # une capture plus vieille : le miroir s'efface
+MIROIR_FONDU_S = {"couleurs": 0.45, "image": 0.15}   # le temps que le panneau met a rejoindre une capture
 JEUX_DOSSIERS = ("\\steamapps\\common\\", "\\epic games\\", "\\riot games\\", "\\gog galaxy\\games\\",
                  "\\gog games\\", "\\ubisoft game launcher\\games\\", "\\ea games\\", "\\origin games\\",
                  "\\xboxgames\\", "\\itch\\apps\\", "\\games\\", "\\jeux\\")
@@ -14877,11 +14895,21 @@ def capturer_miroir():
     return np.asarray(Image.frombytes("RGB", brut.size, brut.rgb).resize((64, lignes), Image.BOX))
 
 
+def pause_miroir(cout):
+    """Le temps entre deux captures, d'apres ce qu'une capture coute (en s) :
+    1/8 s au mieux, et assez pour que capturer ne prenne jamais plus de 3 %
+    du temps -- mais une par seconde au moins."""
+    return max(1.0 / MIROIR_CAPTURES_S, min(MIROIR_PAUSE_MAX_S, float(cout) / MIROIR_PART))
+
+
 def fil_miroir(cfg=None, tours=None):
     """Le fil du miroir : tant que le panneau recopie l'ecran (branche, et
-    miroir_voulu), une capture toutes les 1/30 s dans PANNEAU["miroir"]."""
+    miroir_voulu), une capture dans PANNEAU["miroir"] -- a la cadence que son
+    cout permet (pause_miroir), le cout lisse sur les dernieres : une capture
+    qui traine (le jeu charge le PC) espace les suivantes."""
     cfg = CFG if cfg is None else cfg
-    n = 0
+    priorite_du_fil(-2)                                 # THREAD_PRIORITY_LOWEST : le jeu passe devant
+    n, cout = 0, None
     while ETAT["en_marche"] and (tours is None or n < tours):
         n += 1
         t = time.time()
@@ -14896,10 +14924,14 @@ def fil_miroir(cfg=None, tours=None):
         except Exception as e:
             signaler_capture("Miroir du panneau", e)
             petite = None
+        duree = time.monotonic() - debut
+        cout = duree if cout is None else 0.7 * cout + 0.3 * duree
+        pause = pause_miroir(cout)
+        PANNEAU.update(miroir_cout_ms=cout * 1000.0, miroir_pause_s=pause)
         if petite is not None:
             PANNEAU["miroir"] = {"img": petite, "t": time.time()}
         if tours is None:
-            time.sleep(max(0.0, 1.0 / MIROIR_IPS - (time.monotonic() - debut)))
+            time.sleep(max(0.0, pause - duree))
 
 
 def _flou(img, passes):
@@ -14937,6 +14969,25 @@ def miroir_du_moment(cfg, t):
     return m
 
 
+def image_miroir_fondue(m, t, style):
+    """Le panneau a l'instant t : la capture `m` mise en forme (une fois par
+    capture), et le panneau qui la rejoint en douceur, a sa cadence a lui --
+    entre deux captures espacees, les couleurs glissent au lieu de sauter."""
+    import numpy as np
+    rendu = PANNEAU.get("miroir_rendu")
+    if rendu is None or rendu[0] is not m or rendu[1] != style:      # chaque capture est un dict neuf
+        rendu = PANNEAU["miroir_rendu"] = (m, style, image_miroir(m["img"], style).astype(float))
+    cible = rendu[2]
+    f = PANNEAU.get("miroir_fondu")
+    if f is None or f["img"].shape != cible.shape or not 0 <= t - f["t"] <= 1.0:
+        lisse = cible                                   # il revient (ou le temps a saute) : d'emblee
+    else:
+        k = 1.0 - math.exp(-(t - f["t"]) / MIROIR_FONDU_S.get(style, 0.3))
+        lisse = f["img"] + (cible - f["img"]) * k
+    PANNEAU["miroir_fondu"] = {"img": lisse, "t": t}
+    return np.clip(np.round(lisse), 0, 255).astype(np.uint8)
+
+
 def etat_miroir_lisible(cfg, maintenant=None):
     """Une ligne pour la page : ce que fait le miroir en ce moment."""
     t = time.time() if maintenant is None else maintenant
@@ -14945,7 +14996,11 @@ def etat_miroir_lisible(cfg, maintenant=None):
         return "Le miroir est coupe."
     if miroir_du_moment(cfg, t) is not None:
         jeu = PANNEAU.get("jeu") if 0 <= t - float(PANNEAU.get("jeu_vu") or 0) <= MIROIR_GRACE_S else None
-        return "Le panneau recopie l'ecran%s." % (" (%s)" % jeu if jeu else "")
+        rythme = ""
+        if PANNEAU.get("miroir_pause_s"):
+            rythme = " -- %.1f captures par seconde, %.0f ms chacune" % (
+                1.0 / PANNEAU["miroir_pause_s"], float(PANNEAU.get("miroir_cout_ms") or 0))
+        return "Le panneau recopie l'ecran%s%s." % (" (%s)" % jeu if jeu else "", rythme)
     return {"jeux": "Pas de jeu au premier plan : le panneau garde son contenu.",
             "plein_ecran": "Ni jeu, ni plein ecran : le panneau garde son contenu.",
             "toujours": "Pas encore de capture (le panneau doit etre branche)."}.get(mode, "")
@@ -15021,7 +15076,7 @@ def image_du_panneau(cfg, contenu, t):
     if fl is not None:
         img = image_fl_studio(t, fl, eclat)
     elif miroir is not None:
-        img = image_miroir(miroir["img"], cfg.get("panneau_miroir_style", "image"))
+        img = image_miroir_fondue(miroir, t, cfg.get("panneau_miroir_style", "couleurs"))
         if eclat is not None:
             img = assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
     elif ecran is not None:
@@ -15285,9 +15340,9 @@ def figer_la_memoire():
     return n
 
 
-def presser_ce_fil():
-    """Le fil du panneau passe devant les autres fils de Windows : reveille a
-    l'heure, il n'attend pas qu'un autre ait fini son tour. True si c'est fait."""
+def priorite_du_fil(niveau):
+    """La priorite Windows du fil qui l'appelle : 2 (THREAD_PRIORITY_HIGHEST),
+    -2 (THREAD_PRIORITY_LOWEST)... True si c'est fait."""
     if os.name != "nt":
         return False
     try:
@@ -15295,9 +15350,15 @@ def presser_ce_fil():
         k = ctypes.WinDLL("kernel32", use_last_error=True)
         k.GetCurrentThread.restype = ctypes.c_void_p
         k.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        return bool(k.SetThreadPriority(k.GetCurrentThread(), 2))      # THREAD_PRIORITY_HIGHEST
+        return bool(k.SetThreadPriority(k.GetCurrentThread(), int(niveau)))
     except Exception:
         return False
+
+
+def presser_ce_fil():
+    """Le fil du panneau passe devant les autres fils de Windows : reveille a
+    l'heure, il n'attend pas qu'un autre ait fini son tour. True si c'est fait."""
+    return priorite_du_fil(2)                                         # THREAD_PRIORITY_HIGHEST
 
 
 def compter_saccades(envois, maintenant, fenetre_s=60.0):
@@ -19385,7 +19446,8 @@ class Panneau:
         c.pack(fill="x", pady=(10, 0))
         # « a screen replication mode, especially when playing »
         self.titre(col, "Le miroir de l'ecran").pack(fill="x", pady=(14, 4))
-        self.texte(col, "Le panneau recopie l'ecran : l'image au milieu, ses couleurs autour. Un jeu en plein ecran "
+        self.texte(col, "Le panneau recopie les couleurs de l'ecran. Le jeu d'abord : quelques captures par seconde, "
+                        "jamais plus de 3 % du temps, et le panneau fond de l'une a l'autre. Un jeu en plein ecran "
                         "exclusif peut se derober a la capture ; en fenetre sans bordure, il se recopie.",
                    BRUME, 8, largeur=380).pack(fill="x")
         self.var_panneau_miroir = tk.StringVar(value=str(self.cfg.get("panneau_miroir", "jeux")))
@@ -19396,8 +19458,8 @@ class Panneau:
             r.pack(fill="x", padx=(self.px(22), 0))
         rangee = tk.Frame(col, bg=NUIT)
         rangee.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
-        self.var_panneau_miroir_style = tk.StringVar(value=str(self.cfg.get("panneau_miroir_style", "image")))
-        for valeur, texte in (("image", "L'image"), ("couleurs", "Les couleurs, floues")):
+        self.var_panneau_miroir_style = tk.StringVar(value=str(self.cfg.get("panneau_miroir_style", "couleurs")))
+        for valeur, texte in (("couleurs", "Les couleurs, fondues"), ("image", "L'image au milieu")):
             r = self.radio(rangee, texte, self.var_panneau_miroir_style, valeur)
             r.configure(command=lambda: self.regler_panneau("panneau_miroir_style"))
             r.pack(side="left", padx=(0, self.px(14)))

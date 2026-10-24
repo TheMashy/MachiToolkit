@@ -126,7 +126,7 @@ class Demarrage(unittest.TestCase):
 
     def test_config_absente(self):
         cfg = self.mt.charger_config()
-        self.assertEqual(cfg["config_version"], 6)
+        self.assertEqual(cfg["config_version"], 7)
 
     def test_config_illisible_ne_tue_pas(self):
         """Une ecriture interrompue laisse du JSON tronque. On repart des
@@ -148,7 +148,7 @@ class Demarrage(unittest.TestCase):
         self.ecrire_config({"config_version": 3, "collecte_titres_complets": False})
         cfg = self.mt.charger_config()
         self.assertTrue(cfg["collecte_titres_complets"])
-        self.assertEqual(cfg["config_version"], 6)
+        self.assertEqual(cfg["config_version"], 7)
         # Et une fois passee, elle ne repasse plus : quelqu'un qui decoche la
         # case ne doit pas la retrouver cochee au lancement suivant.
         self.ecrire_config(dict(cfg, collecte_titres_complets=False))
@@ -165,6 +165,18 @@ class Demarrage(unittest.TestCase):
         self.ecrire_config(dict(cfg, jarvis_panneau=True))
         self.assertTrue(self.mt.charger_config()["jarvis_panneau"])
 
+    def test_la_migration_v7_fond_les_couleurs_du_miroir_une_fois(self):
+        """« Make sure my game is not stuttering [...] it can be a blend of
+        colors » : « image », le defaut de la veille, etait ecrit dans chaque
+        fichier. Il passe aux couleurs fondues une fois ; rechoisi, il reste."""
+        self.ecrire_config({"config_version": 6, "panneau_miroir_style": "image"})
+        cfg = self.mt.charger_config()
+        self.assertEqual(cfg["panneau_miroir_style"], "couleurs")
+        self.ecrire_config(dict(cfg, panneau_miroir_style="image"))
+        self.assertEqual(self.mt.charger_config()["panneau_miroir_style"], "image")
+        self.ecrire_config({"config_version": 5})
+        self.assertEqual(self.mt.charger_config()["panneau_miroir_style"], "couleurs", "jamais choisi : le defaut")
+
     def test_valeurs_de_travers_dans_la_migration(self):
         """`int(cfg.get(...))` levait sur null, sur "" et sur "trois" — en
         plein chemin de demarrage, hors de tout filet."""
@@ -173,7 +185,7 @@ class Demarrage(unittest.TestCase):
                                 "pont_intervalle": mauvaise,
                                 "maj_intervalle_heures": mauvaise})
             cfg = self.mt.charger_config()
-            self.assertEqual(cfg["config_version"], 6, repr(mauvaise))
+            self.assertEqual(cfg["config_version"], 7, repr(mauvaise))
 
     def test_entier(self):
         self.assertEqual(self.mt.entier("7", 3), 7)
