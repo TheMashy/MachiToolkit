@@ -3041,7 +3041,8 @@ class DansMachiTool(unittest.TestCase):
         m.PANNEAU["lien"] = carte                 # le fil tourne encore
         del carte.ecrit[:]
         self.assertTrue(m.eteindre_panneau())
-        self.assertEqual(carte.ecrit, [b"MB\x00", b"MF" + bytes(8192)], "luminosite 0, image noire")
+        self.assertEqual(carte.ecrit, [b"MB\x00", b"MF" + bytes(8192), b"MO"],
+                         "luminosite 0, image noire, et pas d'ambiances au silence (croquis v7)")
         # et le fil n'ecrit plus rien par-dessus
         m.PANNEAU["lien"] = carte
         del carte.ecrit[:]
@@ -3049,9 +3050,127 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(carte.ecrit, [])
         # les deux sorties : quitter Machi Tool et l'arret de Windows
         src = open(m.__file__, encoding="utf-8").read()
-        self.assertEqual(src.count("eteindre_panneau()\n                eteindre_guirlande()"), 1, "l'arret de Windows")
+        self.assertEqual(src.count('if not confier_panneau_a_la_carte() and CFG.get("eteindre_en_partant", True):\n'
+                                   '                eteindre_panneau()'), 1,
+                         "l'arret de Windows : la carte prend le relais, sinon noir")
         self.assertEqual(src.count("eteindre_en_partant()\n                eteindre_guirlande()"), 1,
                          "quitter : noir, sauf pour une mise a jour (voir test_les_mises_a_jour_sur_le_panneau)")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_pc_eteint_la_carte_prend_le_relais(self):
+        # « c'est possible que tu laisses les screen savers meme a l'arret du PC ? » -- « keep only
+        # atmospheric effects » : ses reglages a elle (« MA »), le relais (« MW »), et le noir en quittant (« MO »)
+        m = self.m
+        cles = ("fini", "lien", "confie", "croquis", "etat", "carte_veille", "port", "envoyees")
+        sauve = {k: m.PANNEAU.get(k) for k in cles}
+        sauve_maj = dict(m.MAJ)
+        vrais = {n: getattr(m, n) for n in ("trouver_panneau", "ouvrir_panneau", "version_croquis")}
+        def remettre():
+            for n, f in vrais.items():
+                setattr(m, n, f)
+            m.PANNEAU.update(sauve)
+            m.MAJ.clear()
+            m.MAJ.update(sauve_maj)
+        self.addCleanup(remettre)
+        # la trame : 12 octets et leur somme
+        cfg = {"panneau_rouge": 70, "panneau_vert": 85, "panneau_bleu": 100}
+        t = m.trame_veille(cfg)
+        self.assertEqual(len(t), 16)
+        self.assertEqual(t[:2], b"MA")
+        self.assertEqual(list(t[2:5]), [1, 1, 32], "format 1, actif par defaut, luminosite basse")
+        self.assertEqual(int.from_bytes(t[5:7], "big"), (1 << len(m.ECRANS_AMBIANCES)) - 1, "les dix ambiances")
+        self.assertEqual(int.from_bytes(t[7:9], "big"), int(m.reglages_ecrans(cfg)[1]), "« Chaque ecran reste »")
+        self.assertEqual(int.from_bytes(t[9:11], "big"), 0, "jamais d'arret")
+        self.assertEqual(list(t[11:14]), [70, 85, 100], "la balance du panneau")
+        self.assertEqual(int.from_bytes(t[14:], "big"), m.fletcher16(t[2:14]))
+        t = m.trame_veille(dict(cfg, panneau_veille=False, panneau_veille_sans=["aurore", "neige"], panneau_ecrans_duree=120,
+                                panneau_veille_arret_h=2, panneau_veille_luminosite=200))
+        self.assertEqual(t[3], 0)
+        self.assertEqual(t[4], 96, "jamais au-dessus du plafond de l'USB seul")
+        self.assertEqual(int.from_bytes(t[5:7], "big"), (1 << 10) - 1 - 1 - (1 << 9))
+        self.assertEqual(int.from_bytes(t[7:9], "big"), 120)
+        self.assertEqual(int.from_bytes(t[9:11], "big"), 120, "deux heures, en minutes")
+        self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_luminosite=0))[4], 4)
+        self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_arret_h="n'importe"))[9:11], b"\x00\x00")
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_veille"])
+        self.assertEqual(m.PANNEAU_CROQUIS, 7)
+
+        class Carte:
+            def __init__(self):
+                self.ecrit, self.ferme = [], False
+
+            def write(self, octets):
+                self.ecrit.append(bytes(octets))
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.ferme = True
+        # branchee (croquis v7) : ses reglages une fois, puis a chaque changement
+        carte = Carte()
+        m.trouver_panneau = lambda: "COM7"
+        m.ouvrir_panneau = lambda p: carte
+        m.version_croquis = lambda lien: 7
+        m.PANNEAU.update(etat="absent", port=None, envoyees=0, fini=False, lien=None, confie=False)
+        pilote = {"panneau_actif": True, "panneau_contenu": "horloge", "panneau_luminosite": 64}
+        m.piloter_panneau(pilote, tours=3)
+        genres = [o[:2] for o in carte.ecrit]
+        self.assertEqual(genres, [b"MB", b"MA", b"MG", b"MG", b"MG"])
+        self.assertEqual(carte.ecrit[1], m.trame_veille(pilote))
+        del carte.ecrit[:]
+        pilote["panneau_veille_luminosite"] = 20
+        m.piloter_panneau(pilote, tours=2)
+        self.assertEqual([o[:2] for o in carte.ecrit], [b"MB", b"MA", b"MG", b"MG"],
+                         "un reglage qui change : il repart (et la luminosite, la liaison etant neuve)")
+        self.assertEqual(carte.ecrit[1][4], 20)
+        # ce qu'elle repond
+        class Bavarde(Carte):
+            in_waiting = 14
+
+            def read(self, n):
+                return b"VEILLE 1 1023\n"
+        m.lire_bilan_carte(Bavarde())
+        self.assertEqual(m.PANNEAU["carte_veille"], (1, 1023))
+        m.PANNEAU["etat"] = "connecte"
+        self.assertIn("10 ambiances", m.etat_veille_lisible({}))
+        # decoche en cours de route : au silence, noir
+        carte = Carte()
+        m.ouvrir_panneau = lambda p: carte
+        decoche = dict(pilote)
+        ecrire = carte.write
+        carte.write = lambda o: (ecrire(o), o[:2] == b"MG" and decoche.update(panneau_actif=False))
+        m.piloter_panneau(decoche, tours=2)
+        self.assertEqual([o[:2] for o in carte.ecrit], [b"MB", b"MA", b"MG", b"MO"])
+        self.assertTrue(carte.ferme)
+        # Windows s'arrete : la carte prend le relais, une fois
+        carte = Carte()
+        m.PANNEAU.update(lien=carte, croquis=7, fini=False, confie=False)
+        self.assertTrue(m.confier_panneau_a_la_carte({}))
+        self.assertEqual(carte.ecrit, [m.trame_veille({}) + b"MW"])
+        self.assertTrue(m.PANNEAU["fini"], "et le fil n'ecrit plus par-dessus")
+        self.assertTrue(m.confier_panneau_a_la_carte({}))
+        self.assertEqual(len(carte.ecrit), 1, "QUERYENDSESSION puis ENDSESSION : une fois")
+        for croquis, reglage, pourquoi in ((6, {}, "un ancien croquis ne sait pas"), (7, {"panneau_veille": False}, "decoche")):
+            carte = Carte()
+            m.PANNEAU.update(lien=carte, croquis=croquis, fini=False, confie=False)
+            self.assertFalse(m.confier_panneau_a_la_carte(reglage), pourquoi)
+            self.assertEqual(carte.ecrit, [])
+        m.PANNEAU["lien"] = None
+        self.assertFalse(m.confier_panneau_a_la_carte({}), "pas de carte")
+        # une mise a jour : l'anneau reste, puis le noir (pas les ambiances)
+        carte = Carte()
+        m.PANNEAU.update(lien=carte, fini=False)
+        m.MAJ.update(pose_lancee=True, etat="a_poser")
+        self.assertFalse(m.eteindre_en_partant())
+        self.assertEqual(carte.ecrit, [b"MO"])
+        # ce que la page en dit
+        m.PANNEAU.update(etat="connecte", croquis=6, carte_veille=None)
+        self.assertIn("televerse la v7", m.etat_veille_lisible({}))
+        self.assertIn("s'eteint aussi", m.etat_veille_lisible({"panneau_veille": False}))
+        self.assertIn("Aucune ambiance", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}))
+        m.PANNEAU["etat"] = "absent"
+        self.assertIn("des qu'elle sera branchee", m.etat_veille_lisible({}))
 
     def test_le_panneau_dit_qui_ralentit_et_reconnait_son_croquis(self):
         # « ca tombe a 5 fps parfois, tu pourrais fixer ca ? »
