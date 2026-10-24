@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.119.1"
+VERSION = "1.120.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -362,6 +362,11 @@ CONFIG_DEFAUT = {
     # « a screen replication mode, especially when playing » : "jeux", "plein_ecran", "toujours", "jamais"
     "panneau_miroir": "jeux",
     "panneau_miroir_style": "couleurs",  # tout en couleurs fondues ; ou "image" : l'image au milieu
+    # « the right flux color correction (and a specific panel color correction too) » : voir corriger_miroir
+    "panneau_miroir_filtre": True,       # suivre f.lux comme l'ecran l'affiche
+    "panneau_miroir_filtre_force": 1.0,  # 1 = tel que l'ecran
+    "panneau_miroir_temp": 0.0,          # -1 plus froid, +1 plus chaud : au miroir seul
+    "panneau_miroir_teinte": 0.0,        # -1 vert, +1 magenta
     # sous la date, en boucle : meteo, musique (egaliseur et titre), le bonhomme de la journee
     "panneau_cycle": True,
     # « au pire rajoute tout ca en settings dans le tab panel » : la duree de
@@ -14973,6 +14978,10 @@ def fil_miroir(cfg=None, tours=None):
         pause = pause_miroir(cout)
         PANNEAU.update(miroir_cout_ms=cout * 1000.0, miroir_pause_s=pause)
         if petite is not None:
+            try:
+                petite = corriger_miroir(petite, cfg)   # f.lux, et la balance du miroir
+            except Exception as e:
+                signaler_capture("Couleurs du miroir", e)
             PANNEAU["miroir"] = {"img": petite, "t": time.time()}
         if tours is None:
             time.sleep(max(0.0, pause - duree))
@@ -15003,6 +15012,59 @@ def image_miroir(petite, style="image"):
     y0 = (64 - h) // 2
     img[y0:y0 + h] = petite
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def corriger_miroir(petite, cfg):
+    """La capture telle que l'OEIL la voit a l'ecran, puis reglee pour le panneau.
+
+    « Make sure the video game panel view has the right flux color correction
+    (and add a specific panel color correction too). » La capture lit l'image
+    AVANT la rampe gamma, la ou f.lux (Redshift, SunsetScreen...) la jaunit :
+    le soir, le jeu est ambre a l'ecran et bleu sur le panneau. Quand la rampe
+    se lit, on lui fait subir la rampe elle-meme, pixel par pixel -- ce que
+    l'ecran affiche, au plus juste ; sinon, ce que f.lux doit tenir d'apres
+    ses reglages et l'heure (des kelvins). `panneau_miroir_filtre_force`
+    l'attenue ou l'exagere. Puis la balance du miroir, a lui seul (la
+    guirlande garde la sienne) : chaud/froid, vert/magenta. Windows Night
+    Light ne se lit pas : la balance le rattrape a la main. Rien a corriger :
+    la capture telle quelle."""
+    import numpy as np
+    img = None
+    force = max(0.0, float(cfg.get("panneau_miroir_filtre_force", 1.0) or 0.0))
+    if cfg.get("panneau_miroir_filtre", True) and force > 0:
+        lut = rampe_gamma()
+        if lut and lut[2][255] / max(1, lut[0][255]) < 0.97:      # le bleu est abaisse : un filtre agit
+            tables = np.asarray(lut, float)
+            brut = np.asarray(petite, np.uint8)
+            vue = np.stack([tables[c][brut[..., c]] for c in range(3)], -1)
+            img = brut + (vue - brut) * force
+        else:
+            k = kelvin_attendu_flux()
+            if k:
+                img = np.asarray(petite, float) * np.asarray(gains_kelvin(k, 6500.0, force))
+    temp = float(cfg.get("panneau_miroir_temp", 0.0) or 0.0)
+    teinte = float(cfg.get("panneau_miroir_teinte", 0.0) or 0.0)
+    if temp or teinte:
+        # comme la balance de la guirlande : au plus +-30 %
+        gains = (1.0 + 0.30 * temp + 0.15 * teinte, 1.0 - 0.15 * teinte, 1.0 - 0.30 * temp + 0.15 * teinte)
+        img = (np.asarray(petite, float) if img is None else img) * np.asarray(gains)
+    if img is None:
+        return petite
+    return np.clip(np.round(img), 0, 255).astype(np.uint8)
+
+
+def etat_filtre_miroir(cfg):
+    """Une ligne pour la page : ce que le miroir suit du filtre de lumiere bleue."""
+    if not cfg.get("panneau_miroir_filtre", True):
+        return "Le miroir ne suit pas le filtre de lumiere bleue."
+    d = diag_filtre_ecran(cfg)
+    if d.get("source") == "filtre":
+        return "Filtre lu dans la rampe de l'ecran (~%s K) : le miroir le suit au pixel pres." % d.get("kelvin")
+    if d.get("source") == "flux":
+        return "f.lux tourne, rampe illisible : ~%s K d'apres ses reglages et l'heure." % d.get("kelvin")
+    if d.get("nightlight"):
+        return "Windows Night Light ne se lit pas : rechauffe le miroir a la main (chaud/froid)."
+    return "Pas de filtre de lumiere bleue en ce moment : les couleurs du jeu, telles quelles."
 
 
 def miroir_du_moment(cfg, t):
@@ -19338,7 +19400,8 @@ class Panneau:
         for cle in ("panneau_actif", "panneau_contenu", "panneau_luminosite", "panneau_jarvis",
                     "panneau_rotation", "panneau_rouge", "panneau_vert", "panneau_bleu", "panneau_suit_eclat",
                     "panneau_rdv", "panneau_claude", "panneau_discord", "panneau_maj", "panneau_fl", "panneau_miroir",
-                    "panneau_miroir_style", "panneau_cycle",
+                    "panneau_miroir_style", "panneau_miroir_filtre", "panneau_miroir_filtre_force",
+                    "panneau_miroir_temp", "panneau_miroir_teinte", "panneau_cycle",
                     "meteo_ville",
                     "panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_musique",
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
@@ -19509,6 +19572,28 @@ class Panneau:
             r.pack(side="left", padx=(0, self.px(14)))
         self.txt_miroir = self.texte(col, etat_miroir_lisible(self.cfg), BRUME, 8, largeur=360)
         self.txt_miroir.pack(fill="x", pady=(2, 0), padx=(self.px(22), 0))
+        # « make sure the video game panel view has the right flux color correction (and add a specific
+        # panel color correction too) » : ses couleurs a lui, la guirlande garde les siennes
+        self.texte(col, "Ses couleurs", CRAIE, 9, True).pack(anchor="w", pady=(10, 2), padx=(self.px(22), 0))
+        self.var_panneau_miroir_filtre = tk.IntVar(value=1 if self.cfg.get("panneau_miroir_filtre", True) else 0)
+        c = self.case(col, "Suivre le filtre de lumiere bleue (f.lux) : le jeu jaunit sur le panneau comme a l'ecran",
+                      self.var_panneau_miroir_filtre, lambda: self.regler_panneau("panneau_miroir_filtre"))
+        c.configure(wraplength=self.px(360))
+        c.pack(fill="x", padx=(self.px(22), 0))
+        self.txt_miroir_filtre = self.texte(col, etat_filtre_miroir(self.cfg), BRUME, 8, largeur=360)
+        self.txt_miroir_filtre.pack(fill="x", pady=(2, 6), padx=(self.px(22), 0))
+        couleurs = tk.Frame(col, bg=NUIT)
+        couleurs.pack(fill="x", padx=(self.px(22), 0))
+        for cle, nom, bornes, aide in (
+                ("panneau_miroir_filtre_force", "Force du filtre", (0.0, 2.0),
+                 "1 = tel que l'ecran l'affiche ; moins, le panneau reste plus froid ; plus, plus ambre."),
+                ("panneau_miroir_temp", "Chaud / froid", (-1.0, 1.0),
+                 "Pour le miroir seul : negatif refroidit (bleu), positif rechauffe (ambre). 0 = neutre."),
+                ("panneau_miroir_teinte", "Vert / magenta", (-1.0, 1.0),
+                 "Negatif vire au vert, positif au magenta. 0 = neutre.")):
+            v = self.reglette(couleurs, cle, nom, bornes[0], bornes[1], 0.05, aide)
+            v.trace_add("write", lambda *_, cle=cle, v=v: self._panneau_reglage_bientot(cle, round(float(v.get()), 2)))
+            setattr(self, "var_" + cle, v)
         # « qu'il detecte quand j'ai une notification en attente sur Discord »
         self.var_panneau_discord = tk.IntVar(value=1 if self.cfg.get("panneau_discord", True) else 0)
         c = self.case(col, "Les notifications Discord en attente : une pastille violette en haut a gauche, avec "
@@ -19618,6 +19703,8 @@ class Panneau:
             self.cfg[cle] = getattr(self, "var_" + cle).get()
             if cle == "panneau_miroir" and self.cfg[cle] == "jamais":
                 PANNEAU["miroir"] = None                # coupe : il s'efface tout de suite
+        elif cle == "panneau_miroir_filtre":
+            self.cfg[cle] = bool(self.var_panneau_miroir_filtre.get())
         sauver_config(self.cfg)
         self._peindre_panneau()
 
@@ -19754,6 +19841,7 @@ class Panneau:
         if getattr(self, "txt_miroir", None) is not None:
             try:
                 self.txt_miroir.configure(text=etat_miroir_lisible(self.cfg))
+                self.txt_miroir_filtre.configure(text=etat_filtre_miroir(self.cfg))
             except Exception:
                 pass
         if getattr(self, "txt_discord", None) is not None:

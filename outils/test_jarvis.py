@@ -4366,6 +4366,7 @@ class DansMachiTool(unittest.TestCase):
                 "miroir_fondu", "miroir_cout_ms", "miroir_pause_s")
         sauve = {k: m.PANNEAU.get(k) for k in cles}
         vrais = {n: getattr(m, n) for n in ("_capteur", "_ecran_actif", "_vignette_gdi", "capturer_miroir", "zone_reelle",
+                                            "rampe_gamma", "kelvin_attendu_flux", "diag_filtre_ecran",
                                             "premier_plan", "fenetre_active", "lire_discord", "demarrer_audio",
                                             "arreter_audio")}
         en_marche = m.ETAT.get("en_marche")
@@ -4597,6 +4598,49 @@ class DansMachiTool(unittest.TestCase):
             depart, but = rendu(rouge, style)[2], rendu(bleu, style)[2]
             return (int(m.image_du_panneau(c, "horloge", T + dt)[32, 32, 2]) - depart) / (but - depart)
         self.assertGreater(chemin_fait("image"), chemin_fait("couleurs") + 0.2, "l'image rejoint plus vite que les couleurs")
+        # « the right flux color correction (and a specific panel color correction too) »
+        blanc = np.full((36, 64, 3), 200, np.uint8)
+        blanc[0, 0] = (10, 100, 250)
+        m.rampe_gamma = lambda: None
+        m.kelvin_attendu_flux = lambda: None
+        self.assertIs(m.corriger_miroir(blanc, {}), blanc, "pas de filtre, pas de balance : la capture telle quelle")
+        x = np.arange(256)
+        flux = [list(x), [int(v * 0.8) for v in x], [int(v * 0.5) for v in x]]   # ce que f.lux pose le soir
+        m.rampe_gamma = lambda: flux
+        vue = m.corriger_miroir(blanc, {})
+        self.assertEqual(vue[5, 5].tolist(), [200, 160, 100], "la rampe de l'ecran, au pixel pres")
+        self.assertEqual(vue[0, 0].tolist(), [10, 80, 125])
+        self.assertEqual(blanc[5, 5].tolist(), [200, 200, 200], "la capture elle-meme n'est pas touchee")
+        self.assertEqual(m.corriger_miroir(blanc, {"panneau_miroir_filtre_force": 0.5})[5, 5].tolist(), [200, 180, 150],
+                         "la force : a mi-chemin")
+        self.assertEqual(m.corriger_miroir(blanc, {"panneau_miroir_filtre_force": 1.5})[5, 5].tolist(), [200, 140, 50])
+        self.assertIs(m.corriger_miroir(blanc, {"panneau_miroir_filtre": False}), blanc, "decoche : rien")
+        self.assertIs(m.corriger_miroir(blanc, {"panneau_miroir_filtre_force": 0}), blanc)
+        m.rampe_gamma = lambda: [list(x), list(x), list(x)]
+        self.assertIs(m.corriger_miroir(blanc, {}), blanc, "une rampe neutre, f.lux absent : rien")
+        m.kelvin_attendu_flux = lambda: 3400.0
+        chaud = m.corriger_miroir(blanc, {})[5, 5].tolist()
+        self.assertGreater(chaud[0], chaud[2] + 40, "rampe illisible, f.lux tourne : ce qu'il doit tenir (3400 K)")
+        m.kelvin_attendu_flux = lambda: None
+        r, v, b = m.corriger_miroir(blanc, {"panneau_miroir_temp": 1.0})[5, 5].tolist()
+        self.assertTrue(r == 255 and b == 140 and v == 200, "chaud : plus de rouge, moins de bleu")
+        r, v, b = m.corriger_miroir(blanc, {"panneau_miroir_teinte": -1.0})[5, 5].tolist()
+        self.assertTrue(v == 230 and r == b == 170, "vert")
+        m.rampe_gamma = lambda: flux
+        r, v, b = m.corriger_miroir(blanc, {"panneau_miroir_temp": -0.5})[5, 5].tolist()
+        self.assertEqual((r, v, b), (170, 160, 115), "le filtre, puis la balance du miroir")
+        self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir_filtre"], True)
+        self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir_filtre_force"], 1.0)
+        self.assertEqual((m.CONFIG_DEFAUT["panneau_miroir_temp"], m.CONFIG_DEFAUT["panneau_miroir_teinte"]), (0.0, 0.0))
+        # ce que la page en dit
+        for diag, attendu in (({"source": "filtre", "kelvin": 3400}, "au pixel pres"),
+                              ({"source": "flux", "kelvin": 3400}, "rampe illisible"),
+                              ({"source": "nightlight", "nightlight": True}, "a la main"),
+                              ({"source": None}, "telles quelles")):
+            m.diag_filtre_ecran = lambda cfg, diag=diag: diag
+            self.assertIn(attendu, m.etat_filtre_miroir({}))
+        self.assertIn("ne suit pas", m.etat_filtre_miroir({"panneau_miroir_filtre": False}))
+        m.rampe_gamma = lambda: None
         # le jeu d'abord : 8 captures par seconde au plus, jamais plus de 3 % du temps, une par seconde au moins
         self.assertAlmostEqual(m.pause_miroir(0.001), 1 / 8)
         self.assertAlmostEqual(m.pause_miroir(0.012), 0.4)
@@ -4629,6 +4673,14 @@ class DansMachiTool(unittest.TestCase):
         self.assertIn("captures par seconde", m.etat_miroir_lisible({"panneau_miroir": "toujours"}))
         if os.name != "nt":
             self.assertFalse(m.priorite_du_fil(-2), "hors de Windows : rien a faire")
+        m.rampe_gamma = lambda: flux
+        m.capturer_miroir = lambda: blanc
+        m.fil_miroir({"panneau_miroir": "toujours"}, tours=1)
+        self.assertEqual(m.PANNEAU["miroir"]["img"][5, 5].tolist(), [200, 160, 100], "le fil pose la capture corrigee")
+        m.rampe_gamma = lambda: 1 / 0
+        m.fil_miroir({"panneau_miroir": "toujours"}, tours=1)
+        self.assertIs(m.PANNEAU["miroir"]["img"], blanc, "une correction qui rate : la capture quand meme")
+        m.rampe_gamma = lambda: None
         def rate():
             raise OSError("ecran verrouille")
         m.capturer_miroir = rate

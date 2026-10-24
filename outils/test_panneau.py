@@ -478,6 +478,17 @@ class AL_Ecran(unittest.TestCase):
             p._peindre_panneau()
             self.assertEqual(p.txt_miroir.cget("text"), "Le miroir est coupe.")
             M.CFG.update(panneau_miroir="jeux", panneau_miroir_style="couleurs")
+            # « the right flux color correction (and add a specific panel color correction too) »
+            self.assertEqual(p.var_panneau_miroir_filtre.get(), 1)
+            p.var_panneau_miroir_filtre.set(0)
+            p.regler_panneau("panneau_miroir_filtre")
+            self.assertFalse(M.CFG["panneau_miroir_filtre"])
+            self.assertIn("ne suit pas", p.txt_miroir_filtre.cget("text"))
+            M.CFG["panneau_miroir_filtre"] = True
+            p.var_panneau_miroir_temp.set(0.35)
+            p.var_panneau_miroir_filtre_force.set(1.2)
+            self.assertEqual((M.CFG["panneau_miroir_temp"], M.CFG["panneau_miroir_filtre_force"]), (0.35, 1.2))
+            M.CFG.update(panneau_miroir_temp=0.0, panneau_miroir_filtre_force=1.0)
             p.var_panneau_claude.set(0)
             p.regler_panneau("panneau_claude")
             self.assertFalse(M.CFG["panneau_claude"])
