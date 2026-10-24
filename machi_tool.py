@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.115.0"
+VERSION = "1.116.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11653,7 +11653,7 @@ PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la 
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
-PANNEAU_CROQUIS = 5                    # carte/machi_panneau/machi_panneau.ino
+PANNEAU_CROQUIS = 6                    # carte/machi_panneau/machi_panneau.ino
 PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
@@ -14939,9 +14939,15 @@ def etat_panneau_lisible():
             # depuis que la carte a demarre : le transfert USB abime-t-il des images ?
             texte += "  ·  %d image%s abimee%s jetee%s par la carte" % ((jetees,) + ("s",) * 3 if jetees > 1
                                                                         else (jetees, "", "", ""))
+            recues = PANNEAU.get("carte_recues")
+            if recues is not None:
+                # « il y a toujours un probleme de stutter » : chaque image jetee est une saccade
+                texte += " sur %d (%s %%)" % (recues + jetees, ("%.1f" % (100.0 * jetees / max(1, recues + jetees)))
+                                              .replace(".", ","))
         if (PANNEAU.get("croquis") or PANNEAU_CROQUIS) < PANNEAU_CROQUIS:
             texte += ("\nLa carte a un ancien croquis (version %d) : televerse carte/machi_panneau/"
-                      "machi_panneau.ino (version %d) : images controlees, et noir quand le PC s'eteint."
+                      "machi_panneau.ino (version %d) : images controlees et lues par blocs (plus d'images "
+                      "abimees, plus de saccades), et noir quand le PC s'eteint."
                       % (PANNEAU["croquis"], PANNEAU_CROQUIS))
         elif ips and (ips < PANNEAU_IPS * 0.8 or (saccades or 0) >= 10):
             # « ca tombe a 5 fps parfois » : qui ralentit, la carte ou le PC ?

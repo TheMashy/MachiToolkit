@@ -79,6 +79,7 @@ struct MatrixPanel_I2S_DMA {
 // Tool), et d'un coup a chaque pause.
 unsigned long horloge_ms = 0;
 inline unsigned long millis() { return horloge_ms; }
+inline void yield() {}
 
 // Le port serie : tout le flux d'un coup, et des « pauses » (plus longues que
 // le delai de la carte) ou readBytes rend ce qu'il a, comme sur la vraie.
@@ -94,7 +95,21 @@ struct FauxSerial {
     while (passees < pauses.size() && pauses[passees].first <= pos) horloge_ms += pauses[passees++].second;
   }
   int available() { franchir(); return (int)(entree.size() - pos); }
-  int read() { franchir(); if (pos >= entree.size()) return -1; int c = entree[pos]; avancer(pos + 1); return c; }
+  long unitaires = 0;           // les lectures octet par octet (la v5 n'en faisait que ca)
+  int read() { unitaires++; franchir(); if (pos >= entree.size()) return -1; int c = entree[pos]; avancer(pos + 1); return c; }
+  // par blocs (la v6) : ce qui est arrive, jusqu'a la prochaine pause -- une pause, c'est un trou
+  // dans le flux : rien n'arrive pendant qu'elle dure ; plus rien a lire, le temps passe aussi
+  size_t read(uint8_t *d, size_t n) {
+    if (passees < pauses.size() && pauses[passees].first <= pos) { horloge_ms += pauses[passees++].second; return 0; }
+    if (pos >= entree.size()) { horloge_ms += 1; return 0; }
+    size_t fin = std::min(entree.size(), pos + n);
+    for (size_t i = passees; i < pauses.size(); i++)
+      if (pauses[i].first > pos && pauses[i].first < fin) { fin = pauses[i].first; break; }
+    size_t k = fin - pos;
+    memcpy(d, entree.data() + pos, k);
+    avancer(fin);
+    return k;
+  }
   size_t readBytes(uint8_t *d, size_t n) {
     franchir();
     size_t fin = std::min(entree.size(), pos + n);
@@ -139,7 +154,7 @@ int main(int argc, char **argv) {
   FILE *o = fopen(argv[2], "wb");
   for (int i = 0; i < 64 * 64; i++) { fputc(panneau->px[i] >> 8, o); fputc(panneau->px[i] & 0xFF, o); }
   fclose(o);
-  printf("%sDESSINS %ld\n", Serial.sortie.c_str(), panneau->dessins - avant);
+  printf("%sUNITAIRES %ld\nDESSINS %ld\n", Serial.sortie.c_str(), Serial.unitaires, panneau->dessins - avant);
   return 0;
 }
 '''
@@ -217,7 +232,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 5", reponses)
+        self.assertIn("MACHI 6", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -307,6 +322,22 @@ class LaCarte(unittest.TestCase):
         donnees = self.image(4)
         panneau, _, _ = self.envoyer(self.M.trame_image(donnees, 3))
         self.assertTrue((panneau == self.attendu(donnees)).all())
+
+    def test_la_v6_lit_les_images_par_blocs(self):
+        # « il y a toujours un probleme de stutter » -- 863 images abimees jetees par la carte : la v5
+        # lisait chaque image octet par octet, la reserve de l'USB debordait. La v6 lit par blocs :
+        # quelques lectures unitaires par image (l'en-tete), plus 8 192.
+        images = [self.image(k) for k in range(10)]
+        flux = b"".join(self.M.trame_image(d, 3) for d in images) + b"MS"
+        panneau, reponses, _ = self.envoyer(flux)
+        self.assertTrue((panneau == self.attendu(images[-1])).all())
+        self.assertIn("STATS 10 0", reponses)
+        unitaires = int(reponses.split("UNITAIRES ", 1)[1].split()[0])
+        self.assertLess(unitaires, 10 * 10, "l'en-tete seulement, pas les pixels")
+        with open(os.path.join(CROQUIS, "machi_panneau.ino"), encoding="utf-8") as f:
+            croquis = f.read()
+        self.assertNotIn("Serial.readBytes", croquis)
+        self.assertIn("setRxBufferSize(65536)", croquis, "huit images de reserve")
 
     def test_la_luminosite_reste_sous_le_plafond(self):
         _, reponses, _ = self.envoyer(b"MB\xff" + self.M.trame_image(self.image(6), 3) + b"MS")

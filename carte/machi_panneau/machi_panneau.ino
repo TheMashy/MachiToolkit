@@ -1,10 +1,10 @@
-// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 5.
+// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 6.
 // Un panneau 64x64 sur une Adafruit MatrixPortal S3, nourri par USB :
 //   "MG" + 8 192 octets (RGB565, poids fort d'abord) + 2 octets de controle
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 5" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 6" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees).
 //
 // v2 : « ca tombe a 5 fps parfois ». La v1 redessinait les 4 096 pixels a
@@ -32,6 +32,16 @@
 // l'alimentation : la carte redemarrait, remontrait la mire, et ainsi de
 // suite.) Pour verifier le cablage et les couleurs, le bouton « Montrer la
 // mire » de Machi Tool l'envoie toujours.
+//
+// v6 : « il y a toujours un probleme de stutter » -- et la page : 30 images/s,
+// mais des centaines d'images abimees jetees par la carte. Chaque image jetee
+// laisse la precedente a l'ecran : c'est la saccade. La v5 lisait chaque image
+// octet par octet (readBytes) : 8 192 lectures, chacune a travers la file de
+// l'USB. Quand le dessin prenait du temps (les ecrans plein panneau changent
+// tous les pixels), la reserve de 16 Ko debordait, et l'USB de l'ESP32 jetait
+// ce qui ne tenait plus : une image amputee. La v6 lit par blocs, avec 64 Ko
+// de reserve (huit images), et n'abandonne une image qu'apres 200 ms sans
+// rien recevoir.
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 
 // Les broches HUB75 de la MatrixPortal S3 (celles d'Adafruit)
@@ -52,6 +62,7 @@ uint8_t affichee[N];           // ce que le panneau montre deja
 bool tout_redessiner = true;
 uint32_t recues = 0, jetees = 0;
 const unsigned long SILENCE_MS = 5000;   // sans image depuis 5 s : noir
+const unsigned long ATTENTE_MS = 200;    // une image sans un octet depuis 200 ms : abandonnee
 unsigned long derniere_ms = 0;
 bool eteint = false;
 
@@ -71,6 +82,26 @@ uint16_t fletcher16(const uint8_t *d, int n) {
   return (b << 8) | a;
 }
 
+// Lit n octets par blocs -- Serial.read(tampon, n) prend tout ce qui est
+// arrive d'un coup, quand readBytes les prenait un par un. Abandonne apres
+// ATTENTE_MS sans rien recevoir. Rend le nombre d'octets lus.
+size_t lire(uint8_t *d, size_t n) {
+  size_t fait = 0;
+  unsigned long vu = millis();
+  while (fait < n) {
+    long k = (long)Serial.read(d + fait, n - fait);
+    if (k > 0 && (size_t)k <= n - fait) {
+      fait += k;
+      vu = millis();
+    } else if (millis() - vu > ATTENTE_MS) {
+      break;
+    } else {
+      yield();
+    }
+  }
+  return fait;
+}
+
 void dessiner() {
   // deux lignes d'office a chaque image : 32 images, et tout le panneau est refait
   const int bande = recues % (H / 2);
@@ -84,9 +115,9 @@ void dessiner() {
 }
 
 void setup() {
-  Serial.setRxBufferSize(16384);
+  Serial.setRxBufferSize(65536);   // huit images de reserve : le temps de dessiner sans rien perdre
   Serial.begin(115200);        // USB : la vitesse est ignoree
-  Serial.setTimeout(200);
+  Serial.setTimeout(ATTENTE_MS);
 
   HUB75_I2S_CFG cfg(W, H, 1, PINS);
   cfg.clkphase = false;        // sans elle, l'image est decalee d'un pixel sur x
@@ -105,16 +136,16 @@ void loop() {
   int genre = Serial.read();
   if (genre == 'B') {
     uint8_t b;
-    if (Serial.readBytes(&b, 1) == 1) panneau->setBrightness8(min(b, PLAFOND));
+    if (lire(&b, 1) == 1) panneau->setBrightness8(min(b, PLAFOND));
   } else if (genre == 'V') {
-    Serial.println("MACHI 5");
+    Serial.println("MACHI 6");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'F' || genre == 'G') {
-    if (Serial.readBytes(image, N) != N) { jetees++; return; }
+    if (lire(image, N) != (size_t)N) { jetees++; return; }
     if (genre == 'G') {
       uint8_t c[2];
-      if (Serial.readBytes(c, 2) != 2 || fletcher16(image, N) != (uint16_t)(c[0] << 8 | c[1])) {
+      if (lire(c, 2) != 2 || fletcher16(image, N) != (uint16_t)(c[0] << 8 | c[1])) {
         jetees++;              // abimee : jetee, le panneau garde la precedente
         return;
       }
