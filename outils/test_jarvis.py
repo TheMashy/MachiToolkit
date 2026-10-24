@@ -4606,42 +4606,44 @@ class DansMachiTool(unittest.TestCase):
         m._ecran_actif = lambda sct: 1
         m._vignette_gdi = gdi
         petite = m.capturer_miroir()
-        self.assertEqual(demandes, [(64, 36, True)], "16/9 : 64 x 36, les octets bruts")
-        self.assertEqual(petite.shape, (36, 64, 3))
+        # « stretch l'ecran sur tout le panneau plutot que de le fit »
+        self.assertEqual(demandes, [(64, 64, True)], "16/9 : etire sur 64 x 64, les octets bruts")
+        self.assertEqual(petite.shape, (64, 64, 3))
         self.assertEqual(tuple(petite[5, 5]), (30, 20, 10), "le rouge d'abord")
         self.assertEqual(tuple(petite[0, 0]), (255, 0, 0))
         FauxCapteur.monitors = [FauxCapteur.monitors[0], {"left": 0, "top": 0, "width": 340, "height": 1000}]
-        self.assertEqual(m.capturer_miroir().shape, (64, 64, 3), "un ecran en hauteur : jamais plus de 64 lignes")
+        self.assertEqual(m.capturer_miroir().shape, (64, 64, 3), "un ecran en hauteur : 64 x 64 aussi")
         FauxCapteur.monitors = [FauxCapteur.monitors[0], {"left": 0, "top": 0, "width": 320, "height": 180}]
         zones = []
         m._vignette_gdi = lambda zone, colonnes, lignes, brut=False: zones.append(zone) or gdi(zone, colonnes, lignes, brut)
         m.zone_reelle = lambda zone=None, windows=None: dict(quatre_k) if zone is None else zone
-        self.assertEqual(m.capturer_miroir().shape, (36, 64, 3))
+        self.assertEqual(m.capturer_miroir().shape, (64, 64, 3))
         self.assertEqual(zones[-1], quatre_k, "tout l'ecran 4K du jeu, pas la zone que mss avait gardee")
         m.zone_reelle = lambda zone=None, windows=None: {"left": 0, "top": 0, "width": 3440, "height": 1440}
-        self.assertEqual(m.capturer_miroir().shape, (27, 64, 3), "un ecran 21/9")
+        self.assertEqual(m.capturer_miroir().shape, (64, 64, 3), "un ecran 21/9 : etire aussi")
         m.zone_reelle = vrais["zone_reelle"]
         m._vignette_gdi = gdi
         try:
             import PIL  # noqa: F401
             m._vignette_gdi = lambda *a, **k: None
             repli = m.capturer_miroir()
-            self.assertEqual(repli.shape, (36, 64, 3), "sans GDI : mss, puis une moyenne par blocs")
+            self.assertEqual(repli.shape, (64, 64, 3), "sans GDI : mss, puis une moyenne par blocs")
             self.assertEqual(tuple(repli[10, 10]), (200, 100, 50))
         except ImportError:
             pass
-        # l'image : la capture au milieu, telle quelle ; au-dessus et en dessous ses couleurs, floues et sombres
-        petite = np.zeros((36, 64, 3), np.uint8)
+        # l'image : etiree sur tout le panneau, nette -- plus de bandes floues au-dessus et en dessous
+        petite = np.zeros((64, 64, 3), np.uint8)
         petite[:, :32] = (240, 40, 40)
         petite[:, 32:] = (40, 40, 240)
+        petite[::7] = (250, 250, 250)                                   # des lignes, pour voir l'etirement
         img = m.image_miroir(petite, "image")
         self.assertEqual(img.shape, (64, 64, 3))
         self.assertEqual(img.dtype, np.uint8)
-        self.assertTrue((img[14:50] == petite).all(), "l'image du jeu, au milieu, nette")
-        self.assertTrue(img[0:14].any() and img[50:].any(), "les bandes ne sont pas noires")
-        self.assertLess(int(img[0:14].max()), 120, "elles sont sombres : le jeu reste devant")
-        self.assertGreater(int(img[3, 4, 0]), int(img[3, 4, 2]), "elles prolongent les couleurs : rouge a gauche")
-        self.assertGreater(int(img[60, 60, 2]), int(img[60, 60, 0]), "bleu a droite")
+        self.assertTrue((img == petite).all(), "la capture 64 x 64, telle quelle, sur tout le panneau")
+        courte = petite[:36]
+        etiree = m.image_miroir(courte, "image")
+        self.assertTrue((etiree == courte[np.arange(64) * 36 // 64]).all(), "36 lignes : etirees en hauteur")
+        self.assertTrue((etiree[0] == courte[0]).all() and (etiree[63] == courte[35]).all(), "du haut jusqu'en bas")
         couleurs = m.image_miroir(petite, "couleurs")
         self.assertEqual(couleurs.shape, (64, 64, 3))
         saut = np.abs(np.diff(couleurs.astype(int), axis=1)).max()
@@ -4649,7 +4651,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertGreater(int(couleurs[32, 2, 0]), int(couleurs[32, 2, 2]))
         self.assertGreater(int(couleurs[32, 61, 2]), int(couleurs[32, 61, 0]))
         large = m.image_miroir(np.full((27, 64, 3), 90, np.uint8))
-        self.assertTrue((large[18:45] == 90).all(), "21/9 : 27 lignes, au milieu aussi")
+        self.assertTrue((large == 90).all(), "21/9 : etire aussi, pas de bandes")
         # sur le panneau : devant l'horloge et les ecrans, sous les pastilles ; une capture vieille s'efface
         t = 1_800_000_000.0
         cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
@@ -4657,13 +4659,13 @@ class DansMachiTool(unittest.TestCase):
         m.PANNEAU.update(fl=None, discord=None, ecran=None, jeu_vu=0, plein_ecran_vu=0, miroir_rendu=None,
                          miroir_fondu=None, miroir_pause_s=None, miroir={"img": petite, "t": t - 0.05})
         horloge = m.image_du_panneau(cfg, "horloge", t)
-        self.assertFalse((horloge[14:50] == petite).all(), "pas de jeu : l'horloge")
+        self.assertFalse((horloge == petite).all(), "pas de jeu : l'horloge")
         toujours = dict(cfg, panneau_miroir="toujours")
-        self.assertTrue((m.image_du_panneau(toujours, "horloge", t)[14:50] == petite).all(), "le miroir")
-        self.assertTrue((m.image_du_panneau(toujours, "ambiance", t)[14:50] == petite).all(), "quel que soit le contenu")
+        self.assertTrue((m.image_du_panneau(toujours, "horloge", t) == petite).all(), "le miroir")
+        self.assertTrue((m.image_du_panneau(toujours, "ambiance", t) == petite).all(), "quel que soit le contenu")
         self.assertFalse(m.image_du_panneau(toujours, "eteint", t).any(), "eteint reste eteint")
         m.PANNEAU.update(jeu_vu=t - 1, jeu="eldenring.exe")
-        self.assertTrue((m.image_du_panneau(cfg, "horloge", t)[14:50] == petite).all(), "un jeu au premier plan : le miroir")
+        self.assertTrue((m.image_du_panneau(cfg, "horloge", t) == petite).all(), "un jeu au premier plan : le miroir")
         self.assertIn("eldenring.exe", m.etat_miroir_lisible(cfg, t))
         m.PANNEAU["discord"] = 2
         self.assertTrue((m.image_du_panneau(cfg, "horloge", t)[0:9, 0:14] == m.DISCORD_VIOLET).all(axis=2).any(),
@@ -4672,7 +4674,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.image_du_panneau(dict(cfg, panneau_miroir="jamais"), "horloge", t).tolist(), horloge.tolist(),
                          "jamais : l'horloge, meme en jouant")
         m.PANNEAU["miroir"]["t"] = t - m.MIROIR_FRAIS_S - 0.5
-        self.assertFalse((m.image_du_panneau(cfg, "horloge", t)[14:50] == petite).all(), "une capture figee ne reste pas")
+        self.assertFalse((m.image_du_panneau(cfg, "horloge", t) == petite).all(), "une capture figee ne reste pas")
         self.assertIn("garde son contenu", m.etat_miroir_lisible(cfg, t + 10))
         self.assertEqual(m.etat_miroir_lisible(dict(cfg, panneau_miroir="jamais"), t), "Le miroir est coupe.")
         # « you don't have to replicate every frame » : le panneau fond d'une capture a l'autre, a SA cadence

@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.121.0"
+VERSION = "1.121.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -361,7 +361,7 @@ CONFIG_DEFAUT = {
     "panneau_fl": True,
     # « a screen replication mode, especially when playing » : "jeux", "plein_ecran", "toujours", "jamais"
     "panneau_miroir": "jeux",
-    "panneau_miroir_style": "couleurs",  # tout en couleurs fondues ; ou "image" : l'image au milieu
+    "panneau_miroir_style": "couleurs",  # tout en couleurs fondues ; ou "image" : l'image etiree
     # « the right flux color correction (and a specific panel color correction too) » : voir corriger_miroir
     "panneau_miroir_filtre": True,       # suivre f.lux comme l'ecran l'affiche
     "panneau_miroir_filtre_force": 1.0,  # 1 = tel que l'ecran
@@ -14792,11 +14792,10 @@ def image_de_l_ecran(e, t, duree, dessous=None):
 # LE MIROIR DE L'ECRAN. « Add a screen replication mode, especially when
 # playing : the board can replicate the colors of the game. » Pendant un jeu
 # (ou toujours, ou aussi pour une video en plein ecran : panneau_miroir), le
-# panneau recopie l'ecran ou il se joue : reduit a 64 de large, a sa
-# proportion (64 x 36 pour du 16/9), au milieu, et au-dessus et en dessous
-# ses propres couleurs, floues et assombries -- ou tout en couleurs floues
-# (panneau_miroir_style). Un fil a lui capture, GDI reduisant l'image lui-meme :
-# le fil du panneau ne fait que la poser.
+# panneau recopie l'ecran ou il se joue, etire sur tout le panneau (« stretch
+# l'ecran sur tout le panneau plutot que de le fit ») -- ou tout en couleurs
+# floues (panneau_miroir_style). Un fil a lui capture, GDI reduisant l'image
+# lui-meme : le fil du panneau ne fait que la poser.
 # Un jeu : son .exe dans un dossier de jeux (Steam, Epic, Riot, GOG...), ou
 # une appli en plein ecran qui n'est ni un navigateur ni un lecteur video.
 # Trois secondes ailleurs (un Alt+Tab) ne l'arretent pas. Un jeu en plein
@@ -14933,15 +14932,16 @@ def miroir_voulu(cfg, t):
 
 
 def capturer_miroir():
-    """L'ecran de la fenetre au premier plan, reduit a 64 de large et a sa
-    proportion (64 x 36 pour du 16/9), en RGB ; GDI le reduit lui-meme --
-    sinon, mss et une moyenne par blocs. None si rien ne se capture."""
+    """L'ecran de la fenetre au premier plan, reduit a 64 x 64 -- etire, quelle
+    que soit sa proportion : chaque pixel du panneau, la moyenne de sa part
+    d'ecran (un 16/9 : 60 x 34 pixels de 4K chacun) --, en RGB ; GDI le reduit
+    lui-meme, sinon mss et une moyenne par blocs. None si rien ne se capture."""
     import numpy as np
     sct = _capteur()
     zone = zone_reelle()                                # l'ecran du jeu, dans sa definition du moment
     if zone is None:
         zone = sct.monitors[max(1, min(_ecran_actif(sct), len(sct.monitors) - 1))]
-    lignes = max(8, min(64, int(round(64 * zone["height"] / max(1, zone["width"])))))
+    lignes = 64
     octets = _vignette_gdi(zone, 64, lignes, brut=True)
     if octets and len(octets) >= 64 * lignes * 4:
         return np.frombuffer(octets, np.uint8)[:64 * lignes * 4].reshape(lignes, 64, 4)[..., 2::-1].copy()
@@ -15004,9 +15004,9 @@ def _flou(img, passes):
 
 
 def image_miroir(petite, style="image"):
-    """Le panneau a partir de la capture reduite : l'image au milieu, ses
-    couleurs floues et assombries au-dessus et en dessous ; ou, en style
-    « couleurs », tout en couleurs floues et un peu plus vives."""
+    """Le panneau a partir de la capture reduite : l'image etiree sur tout le
+    panneau ; ou, en style « couleurs », tout en couleurs floues et un peu
+    plus vives. Une capture de moins de 64 lignes s'etire en hauteur."""
     import numpy as np
     h = petite.shape[0]
     etiree = np.asarray(petite, float)[np.clip((np.arange(64) * h / 64).astype(int), 0, h - 1)]
@@ -15014,10 +15014,7 @@ def image_miroir(petite, style="image"):
         f = _flou(etiree, 10)
         gris = f.mean(axis=2, keepdims=True)
         return np.clip(gris + (f - gris) * 1.4, 0, 255).astype(np.uint8)
-    img = _flou(etiree, 6) * 0.35
-    y0 = (64 - h) // 2
-    img[y0:y0 + h] = petite
-    return np.clip(img, 0, 255).astype(np.uint8)
+    return np.clip(etiree, 0, 255).astype(np.uint8)
 
 
 def corriger_miroir(petite, cfg):
@@ -19699,7 +19696,7 @@ class Panneau:
         rangee = tk.Frame(col, bg=NUIT)
         rangee.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
         self.var_panneau_miroir_style = tk.StringVar(value=str(self.cfg.get("panneau_miroir_style", "couleurs")))
-        for valeur, texte in (("couleurs", "Les couleurs, fondues"), ("image", "L'image au milieu")):
+        for valeur, texte in (("couleurs", "Les couleurs, fondues"), ("image", "L'image, etiree")):
             r = self.radio(rangee, texte, self.var_panneau_miroir_style, valeur)
             r.configure(command=lambda: self.regler_panneau("panneau_miroir_style"))
             r.pack(side="left", padx=(0, self.px(14)))
