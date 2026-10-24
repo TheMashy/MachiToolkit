@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.119.0"
+VERSION = "1.119.1"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -3137,6 +3137,45 @@ def nombre_ecrans():
         return 0
 
 
+def zone_reelle(zone=None, windows=None):
+    """Le rectangle d'un ecran en VRAIS pixels, tel qu'il est A CET INSTANT :
+    l'ecran de la fenetre au premier plan (le jeu) si `zone` est None, sinon
+    celui qui contient le centre de `zone`. Hors de Windows, ou s'il ne
+    repond pas : `zone` telle quelle. `windows` : (win32api, win32gui), pour
+    les tests.
+
+    « Ca marchait bien pour un jeu en 1080p, mais en 4K ca ne montre que le
+    quart en haut a gauche. » mss lit la geometrie des ecrans UNE fois, a sa
+    creation. Un jeu en plein ecran exclusif change la definition de l'ecran
+    (un jeu en 1080p sur un ecran 4K, un 4K virtuel DSR sur un ecran 1080p) :
+    la zone gardee n'en couvrait plus que le quart, agrandi. Windows dit ici
+    le mode en cours (EnumDisplaySettings) -- et en pixels reels, quelle que
+    soit la mise a l'echelle de l'affichage."""
+    if windows is None:
+        if os.name != "nt":
+            return zone
+        try:
+            import win32api
+            import win32gui
+        except ImportError:
+            return zone
+        windows = (win32api, win32gui)
+    api, gui = windows
+    try:
+        if zone is None:
+            h = gui.GetForegroundWindow()
+            ecran = api.MonitorFromWindow(h, 2) if h else api.MonitorFromPoint((0, 0), 1)   # le plus proche ; le principal
+        else:
+            ecran = api.MonitorFromPoint((int(zone["left"] + zone["width"] // 2),
+                                          int(zone["top"] + zone["height"] // 2)), 2)
+        mode = api.EnumDisplaySettings(api.GetMonitorInfo(ecran)["Device"], -1)    # ENUM_CURRENT_SETTINGS
+        reelle = {"left": int(mode.Position_x), "top": int(mode.Position_y),
+                  "width": int(mode.PelsWidth), "height": int(mode.PelsHeight)}
+        return reelle if reelle["width"] > 0 and reelle["height"] > 0 else zone
+    except Exception:
+        return zone
+
+
 def _ecran_actif(sct):
     rect = rectangle_fenetre_active()
     if not rect:
@@ -3170,7 +3209,10 @@ def _vignette_gdi(zone, colonnes, lignes, brut=False):
         return None
 
     garde = getattr(_local, "gdi", None)
-    if garde is None or garde["taille"] != (colonnes, lignes):
+    # la taille de la vignette, et celle de l'ecran : une definition qui change
+    # (un jeu en plein ecran exclusif) refait les contextes
+    taille = (colonnes, lignes, int(zone["width"]), int(zone["height"]))
+    if garde is None or garde["taille"] != taille:
         if garde is not None:
             _liberer_gdi(garde)
         # La garde se remplit AU FUR ET A MESURE : ce qui a ete obtenu avant
@@ -3178,7 +3220,7 @@ def _vignette_gdi(zone, colonnes, lignes, brut=False):
         # que le contexte d'ecran ; un echec plus tardif -- le bitmap qui ne
         # s'alloue plus -- laissait le contexte memoire derriere lui, un par
         # image, jusqu'a epuisement du quota du processus.
-        neuf = {"taille": (colonnes, lignes)}
+        neuf = {"taille": taille}
         try:
             neuf["fenetre"] = win32gui.GetDesktopWindow()
             neuf["dc"] = win32gui.GetWindowDC(neuf["fenetre"])
@@ -3725,7 +3767,7 @@ def couleur_ecran(source, boost, colonnes=4):
         sct = _capteur()
         index = _ecran_actif(sct) if source == "actif" else int(source)
         index = max(1, min(index, len(sct.monitors) - 1))
-        zone = sct.monitors[index]
+        zone = zone_reelle(sct.monitors[index])         # sa definition du moment, pas celle du demarrage
 
         colonnes = max(2, min(32, int(colonnes)))
         lignes = max(2, int(round(colonnes * zone["height"] / max(1, zone["width"]))))
@@ -14885,7 +14927,9 @@ def capturer_miroir():
     sinon, mss et une moyenne par blocs. None si rien ne se capture."""
     import numpy as np
     sct = _capteur()
-    zone = sct.monitors[max(1, min(_ecran_actif(sct), len(sct.monitors) - 1))]
+    zone = zone_reelle()                                # l'ecran du jeu, dans sa definition du moment
+    if zone is None:
+        zone = sct.monitors[max(1, min(_ecran_actif(sct), len(sct.monitors) - 1))]
     lignes = max(8, min(64, int(round(64 * zone["height"] / max(1, zone["width"])))))
     octets = _vignette_gdi(zone, 64, lignes, brut=True)
     if octets and len(octets) >= 64 * lignes * 4:

@@ -4365,7 +4365,7 @@ class DansMachiTool(unittest.TestCase):
         cles = ("miroir", "jeu", "jeu_vu", "plein_ecran_vu", "etat", "fl", "discord", "ecran", "miroir_rendu",
                 "miroir_fondu", "miroir_cout_ms", "miroir_pause_s")
         sauve = {k: m.PANNEAU.get(k) for k in cles}
-        vrais = {n: getattr(m, n) for n in ("_capteur", "_ecran_actif", "_vignette_gdi", "capturer_miroir",
+        vrais = {n: getattr(m, n) for n in ("_capteur", "_ecran_actif", "_vignette_gdi", "capturer_miroir", "zone_reelle",
                                             "premier_plan", "fenetre_active", "lire_discord", "demarrer_audio",
                                             "arreter_audio")}
         en_marche = m.ETAT.get("en_marche")
@@ -4416,6 +4416,56 @@ class DansMachiTool(unittest.TestCase):
         self.assertTrue(voulu("toujours", 99999.0))
         self.assertFalse(voulu("jamais", 1000.5))
         self.assertFalse(m.miroir_voulu({}, 50000.0), "par defaut, sans jeu : non")
+        # « en 4K ca ne montre que le quart en haut a gauche » : l'ecran tel qu'il est, pas tel que mss l'a vu
+        class Mode:
+            def __init__(self, x, y, l, h):
+                self.Position_x, self.Position_y, self.PelsWidth, self.PelsHeight = x, y, l, h
+        modes = {"\\\\.\\DISPLAY1": Mode(0, 0, 3840, 2160), "\\\\.\\DISPLAY2": Mode(3840, 0, 1920, 1080)}
+        class FauxApi:
+            appels = []
+            @staticmethod
+            def MonitorFromWindow(h, defaut):
+                FauxApi.appels.append(("fenetre", h, defaut))
+                return "B" if h == 9 else "A"
+            @staticmethod
+            def MonitorFromPoint(p, defaut):
+                FauxApi.appels.append(("point", p, defaut))
+                return "B" if p[0] >= 3840 else "A"
+            @staticmethod
+            def GetMonitorInfo(ecran):
+                return {"Device": "\\\\.\\DISPLAY1" if ecran == "A" else "\\\\.\\DISPLAY2"}
+            @staticmethod
+            def EnumDisplaySettings(nom, quoi):
+                assert quoi == -1, "le mode EN COURS"
+                return modes[nom]
+        class FauxGui:
+            premier = 7
+            @staticmethod
+            def GetForegroundWindow():
+                return FauxGui.premier
+        win = (FauxApi, FauxGui)
+        quatre_k = {"left": 0, "top": 0, "width": 3840, "height": 2160}
+        self.assertEqual(m.zone_reelle(None, win), quatre_k, "l'ecran du jeu, en vrais pixels")
+        self.assertEqual(m.zone_reelle({"left": 0, "top": 0, "width": 1920, "height": 1080}, win), quatre_k,
+                         "la zone de mss date d'un jeu en 1080p : l'ecran entier, pas son quart")
+        self.assertEqual(m.zone_reelle({"left": 3840, "top": 0, "width": 960, "height": 540}, win),
+                         {"left": 3840, "top": 0, "width": 1920, "height": 1080}, "le second ecran")
+        FauxGui.premier = 9
+        self.assertEqual(m.zone_reelle(None, win)["left"], 3840, "le jeu sur le second ecran")
+        FauxGui.premier = 0
+        FauxApi.appels.clear()
+        self.assertEqual(m.zone_reelle(None, win), quatre_k)
+        self.assertEqual(FauxApi.appels, [("point", (0, 0), 1)], "sans fenetre : l'ecran principal")
+        modes["\\\\.\\DISPLAY1"] = Mode(0, 0, 1920, 1080)
+        self.assertEqual(m.zone_reelle(None, win)["width"], 1920, "le jeu repasse en 1080p : on suit")
+        modes["\\\\.\\DISPLAY1"] = Mode(0, 0, 0, 0)
+        ancienne = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+        self.assertIs(m.zone_reelle(ancienne, win), ancienne, "un mode illisible : la zone telle quelle")
+        FauxApi.EnumDisplaySettings = staticmethod(lambda nom, quoi: 1 / 0)
+        self.assertIs(m.zone_reelle(ancienne, win), ancienne, "Windows ne repond pas : la zone telle quelle")
+        if os.name != "nt":
+            self.assertIsNone(m.zone_reelle(), "hors de Windows : mss decide")
+            self.assertIs(m.zone_reelle(ancienne), ancienne)
         # la capture : GDI reduit l'ecran a 64 de large, a sa proportion ; le BGRA devient du RGB
         class FauxCapteur:
             monitors = [{"left": 0, "top": 0, "width": 320, "height": 180},
@@ -4443,6 +4493,15 @@ class DansMachiTool(unittest.TestCase):
         FauxCapteur.monitors = [FauxCapteur.monitors[0], {"left": 0, "top": 0, "width": 340, "height": 1000}]
         self.assertEqual(m.capturer_miroir().shape, (64, 64, 3), "un ecran en hauteur : jamais plus de 64 lignes")
         FauxCapteur.monitors = [FauxCapteur.monitors[0], {"left": 0, "top": 0, "width": 320, "height": 180}]
+        zones = []
+        m._vignette_gdi = lambda zone, colonnes, lignes, brut=False: zones.append(zone) or gdi(zone, colonnes, lignes, brut)
+        m.zone_reelle = lambda zone=None, windows=None: dict(quatre_k) if zone is None else zone
+        self.assertEqual(m.capturer_miroir().shape, (36, 64, 3))
+        self.assertEqual(zones[-1], quatre_k, "tout l'ecran 4K du jeu, pas la zone que mss avait gardee")
+        m.zone_reelle = lambda zone=None, windows=None: {"left": 0, "top": 0, "width": 3440, "height": 1440}
+        self.assertEqual(m.capturer_miroir().shape, (27, 64, 3), "un ecran 21/9")
+        m.zone_reelle = vrais["zone_reelle"]
+        m._vignette_gdi = gdi
         try:
             import PIL  # noqa: F401
             m._vignette_gdi = lambda *a, **k: None
