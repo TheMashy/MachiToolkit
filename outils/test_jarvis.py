@@ -4064,6 +4064,17 @@ class DansMachiTool(unittest.TestCase):
         for k in range(3):
             self.assertEqual(sorted(suite[k * len(m.ECRANS):(k + 1) * len(m.ECRANS)]), sorted(m.ECRANS))
         self.assertTrue(all(a != b for a, b in zip(suite, suite[1:])), "jamais deux fois le meme de suite")
+        # « j'aime beaucoup l'aurore boreale, tu peux en faire plus comme ca ? » : des ambiances, et le choix
+        self.assertGreaterEqual(len(m.ECRANS_AMBIANCES), 10)
+        self.assertTrue(set(m.ECRANS_AMBIANCES) <= set(m.ECRANS))
+        self.assertEqual(list(m.ECRANS)[:len(m.ECRANS_AMBIANCES)], list(m.ECRANS_AMBIANCES), "les ambiances d'abord")
+        sans = [n for n in m.ECRANS if n not in m.ECRANS_AMBIANCES]
+        self.assertEqual(m.ecrans_permis({"panneau_ecrans_sans": sans}), list(m.ECRANS_AMBIANCES))
+        self.assertEqual(m.ecrans_permis({}), list(m.ECRANS))
+        m.PANNEAU.pop("ecrans_sac", None)
+        vus = {m.prochain_ecran(rng, permis=m.ECRANS_AMBIANCES) for _ in range(40)}
+        self.assertEqual(vus, set(m.ECRANS_AMBIANCES), "seulement celles qu'on a gardees, toutes")
+        self.assertIsNone(m.prochain_ecran(rng, permis=[]))
         # les reglages, bornes
         self.assertEqual(m.reglages_ecrans({}), (300.0, 15.0))
         self.assertEqual(m.reglages_ecrans({"panneau_ecrans_intervalle": 0, "panneau_ecrans_duree": 999}),
@@ -4097,6 +4108,11 @@ class DansMachiTool(unittest.TestCase):
         self.assertIsNone(du(dict(cfg, panneau_ecrans=False), t0 + 400), "decoche")
         m.demander_ecran("feu")
         self.assertEqual(du(dict(cfg, panneau_ecrans=False), t0 + 401)["nom"], "feu", "« Montrer un ecran » : tout de suite")
+        m.PANNEAU.update(ecran=None, ecran_fin=t0)
+        self.assertIsNone(du(dict(cfg, panneau_ecrans_sans=list(m.ECRANS)), t0 + 400), "tous decoches : aucun")
+        m.demander_ecran("meduses")
+        self.assertEqual(du(dict(cfg, panneau_ecrans_sans=list(m.ECRANS)), t0 + 401)["nom"], "meduses",
+                         "demande par son nom : meme decoche")
         m.PANNEAU.update(ecran=None, ecran_fin=t0 + 10_000_000)
         self.assertIsNone(du(cfg, t0 + 500), "l'horloge a recule : on repart d'ici")
         self.assertEqual(m.PANNEAU["ecran_fin"], t0 + 500)
