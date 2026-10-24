@@ -561,13 +561,23 @@ class AL_Ecran(unittest.TestCase):
             M.PANNEAU.pop("ecran_demande", None)
             p.montrer_ecran()
             self.assertTrue(M.PANNEAU.pop("ecran_demande"))
+            # lesquels : une case par ecran, « Tous », « Les ambiances seulement »
+            self.assertEqual(set(p.vars_ecrans), set(M.ECRANS))
+            p.vars_ecrans["matrice"].set(0)
+            p.choisir_ecrans()
+            self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"])
+            p.choisir_ecrans(list(M.ECRANS_AMBIANCES))
+            self.assertEqual(M.ecrans_permis(M.CFG), list(M.ECRANS_AMBIANCES))
+            p.choisir_ecrans(list(M.ECRANS))
+            self.assertEqual(M.CFG["panneau_ecrans_sans"], [])
             self.assertAlmostEqual(float(p.var_panneau_eq_sensibilite.get()), 1.0)
             p.var_panneau_eq_sensibilite.set(1.8)
             self.assertEqual(M.CFG["panneau_eq_sensibilite"], 1.8)
         finally:
             for cle in ("panneau_cycle_duree", "panneau_cycle_fondu", "panneau_cycle_meteo", "panneau_cycle_saut",
                         "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes", "panneau_eq_sensibilite",
-                        "panneau_ecrans", "panneau_ecrans_intervalle", "panneau_ecrans_duree"):
+                        "panneau_ecrans", "panneau_ecrans_intervalle", "panneau_ecrans_duree",
+                        "panneau_ecrans_sans"):
                 M.CFG[cle] = M.CONFIG_DEFAUT[cle]
             p.root.destroy()
 
