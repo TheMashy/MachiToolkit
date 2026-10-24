@@ -3106,7 +3106,7 @@ class DansMachiTool(unittest.TestCase):
         m.lire_bilan_carte(Bilan())
         self.assertEqual((m.PANNEAU["carte_recues"], m.PANNEAU["carte_jetees"]), (812, 3))
         self.assertEqual(m.PANNEAU["_recu"], b"STATS 9", "la ligne pas finie attend la suite")
-        self.assertIn("3 images abimees jetees par la carte", m.etat_panneau_lisible()[0])
+        self.assertIn("3 images abimees jetees par la carte sur 815 (0,4 %)", m.etat_panneau_lisible()[0])
         m.lire_bilan_carte(object())                  # une carte sans tampon (les faux des tests)
 
     def test_le_resume_du_jour_attend_le_demarrage_et_une_minute_d_activite(self):
