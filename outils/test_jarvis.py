@@ -4362,7 +4362,8 @@ class DansMachiTool(unittest.TestCase):
         # replicate the colors of the game on the board »
         import numpy as np
         m = self.m
-        cles = ("miroir", "jeu", "jeu_vu", "plein_ecran_vu", "etat", "fl", "discord", "ecran")
+        cles = ("miroir", "jeu", "jeu_vu", "plein_ecran_vu", "etat", "fl", "discord", "ecran", "miroir_rendu",
+                "miroir_fondu", "miroir_cout_ms", "miroir_pause_s")
         sauve = {k: m.PANNEAU.get(k) for k in cles}
         vrais = {n: getattr(m, n) for n in ("_capteur", "_ecran_actif", "_vignette_gdi", "capturer_miroir",
                                             "premier_plan", "fenetre_active", "lire_discord", "demarrer_audio",
@@ -4406,7 +4407,7 @@ class DansMachiTool(unittest.TestCase):
         # qui le veut : jeux (par defaut), plein ecran, toujours, jamais -- et trois secondes de grace (un Alt+Tab)
         voulu = lambda mode, t: m.miroir_voulu({"panneau_miroir": mode}, t)
         self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir"], "jeux")
-        self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir_style"], "image")
+        self.assertEqual(m.CONFIG_DEFAUT["panneau_miroir_style"], "couleurs", "« it can be a blend of colors »")
         self.assertTrue(voulu("jeux", 1000.5))
         self.assertTrue(voulu("jeux", 1000.0 + m.MIROIR_GRACE_S - 0.1), "un Alt+Tab ne l'arrete pas")
         self.assertFalse(voulu("jeux", 1000.0 + m.MIROIR_GRACE_S + 0.5), "le jeu quitte : le miroir aussi")
@@ -4473,9 +4474,9 @@ class DansMachiTool(unittest.TestCase):
         # sur le panneau : devant l'horloge et les ecrans, sous les pastilles ; une capture vieille s'efface
         t = 1_800_000_000.0
         cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_cycle": False,
-               "panneau_claude": False, "panneau_ecrans": False}
-        m.PANNEAU.update(fl=None, discord=None, ecran=None, jeu_vu=0, plein_ecran_vu=0,
-                         miroir={"img": petite, "t": t - 0.05})
+               "panneau_claude": False, "panneau_ecrans": False, "panneau_miroir_style": "image"}
+        m.PANNEAU.update(fl=None, discord=None, ecran=None, jeu_vu=0, plein_ecran_vu=0, miroir_rendu=None,
+                         miroir_fondu=None, miroir_pause_s=None, miroir={"img": petite, "t": t - 0.05})
         horloge = m.image_du_panneau(cfg, "horloge", t)
         self.assertFalse((horloge[14:50] == petite).all(), "pas de jeu : l'horloge")
         toujours = dict(cfg, panneau_miroir="toujours")
@@ -4495,6 +4496,55 @@ class DansMachiTool(unittest.TestCase):
         self.assertFalse((m.image_du_panneau(cfg, "horloge", t)[14:50] == petite).all(), "une capture figee ne reste pas")
         self.assertIn("garde son contenu", m.etat_miroir_lisible(cfg, t + 10))
         self.assertEqual(m.etat_miroir_lisible(dict(cfg, panneau_miroir="jamais"), t), "Le miroir est coupe.")
+        # « you don't have to replicate every frame » : le panneau fond d'une capture a l'autre, a SA cadence
+        rouge = np.full((36, 64, 3), (220, 30, 30), np.uint8)
+        bleu = np.full((36, 64, 3), (30, 30, 220), np.uint8)
+        fondu = dict(cfg, panneau_miroir="toujours", panneau_miroir_style="couleurs")
+        rendu = lambda img, style="couleurs": m.image_miroir(img, style)[32, 32].tolist()
+        t2 = t + 100
+        m.PANNEAU.update(miroir={"img": rouge, "t": t2}, miroir_fondu=None, miroir_rendu=None)
+        bleus = []
+        for i in range(75):                                            # 2,5 s, 30 images par seconde
+            ti = t2 + i / 30
+            if i == 6:
+                m.PANNEAU["miroir"] = {"img": bleu, "t": ti}           # la capture suivante, 0,2 s apres
+            img = m.image_du_panneau(fondu, "horloge", ti)
+            if i == 0:
+                self.assertEqual(img[32, 32].tolist(), rendu(rouge), "il arrive : d'emblee, sans fondre depuis rien")
+            bleus.append(int(img[32, 32, 2]))
+        self.assertEqual(len(set(bleus[:6])), 1, "entre deux captures : il tient")
+        self.assertLess(bleus[6] - bleus[0], 30, "une image du panneau apres la capture : a peine parti")
+        self.assertEqual(bleus, sorted(bleus), "il glisse, sans revenir en arriere")
+        self.assertTrue(120 < bleus[6 + 15] < 220, "au bout d'une demi-seconde : en chemin")
+        self.assertGreaterEqual(bleus[-1], rendu(bleu)[2] - 10, "au bout de deux secondes : arrive")
+        self.assertTrue(all(b - a <= 20 for a, b in zip(bleus, bleus[1:])), "pas un saut")
+        m.PANNEAU["miroir"] = {"img": rouge, "t": t2 + 20}
+        self.assertEqual(m.image_du_panneau(fondu, "horloge", t2 + 20)[32, 32].tolist(), rendu(rouge),
+                         "revenu apres un moment : d'emblee")
+        rendus = []
+        vrai_rendu = m.image_miroir
+        m.image_miroir = lambda petite, style="image": rendus.append(1) or vrai_rendu(petite, style)
+        try:
+            for i in range(1, 6):
+                m.image_du_panneau(fondu, "horloge", t2 + 20 + i / 30)
+        finally:
+            m.image_miroir = vrai_rendu
+        self.assertEqual(rendus, [], "une capture se met en forme une fois, pas a chaque image")
+        def chemin_fait(style, dt=0.15):
+            c, T = dict(fondu, panneau_miroir_style=style), t2 + 50
+            m.PANNEAU.update(miroir={"img": rouge, "t": T}, miroir_fondu=None, miroir_rendu=None)
+            m.image_du_panneau(c, "horloge", T)
+            m.PANNEAU["miroir"] = {"img": bleu, "t": T + 0.01}
+            depart, but = rendu(rouge, style)[2], rendu(bleu, style)[2]
+            return (int(m.image_du_panneau(c, "horloge", T + dt)[32, 32, 2]) - depart) / (but - depart)
+        self.assertGreater(chemin_fait("image"), chemin_fait("couleurs") + 0.2, "l'image rejoint plus vite que les couleurs")
+        # le jeu d'abord : 8 captures par seconde au plus, jamais plus de 3 % du temps, une par seconde au moins
+        self.assertAlmostEqual(m.pause_miroir(0.001), 1 / 8)
+        self.assertAlmostEqual(m.pause_miroir(0.012), 0.4)
+        self.assertAlmostEqual(m.pause_miroir(0.2), 1.0)
+        for cout in (0.0005, 0.002, 0.004, 0.01, 0.02, 0.029):
+            self.assertLessEqual(cout / m.pause_miroir(cout), m.MIROIR_PART + 1e-9, cout)
+        self.assertLess(m.MIROIR_PAUSE_MAX_S, m.MIROIR_FRAIS_S, "la plus longue pause n'efface pas le miroir")
         # le fil : il ne capture que panneau branche, miroir voulu, panneau allume
         captures = []
         m.capturer_miroir = lambda: captures.append(1) or petite
@@ -4511,6 +4561,15 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(len(captures), 2)
         self.assertIs(m.PANNEAU["miroir"]["img"], petite)
         self.assertAlmostEqual(m.PANNEAU["miroir"]["t"], time.time(), delta=5)
+        self.assertAlmostEqual(m.PANNEAU["miroir_pause_s"], 1 / 8, msg="une capture qui ne coute rien : 8 par seconde")
+        m.capturer_miroir = lambda: time.sleep(0.04) or petite
+        m.fil_miroir({"panneau_miroir": "toujours"}, tours=1)
+        self.assertGreaterEqual(m.PANNEAU["miroir_cout_ms"], 35)
+        self.assertAlmostEqual(m.PANNEAU["miroir_pause_s"], 1.0, msg="une capture qui coute : une par seconde")
+        m.PANNEAU.update(miroir={"img": petite, "t": time.time()}, jeu_vu=0)
+        self.assertIn("captures par seconde", m.etat_miroir_lisible({"panneau_miroir": "toujours"}))
+        if os.name != "nt":
+            self.assertFalse(m.priorite_du_fil(-2), "hors de Windows : rien a faire")
         def rate():
             raise OSError("ecran verrouille")
         m.capturer_miroir = rate
