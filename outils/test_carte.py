@@ -298,7 +298,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 7", reponses)
+        self.assertIn("MACHI 8", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -507,6 +507,22 @@ class LaCarte(unittest.TestCase):
         (r100, v100), (r50, v50) = rouge(100), rouge(50)
         self.assertLess(r50, r100 * 0.85, "le rouge baisse, comme sur les images du PC")
         self.assertEqual(v50, v100, "le vert ne bouge pas")
+
+    def test_les_ambiances_suivent_le_sens_du_panneau(self):
+        # « le sketch display les screen savers avec un angle de 90 degres » : la carte (v8) tourne ses
+        # ambiances exactement comme Machi Tool tourne ses images (tourner_panneau)
+        seule = [n for n in self.M.ECRANS_AMBIANCES if n != "coucher"]
+        droite, _, _ = self.envoyer(self.veille(panneau_veille_sans=seule) + b"MW", ["+2000"])
+        self.assertTrue(droite.any())
+        for degres in (90, 180, 270):
+            with self.subTest(degres=degres):
+                tournee, reponses, _ = self.envoyer(self.veille(panneau_veille_sans=seule, panneau_rotation=degres)
+                                                    + b"MW", ["+2000"])
+                self.assertIn("VEILLE 1", reponses)
+                self.assertTrue((tournee == self.M.tourner_panneau(droite, degres)).all(), degres)
+        # une v7 ignorait ces deux bits : la trame reste celle qu'elle comprend
+        t = self.veille(panneau_rotation=270)
+        self.assertEqual((t[2], t[3] & 1, t[3] >> 1), (1, 1, 3))
 
     def test_chaque_ambiance_se_dessine_et_bouge(self):
         # « keep only atmospheric effects » : les dix ambiances de Machi Tool, et elles seules

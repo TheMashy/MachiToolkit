@@ -386,9 +386,15 @@ class AL_Ecran(unittest.TestCase):
         retires = []
         M.retirer_agenda = lambda cfg, ident: (retires.append(ident), {"texte": "Retire."})[1]
         auj = time.strftime("%Y-%m-%d")
+        # un jour a venir DANS la semaine d'aujourd'hui (donc dans son mois, qui couvre des semaines entieres) :
+        # demain, sauf le dimanche -- demain est alors dans la semaine d'apres, que la vue « semaine » ne
+        # montre pas, et hier n'est plus « a venir » : le jour meme
+        voisin = M._jv.plus_jours(auj, 1)
+        if voisin > M._jv.bornes_vue("semaine", auj)[1]:
+            voisin = auj
         rdv = [{"id": 11, "date": auj, "heure": "18:00", "label": "Kine-temoin"},
-               {"id": 12, "date": M._jv.plus_jours(auj, 1), "heure": "10:15", "label": "Dentiste-temoin"},
-               {"id": 13, "date": M._jv.plus_jours(auj, 1), "fin": M._jv.plus_jours(auj, 4), "label": "Vacances-temoin"}]
+               {"id": 12, "date": voisin, "heure": "10:15", "label": "Dentiste-temoin"},
+               {"id": 13, "date": voisin, "fin": M._jv.plus_jours(voisin, 3), "label": "Vacances-temoin"}]
         p = M.Panneau(M.CFG, lambda: None)
         try:
             p.remplir_agenda = lambda discret=False: None        # pas de BrainDebugger ici

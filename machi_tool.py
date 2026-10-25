@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.121.1"
+VERSION = "1.122.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11718,7 +11718,7 @@ PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la 
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
-PANNEAU_CROQUIS = 7                    # carte/machi_panneau/machi_panneau.ino
+PANNEAU_CROQUIS = 8                    # carte/machi_panneau/machi_panneau.ino
 PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
@@ -15224,9 +15224,12 @@ VEILLE_ARRETS_H = (0, 1, 2, 4, 8)
 def trame_veille(cfg):
     """« MA » : les reglages des ecrans de veille de la carte (croquis v7), qu'elle
     garde meme debranchee -- 12 octets et leur Fletcher-16 : le format (1),
-    actif, la luminosite, les ambiances (un bit chacune, dans l'ordre
-    d'ECRANS_AMBIANCES), la duree d'un ecran (s, celle de « Chaque ecran »),
-    l'arret au bout de (min, 0 : jamais), la balance du panneau (0-100)."""
+    actif (bit 0) et le sens du panneau (bits 1-2, des quarts de tour comme
+    tourner_panneau : « le sketch display les screen savers avec un angle de
+    90 degres » ; le croquis v8 les suit, la v7 les ignore), la luminosite,
+    les ambiances (un bit chacune, dans l'ordre d'ECRANS_AMBIANCES), la duree
+    d'un ecran (s, celle de « Chaque ecran »), l'arret au bout de (min, 0 :
+    jamais), la balance du panneau (0-100)."""
     sans = set(cfg.get("panneau_veille_sans") or [])
     masque = sum(1 << i for i, nom in enumerate(ECRANS_AMBIANCES) if nom not in sans)
     duree = int(reglages_ecrans(cfg)[1])
@@ -15237,7 +15240,9 @@ def trame_veille(cfg):
     lum = max(VEILLE_LUMINOSITE_BORNES[0], min(VEILLE_LUMINOSITE_BORNES[1],
                                                entier(cfg.get("panneau_veille_luminosite", 32), 32)))
     rouge, vert, bleu = (int(round(x * 100)) for x in balance_panneau(cfg))
-    d = (bytes([1, 1 if cfg.get("panneau_veille", True) else 0, lum]) + masque.to_bytes(2, "big")
+    quarts = (entier(cfg.get("panneau_rotation", 0), 0) // 90) % 4
+    actif = (1 if cfg.get("panneau_veille", True) else 0) | quarts << 1
+    d = (bytes([1, actif, lum]) + masque.to_bytes(2, "big")
          + duree.to_bytes(2, "big") + arret.to_bytes(2, "big") + bytes([rouge, vert, bleu]))
     return b"MA" + d + fletcher16(d).to_bytes(2, "big")
 
@@ -15735,8 +15740,11 @@ def etat_veille_lisible(cfg):
         return "Les reglages partiront a la carte des qu'elle sera branchee."
     croquis = PANNEAU.get("croquis") or 1
     if croquis < 7:
-        return ("La carte a le croquis v%d : televerse la v7 (carte/machi_panneau/machi_panneau.ino) pour "
+        return ("La carte a le croquis v%d : televerse la v8 (carte/machi_panneau/machi_panneau.ino) pour "
                 "qu'elle dessine les ambiances elle-meme." % croquis)
+    if croquis < 8 and (entier(cfg.get("panneau_rotation", 0), 0) // 90) % 4:
+        return ("La carte a le croquis v7 : ses ambiances ne suivent pas le sens du panneau. Televerse la v8 "
+                "(carte/machi_panneau/machi_panneau.ino).")
     if PANNEAU.get("carte_veille"):
         return "La carte a ses reglages : %d ambiance%s quand le PC s'eteindra." % (n, "s" if n > 1 else "")
     return "Les reglages partent a la carte..."
@@ -15768,7 +15776,8 @@ def etat_panneau_lisible():
         if (PANNEAU.get("croquis") or PANNEAU_CROQUIS) < PANNEAU_CROQUIS:
             texte += ("\nLa carte a un ancien croquis (version %d) : televerse carte/machi_panneau/"
                       "machi_panneau.ino (version %d) : images controlees et lues par blocs (plus d'images "
-                      "abimees, plus de saccades), et ses propres ambiances quand le PC s'eteint."
+                      "abimees, plus de saccades), et ses propres ambiances quand le PC s'eteint, dans le "
+                      "sens du panneau."
                       % (PANNEAU["croquis"], PANNEAU_CROQUIS))
         elif ips and (ips < PANNEAU_IPS * 0.8 or (saccades or 0) >= 10):
             # « ca tombe a 5 fps parfois » : qui ralentit, la carte ou le PC ?
