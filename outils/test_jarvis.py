@@ -3093,7 +3093,11 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_luminosite=0))[4], 4)
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_arret_h="n'importe"))[9:11], b"\x00\x00")
         self.assertTrue(m.CONFIG_DEFAUT["panneau_veille"])
-        self.assertEqual(m.PANNEAU_CROQUIS, 7)
+        self.assertEqual(m.PANNEAU_CROQUIS, 8)
+        # « le sketch display les screen savers avec un angle de 90 degres » : le sens du panneau, bits 1-2
+        for degres, octet in ((0, 1), (90, 3), (180, 5), (270, 7), (450, 3)):
+            self.assertEqual(m.trame_veille(dict(cfg, panneau_rotation=degres))[3], octet, degres)
+        self.assertEqual(m.trame_veille(dict(cfg, panneau_rotation=270, panneau_veille=False))[3], 6)
 
         class Carte:
             def __init__(self):
@@ -3166,7 +3170,10 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(carte.ecrit, [b"MO"])
         # ce que la page en dit
         m.PANNEAU.update(etat="connecte", croquis=6, carte_veille=None)
-        self.assertIn("televerse la v7", m.etat_veille_lisible({}))
+        self.assertIn("televerse la v8", m.etat_veille_lisible({}))
+        m.PANNEAU["croquis"] = 7
+        self.assertIn("ne suivent pas le sens", m.etat_veille_lisible({"panneau_rotation": 90}))
+        self.assertNotIn("v7", m.etat_veille_lisible({"panneau_rotation": 0}), "droit, la v7 suffit")
         self.assertIn("s'eteint aussi", m.etat_veille_lisible({"panneau_veille": False}))
         self.assertIn("Aucune ambiance", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}))
         m.PANNEAU["etat"] = "absent"

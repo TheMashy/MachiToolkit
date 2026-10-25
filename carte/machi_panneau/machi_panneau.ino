@@ -1,10 +1,10 @@
-// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 7.
+// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 8.
 // Un panneau 64x64 sur une Adafruit MatrixPortal S3, nourri par USB :
 //   "MG" + 8 192 octets (RGB565, poids fort d'abord) + 2 octets de controle
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 7" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 8" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees),
 //   "MA" + 12 octets + 2 de controle = les reglages des ecrans de veille
 //                    (gardes dans la carte : ils survivent a une coupure),
@@ -60,6 +60,13 @@
 // luminosite a part (basse), et une carte qui a redemarre faute de tension
 // (ESP_RST_BROWNOUT) reste noire jusqu'au retour du PC -- plus jamais la
 // boucle de la v5.
+//
+// v8 : « le sketch display les screen savers avec un angle de 90 degres ».
+// Machi Tool tourne ses images avant de les envoyer (« Sens du panneau » : la
+// carte posee de travers) ; les ambiances de la v7, dessinees par la carte,
+// ne tournaient pas. Le sens du panneau arrive maintenant avec les reglages
+// ("MA", deux bits de l'octet « actif » : une v7 les ignore), et la carte
+// tourne ses ambiances exactement comme Machi Tool tourne ses images.
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Preferences.h>
 #include <esp_system.h>
@@ -97,6 +104,7 @@ struct Reglages {
   uint8_t actif = 0, lum = 32;
   uint16_t masque = 0x3FF, duree_s = 120, arret_min = 0;
   uint8_t rouge = 100, vert = 100, bleu = 100;
+  uint8_t quarts = 0;          // le sens du panneau : des quarts de tour, sens horaire
 };
 Reglages reglages;
 uint8_t reglages_bruts[12];    // tels que Machi Tool les a envoyes : ce que la carte garde
@@ -689,10 +697,15 @@ void commencer_veille() {
   tout_redessiner = true;
 }
 
-// la scene, en fondu (k), vers le panneau : la balance et la clarte de Machi Tool
+// la scene, en fondu (k), vers le panneau : tournee comme Machi Tool tourne ses
+// images (tourner_panneau : np.rot90, sens horaire), avec sa balance et sa clarte
 void poser_scene(float k) {
   for (int p = 0, i = 0; p < W * H; p++, i += 2) {
-    const float *s = scene[p / W][p % W];
+    const int y = p / W, x = p % W;
+    const float *s = reglages.quarts == 1 ? scene[H - 1 - x][y]
+                   : reglages.quarts == 2 ? scene[H - 1 - y][W - 1 - x]
+                   : reglages.quarts == 3 ? scene[x][W - 1 - y]
+                   : scene[y][x];
     const uint8_t r = lut[0][(int)borne(s[0] * k, 0, 255)];
     const uint8_t v = lut[1][(int)borne(s[1] * k, 0, 255)];
     const uint8_t b = lut[2][(int)borne(s[2] * k, 0, 255)];
@@ -721,11 +734,13 @@ void veiller(unsigned long maintenant) {
   poser_scene(fminf(1.0f, fminf(ecoule / 1.0f, (duree - ecoule) / 1.0f)));
 }
 
-// "MA" : 12 octets -- format, actif, luminosite, ecrans (16 bits), duree d'un
-// ecran (s, 16 bits), arret apres (min, 16 bits, 0 = jamais), balance r v b
-// -- puis leur Fletcher-16. Abimes : ignores.
+// "MA" : 12 octets -- format, actif (bit 0) et le sens du panneau (bits 1-2,
+// des quarts de tour), luminosite, ecrans (16 bits), duree d'un ecran (s,
+// 16 bits), arret apres (min, 16 bits, 0 = jamais), balance r v b -- puis
+// leur Fletcher-16. Abimes : ignores.
 void decoder(const uint8_t *d) {
   reglages.actif = d[1] & 1;
+  reglages.quarts = (d[1] >> 1) & 3;
   reglages.lum = d[2];
   reglages.masque = d[3] << 8 | d[4];
   const int duree = d[5] << 8 | d[6];
@@ -789,7 +804,7 @@ void loop() {
       if (etat != VEILLE) panneau->setBrightness8(min(b, PLAFOND));
     }
   } else if (genre == 'V') {
-    Serial.println("MACHI 7");
+    Serial.println("MACHI 8");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'A') {
