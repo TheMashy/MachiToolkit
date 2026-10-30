@@ -1694,7 +1694,16 @@ inline void cr_encre_lire(const uint16_t (*m)[3], float sx, float sy, uint16_t *
   for (int c = 0; c < 3; c++) v[c] = (uint16_t)(f[c] + 0.5f);   // un melange : jamais au-dela de 65535
 }
 
+#ifdef CR_PROFIL
+double cr_p[4];
+#define CR_T(k) auto _t##k = std::chrono::steady_clock::now();
+#define CR_A(i, a, b) cr_p[i] += std::chrono::duration<double, std::milli>(_t##b - _t##a).count();
+#else
+#define CR_T(k)
+#define CR_A(i, a, b)
+#endif
 void cr_encre_pas(E_encre &e, float h) {
+  CR_T(0)
   e.horloge += h;
   const float c = e.horloge;
   if (c >= e.prochaine && e.ng < 8) {                    // une goutte d'une autre couleur
@@ -1749,6 +1758,7 @@ void cr_encre_pas(E_encre &e, float h) {
       e.vit[y * 64 + x][0] = (int16_t)(vx * kv); e.vit[y * 64 + x][1] = (int16_t)(vy * kv);
     }
   }
+  CR_T(1) CR_A(0, 0, 1)
   for (int n = 0; n < e.ng; n++) {
     CR_Goutte &g = e.g[n];
     if (g.age < 0.55f) {                                 // elle lache son encre en entrant
@@ -1771,12 +1781,14 @@ void cr_encre_pas(E_encre &e, float h) {
   for (int n = 0; n < e.ng; n++) if (e.g[n].age < 14) e.g[garde++] = e.g[n];
   e.ng = garde;
   // l'encre suit le courant : on remonte le courant, puis on corrige l'aller-retour (MacCormack)
+  CR_T(2) CR_A(1, 1, 2)
   const float iv = 1.0f / kv;
   for (int y = 0; y < 64; y++)
     for (int x = 0; x < 64; x++) {
       const int i = y * 64 + x;
       cr_encre_lire(e.m, x - e.vit[i][0] * iv, y - e.vit[i][1] * iv, e.av[i]);
     }
+  CR_T(3) CR_A(2, 2, 3)
   const float dilue = expf(-h / 17.0f), perd = 0.01f * h * CR_ENCRE_ECH;
   for (int y = 0; y < 64 + CR_ENCRE_K - 1; y++) {
     if (y < 64)
