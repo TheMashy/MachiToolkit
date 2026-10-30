@@ -69,17 +69,17 @@ ec_fen ec_fen_placer(float ox, float oy, float k = 1.0f) {
   return f;
 }
 // ajoute la ligne y de la fenetre a sortie[64]
-void ec_fen_ligne(const uint16_t *champ, int taille, const ec_fen &f, int y, float *sortie) {
+void ec_fen_ligne(const uint16_t *source, int taille, const ec_fen &f, int y, float *sortie) {
   const int m = taille - 1;
-  const uint16_t *l0 = champ + ((y + f.y0) & m) * taille, *l1 = champ + ((y + f.y0 + 1) & m) * taille;
+  const uint16_t *l0 = source + ((y + f.y0) & m) * taille, *l1 = source + ((y + f.y0 + 1) & m) * taille;
   for (int x = 0; x < 64; x++) {
     const int xa = (x + f.x0) & m, xb = (x + f.x0 + 1) & m;
     sortie[x] += l0[xa] * f.a + l0[xb] * f.b + l1[xa] * f.c + l1[xb] * f.d;
   }
 }
-inline float ec_fen_val(const uint16_t *champ, int taille, const ec_fen &f, int x, int y) {
+inline float ec_fen_val(const uint16_t *source, int taille, const ec_fen &f, int x, int y) {
   const int m = taille - 1;
-  const uint16_t *l0 = champ + ((y + f.y0) & m) * taille, *l1 = champ + ((y + f.y0 + 1) & m) * taille;
+  const uint16_t *l0 = source + ((y + f.y0) & m) * taille, *l1 = source + ((y + f.y0 + 1) & m) * taille;
   const int xa = (x + f.x0) & m, xb = (x + f.x0 + 1) & m;
   return l0[xa] * f.a + l0[xb] * f.b + l1[xa] * f.c + l1[xb] * f.d;
 }
@@ -383,6 +383,7 @@ void s_nuages(int humeur, bool debut, float t, float ecoule, float dt) {
   if (orage) {   // un eclair dans les nuages, de temps en temps
     const float s = sinf(t * 0.9f), s2 = s * s, s4 = s2 * s2, s8 = s4 * s4, s16 = s8 * s8, s32 = s16 * s16;
     eclair = s32 * s8 * (0.5f + 0.5f * sinf(t * 23));
+    if (eclair < 1e-4f) eclair = 0;   // sin^40 tombe dans les flottants denormaux : lents, et invisibles
   }
   // le champ f, ligne par ligne ; « dessus » le compare a la ligne deux plus haut (np.roll, qui boucle)
   float f[4][64];
@@ -413,7 +414,7 @@ void s_nuages(int humeur, bool debut, float t, float ecoule, float dt) {
       }
       float *p = scene[y][x];
       for (int k = 0; k < 3; k++) p[k] = p[k] * (1 - nuage) + c[k] * nuage;
-      if (orage) ajouter(y, x, nuage * eclair, 120, 120, 160);
+      if (eclair > 0) ajouter(y, x, nuage * eclair, 120, 120, 160);
     }
   }
   if (neon)   // la ville, en contrebas
@@ -455,10 +456,10 @@ void s_orage(int humeur, bool debut, float t, float ecoule, float dt) {
     e.eclair_debut = ecoule;
   }
   const float age = ecoule - e.eclair_debut;
-  const bool trace = age <= 0.35f;
-  const float eclat = trace ? (1 - age / 0.35f) * (0.6f + 0.4f * sinf(age * 60)) : 0.0f;
+  const bool visible = age <= 0.35f;
+  const float eclat = visible ? (1 - age / 0.35f) * (0.6f + 0.4f * sinf(age * 60)) : 0.0f;
   degrade2(14 + 90 * eclat, 16 + 90 * eclat, 24 + 120 * eclat, 40 + 90 * eclat, 44 + 90 * eclat, 58 + 120 * eclat);
-  if (trace) {
+  if (visible) {
     const float k = fminf(1.0f, eclat * 1.5f);
     for (int y = 0; y < 50; y++) pointer(y, e.ex[y], 230 * k, 230 * k, 255 * k);
   }
@@ -800,7 +801,7 @@ void s_cascade(int humeur, bool debut, float t, float ecoule, float dt) {
   const float s3 = sinf(t * 3), c3 = cosf(t * 3);
   for (int y = 0; y < 64; y++) {
     const float k = y / 64.0f;
-    const float ciel[3] = {h0[0] + (h1[0] - h0[0]) * k, h0[1] + (h1[1] - h0[1]) * k, h0[2] + (h1[2] - h0[2]) * k};
+    const float haut_bas[3] = {h0[0] + (h1[0] - h0[0]) * k, h0[1] + (h1[1] - h0[1]) * k, h0[2] + (h1[2] - h0[2]) * k};
     const float larg = 8 + (y - 6) * 0.1f;
     const float gauche = 32 - larg - 1 - 2 * sinf(y * 0.3f), droite = 32 + larg + 1 + 2 * sinf(y * 0.37f + 1);
     const bool chute = y >= 6 && y < 50;
@@ -815,7 +816,7 @@ void s_cascade(int humeur, bool debut, float t, float ecoule, float dt) {
         v = (lune ? 60 : 120) + ev * k2;
         b = (lune ? 90 : 120) + eb * k2;
       } else {
-        r = ciel[0]; v = ciel[1]; b = ciel[2];
+        r = haut_bas[0]; v = haut_bas[1]; b = haut_bas[2];
         if (chute && fabsf(x - 32.0f) <= larg) {   // l'eau qui tombe en filets
           const float filets = (e.eau[ligne * 64 + col[x]] + e.eau[ligne2 * 64 + ((col[x] + 7) & 63)]) * (0.5f / 65535.0f);
           const float k2 = (0.5f + 0.5f * filets) * e.bordk[y - 6][x - 20];

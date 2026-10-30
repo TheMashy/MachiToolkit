@@ -1,32 +1,1116 @@
 // lot_cocon_reveries.h -- les ecrans de ce lot, portes de machi_tool.py (croquis v10).
+// LE COCON (des bougies, une cheminee, un the sous la pluie, la poussiere dans un rayon de soleil, une lampe a
+// fibres, une boule plasma, un vinyle) et LES REVERIES (des rubans de soie, l'encre dans l'eau, des courants de
+// lumiere, un kaleidoscope, un pendule de sable, un flocon qui pousse, un vortex). Chacun une seule ambiance.
 #pragma once
 
-struct E_bougies { char rien; };
+// --- les outils du lot (prefixe cr_) ------------------------------------------------------------------------------
+
+// exp, sin, cos, log rapides : les jumeaux de numpy a 1e-6 pres, sans les 100-300 cycles de la carte
+inline float cr_exp(float x) {
+  float y = x * 1.44269504f;
+  if (y < -125.0f) return 0.0f;
+  if (y > 125.0f) y = 125.0f;
+  const int n = (int)(y + 126.5f) - 126;              // l'entier le plus proche
+  const float f = y - (float)n;                       // dans [-0.5, 0.5]
+  const float p = 1.0f + f * (0.693147181f + f * (0.240226507f + f * (0.0555041087f + f * (0.00961812911f
+                  + f * (0.00133335581f + f * 0.000154035304f)))));
+  const uint32_t bits = (uint32_t)(n + 127) << 23;
+  float deux;
+  memcpy(&deux, &bits, 4);
+  return p * deux;
+}
+inline float cr_sin(float x) {
+  float k = x * 0.159154943f;                          // en tours
+  k -= (float)(int)(k + (k >= 0 ? 0.5f : -0.5f));     // dans [-0.5, 0.5]
+  if (k > 0.25f) k = 0.5f - k;
+  else if (k < -0.25f) k = -0.5f - k;
+  const float z = k * 6.28318531f, z2 = z * z;
+  return z * (1.0f + z2 * (-0.166666667f + z2 * (0.00833333333f + z2 * (-0.000198412698f + z2 * 2.75573192e-6f))));
+}
+inline float cr_cos(float x) { return cr_sin(x + 1.57079633f); }
+inline float cr_log(float x) {                         // x > 0
+  uint32_t bits;
+  memcpy(&bits, &x, 4);
+  const int ex = (int)((bits >> 23) & 255) - 127;
+  bits = (bits & 0x007FFFFFu) | 0x3F800000u;
+  float m;
+  memcpy(&m, &bits, 4);                                // dans [1, 2)
+  const float s = (m - 1.0f) / (m + 1.0f), s2 = s * s; // ln m = 2 atanh(s)
+  return ex * 0.693147181f + 2.0f * s * (1.0f + s2 * (0.333333333f + s2 * (0.2f + s2 * (0.142857143f + s2 * 0.111111111f))));
+}
+inline float cr_atan2(float y, float x) {
+  const float ax = fabsf(x), ay = fabsf(y);
+  const float mx = fmaxf(ax, ay), mn = fminf(ax, ay);
+  if (mx <= 0.0f) return 0.0f;
+  const float a = mn / mx, s = a * a;
+  float r = a * (0.99997726f + s * (-0.33262347f + s * (0.19354346f + s * (-0.11643287f + s * (0.05265332f - s * 0.01172120f)))));
+  if (ay > ax) r = 1.57079633f - r;
+  if (x < 0) r = 3.14159265f - r;
+  return y < 0 ? -r : r;
+}
+inline float cr_clip01(float v) { return v < 0 ? 0.0f : v > 1 ? 1.0f : v; }
+inline float cr_ramp(float v) { return v < 0 ? 0.0f : v; }
+
+// un point pose entre les pixels, partage sur ses quatre voisins (_cocon_tamponner) ; hors du panneau, perdu
+inline void cr_tamponner(float y, float x, float r, float v, float b) {
+  const float fy0 = floorf(y), fx0 = floorf(x);
+  const int y0 = (int)fy0, x0 = (int)fx0;
+  if (y0 < -1 || y0 > 63 || x0 < -1 || x0 > 63) return;
+  const float fy = y - fy0, fx = x - fx0;
+  const float w[4] = {(1 - fy) * (1 - fx), (1 - fy) * fx, fy * (1 - fx), fy * fx};
+  for (int k = 0; k < 4; k++) {
+    const int yy = y0 + (k >> 1), xx = x0 + (k & 1);
+    if (yy < 0 || yy > 63 || xx < 0 || xx > 63) continue;
+    float *p = scene[yy][xx];
+    p[0] += w[k] * r; p[1] += w[k] * v; p[2] += w[k] * b;
+  }
+}
+// la meme chose dans un tampon d'une couleur (64 x 64)
+inline void cr_tamponner1(float *buf, float y, float x, float v) {
+  const float fy0 = floorf(y), fx0 = floorf(x);
+  const int y0 = (int)fy0, x0 = (int)fx0;
+  if (y0 < -1 || y0 > 63 || x0 < -1 || x0 > 63) return;
+  const float fy = y - fy0, fx = x - fx0;
+  if (y0 >= 0) {
+    if (x0 >= 0) buf[y0 * 64 + x0] += (1 - fy) * (1 - fx) * v;
+    if (x0 < 63) buf[y0 * 64 + x0 + 1] += (1 - fy) * fx * v;
+  }
+  if (y0 < 63) {
+    if (x0 >= 0) buf[(y0 + 1) * 64 + x0] += fy * (1 - fx) * v;
+    if (x0 < 63) buf[(y0 + 1) * 64 + x0 + 1] += fy * fx * v;
+  }
+}
+// et dans un tampon de trois couleurs (64 x 64 x 3)
+inline void cr_tamponner3(float *buf, float y, float x, float r, float v, float b) {
+  const float fy0 = floorf(y), fx0 = floorf(x);
+  const int y0 = (int)fy0, x0 = (int)fx0;
+  if (y0 < -1 || y0 > 63 || x0 < -1 || x0 > 63) return;
+  const float fy = y - fy0, fx = x - fx0;
+  const float w[4] = {(1 - fy) * (1 - fx), (1 - fy) * fx, fy * (1 - fx), fy * fx};
+  for (int k = 0; k < 4; k++) {
+    const int yy = y0 + (k >> 1), xx = x0 + (k & 1);
+    if (yy < 0 || yy > 63 || xx < 0 || xx > 63) continue;
+    float *p = buf + (yy * 64 + xx) * 3;
+    p[0] += w[k] * r; p[1] += w[k] * v; p[2] += w[k] * b;
+  }
+}
+
+// _cocon_flou : [1 2 1] / 4 sur les deux axes, n fois, les bords ne se raccordent pas (au-dela : zero) ;
+// en place, sur un tampon de c couleurs (entrelacees), dans la boite [y0, y1) x [x0, x1) (dehors : zero)
+void cr_flou_cocon(float *a, int c, int n, int y0 = 0, int y1 = 64, int x0 = 0, int x1 = 64) {
+  float avant[64 * 3];
+  for (int pas = 0; pas < n; pas++) {
+    for (int y = y0; y < y1; y++) {                    // les lignes
+      float *l = a + (y * 64) * c;
+      for (int k = 0; k < c; k++) {
+        float g = 0, m = l[x0 * c + k];
+        for (int x = x0; x < x1; x++) {
+          const float d = x + 1 < x1 ? l[(x + 1) * c + k] : 0.0f;
+          l[x * c + k] = (g + 2 * m + d) * 0.25f;
+          g = m; m = d;
+        }
+      }
+    }
+    for (int i = 0; i < 64 * c; i++) avant[i] = 0;     // les colonnes
+    for (int y = y0; y < y1; y++) {
+      float *l = a + (y * 64) * c;
+      const float *s = y + 1 < y1 ? a + ((y + 1) * 64) * c : nullptr;
+      for (int i = x0 * c; i < x1 * c; i++) {
+        const float m = l[i];
+        l[i] = (avant[i] + 2 * m + (s ? s[i] : 0.0f)) * 0.25f;
+        avant[i] = m;
+      }
+    }
+  }
+}
+// _reveries_flou : le meme, les bords recopies (la lumiere ne fuit pas), sur un tampon de taille x taille
+void cr_flou_rev(float *a, int c, int n, int taille = 64) {
+  float avant[64 * 3];
+  const int m1 = taille - 1;
+  for (int pas = 0; pas < n; pas++) {
+    for (int y = 0; y < taille; y++) {
+      float *l = a + (y * taille) * c;
+      for (int k = 0; k < c; k++) {
+        float g = l[k], m = l[k];
+        for (int x = 0; x < taille; x++) {
+          const float d = l[(x < m1 ? x + 1 : m1) * c + k];
+          l[x * c + k] = (g + 2 * m + d) * 0.25f;
+          g = m; m = d;
+        }
+      }
+    }
+    for (int i = 0; i < taille * c; i++) avant[i] = a[i];
+    for (int y = 0; y < taille; y++) {
+      float *l = a + (y * taille) * c;
+      const float *s = a + ((y < m1 ? y + 1 : m1) * taille) * c;
+      for (int i = 0; i < taille * c; i++) {
+        const float m = l[i];
+        l[i] = (avant[i] + 2 * m + s[i]) * 0.25f;
+        avant[i] = m;
+      }
+    }
+  }
+}
+
+// _reveries_halo : un grand halo pas cher -- a demi-taille (32 x 32 x 3), flou n fois, remis a la taille du
+// panneau et flou une fois (ce qui revient a l'agrandir en melangeant 1/4 - 3/4) ; ajoute k * halo a la scene
+void cr_halo_rev(const float *src, float *petit, int n, float k) {
+  for (int y = 0; y < 32; y++)
+    for (int x = 0; x < 32; x++)
+      for (int c = 0; c < 3; c++) {
+        const float *p = src + ((2 * y) * 64 + 2 * x) * 3 + c;
+        petit[(y * 32 + x) * 3 + c] = (p[0] + p[3] + p[192] + p[195]) * 0.25f;
+      }
+  cr_flou_rev(petit, 3, n, 32);
+  for (int y = 0; y < 64; y++) {
+    const int ya = y & 1 ? y >> 1 : max(0, (y >> 1) - 1), yb = y & 1 ? min(31, (y >> 1) + 1) : y >> 1;
+    const float wa = y & 1 ? 0.75f : 0.25f, wb = 1 - wa;
+    for (int x = 0; x < 64; x++) {
+      const int xa = x & 1 ? x >> 1 : max(0, (x >> 1) - 1), xb = x & 1 ? min(31, (x >> 1) + 1) : x >> 1;
+      const float va = x & 1 ? 0.75f : 0.25f, vb = 1 - va;
+      const float *p = petit + (ya * 32 + xa) * 3, *q = petit + (ya * 32 + xb) * 3;
+      const float *r = petit + (yb * 32 + xa) * 3, *s = petit + (yb * 32 + xb) * 3;
+      for (int c = 0; c < 3; c++)
+        scene[y][x][c] += k * (wa * (va * p[c] + vb * q[c]) + wb * (va * r[c] + vb * s[c]));
+    }
+  }
+}
+
+// _reveries_lumiere : de la lumiere qui s'additionne -> des couleurs, qui saturent en douceur
+inline void cr_lumiere(float *l, float k) {
+  const float m = fmaxf(l[0], fmaxf(l[1], l[2]));
+  if (m <= 1e-6f) { l[0] = l[1] = l[2] = 0; return; }
+  const float f = 255.0f * (1 - cr_exp(-m / k)) / m;
+  l[0] *= f; l[1] *= f; l[2] *= f;
+}
+
+// _reveries_palette : une palette en boucle, sans couture
+inline void cr_palette_rev(const float (*pal)[3], int n, float k, float *out, bool doux = true) {
+  k = (k - floorf(k)) * n;
+  const float fk = floorf(k);
+  int i = (int)fk % n;
+  if (i < 0) i += n;
+  float f = k - fk;
+  if (doux) f = f * f * (3 - 2 * f);
+  const float *a = pal[i], *b = pal[(i + 1) % n];
+  for (int c = 0; c < 3; c++) out[c] = a[c] * (1 - f) + b[c] * f;
+}
+
+// _cocon_palette : une valeur (0..1) -> une couleur, le long d'une suite (np.interp, borne aux deux bouts)
+inline void cr_palette_cocon(const float *pas, const float (*coul)[3], int n, float v, float *out) {
+  if (v <= pas[0]) { out[0] = coul[0][0]; out[1] = coul[0][1]; out[2] = coul[0][2]; return; }
+  for (int i = 1; i < n; i++)
+    if (v <= pas[i]) {
+      const float f = (v - pas[i - 1]) / (pas[i] - pas[i - 1]);
+      for (int c = 0; c < 3; c++) out[c] = coul[i - 1][c] + (coul[i][c] - coul[i - 1][c]) * f;
+      return;
+    }
+  out[0] = coul[n - 1][0]; out[1] = coul[n - 1][1]; out[2] = coul[n - 1][2];
+}
+
+// _fenetre sur un champ en uint16 : la partie fractionnaire est la meme partout, on la prepare une fois
+struct cr_Fen { const uint16_t *c; int m, sh, x0, y0; float fx, fy; };
+inline cr_Fen cr_fen(const uint16_t *c, int taille, float ox, float oy) {
+  cr_Fen f;
+  f.c = c; f.m = taille - 1; f.sh = taille == 128 ? 7 : 6;
+  const float a = floorf(ox), b = floorf(oy);
+  f.x0 = (int)a; f.y0 = (int)b; f.fx = ox - a; f.fy = oy - b;
+  return f;
+}
+inline float cr_lire(const cr_Fen &f, int x, int y) {
+  const int xa = (x + f.x0) & f.m, xb = (x + f.x0 + 1) & f.m;
+  const int ya = ((y + f.y0) & f.m) << f.sh, yb = ((y + f.y0 + 1) & f.m) << f.sh;
+  const float a = f.c[ya + xa], b = f.c[ya + xb], d = f.c[yb + xa], g = f.c[yb + xb];
+  const float h = a + (b - a) * f.fx, l = d + (g - d) * f.fx;
+  return (h + (l - h) * f.fy) * (1.0f / 65535.0f);
+}
+
+// --- les bougies -------------------------------------------------------------------------------------------------
+
+static const float CR_BOUGIES[4][7] = {   // x de la meche, demi-largeur, haut de la cire, pied, couleur de la cire
+  {12.5f, 3.5f, 31.0f, 57.0f, 236, 214, 178}, {25.5f, 4.5f, 41.0f, 59.0f, 238, 196, 168},
+  {39.0f, 3.0f, 23.0f, 56.0f, 238, 222, 192}, {51.5f, 4.0f, 36.0f, 58.0f, 232, 172, 96}};
+static const float CR_LOINTAINES[4][3] = {{5, 20, 3.2f}, {33, 9, 2.6f}, {58, 15, 3.6f}, {46, 26, 2.4f}};
+
+// humeurs : 0 = (une seule ambiance)
+struct E_bougies {
+  float f[4][5], ph[4][6], fs[4], ps[4];   // les rythmes de chaque flamme
+  float lph[4], lvit[4];                   // les bougies lointaines
+  float fk[28], fteinte[28][3];            // le filet de fumee : (1 - k/28)^1.3, sa teinte
+  uint16_t grain[4096];
+  uint16_t fond[4096][3];                  // le mur et la table, x 256
+};
 void s_bougies(int humeur, bool debut, float t, float ecoule, float dt) {
   E_bougies &e = etat_ecran<E_bougies>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)ecoule; (void)dt;
+  if (debut) {
+    static const float lo[5] = {1.1f, 2.4f, 4.4f, 0.35f, 1.3f}, hi[5] = {1.7f, 3.3f, 6.0f, 0.6f, 2.0f};
+    for (int c = 0; c < 4; c++) {
+      for (int k = 0; k < 5; k++) e.f[c][k] = hasard(lo[k], hi[k]);
+      for (int k = 0; k < 6; k++) e.ph[c][k] = hasard(0, PI2);
+      e.fs[c] = hasard(0.05f, 0.085f);
+      e.ps[c] = hasard(0, PI2);
+    }
+    brume_n(e.grain, 64, 2);
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 64; x++) {
+        float c[3];
+        if (y == 53) { c[0] = 30; c[1] = 18; c[2] = 12; }
+        else if (y > 53) {                                 // la table, son bois
+          const float k = (y - 53) / 11.0f, b = 0.88f + 0.12f * sinf(y * 2.3f + sinf(x * 0.13f) * 2);
+          c[0] = (28 + (11 - 28) * k) * b; c[1] = (16 + (6 - 16) * k) * b; c[2] = (10 + (4 - 10) * k) * b;
+        } else {                                           // le mur, plus sombre dans les coins
+          const float k = y / 53.0f;
+          const float coin = cr_clip01(1 - hypotf((x - 32) / 44.0f, (y - 40) / 52.0f));
+          const float m = (0.85f + 0.3f * e.grain[y * 64 + x] / 65535.0f) * (0.55f + 0.45f * coin);
+          c[0] = (5 + 8 * k) * m; c[1] = (3 + 5 * k) * m; c[2] = (4 + 4 * k) * m;
+        }
+        for (int k = 0; k < 3; k++) e.fond[y * 64 + x][k] = (uint16_t)(c[k] * 256 + 0.5f);
+      }
+    for (int i = 0; i < 4; i++) { e.lph[i] = hasard(0, PI2); e.lvit[i] = hasard(0.25f, 0.5f); }
+    for (int k = 0; k < 28; k++) {
+      e.fk[k] = powf(1 - k / 28.0f, 1.3f);
+      const float proche = expf(-k / 6.0f);
+      e.fteinte[k][0] = 150 * proche + 80 * (1 - proche);
+      e.fteinte[k][1] = 112 * proche + 80 * (1 - proche);
+      e.fteinte[k][2] = 84 * proche + 92 * (1 - proche);
+    }
+  }
+  const float s1 = fmaxf(0.0f, sinf(t * 0.083f + 1.0f));
+  const float vent = 0.22f * sinf(t * 0.19f) * s1 * s1;                 // un courant d'air, parfois
+  float h[4], pente[4], eclat[4], fumee[4], yf[4], yc[4], gx[4], k45[4];
+  for (int c = 0; c < 4; c++) {
+    const float *f = e.f[c], *ph = e.ph[c], hw = CR_BOUGIES[c][1];
+    fumee[c] = cr_clip01((sinf(t * e.fs[c] + e.ps[c]) - 0.74f) / 0.26f);   // de temps en temps elle fume
+    const float vie = 1 + 0.07f * sinf(t * f[0] + ph[0]) + 0.045f * sinf(t * f[1] + ph[1]) + 0.025f * sinf(t * f[2] + ph[2]);
+    h[c] = (6.0f + hw * 0.6f) * vie * (1 - 0.15f * fumee[c]);
+    pente[c] = 0.12f * sinf(t * f[3] + ph[3]) + 0.06f * sinf(t * f[4] + ph[4]) + vent;
+    eclat[c] = vie * (1 - 0.12f * fumee[c]);
+    yf[c] = CR_BOUGIES[c][2] - 1.2f;
+    yc[c] = yf[c] - h[c] * 0.35f;
+    gx[c] = CR_BOUGIES[c][0] + pente[c] * h[c] * 0.2f;
+    k45[c] = eclat[c] * 0.45f;
+  }
+  // le mur et la table, eclaires par les flammes
+  for (int y = 0; y < 64; y++) {
+    float dy2[4], dt2[4];
+    for (int c = 0; c < 4; c++) {
+      dy2[c] = (y - yc[c]) * (y - yc[c]);
+      dt2[c] = (y - CR_BOUGIES[c][3]) * 1.6f * (y - CR_BOUGIES[c][3]) * 1.6f;
+    }
+    for (int x = 0; x < 64; x++) {
+      float l = 0;
+      for (int c = 0; c < 4; c++) {
+        const float dx = x - gx[c];
+        l += k45[c] * cr_exp(-sqrtf(dx * dx + dy2[c]) * 0.1f);
+      }
+      if (y >= 53)
+        for (int c = 0; c < 4; c++) {                  // sur la table
+          const float dx = (x - CR_BOUGIES[c][0]) * 0.55f;
+          l += k45[c] * cr_exp(-sqrtf(dx * dx + dt2[c]) * (1.0f / 6.0f));
+        }
+      const uint16_t *f = e.fond[y * 64 + x];
+      const float m = (1 + 5 * l) * (1.0f / 256.0f), a = l * 0.42f;
+      peindre(y, x, f[0] * m + a * 255, f[1] * m + a * 125, f[2] * m + a * 50);
+    }
+  }
+  for (int i = 0; i < 4; i++) {                          // d'autres bougies, loin, floues
+    const float cx = CR_LOINTAINES[i][0], cy = CR_LOINTAINES[i][1], r = CR_LOINTAINES[i][2];
+    const float w = 0.11f + 0.025f * sinf(t * e.lvit[i] + e.lph[i]);
+    for (int y = max(0, (int)(cy - r) - 1); y <= min(63, (int)(cy + r) + 1); y++)
+      for (int x = max(0, (int)(cx - r) - 1); x <= min(63, (int)(cx + r) + 1); x++) {
+        const float k = cr_clip01((r - hypotf(x - cx, y - cy)) / 1.6f) * w;
+        if (k > 0) ajouter(y, x, k, 255, 150, 70);
+      }
+  }
+  for (int c = 0; c < 4; c++) {                          // chaque bougie : on ne travaille que pres d'elle
+    const float cx = CR_BOUGIES[c][0], hw = CR_BOUGIES[c][1], haut = CR_BOUGIES[c][2], pied = CR_BOUGIES[c][3];
+    const float *cire = CR_BOUGIES[c] + 4;
+    const int y0 = max(0, (int)(yf[c] - h[c] * 1.3f) - 2), x0 = max(0, (int)(cx - hw - 4));
+    const int y1 = (int)pied + 1, x1 = min(64, (int)(cx + hw + 5));
+    const float wfl = 1.2f + hw * 0.13f;
+    const float bord_k = 0.62f + 0.2f * eclat[c], cuv_k = 0.8f + 0.2f * eclat[c];
+    const float hw1 = hw - 1.0f;
+    for (int y = y0; y < y1; y++) {
+      const float dy = y - yc[c], dy2 = dy * dy;
+      const float dessous = cr_exp(-(y - haut) / 6.0f) * eclat[c];  // la cire s'allume sous la flamme
+      const float s = (yf[c] - y) / h[c];                // la flamme : 0 au pied, 1 a la pointe
+      const float q = cr_clip01((s + 0.25f) / 1.25f);
+      const float larg = wfl * 2.6f * sqrtf(q) * (1 - q) + 1e-3f;
+      const float sc = cr_clip01(s);
+      const float axe = cx + pente[c] * sc * sc * h[c];
+      const bool flamme = q > 0 && q < 1;
+      const float coeur_k = cr_clip01((0.62f - s) / 0.3f) * cr_clip01((s + 0.05f) / 0.2f);
+      const float coeur_l = larg * 0.55f + 0.3f;
+      const float by = (y - haut) / 1.3f, cy = (y - haut) / 0.7f;
+      for (int x = x0; x < x1; x++) {
+        float *w = scene[y][x];
+        const float dx = x - gx[c];
+        const float g = eclat[c] * 0.4f * cr_exp(-sqrtf(dx * dx + dy2) * (1.0f / 2.6f));   // l'eclat autour
+        w[0] += g * 255; w[1] += g * 150; w[2] += g * 60;
+        const float xn = (x - cx) / hw;
+        if (fabsf(xn) <= 1.0f && y >= haut && y <= pied) {   // le corps : un cylindre de cire
+          const float cyl = sqrtf(cr_clip01(1 - xn * xn));
+          const float a = 0.12f + 0.24f * cyl, d = dessous * (0.25f + 0.75f * cyl * sqrtf(cyl)) * 0.9f;
+          w[0] = cire[0] * 0.95f * a + d * 255; w[1] = cire[1] * 0.72f * a + d * 160; w[2] = cire[2] * 0.5f * a + d * 75;
+        }
+        if (xn * xn + by * by <= 1 && y < haut + 0.5f) {
+          w[0] = cire[0] * bord_k; w[1] = cire[1] * 0.86f * bord_k; w[2] = cire[2] * 0.7f * bord_k;
+        }
+        const float cu = (x - cx) / hw1;
+        if (cu * cu + cy * cy <= 1) { w[0] = 255 * cuv_k; w[1] = 190 * cuv_k; w[2] = 100 * cuv_k; }   // la cire fondue
+        const float ecart = fabsf(x - axe);
+        const float inten = flamme ? cr_clip01(1.15f - ecart / larg) : 0.0f;
+        const float coeur = coeur_k > 0 ? cr_clip01(1.0f - ecart / coeur_l) * coeur_k : 0.0f;
+        if (inten > 0 || coeur > 0) {
+          const float m = cr_clip01(inten * 1.4f - 0.25f - sc * 0.5f);
+          const float k = 1 - 0.7f * inten;
+          w[0] = w[0] * k + 255 * inten + coeur * 204;
+          w[1] = w[1] * k + (115 + 90 * m) * inten + coeur * 196;
+          w[2] = w[2] * k + (25 + 75 * m) * inten + coeur * 176;
+        }
+      }
+    }
+  }
+  for (int c = 0; c < 4; c++) {                          // un filet de fumee qui monte en ondulant
+    if (fumee[c] <= 0.01f) continue;
+    const float phf = e.ph[c][5];
+    for (int k = 0; k < 28; k++) {
+      const float ys = yf[c] - h[c] * 0.98f - 0.5f - k * 0.9f;
+      const float xs = CR_BOUGIES[c][0] + pente[c] * h[c] + sinf(k * 0.27f - t * 1.3f + phf) * (0.15f + k * 0.07f)
+                       + k * k * 0.006f * (vent * 4 + 0.3f);
+      const float force = fumee[c] * e.fk[k] * (0.6f + 0.4f * sinf(k * 0.45f - t * 2.0f + phf)) * cr_clip01(k / 3.0f);
+      cr_tamponner(ys, xs, e.fteinte[k][0] * force, e.fteinte[k][1] * force, e.fteinte[k][2] * force);
+    }
+  }
 }
 
-struct E_cheminee { char rien; };
+// --- la cheminee -------------------------------------------------------------------------------------------------
+
+static const float CR_BUCHES[3][5] = {{17.0f, 47.5f, 47.0f, 46.5f, 3.0f}, {16.0f, 54.0f, 42.0f, 51.0f, 2.9f},
+                                      {48.0f, 55.0f, 35.0f, 49.0f, 2.2f}};   // le bout coupe, l'autre, le rayon
+static const float CR_FEU_PAS[6] = {0.0f, 0.16f, 0.38f, 0.6f, 0.8f, 1.0f};
+static const float CR_FEU[6][3] = {{0, 0, 0}, {110, 14, 2}, {220, 60, 6}, {255, 140, 30}, {255, 200, 80}, {255, 236, 160}};
+
+struct CR_Ecorce { uint16_t i; uint8_t buche, drapeaux; int8_t ny; uint8_t rb, ec[3]; };   // drapeaux : 1 fente, 2 bout, 4 cerne
+struct CR_Braise { uint16_t i; float b; };
+
+// humeurs : 0 = (une seule ambiance)
+struct E_cheminee {
+  uint16_t base[4096][3], vive[4096][3];   // la piece : base + vif * vive (x 32)
+  uint16_t souffle[4096], flamA[4096], flamB[4096], tmp[4096];
+  uint8_t masque[4096];                    // au semis : 1 joint, 2 objet, 4 ouverture
+  CR_Ecorce ecorce[640];
+  CR_Braise braise[160];
+  int necorce, nbraise, debut_buche[4];
+  float haut_ouv[64];
+  float etin[11][6];                       // les etincelles : x, y, vy, age, vie, phase
+};
+
+inline bool cr_ouverture(float hauts, int x, int y) { return fabsf(x - 32.0f) <= 18.5f && y >= hauts && y <= 57; }
+
+void cr_cheminee_preparer(E_cheminee &e) {
+  float *alb = &scene[0][0][0];                          // l'albedo, le temps du semis
+  for (int i = 0; i < 4096; i++) { alb[3 * i] = 26; alb[3 * i + 1] = 18; alb[3 * i + 2] = 16; }
+  uint8_t *mq = e.masque;
+  int y = 14;
+  while (y < 64) {                                       // des assises de pierres, des blocs decales
+    const int hh = 5 + (int)(aleatoire() % 3);
+    float x0 = -hasard(0, 9);
+    while (x0 < 64) {
+      const float w = hasard(6, 13);
+      const float k = hasard(0, 1), g = hasard(0.68f, 1.12f);
+      const float c[3] = {(122 * (1 - k) + 134 * k) * g, (112 * (1 - k) + 104 * k) * g, (102 * (1 - k) + 82 * k) * g};
+      for (int yy = y; yy < min(64, y + hh); yy++)
+        for (int x = 0; x < 64; x++)
+          if (x >= x0 && x < x0 + w) {
+            const float m = yy == y + 1 ? 1.15f : yy == y + hh - 1 ? 0.8f : 1.0f;
+            for (int j = 0; j < 3; j++) alb[(yy * 64 + x) * 3 + j] = c[j] * m;
+          }
+      const int cxa = (int)ceilf(x0) + 1, cxb = (int)ceilf(x0 + w) - 1;
+      for (int cy : {y + 1, y + hh - 1})                // des coins arrondis
+        for (int cx : {cxa, cxb})
+          if (cy >= 0 && cy < 64 && cx >= 0 && cx < 64) mq[cy * 64 + cx] |= 1;
+      const int xc = (int)ceilf(x0);
+      if (xc >= 0 && xc < 64)
+        for (int yy = y; yy < min(64, y + hh); yy++) mq[yy * 64 + xc] |= 1;
+      x0 += w;
+    }
+    for (int x = 0; x < 64; x++) mq[y * 64 + x] |= 1;
+    y += hh;
+  }
+  brume_n(e.tmp, 64, 1);
+  for (int i = 14 * 64; i < 4096; i++) {
+    const float m = 0.85f + 0.3f * e.tmp[i] / 65535.0f;
+    for (int j = 0; j < 3; j++) alb[3 * i + j] *= m;
+    if (mq[i] & 1) { alb[3 * i] = 44; alb[3 * i + 1] = 38; alb[3 * i + 2] = 34; }
+  }
+  auto poser_alb = [&](int yy, int xx, float r, float v, float b) {
+    float *p = alb + (yy * 64 + xx) * 3; p[0] = r; p[1] = v; p[2] = b;
+  };
+  for (int yy = 8; yy <= 13; yy++)                       // le manteau, une poutre
+    for (int x = 0; x < 64; x++) {
+      const float k = 0.82f + 0.18f * sinf(x * 0.7f + sinf(yy * 1.9f) * 2);
+      if (yy == 8) poser_alb(yy, x, 120, 76, 44);
+      else if (yy == 13) poser_alb(yy, x, 60, 36, 20);
+      else poser_alb(yy, x, 84 * k, 50 * k, 28 * k);
+    }
+  for (int yy = 0; yy < 64; yy++)                         // sur le manteau : une pendule, un vase, un cadre
+    for (int x = 0; x < 64; x++) {
+      const float px = (x - 32) / 3.2f, py = (yy - 3.2f) / 2.4f;
+      const bool pendule = (abs(x - 32) <= 3 && yy >= 3 && yy <= 7) || px * px + py * py <= 1;
+      const bool vase = (hypotf(x - 12.0f, (yy - 5.5f) * 1.2f) <= 2.2f || (fabsf(x - 12.0f) <= 0.8f && yy >= 2 && yy <= 4)) && yy <= 7;
+      const bool cadre = x >= 48 && x <= 54 && yy >= 2 && yy <= 7;
+      if (pendule) poser_alb(yy, x, 92, 58, 34);
+      if (hypotf(x - 32.0f, yy - 3.6f) <= 1.7f) poser_alb(yy, x, 200, 186, 150);
+      if (vase) poser_alb(yy, x, 70, 96, 104);
+      if (cadre) poser_alb(yy, x, 130, 100, 56);
+      if (x >= 49 && x <= 53 && yy >= 3 && yy <= 6) poser_alb(yy, x, 56, 60, 70);
+      if (pendule || vase || cadre) mq[yy * 64 + x] |= 2;
+    }
+  poser_alb(3, 32, 60, 40, 30);
+  static const int8_t branches[5][2] = {{10, 0}, {11, 1}, {13, 0}, {14, 1}, {12, 0}};   // quelques branches seches
+  for (auto &b : branches) { poser_alb(b[1], b[0], 110, 80, 50); mq[b[1] * 64 + b[0]] |= 2; }
+  for (int x = 0; x < 64; x++) {
+    const float u = (x - 32) / 18.5f;
+    e.haut_ouv[x] = 22 + 4.5f * u * u * u * u;
+  }
+  for (int yy = 58; yy < 64; yy++)
+    for (int x = 0; x < 64; x++) {
+      if (abs(x - 32) <= 30) { if (yy >= 60) poser_alb(yy, x, 96, 86, 78); else poser_alb(yy, x, 150, 136, 122); }
+      else poser_alb(yy, x, 16, 12, 11);
+    }
+  // la lumiere de la piece : base + vif * vive ; dans l'atre, son fond noirci
+  static const float B5[5] = {1 / 16.0f, 4 / 16.0f, 6 / 16.0f, 4 / 16.0f, 1 / 16.0f};
+  static const float chaud[3] = {1.55f, 0.78f, 0.36f}, k0[3] = {0.11f, 0.1f, 0.11f};
+  for (int yy = 0; yy < 64; yy++)
+    for (int x = 0; x < 64; x++) {
+      const int i = yy * 64 + x;
+      float b[3], v[3];
+      if (cr_ouverture(e.haut_ouv[x], x, yy)) {
+        const float k = cr_clip01((yy - 22) / 35.0f);
+        float f[3] = {12 + 12 * k, 7 + 6 * k, 6 + 3 * k};
+        if (yy % 3 == 0 || (x + ((yy / 3) % 2) * 3) % 6 == 0) for (int j = 0; j < 3; j++) f[j] *= 0.7f;
+        const float jo = cr_clip01(fabsf(x - 32.0f) / 18.5f), m = 1 - 0.6f * jo * jo * jo;
+        const float li = expf(-hypotf(x - 32.0f, (yy - 49) * 1.3f) / 9.0f);
+        for (int j = 0; j < 3; j++) { b[j] = f[j] * m * 0.6f; v[j] = f[j] * m * li * 3.2f * chaud[j]; }
+        mq[i] |= 4;
+      } else {
+        float pres = 0;                                   // les pierres au bord de l'atre (le flou de l'ouverture)
+        for (int a = -2; a <= 2; a++)
+          for (int c = -2; c <= 2; c++) {
+            const int ya = yy + a, xc = x + c;
+            if (ya >= 0 && ya < 64 && xc >= 0 && xc < 64 && cr_ouverture(e.haut_ouv[xc], xc, ya)) pres += B5[a + 2] * B5[c + 2];
+          }
+        const float d = hypotf((x - 32) * 0.75f, (yy - 46) * 0.95f);
+        const float lp = expf(-d / 13.0f) + 0.3f * expf(-d / 34.0f) + pres * 1.3f + (yy == 13) * 0.35f
+                         + ((mq[i] & 2) ? 0.3f : 0.0f) + (yy < 8) * 0.08f;
+        for (int j = 0; j < 3; j++) { b[j] = alb[3 * i + j] * k0[j]; v[j] = alb[3 * i + j] * lp * chaud[j]; }
+      }
+      for (int j = 0; j < 3; j++) {
+        e.base[i][j] = (uint16_t)fminf(65535.0f, b[j] * 32 + 0.5f);
+        e.vive[i][j] = (uint16_t)fminf(65535.0f, v[j] * 32 + 0.5f);
+      }
+    }
+  // le lit de braises
+  brume_n(e.tmp, 64, 1);
+  e.nbraise = 0;
+  for (int yy = 54; yy <= 57; yy++)
+    for (int x = 14; x <= 50; x++) {
+      const float u = (x - 32) / 17.0f;
+      if (yy >= 54.5f + 2 * u * u && e.nbraise < 160)
+        e.braise[e.nbraise++] = {(uint16_t)(yy * 64 + x), cr_clip01((e.tmp[yy * 64 + x] / 65535.0f - 0.28f) * 1.9f)};
+    }
+  brume_n(e.souffle, 64, 5);
+  brume_n(e.flamA, 64, 5);
+  brume_n(e.flamB, 64, 2);
+  // les buches : leur ecorce, leurs fentes, leur bout coupe et ses cernes
+  brume_n(e.tmp, 64, 1);
+  e.necorce = 0;
+  for (int b = 0; b < 3; b++) {
+    e.debut_buche[b] = e.necorce;
+    const float ax = CR_BUCHES[b][0], ay = CR_BUCHES[b][1], bx = CR_BUCHES[b][2], by = CR_BUCHES[b][3], r = CR_BUCHES[b][4];
+    const float vx = bx - ax, vy = by - ay, l2 = vx * vx + vy * vy, l = sqrtf(l2);
+    for (int yy = 40; yy < 64; yy++)
+      for (int x = 0; x < 64; x++) {
+        const float u = cr_clip01(((x - ax) * vx + (yy - ay) * vy) / l2);
+        const float px = x - (ax + u * vx), py = yy - (ay + u * vy), d = hypotf(px, py);
+        const float rb = hypotf((x - ax) * 1.25f, yy - ay) / r;
+        const bool bout = rb * r <= r * 1.02f;
+        if (!(d <= r || bout) || e.necorce >= 640) continue;
+        const float ny = fmaxf(-1.0f, fminf(1.0f, py / r));
+        const float cyl = sqrtf(cr_clip01(1 - (d / r) * (d / r)));
+        const float sillons = 0.75f + 0.25f * sinf(ny * 5.5f + sinf(u * l * 0.35f) * 1.3f);   // l'ecorce, en long
+        const float k = (0.35f + 0.65f * cyl) * sillons;
+        CR_Ecorce &c = e.ecorce[e.necorce++];
+        c.i = (uint16_t)(yy * 64 + x);
+        c.buche = (uint8_t)b;
+        c.ny = (int8_t)lrintf(ny * 127);
+        c.rb = (uint8_t)fminf(255.0f, rb * 200 + 0.5f);
+        c.ec[0] = (uint8_t)(74 * k + 0.5f); c.ec[1] = (uint8_t)(44 * k + 0.5f); c.ec[2] = (uint8_t)(24 * k + 0.5f);
+        c.drapeaux = 0;
+        if (e.tmp[c.i] > 0.66f * 65535 && ny > 0.05f && d <= r) c.drapeaux |= 1;
+        if (bout) {
+          c.drapeaux |= 2;
+          if (fabsf(rb - 0.55f) < 0.17f || rb < 0.15f) c.drapeaux |= 4;
+        }
+      }
+  }
+  e.debut_buche[3] = e.necorce;
+}
+
+void cr_buche(E_cheminee &e, int b, float vif, const cr_Fen &souffle) {
+  for (int n = e.debut_buche[b]; n < e.debut_buche[b + 1]; n++) {
+    const CR_Ecorce &c = e.ecorce[n];
+    const int y = c.i >> 6, x = c.i & 63;
+    float col[3];
+    if (c.drapeaux & 2) {                                // le bout coupe, clair, et ses cernes
+      const float k = (0.75f + 0.25f * vif) * (1.05f - 0.35f * c.rb / 200.0f) * ((c.drapeaux & 4) ? 0.6f : 1.0f);
+      col[0] = 170 * k; col[1] = 110 * k; col[2] = 62 * k;
+    } else {
+      const float so = cr_lire(souffle, x, y);
+      if (c.drapeaux & 1) {
+        const float k = 0.3f + 0.7f * so;
+        col[0] = 255 * k; col[1] = 110 * k; col[2] = 25 * k;
+      } else {
+        const float ny = c.ny / 127.0f;
+        const float dessus = cr_clip01(-ny - 0.2f) * vif * 0.85f, dessous = cr_clip01(ny - 0.2f) * so * 0.55f;
+        col[0] = c.ec[0] + dessus * 255 + dessous * 255;
+        col[1] = c.ec[1] + dessus * 125 + dessous * 80;
+        col[2] = c.ec[2] + dessus * 45 + dessous * 15;
+      }
+    }
+    peindre(y, x, col[0], col[1], col[2]);
+  }
+}
+
 void s_cheminee(int humeur, bool debut, float t, float ecoule, float dt) {
   E_cheminee &e = etat_ecran<E_cheminee>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)ecoule;
+  if (debut) cr_cheminee_preparer(e);
+  const float vif = 0.84f + 0.07f * sinf(t * 2.3f) + 0.05f * sinf(t * 3.7f + 1.3f) + 0.04f * sinf(t * 6.1f + 0.4f);
+  for (int i = 0; i < 4096; i++) {
+    const uint16_t *b = e.base[i], *v = e.vive[i];
+    float *p = &scene[0][0][0] + 3 * i;
+    p[0] = (b[0] + vif * v[0]) * (1 / 32.0f);
+    p[1] = (b[1] + vif * v[1]) * (1 / 32.0f);
+    p[2] = (b[2] + vif * v[2]) * (1 / 32.0f);
+  }
+  const cr_Fen souffle = cr_fen(e.souffle, 64, t * 2.2f, t * 1.4f);   // les braises respirent, par vagues
+  for (int n = 0; n < e.nbraise; n++) {
+    const int y = e.braise[n].i >> 6, x = e.braise[n].i & 63;
+    float c[3];
+    cr_palette_cocon(CR_FEU_PAS, CR_FEU, 6, e.braise[n].b * (0.35f + 0.8f * cr_lire(souffle, x, y)) * 0.85f, c);
+    peindre(y, x, c[0] + 34, c[1] + 6, c[2] + 2);
+  }
+  cr_buche(e, 0, vif, souffle);
+  // les flammes : des langues qui montent des buches, rongees par un bruit qui file vers le haut
+  float haut[64];
+  for (int x = 0; x < 64; x++) haut[x] = 0;
+  static const float langues[5][3] = {{21, 14, 3.2f}, {26, 22, 3.6f}, {31.5f, 27, 4.0f}, {37, 21, 3.6f}, {42.5f, 14, 3.2f}};
+  for (int j = 0; j < 5; j++) {
+    const float c = langues[j][0] + 1.5f * sinf(t * (0.5f + 0.13f * j) + j * 1.7f);
+    const float hj = langues[j][1] * (0.74f + 0.15f * sinf(t * (1.7f + 0.31f * j) + j * 2.3f) + 0.11f * sinf(t * (3.9f + 0.43f * j) + j));
+    const float iw = 1.0f / langues[j][2];
+    for (int x = 0; x < 64; x++) {
+      const float u = (x - c) * iw;
+      if (u * u < 30) haut[x] = fmaxf(haut[x], hj * cr_exp(-u * u));
+    }
+  }
+  const cr_Fen n1 = cr_fen(e.flamA, 64, 10 + sinf(t * 0.3f) * 4, 30 + t * 15);
+  const cr_Fen n2 = cr_fen(e.flamB, 64, 50, 70 + t * 24);
+  for (int y = 18; y < 54; y++) {
+    const float hgt = 50.5f - y;
+    const float decal = (1.3f * cr_sin(y * 0.42f + t * 3.1f) + 0.6f * cr_sin(y * 0.9f - t * 5.3f)) * cr_clip01(hgt / 14);
+    for (int x = 13; x < 52; x++) {
+      if (!cr_ouverture(e.haut_ouv[x], x, y)) continue;
+      float xd = x + decal;                              // np.interp : borne aux deux bouts
+      xd = fmaxf(0.0f, fminf(63.0f, xd));
+      const int xi = min(62, (int)xd);
+      const float hx = haut[xi] + (haut[xi + 1] - haut[xi]) * (xd - xi);
+      if (hx <= 0) continue;
+      const float r = hgt / (hx + 0.6f);
+      const float f = (1 - r) * 1.25f - (0.55f * cr_lire(n1, x, y) + 0.45f * cr_lire(n2, x, y)) * (0.25f + 0.9f * cr_clip01(r));
+      const float flamme = cr_clip01(f) * cr_clip01(hx / 7);
+      if (flamme <= 0) continue;
+      float c[3];
+      cr_palette_cocon(CR_FEU_PAS, CR_FEU, 6, flamme * 0.97f, c);
+      const float k = 1 - 0.5f * cr_clip01(flamme * 2);
+      float *z = scene[y][x];
+      z[0] = z[0] * k + c[0]; z[1] = z[1] * k + c[1]; z[2] = z[2] * k + c[2];
+    }
+  }
+  cr_buche(e, 1, vif, souffle);
+  cr_buche(e, 2, vif, souffle);
+  // des etincelles qui montent en voletant, s'eteignent, et repartent des buches
+  if (debut)
+    for (auto &s : e.etin) {
+      const float vie = hasard(1.2f, 2.6f), age = hasard(0, 1) * vie, vy = -hasard(8, 15);
+      s[0] = hasard(22, 42); s[1] = hasard(45, 49) + vy * age; s[2] = vy; s[3] = age; s[4] = vie; s[5] = hasard(0, 6);
+    }
+  float reste = fminf(dt, 1.0f);
+  while (reste > 1e-6f) {
+    const float hp = fminf(reste, 0.05f), amorti = expf(-hp * 0.35f);
+    reste -= hp;
+    for (auto &s : e.etin) {
+      s[0] += sinf(s[3] * 3.1f + s[5]) * 5.0f * hp;
+      s[1] += s[2] * hp;
+      s[2] *= amorti;
+      s[3] += hp;
+    }
+  }
+  for (auto &s : e.etin)
+    if (s[3] >= s[4]) { s[0] = hasard(22, 42); s[1] = hasard(45, 49); s[2] = -hasard(8, 15); s[3] = 0; s[4] = hasard(1.2f, 2.6f); s[5] = hasard(0, 6); }
+  for (auto &s : e.etin) {
+    const float vie = cr_clip01((1 - s[3] / s[4]) * 2.5f) * (0.85f + 0.15f * sinf(s[3] * 9 + s[5]));
+    const int xi = max(0, min(63, (int)s[0]));
+    if (!(s[1] > e.haut_ouv[xi] + 1)) continue;
+    pointer(s[1] + 1, s[0], vie * 200, vie * 90, vie * 30);   // une courte trainee
+    pointer(s[1], s[0], vie * 255, vie * 205, vie * 120);
+  }
 }
 
-struct E_the { char rien; };
+// --- le the sous la pluie ----------------------------------------------------------------------------------------
+
+static const float CR_THE_LUMIERES[5][3] = {{255, 170, 70}, {255, 214, 160}, {70, 190, 215}, {255, 96, 120}, {150, 130, 255}};
+
+// humeurs : 0 = (une seule ambiance)
+struct E_the {
+  uint8_t coul[4096][3];                   // la ville floue derriere la vitre, ou la couleur fixe (l'interieur)
+  uint8_t fixe[4096];                      // 1 : l'interieur, la lampe, la tasse (rien n'y bouge)
+  float halo[4096];                        // la lumiere de la lampe
+  uint16_t buee[4096], volutes[4096];
+  float trace[44 * 64];                    // ou les gouttes qui glissent ont nettoye la buee
+  float bx[13], by[13], br[13], bc[13][3], bp[13];   // les lumieres floues de la ville
+  float gx[16], gy[16], gl[16];            // les gouttes posees sur la vitre
+  float glisse[3][4], prochaine;
+  int nglisse;
+  Pluie pluie;
+};
+
+void cr_the_preparer(E_the &e) {
+  float *d = &scene[0][0][0];                            // dehors, le temps du semis
+  float toits[64];
+  for (int x = 0; x < 64; x++) toits[x] = 64;
+  int x0 = -3;
+  while (x0 < 64) {                                      // des immeubles au loin
+    const int l = 5 + (int)(aleatoire() % 6);
+    const float h = hasard(15, 30);
+    for (int x = max(0, x0); x < min(64, max(0, x0 + l)); x++) toits[x] = h;
+    x0 += l;
+  }
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      float *p = d + (y * 64 + x) * 3;
+      const float k = cr_clip01(y / 43.0f);              // le ciel de ville, plus clair en bas
+      p[0] = 7 + 27 * k; p[1] = 9 + 15 * k; p[2] = 24 + 22 * k;
+      if (y >= toits[x]) {
+        p[0] = 14 + (y - 16) * 0.3f; p[1] = 13 + (y - 16) * 0.2f; p[2] = 28 + (y - 16) * 0.3f;
+        const bool fen = y % 3 == 0 && x % 3 == 1 && hasard(0, 1) < 0.35f;
+        const bool chaude = hasard(0, 1) < 0.75f;
+        if (fen) {
+          if (chaude) { p[0] = 200; p[1] = 140; p[2] = 70; }
+          else { p[0] = 110; p[1] = 150; p[2] = 190; }
+        }
+      }
+    }
+  cr_flou_cocon(d, 3, 2);                                // tout est flou, derriere la buee
+  for (int i = 0; i < 13; i++) {
+    e.bx[i] = hasard(4, 62); e.by[i] = hasard(20, 43); e.br[i] = hasard(2.0f, 4.2f);
+    const float *c = CR_THE_LUMIERES[aleatoire() % 5];
+    const float k = hasard(0.3f, 0.5f);
+    for (int j = 0; j < 3; j++) e.bc[i][j] = c[j] * k;
+    e.bp[i] = hasard(0, 6);
+  }
+  brume_n(e.buee, 64, 4);
+  brume_n(e.volutes, 64, 3);
+  const float cx = 42.5f, haut = 42.0f, bas = 53.0f, hw = 5.6f;
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const int i = y * 64 + x;
+      const float halo = expf(-hypotf(x - 12.0f, (y - 32) * 1.1f) / 11.0f);
+      e.halo[i] = halo;
+      const float b = cr_clip01(0.3f + 0.5f * e.buee[i] / 65535.0f + 0.3f * cr_clip01((y - 20) / 23.0f));
+      e.buee[i] = (uint16_t)(b * 65535 + 0.5f);
+      const bool vitre = y <= 43 && x >= 3;
+      const bool cadre = y <= 43 && (x <= 2 || (x >= 27 && x <= 28) || (y >= 15 && y <= 16));
+      // l'interieur : le cadre, le rebord profond (vu d'en haut), son chant, le mur dessous
+      float c[3] = {0, 0, 0};
+      const float lum_r = 0.1f + 1.25f * expf(-hypotf((x - 12) * 0.85f, (y - 47) * 1.2f) / 10.0f)
+                          + 0.35f * expf(-hypotf(x - 20.0f, y - 50.0f) / 22.0f);
+      if (cadre) {
+        const float k = (0.9f + 0.1f * sinf(x * 0.8f + y * 0.3f)) * (0.25f + 0.9f * halo);
+        c[0] = 70 * k; c[1] = 42 * k; c[2] = 24 * k;
+      }
+      if (y >= 44 && y <= 55) {
+        const float k = (0.9f + 0.1f * sinf(y * 2.6f + sinf(x * 0.2f) * 1.5f)) * lum_r * (y == 44 ? 0.55f : 1.0f);
+        c[0] = 118 * k; c[1] = 74 * k; c[2] = 42 * k;
+        const float ox = (x - 52) / 8.0f, oy = (y - 53) / 2.2f;
+        if (ox * ox + oy * oy <= 1) for (int j = 0; j < 3; j++) c[j] *= 0.5f;   // l'ombre de la tasse
+      }
+      if (y >= 56 && y <= 58) {
+        const float k = 0.75f * lum_r * (y == 56 ? 1.3f : 1.0f);
+        c[0] = 84 * k; c[1] = 52 * k; c[2] = 30 * k;
+      }
+      if (y >= 59) {
+        const float k = 0.18f + 0.4f * expf(-hypotf(x - 12.0f, y - 52.0f) / 12.0f);
+        c[0] = 40 * k; c[1] = 26 * k; c[2] = 22 * k;
+      }
+      static const float livres[2][6] = {{52, 50, 54, 34, 74, 70}, {54, 46, 49, 118, 34, 34}};   // deux livres, dans le coin
+      for (auto &l : livres)
+        if (x >= l[0] && y >= l[1] && y <= l[2]) {
+          float k[3] = {l[3], l[4], l[5]};
+          if (y == l[1]) { k[0] = 150; k[1] = 130; k[2] = 100; }   // la tranche des pages, vue d'en haut
+          else if (y == l[1] + 2 && x > l[0] + 1) { k[0] = l[3] * 0.6f + 90; k[1] = l[4] * 0.6f + 70; k[2] = l[5] * 0.6f + 20; }
+          const float m = lum_r * 1.1f + 0.08f;
+          for (int j = 0; j < 3; j++) c[j] = k[j] * m;
+        }
+      // la lampe, au fond du rebord : un abat-jour qui luit, un pied fin
+      const float rel = (y - 27) / 8.0f;
+      const bool abat = rel >= 0 && rel <= 1 && fabsf(x - 12.0f) <= 3.5f + rel * 2.6f;
+      const float px = (x - 12) / 3.2f, py = (y - 46.3f) / 1.1f;
+      const bool pied = (fabsf(x - 12.0f) < 0.6f && y > 35 && y < 46) || px * px + py * py <= 1;
+      const bool interieur = !vitre || cadre;
+      if (abat) {
+        const float k = (0.55f + 0.45f * rel) * (0.92f + 0.08f * sinf(x * 1.9f));
+        c[0] = 255 * k; c[1] = 172 * k; c[2] = 88 * k;
+      }
+      if (pied) { c[0] = 60; c[1] = 40; c[2] = 24; }
+      for (int j = 0; j < 3; j++) c[j] += halo * 0.22f * (j == 0 ? 255 : j == 1 ? 160 : 80);
+      // la tasse, devant : un cylindre creme eclaire de la gauche, son anse, sa soucoupe, le the dedans
+      const float xn = (x - cx) / hw;
+      const float lam = cr_clip01(-0.75f * xn + 0.66f * sqrtf(cr_clip01(1 - xn * xn)));
+      static const float creme[3] = {232, 214, 186};
+      const bool corps = fabsf(xn) <= 1 && y >= haut && y <= bas;
+      float an = (x - (cx + hw + 1.4f)) / 2.9f, an2 = (y - 47) / 3.1f;
+      an = an * an + an2 * an2;
+      const bool anse = an <= 1 && an >= 0.3f && x > cx + hw - 0.5f;
+      const float su = (x - cx) / 8.6f, sv = (y - bas - 0.4f) / 1.5f;
+      const bool soucoupe = su * su + sv * sv <= 1 && !corps;
+      const float bv = (y - haut) / 1.45f;
+      const bool bord = xn * xn + bv * bv <= 1;
+      const float tu = (x - cx) / (hw - 1.1f), tv = (y - haut) / 0.8f;
+      const bool the = tu * tu + tv * tv <= 1;
+      if (corps) {
+        const float k = 0.12f + 0.66f * lam - 0.06f * (y - haut) / (bas - haut);
+        for (int j = 0; j < 3; j++) c[j] = creme[j] * k;
+        if (fabsf(xn + 0.45f) < 0.1f && y >= haut + 1 && y <= bas - 3) for (int j = 0; j < 3; j++) c[j] = creme[j] * 0.97f;
+      } else if (anse || soucoupe || bord || the) {
+        for (int j = 0; j < 3; j++) c[j] = 0;
+      }
+      if (anse) for (int j = 0; j < 3; j++) c[j] = creme[j] * 0.2f;
+      if (soucoupe) { const float k = 0.16f + 0.42f * cr_clip01(-(x - cx) / 8.6f + 0.5f); for (int j = 0; j < 3; j++) c[j] = creme[j] * k; }
+      if (bord) { const float k = 0.32f + 0.55f * cr_clip01(0.6f - xn); for (int j = 0; j < 3; j++) c[j] = creme[j] * k; }
+      if (the) { c[0] = 96; c[1] = 46; c[2] = 16; }
+      if (y == (int)haut && x == (int)cx - 2) { c[0] = 220; c[1] = 150; c[2] = 80; }   // la lampe dans le the
+      const bool objet = corps || anse || soucoupe || bord;
+      e.fixe[i] = interieur || abat || pied || objet;
+      if (e.fixe[i]) for (int j = 0; j < 3; j++) e.coul[i][j] = (uint8_t)fminf(255.0f, c[j] + 0.5f);
+      else for (int j = 0; j < 3; j++) e.coul[i][j] = (uint8_t)fminf(255.0f, d[3 * i + j] + 0.5f);
+    }
+  for (int i = 0; i < 16; i++) { e.gx[i] = hasard(4, 62); e.gy[i] = hasard(1, 42); e.gl[i] = hasard(0.35f, 0.7f); }
+  semer_pluie(e.pluie, 40);
+}
+
 void s_the(int humeur, bool debut, float t, float ecoule, float dt) {
   E_the &e = etat_ecran<E_the>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur;
+  if (debut) cr_the_preparer(e);
+  for (int i = 0; i < 4096; i++) {                        // la ville, derriere la vitre
+    float *p = &scene[0][0][0] + 3 * i;
+    p[0] = e.coul[i][0]; p[1] = e.coul[i][1]; p[2] = e.coul[i][2];
+  }
+  for (int i = 0; i < 13; i++) {                         // les lumieres floues qui respirent
+    const float w = 0.8f + 0.2f * sinf(t * 0.4f + e.bp[i]);
+    const float r = e.br[i];
+    for (int y = max(0, (int)(e.by[i] - r) - 1); y <= min(63, (int)(e.by[i] + r) + 1); y++)
+      for (int x = max(0, (int)(e.bx[i] - r) - 1); x <= min(63, (int)(e.bx[i] + r) + 1); x++) {
+        const float k = cr_clip01((r - hypotf(x - e.bx[i], y - e.by[i])) / 1.4f) * w;
+        if (k > 0) ajouter(y, x, k, e.bc[i][0], e.bc[i][1], e.bc[i][2]);
+      }
+  }
+  static const float voitures[2][6] = {{23.0f, 38.0f, 1, 255, 225, 170}, {31.0f, 40.5f, -1, 255, 60, 50}};
+  for (auto &v : voitures) {                              // une voiture passe, en bas, de temps en temps
+    const float k = fmodf(t / v[0], 1.0f);
+    const float xv = v[2] > 0 ? -12 + k * 100 : 76 - k * 100;
+    for (float dx : {0.0f, 5.0f}) {
+      const float cxv = xv + dx;
+      if (cxv < -3 || cxv > 67) continue;
+      for (int y = (int)v[1] - 3; y <= (int)v[1] + 3; y++)
+        for (int x = max(0, (int)cxv - 3); x <= min(63, (int)cxv + 3); x++) {
+          const float a = cr_clip01((2.4f - hypotf(x - cxv, y - v[1])) / 1.3f) * 0.42f;
+          if (a > 0) ajouter(y, x, a, v[3], v[4], v[5]);
+        }
+    }
+  }
+  pluie(e.pluie, dt, 46, 52, 78, 0.12f);
+  // la buee : elle voile et eclaircit la ville ; la lampe l'eclaire ; les gouttes qui glissent la nettoient
+  const float pas = fminf(dt, 1.0f), efface = expf(-pas / 18.0f);
+  for (int i = 0; i < 44 * 64; i++) e.trace[i] *= efface;
+  if (ecoule >= e.prochaine && e.nglisse < 3) {
+    e.prochaine = ecoule + hasard(2.5f, 7.0f);
+    float *g = e.glisse[e.nglisse++];
+    g[0] = hasard(5, 62); g[1] = hasard(2, 24); g[2] = hasard(3.5f, 7.0f); g[3] = hasard(0, 6);
+  }
+  int restent = 0;
+  for (int n = 0; n < e.nglisse; n++) {
+    float *g = e.glisse[n];
+    const float y0 = g[1];
+    g[1] += g[2] * pas;
+    g[0] += sinf(g[1] * 0.6f + g[3]) * 0.08f;
+    const int col = (((int)lrintf(g[0])) % 64 + 64) % 64;
+    for (int y = max(0, (int)y0); y <= min(43, (int)g[1]); y++) e.trace[y * 64 + col] = 1.0f;
+    if (g[1] < 43) for (int j = 0; j < 4; j++) e.glisse[restent][j] = g[j];
+    if (g[1] < 43) restent++;
+  }
+  e.nglisse = restent;
+  for (int i = 0; i < 4096; i++) {
+    float *p = &scene[0][0][0] + 3 * i;
+    if (e.fixe[i]) { p[0] = e.coul[i][0]; p[1] = e.coul[i][1]; p[2] = e.coul[i][2]; continue; }
+    const float b = e.buee[i] * (1.0f / 65535.0f) * (i < 44 * 64 ? 1 - 0.8f * e.trace[i] : 1.0f);
+    const float h = e.halo[i], k = 1 - 0.6f * b;
+    p[0] = p[0] * k + (18 + h * 93.5f) * b + h * 56.1f;
+    p[1] = p[1] * k + (18 + h * 57.75f) * b + h * 35.2f;
+    p[2] = p[2] * k + (28 + h * 33.0f) * b + h * 17.6f;
+  }
+  for (int i = 0; i < 16; i++) {                         // les gouttes posees sur la vitre
+    const int y = (int)e.gy[i], x = (int)e.gx[i];
+    if (e.fixe[y * 64 + x]) continue;
+    const float h = e.halo[y * 64 + x], g = e.gl[i];
+    pointer(y, x, g * (70 + h * 200) + h * 56.1f, g * (72 + h * 130) + h * 35.2f, g * (90 + h * 70) + h * 17.6f);
+  }
+  for (int n = 0; n < e.nglisse; n++)
+    for (int k = 0; k < 2; k++) {
+      const int y = (int)(e.glisse[n][1] + k), x = (int)e.glisse[n][0];
+      if (y < 0 || y > 63 || x < 0 || x > 63 || e.fixe[y * 64 + x]) continue;
+      const float h = e.halo[y * 64 + x];
+      if (k == 0) pointer(y, x, 150 + h * 56.1f, 155 + h * 35.2f, 175 + h * 17.6f);
+      else pointer(y, x, 90 + h * 56.1f, 95 + h * 35.2f, 120 + h * 17.6f);
+    }
+  // la vapeur : deux volutes qui montent en ondulant, s'elargissent et s'effacent
+  const cr_Fen vol = cr_fen(e.volutes, 64, 7, 40 + t * 3.1f);
+  static const float volutes[2][3] = {{41.0f, 0.0f, 3.4f}, {44.0f, 2.1f, 2.9f}};
+  float derive[2], respire[2];
+  for (int j = 0; j < 2; j++) { derive[j] = sinf(t * 0.11f + j * 2); respire[j] = 0.75f + 0.25f * sinf(t * 0.3f + j * 1.3f); }
+  for (int y = 2; y <= 41; y++) {
+    const float hh = 41.5f - y;
+    float xc[2], iw[2], k[2];
+    int xa = 62, xb = 23;
+    for (int j = 0; j < 2; j++) {
+      const float phase = hh - volutes[j][2] * t;
+      xc[j] = volutes[j][0] + (0.4f + hh * 0.12f) * sinf(phase * 0.26f + volutes[j][1]) + hh * 0.07f * derive[j];
+      const float w = 0.9f + hh * 0.05f;
+      iw[j] = 1.0f / w;
+      const float bouffee = fmaxf(cr_clip01(0.35f + 0.8f * sinf(phase * 0.3f + volutes[j][1] * 1.7f)), cr_clip01(1 - hh / 6) * 0.85f);
+      k[j] = cr_clip01(hh / 2.0f) * expf(-hh / 15.0f) * bouffee * respire[j];
+      if (k[j] > 0) { xa = min(xa, (int)(xc[j] - 4.5f * w)); xb = max(xb, (int)(xc[j] + 4.5f * w) + 1); }
+    }
+    for (int x = max(24, xa); x <= min(61, xb); x++) {
+      float v = 0;
+      for (int j = 0; j < 2; j++) {
+        const float u = (x - xc[j]) * iw[j];
+        if (k[j] > 0 && u * u < 20) v += k[j] * cr_exp(-u * u);
+      }
+      if (v <= 1e-4f) continue;
+      v = fminf(1.3f, v * (0.55f + 0.6f * cr_lire(vol, x, y))) * 1.1f;
+      ajouter(y, x, v, 215, 200, 185);
+    }
+  }
 }
 
-struct E_poussiere { char rien; };
+// --- la poussiere dans la lumiere --------------------------------------------------------------------------------
+
+static const float CR_FENETRE[4] = {7.0f, 6.0f, 16.0f, 23.0f};     // la vitre : x, y, largeur, hauteur
+
+// la vitre laisse-t-elle passer le soleil en (x, y) ?
+inline bool cr_jour(float x, float y) {
+  if (!(x >= 7 && x < 23 && y >= 6 && y < 29)) return false;
+  if ((x >= 14 && x < 16) || (y >= 16 && y < 18)) return false;   // le croisillon
+  const float dx = x - 19.5f;                            // un vase a long col, sur l'appui
+  if (hypotf(dx, (y - 25.6f) * 1.1f) <= 2.5f || (fabsf(dx) <= 0.8f && y >= 20.5f) || (fabsf(dx) <= 1.3f && y >= 20.2f && y < 21.2f))
+    return false;
+  return true;
+}
+
+// la n-ieme plus petite valeur (quickselect, en place)
+float cr_nieme(float *a, int n, int k) {
+  int g = 0, d = n - 1;
+  while (g < d) {
+    const float pivot = a[(g + d) / 2];
+    int i = g, j = d;
+    while (i <= j) {
+      while (a[i] < pivot) i++;
+      while (a[j] > pivot) j--;
+      if (i <= j) { const float c = a[i]; a[i] = a[j]; a[j] = c; i++; j--; }
+    }
+    if (k <= j) d = j;
+    else if (k >= i) g = i;
+    else return a[k];
+  }
+  return a[k];
+}
+
+// humeurs : 0 = (une seule ambiance)
+struct E_poussiere {
+  uint16_t piece[4096][3];                 // la piece (x 256)
+  uint16_t lum0[4096];                     // clarte + 2.2 tache + 0.9 rebond (x 16384)
+  uint16_t tache[4096];                    // la tache de soleil au sol (x 65535)
+  int16_t dtache[4096];                    // tache douce - tache (x 32767)
+  uint16_t rayon[4096];                    // le rayon (x 50000)
+  int16_t drayon[4096];                    // rayon doux - rayon (x 27000)
+  uint8_t drapeaux[4096];                  // 1 la vitre, 2 le rideau
+  float puiss[257];                        // x^0.9 sur [0, 1.2]
+  float g[130][7];                         // les poussieres
+};
+
+void cr_poussiere_preparer(E_poussiere &e) {
+  float *ray = &scene[0][0][0], *tmp = ray + 4096, *tmp2 = ray + 8192;
+  for (int i = 0; i < 4096; i++) ray[i] = 0;
+  // le rayon : chaque point de la vitre, tire jusqu'a sa tache au sol ; ce qui s'empile fait la densite
+  for (int iv = 0; iv < 80; iv++)
+    for (int iu = 0; iu < 56; iu++) {
+      const float u = iu / 55.0f, v = iv / 79.0f;
+      const float wx = 7 + u * 16, wy = 6 + v * 23;
+      if (!cr_jour(wx, wy)) continue;
+      const float fy = 62 - v * 15, fx = 22 + (fy - 47) * 0.9f + u * (15 + (fy - 47) * 0.6f);
+      for (int k = 0; k < 40; k++) {
+        const float s = 0.02f + 0.96f * k / 39.0f;
+        cr_tamponner1(ray, wy + s * (fy - wy), wx + s * (fx - wx), 1.0f);
+      }
+    }
+  cr_flou_cocon(ray, 1, 1);
+  int n = 0;
+  for (int i = 0; i < 4096; i++) if (ray[i] > 0) tmp2[n++] = ray[i];   // np.percentile(rayon[rayon > 0], 92)
+  const float pos = 0.92f * (n - 1);
+  const int lo = (int)pos;
+  const float a = cr_nieme(tmp2, n, lo), b = lo + 1 < n ? cr_nieme(tmp2, n, lo + 1) : a;
+  const float p92 = a + (b - a) * (pos - lo);
+  for (int i = 0; i < 4096; i++) ray[i] = fminf(1.2f, fmaxf(0.0f, ray[i] / p92));
+  for (int i = 0; i < 4096; i++) tmp[i] = ray[i];
+  cr_flou_cocon(tmp, 1, 2);                              // le rayon doux (sous un nuage)
+  for (int i = 0; i < 4096; i++) {
+    e.rayon[i] = (uint16_t)(ray[i] * 50000 + 0.5f);
+    e.drayon[i] = (int16_t)lrintf((tmp[i] - ray[i]) * 27000);
+  }
+  // la tache au sol : pour chaque pixel du plancher, le point de la vitre qu'il voit (sur-echantillonne)
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      float s = 0;
+      for (int oy = -1; oy <= 1; oy++)
+        for (int ox = -1; ox <= 1; ox++) {
+          const float yy = y + oy * 0.33f, xx = x + ox * 0.33f;
+          if (yy < 44) continue;
+          const float vv = (62 - yy) / 15, x0 = 22 + (yy - 47) * 0.9f;
+          const float uu = (xx - x0) / fmaxf(15 + (yy - 47) * 0.6f, 1.0f);
+          s += cr_jour(7 + uu * 16, 6 + vv * 23) ? 1.0f / 9 : 0.0f;
+        }
+      ray[y * 64 + x] = s;
+    }
+  for (int i = 0; i < 4096; i++) tmp[i] = ray[i];
+  cr_flou_cocon(tmp, 1, 1);                              // la tache douce
+  for (int i = 0; i < 4096; i++) {
+    e.tache[i] = (uint16_t)(ray[i] * 65535 + 0.5f);
+    e.dtache[i] = (int16_t)lrintf((tmp[i] - ray[i]) * 32767);
+  }
+  cr_flou_cocon(ray, 1, 6);                              // le rebond, partout
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const int i = y * 64 + x;
+      const float clarte = 0.5f * expf(-hypotf(x - 15.0f, y - 18.0f) / 16.0f);   // le jour autour de la fenetre
+      e.lum0[i] = (uint16_t)fminf(65535.0f, (clarte + 2.2f * e.tache[i] / 65535.0f + 0.9f * ray[i]) * 16384 + 0.5f);
+    }
+  // la piece : un mur a rayures discretes, une plinthe, un plancher dont les lames filent vers le fond
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const int i = y * 64 + x;
+      float c[3];
+      const bool vitre = cr_jour(x, y);
+      if (y >= 44) {
+        const float pas = 7.0f * fmaxf(y - 6.0f, 1.0f) / 38.0f, k = (x - 33) / pas, lame = floorf(k + 0.5f);
+        const bool joint = fabsf(k - lame) * pas < 0.5f;
+        const float s = sinf(lame * 12.9898f), m = (0.85f + 0.15f * s * s) * (joint ? 0.55f : 1.0f);
+        c[0] = 62 * m; c[1] = 38 * m; c[2] = 22 * m;
+      } else {
+        const float k = cr_clip01(y / 42.0f), m = 0.95f + 0.05f * sinf(x * 1.25f);
+        c[0] = (24 + 6 * k) * m; c[1] = (17 + 4 * k) * m; c[2] = (15 + 2 * k) * m;
+      }
+      if (y >= 41 && y <= 43) { c[0] = 40; c[1] = 28; c[2] = 22; }   // la plinthe
+      if (y == 41) { c[0] = 52; c[1] = 38; c[2] = 30; }
+      if (x >= 6 && x <= 23 && y >= 5 && y <= 29 && !vitre) { c[0] = 44; c[1] = 28; c[2] = 18; }
+      if (y >= 29 && y <= 30 && x >= 4 && x <= 25) { c[0] = 70; c[1] = 48; c[2] = 30; }   // l'appui
+      const bool rideau = x <= 4.5f - 0.06f * fmaxf(0.0f, y - 30.0f) && y >= 3 && y <= 42;
+      if (rideau) {
+        const float p = 0.75f + 0.25f * sinf(x * 1.5f + 0.5f + sinf(y * 0.15f) * 0.6f);
+        c[0] = 96 * p; c[1] = 40 * p; c[2] = 44 * p;
+      }
+      if (y == 3 && x <= 26) { c[0] = 60; c[1] = 44; c[2] = 30; }   // la tringle
+      if (x >= 45 && x <= 56 && y >= 11 && y <= 21) { c[0] = 48; c[1] = 34; c[2] = 22; }   // un petit tableau
+      if (x >= 46 && x <= 55 && y >= 12 && y <= 20) {
+        const float k = (y - 12) / 8.0f;
+        c[0] = 40 + 14 * k; c[1] = 52 + 6 * k; c[2] = 64 - 24 * k;
+        if (y >= 17 && y <= 18 + sinf(x * 0.9f)) { c[0] = 70; c[1] = 64; c[2] = 40; }
+      }
+      for (int j = 0; j < 3; j++) e.piece[i][j] = (uint16_t)(c[j] * 256 + 0.5f);
+      e.drapeaux[i] = (vitre ? 1 : 0) | (rideau ? 2 : 0);
+    }
+  for (int k = 0; k <= 256; k++) e.puiss[k] = powf(k * (1.2f / 256), 0.9f);
+  for (auto &g : e.g) {
+    g[0] = hasard(-4, 70); g[1] = hasard(0, 66); g[2] = hasard(0, PI2); g[3] = hasard(0.4f, 2.4f);
+    g[4] = hasard(0.12f, 0.45f) * (aleatoire() & 1 ? 1 : -1); g[5] = hasard(0.4f, 1.3f); g[6] = hasard(0.35f, 1.0f);
+  }
+}
+
 void s_poussiere(int humeur, bool debut, float t, float ecoule, float dt) {
   E_poussiere &e = etat_ecran<E_poussiere>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)ecoule;
+  if (debut) cr_poussiere_preparer(e);
+  const float v = sinf(t * 0.105f + 1.0f) * 0.6f + sinf(t * 0.043f + 2.0f) * 0.4f;
+  float nuage = cr_clip01((v - 0.3f) / 0.45f);
+  nuage = nuage * nuage * (3 - 2 * nuage);               // un nuage passe devant le soleil
+  const float soleil = 1 - 0.62f * nuage;
+  const float ciel[3] = {236 * (1 - nuage) + 160 * nuage, 214 * (1 - nuage) + 166 * nuage, 170 * (1 - nuage) + 184 * nuage};
+  const float kv = 0.62f + 0.38f * soleil;
+  float rideau[5];
+  for (int x = 0; x < 5; x++) rideau[x] = 1 + 1.2f * soleil * expf(-(4.5f - x) / 1.5f);   // le bord du rideau, dans le jour
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const int i = y * 64 + x;
+      if (e.drapeaux[i] & 1) {
+        const float k = kv * (0.9f + 0.1f * (y - 6) / 23.0f);
+        peindre(y, x, ciel[0] * k, ciel[1] * k, ciel[2] * k);
+        continue;
+      }
+      const float dta = e.dtache[i] * (1.0f / 32767);
+      const float tache = e.tache[i] * (1.0f / 65535) + nuage * dta;   // sous le nuage, l'ombre s'adoucit
+      const float rayon = e.rayon[i] * (1.0f / 50000) + nuage * e.drayon[i] * (1.0f / 27000);
+      const float lum = 0.62f + soleil * (e.lum0[i] * (1.0f / 16384) + nuage * 2.2f * dta);
+      const float ts = tache * soleil;
+      float m = lum * (1.0f / 256);
+      if (e.drapeaux[i] & 2) m *= rideau[x];
+      const float q = fmaxf(0.0f, fminf(1.2f, rayon)) * (256 / 1.2f);
+      const int qi = min(255, (int)q);
+      const float r = (e.puiss[qi] + (e.puiss[qi + 1] - e.puiss[qi]) * (q - qi)) * 0.3f * soleil;
+      const float tr = (e.drapeaux[i] & 2) ? rideau[x] : 1.0f;
+      peindre(y, x, e.piece[i][0] * m + ts * 40 * tr + r * 255, e.piece[i][1] * m * 0.93f + ts * 30 * tr + r * 214,
+              e.piece[i][2] * m * 0.82f + ts * 14 * tr + r * 150);
+    }
+  const float pas = fminf(dt, 0.5f);                     // les poussieres : elles derivent et tournoient
+  for (auto &g : e.g) {
+    g[0] += (0.7f * sinf(g[1] * 0.11f + t * 0.09f + g[2]) + 0.3f * sinf(t * 0.05f + g[2] * 3)) * pas;
+    g[1] += (0.5f * cosf(g[0] * 0.09f - t * 0.07f + g[2]) + 0.12f) * pas;
+    g[0] = fmodf(fmodf(g[0] + 4, 74) + 74, 74) - 4;
+    g[1] = fmodf(fmodf(g[1], 66) + 66, 66);
+    const float px = g[0] + g[3] * cosf(t * g[4] + g[2]);
+    const float py = g[1] + g[3] * sinf(t * g[4] * 1.1f + g[2]) * 0.8f;
+    if (!(px >= 0 && px < 64 && py >= 0 && py < 64)) continue;
+    const int i = (int)py * 64 + (int)px;
+    if (e.drapeaux[i] & 1) continue;
+    const float rayon = e.rayon[i] * (1.0f / 50000) + nuage * e.drayon[i] * (1.0f / 27000);
+    const float s = 0.5f + 0.5f * sinf(t * g[5] + g[2] * 2);
+    const float eclat = g[6] * cr_clip01((rayon - 0.1f) * 2.2f) * soleil * s * s * 1.25f;
+    if (eclat > 0) cr_tamponner(py, px, eclat * 255, eclat * 226, eclat * 165);
+  }
 }
 
 struct E_fibres { char rien; };
