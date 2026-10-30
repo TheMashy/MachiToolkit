@@ -298,7 +298,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 8", reponses)
+        self.assertIn("MACHI 9", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -523,6 +523,23 @@ class LaCarte(unittest.TestCase):
         # une v7 ignorait ces deux bits : la trame reste celle qu'elle comprend
         t = self.veille(panneau_rotation=270)
         self.assertEqual((t[2], t[3] & 1, t[3] >> 1), (1, 1, 3))
+
+    def test_la_neige_de_la_carte_fait_des_tas(self):
+        # « plutot que de grosses colonnes rigides » : sur la carte aussi (v9), la neige s'eboule en tas
+        seule = [n for n in self.M.ECRANS_AMBIANCES if n != "neige"]
+        panneau, _, _ = self.envoyer(self.veille(panneau_veille_sans=seule, panneau_ecrans_duree=600) + b"MW",
+                                     ["+300000"])
+        blanc = ((panneau >> 11) >= 20) & (((panneau >> 5) & 0x3F) >= 40) & ((panneau & 0x1F) >= 20)
+        hauteurs = []
+        for x in range(64):                                  # la neige au sol : du bas, tant que c'est blanc
+            h = 0
+            while h < 40 and blanc[63 - h, x]:
+                h += 1
+            hauteurs.append(h)
+        hauteurs = np.array(hauteurs)
+        self.assertGreater(int(hauteurs.max()), 6, "elle s'est amassee")
+        self.assertGreater(int(hauteurs.max() - hauteurs.min()), 3, "en tas, pas en couche plate")
+        self.assertLessEqual(int(np.abs(np.diff(hauteurs)).max()), 3, "des pentes douces, plus de colonnes")
 
     def test_chaque_ambiance_se_dessine_et_bouge(self):
         # « keep only atmospheric effects » : les dix ambiances de Machi Tool, et elles seules

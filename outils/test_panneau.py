@@ -610,13 +610,19 @@ class AL_Ecran(unittest.TestCase):
             M.PANNEAU.pop("ecran_demande", None)
             p.montrer_ecran()
             self.assertTrue(M.PANNEAU.pop("ecran_demande"))
-            # lesquels : une case par ecran, « Tous », « Les ambiances seulement »
-            self.assertEqual(set(p.vars_ecrans), set(M.ECRANS))
+            # lesquels : une case par ecran, une par famille des cent aurores, « Tous », « Les ambiances et les aurores »
+            self.assertEqual(set(p.vars_ecrans), set(M.ECRANS) - set(M.ECRANS_AURORES))
+            self.assertEqual(set(p.vars_familles), {"boreales", "tunnels"})
             p.vars_ecrans["matrice"].set(0)
             p.choisir_ecrans()
             self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"])
-            p.choisir_ecrans(list(M.ECRANS_AMBIANCES))
-            self.assertEqual(M.ecrans_permis(M.CFG), list(M.ECRANS_AMBIANCES))
+            p.vars_familles["tunnels"][0].set(0)
+            p.choisir_ecrans()
+            self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"] + [n for n in M.ECRANS_AURORES if n.startswith("tunnel_")],
+                             "une famille decochee : ses vingt tunnels")
+            p.choisir_ecrans(list(M.ECRANS_AMBIANCES) + list(M.ECRANS_AURORES))
+            self.assertEqual(M.ecrans_permis(M.CFG), list(M.ECRANS_AMBIANCES) + list(M.ECRANS_AURORES))
+            self.assertEqual(p.vars_familles["tunnels"][0].get(), 1)
             p.choisir_ecrans(list(M.ECRANS))
             self.assertEqual(M.CFG["panneau_ecrans_sans"], [])
             self.assertAlmostEqual(float(p.var_panneau_eq_sensibilite.get()), 1.0)

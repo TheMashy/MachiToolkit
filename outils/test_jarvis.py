@@ -3093,7 +3093,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_luminosite=0))[4], 4)
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_arret_h="n'importe"))[9:11], b"\x00\x00")
         self.assertTrue(m.CONFIG_DEFAUT["panneau_veille"])
-        self.assertEqual(m.PANNEAU_CROQUIS, 8)
+        self.assertEqual(m.PANNEAU_CROQUIS, 9)
         # « le sketch display les screen savers avec un angle de 90 degres » : le sens du panneau, bits 1-2
         for degres, octet in ((0, 1), (90, 3), (180, 5), (270, 7), (450, 3)):
             self.assertEqual(m.trame_veille(dict(cfg, panneau_rotation=degres))[3], octet, degres)
@@ -3170,7 +3170,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(carte.ecrit, [b"MO"])
         # ce que la page en dit
         m.PANNEAU.update(etat="connecte", croquis=6, carte_veille=None)
-        self.assertIn("televerse la v8", m.etat_veille_lisible({}))
+        self.assertIn("televerse la v9", m.etat_veille_lisible({}))
         m.PANNEAU["croquis"] = 7
         self.assertIn("ne suivent pas le sens", m.etat_veille_lisible({"panneau_rotation": 90}))
         self.assertNotIn("v7", m.etat_veille_lisible({"panneau_rotation": 0}), "droit, la v7 suffit")
@@ -4169,16 +4169,17 @@ class DansMachiTool(unittest.TestCase):
             with self.subTest(ecran=nom):
                 self.assertTrue(titre)
                 images = []
+                n = 21 if nom in m.ECRANS_AURORES else 91       # les cent aurores : un moteur, une seconde chacune suffit
                 for essai in range(2):
                     e = {"rng": np.random.default_rng(5)}
                     debut = time.perf_counter()
-                    vues = [f(e, t0 + i / 30, i / 30, 0.0 if i == 0 else 1 / 30) for i in range(91)]
-                    cout = (time.perf_counter() - debut) / 91
+                    vues = [f(e, t0 + i / 30, i / 30, 0.0 if i == 0 else 1 / 30) for i in range(n)]
+                    cout = (time.perf_counter() - debut) / n
                     images.append(vues)
                 img = images[0][-1]
                 self.assertEqual((img.shape, img.dtype), ((64, 64, 3), np.uint8))
                 self.assertGreater(int(img.any(axis=2).sum()), 40, "il se voit")
-                self.assertFalse((images[0][45] == images[0][90]).all(), "il bouge")
+                self.assertFalse((images[0][n // 2] == images[0][n - 1]).all(), "il bouge")
                 self.assertTrue((images[0][-1] == images[1][-1]).all(), "la meme graine, le meme ecran")
                 self.assertLess(cout, 0.02, "%.1f ms par image" % (cout * 1000))
         # chacun son tour, dans un ordre melange, jamais deux fois de suite
@@ -4261,6 +4262,67 @@ class DansMachiTool(unittest.TestCase):
         fin = m.image_du_panneau(cfg, "horloge", t0 + 5 + 15.5)
         self.assertTrue((fin == m.image_du_panneau(dict(cfg, panneau_ecrans=False), "horloge", t0 + 5 + 15.5)).all(),
                         "fini : l'horloge")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_les_cent_aurores(self):
+        # « tu peux generer 100 screensavers differents dans un mood des aurores boreales ? j'aime bcp le tunnel aussi »
+        import numpy as np
+        m = self.m
+        presets = m._presets_boreaux()
+        self.assertEqual(len(presets), 100)
+        self.assertEqual(len(m.ECRANS_AURORES), 100)
+        self.assertEqual(len({titre for _, titre, _ in presets}), 100, "cent titres differents")
+        self.assertTrue(all(c in m.ECRANS for c in m.ECRANS_AURORES))
+        self.assertEqual(sorted(sum((list(f[2]) for f in m.FAMILLES_ECRANS), [])), sorted(m.ECRANS_AURORES),
+                         "deux familles, qui font les cent")
+        self.assertEqual([len(f[2]) for f in m.FAMILLES_ECRANS], [80, 20], "80 paysages, 20 tunnels")
+        self.assertEqual(m.ECRANS_AURORES[0], "boreale_01", "des noms fixes : la config retient ceux qu'on decoche")
+        self.assertEqual(m.ECRANS["boreale_01"][0], m._presets_boreaux()[0][1], "le meme reglage d'une fois sur l'autre")
+        # vraiment differents : deux a deux, jamais la meme image
+        t0 = 1_800_000_000.0
+        images = []
+        for cle in m.ECRANS_AURORES:
+            e = {"rng": np.random.default_rng(5)}
+            images.append(m.ECRANS[cle][1](e, t0 + 6.0, 6.0, 0.0).astype(np.int16).reshape(-1))
+        images = np.array(images)
+        ecarts = np.array([np.abs(images - im).mean(axis=1) for im in images])
+        np.fill_diagonal(ecarts, 255)
+        self.assertGreater(float(ecarts.min()), 2.0, "deux ecrans qui se ressemblent trop")
+        # dans le mood : sombres et colores, ni noirs ni blancs ; et toujours vivants au bout de deux minutes
+        for cle in m.ECRANS_AURORES:
+            with self.subTest(ecran=cle):
+                e = {"rng": np.random.default_rng(5)}
+                f = m.ECRANS[cle][1]
+                a, b = f(e, t0 + 125.0, 125.0, 0.0), f(e, t0 + 125.5, 125.5, 0.5)
+                self.assertGreater(int((a.max(axis=2) > 60).sum()), 60, "de la lumiere")
+                self.assertLess(float(a.mean()), 110, "un ciel de nuit, pas un aplat")
+                self.assertFalse((a == b).all(), "il bouge encore")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_neige_fait_des_tas(self):
+        # « pour la neige tu peux faire en sorte qu'elle fasse des tas lorsqu'elle s'accumule trop vers le haut
+        # (plutot qu'elle fasse de grosses colonnes rigides) »
+        import numpy as np
+        m = self.m
+        sol = np.zeros(64)
+        sol[20] = 12.0                                      # une colonne, comme avant
+        apres = sol
+        for _ in range(200):
+            apres = m._neige_ebouler(apres)
+        self.assertAlmostEqual(float(apres.sum()), 12.0, places=6, msg="rien ne se perd, elle s'eboule")
+        self.assertLessEqual(float(np.abs(apres - np.roll(apres, -1)).max()), m.NEIGE_TALUS + 0.05, "des pentes douces")
+        self.assertEqual(int(np.argmax(apres)), 20, "le tas reste ou elle est tombee")
+        e = {"rng": np.random.default_rng(3)}
+        t0 = 1_800_000_000.0
+        for i in range(3000):                                # cinq minutes de neige
+            img = m._ecran_neige(e, t0 + i / 10, i / 10, 0.0 if i == 0 else 0.1)
+        h = e["sol"]
+        self.assertLessEqual(float(np.abs(h - np.roll(h, -1)).max()), 2 * m.NEIGE_TALUS, "plus de colonnes")
+        self.assertGreater(float(h.max() - h.min()), 4.0, "des tas, pas une couche plate")
+        self.assertLess(float(h.max()), m.NEIGE_MAX, "et jamais jusqu'en haut")
+        sommet = int(np.argmax(h))
+        crete = int(np.ceil(64 - h[sommet] + 1))
+        self.assertGreater(int(img[min(63, crete), sommet].sum()), int(img[63, sommet].sum()), "la crete claire, le pied plus bleu")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_les_journees_a_noter(self):
