@@ -49,6 +49,14 @@ inline float v3_exp(float x) {
   return r;
 }
 
+// une table lue en interpolant (x * echelle entre 0 et n)
+inline float v3_lire(const float *tab, float x, float echelle, int n) {
+  const float f = x * echelle;
+  if (f >= n) return tab[n];
+  const int i = (int)f;
+  return tab[i] + (tab[i + 1] - tab[i]) * (f - i);
+}
+
 // atan et atan2 rapides (erreur ~1e-5 rad) : l'ocean en fait deux par pixel
 inline float v3_atan(float x) {   // |x| <= 1
   const float z = x * x;
@@ -62,6 +70,14 @@ inline float v3_atan2(float y, float x) {
   if (ay > ax) a = 1.57079633f - a;
   if (x < 0) a = V3_PI - a;
   return y < 0 ? -a : a;
+}
+
+// _v3d_creneau : un creneau periodique (allume sur d au milieu) moyenne sur une largeur w autour de
+// x : des fenetres sans scintillement, nettes de pres, fondues de loin
+inline float v3_cumul(float x, float d) { const float f = floorf(x); return f * d + borne(x - f - (0.5f - d / 2), 0, d); }
+inline float v3_creneau(float x, float d, float w) {
+  w = v3_mx(w, 1e-3f);
+  return (v3_cumul(x + w / 2, d) - v3_cumul(x - w / 2, d)) / w;
 }
 
 // _v3d_flou : un flou en boites successives (rayon r <= 7, n fois), les bords prolonges, sur une image
@@ -125,6 +141,42 @@ inline void v3_relire_prep(V3Relire &r) {
     const float f = i * 0.5f - 0.25f;
     const int a = (int)floorf(f);
     r.a[i] = (uint8_t)max(0, a); r.b[i] = (uint8_t)min(31, a + 1); r.w[i] = f - a;
+  }
+}
+// Le meme flou en boites, mais « eparpille » : quand peu de pixels brillent, chacun repand sa lumiere sur
+// ses voisins avec les poids exacts du flou (bords prolonges compris), au lieu de flouter toute l'image.
+struct V3Noyau { float w[64][5]; };   // ce que le pixel i donne au pixel i + d - 2 (boite de 3, deux fois)
+void v3_noyau_prep(V3Noyau &k) {
+  float o[64 * 3], l[(64 + 16) * 3];
+  for (int i = 0; i < 64; i++) {
+    for (int j = 0; j < 64 * 3; j++) o[j] = 0;
+    o[i * 3] = 1;
+    v3_boites(o, 64, 1, 2, l);
+    for (int d = 0; d < 5; d++) { const int j = i + d - 2; k.w[i][d] = (j >= 0 && j < 64) ? o[j * 3] : 0; }
+  }
+}
+// repand (r, g, b) du pixel (y, x) dans acc
+inline void v3_repandre(float (*acc)[64][3], const V3Noyau &k, int y, int x, float r, float g, float b) {
+  if (y >= 2 && y < 62 && x >= 2 && x < 62) {   // loin des bords : le noyau entier, sans tests
+    const float *wx = k.w[x];
+    for (int dy = 0; dy < 5; dy++) {
+      const float wy = k.w[y][dy], ry = wy * r, gy = wy * g, by = wy * b;
+      float *p = acc[y + dy - 2][x - 2];
+      for (int dx = 0; dx < 5; dx++, p += 3) { p[0] += wx[dx] * ry; p[1] += wx[dx] * gy; p[2] += wx[dx] * by; }
+    }
+    return;
+  }
+  for (int dy = 0; dy < 5; dy++) {
+    const int yy = y + dy - 2;
+    const float wy = k.w[y][dy];
+    if (wy == 0) continue;
+    for (int dx = 0; dx < 5; dx++) {
+      const int xx = x + dx - 2;
+      const float w = wy * k.w[x][dx];
+      if (w == 0) continue;
+      float *p = acc[yy][xx];
+      p[0] += w * r; p[1] += w * g; p[2] += w * b;
+    }
   }
 }
 inline void v3_relire(const float (*d)[32][3], const V3Relire &r, int y, int x, float *o) {
@@ -206,18 +258,605 @@ inline float v3_normal() {
 
 // --- 1. la ville cyberpunk en 3D ---------------------------------------------------------
 
-struct E_cyber_3d { char rien; };
-void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
-  E_cyber_3d &e = etat_ecran<E_cyber_3d>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+// On vole dans une avenue-canyon. La ville est une grille de cases (une tour par case, des rues en
+// travers) ; chaque colonne lance son rayon de case en case et garde la plus proche tour qui couvre
+// chaque pixel. Tout ce qui ne depend que de la tour (sa hauteur, ses tirages, ses neons, la largeur
+// d'un pixel sur sa facade) est calcule une fois par colonne ; par pixel il reste l'etage, la fenetre,
+// la brume. Par-dessus : les enseignes en drapeau et les passerelles (du plus proche au plus loin), les
+// voitures volantes, la lueur des neons (en demi-image) et la pluie.
+
+const float V3_CY_F = 30, V3_CY_VITESSE = 0.75f;
+const int V3_CY_K = 32;
+const float V3_CY_NEONS[6][3] = {{255, 40, 170}, {40, 225, 255}, {255, 205, 50}, {255, 40, 170}, {40, 225, 255}, {170, 80, 255}};
+const float V3_CY_VITRES[4][3] = {{255, 175, 90}, {90, 205, 255}, {255, 110, 190}, {230, 235, 255}};
+
+struct V3Auto { float x, y, z, vx, vz, vie; int genre; };
+struct V3Objet { float zs, xa, xb, v0, v1, c[3], q; int32_t ident; int genre; };
+struct E_cyber_3d {
+  uint16_t brume[64 * 64];
+  float zbuf[64][64];
+  float lum[32][32][3];        // ce qui brille, en demi-image : la lueur
+  uint64_t pris[64];           // les pixels deja pris par une enseigne plus proche
+  float puiss[257];            // r^1,3
+  V3Relire relire;
+  V3Auto autos[4];
+  float px[55], py[55], pv[55];
+  float fz0, phase;
+  int32_t g, bz0;
+};
+
+inline float v3_cy_hauteur(const E_cyber_3d &e, int32_t ix, int32_t iz) {   // _cyber_hauteurs (0 : une rue)
+  const int m = v3_mod(ix, 10);
+  if (m == 9 || m == 0 || v3_hasard(iz, 7, e.g + 2) < 0.16f) return 0;   // l'avenue, une avenue en travers, une rue
+  const float r = v3_hasard(ix, iz, e.g), r2 = v3_hasard(ix, iz, e.g + 1);
+  const bool bord = ix == -2 || ix == 1;                                    // les murs de l'avenue
+  float h = bord ? 2.8f + 4.0f * r : 1.0f + 5.5f * v3_lire(e.puiss, r, 256, 256);
+  if (bord && r2 < 0.12f) h = 1.2f + 0.8f * r;                             // une tour basse : on voit derriere
+  if (r2 > 0.93f) h += 4.5f;                                                 // quelques geantes
+  return h;
+}
+// ajoute a la lueur (demi-image) ce qu'un pixel emet
+inline void v3_cy_lueur(E_cyber_3d &e, int y, int x, float r, float g, float b) {
+  float *p = e.lum[y >> 1][x >> 1];
+  p[0] += r * 0.25f; p[1] += g * 0.25f; p[2] += b * 0.25f;
 }
 
-struct E_survol { char rien; };
+void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
+  E_cyber_3d &e = etat_ecran<E_cyber_3d>(debut);
+  (void)humeur;
+  const float F = V3_CY_F;
+  if (debut) {
+    e.g = (int32_t)(aleatoire() >> 12);
+    const float z0 = hasard(0, 3000);
+    e.bz0 = (int32_t)floorf(z0); e.fz0 = z0 - e.bz0;
+    e.phase = hasard(0, 100);
+    brume_n(e.brume, 64, 5);
+    for (int i = 0; i < 55; i++) { e.px[i] = hasard(0, 64); e.py[i] = hasard(0, 64); e.pv[i] = hasard(55, 80); }
+    for (int i = 0; i < 4; i++) { e.autos[i].vie = -1; e.autos[i].genre = i % 2; }
+    for (int i = 0; i <= 256; i++) e.puiss[i] = i ? expf(1.3f * logf(i / 256.0f)) : 0;
+    v3_relire_prep(e.relire);
+  }
+  const int32_t g = e.g;
+  // la camera avance dans l'avenue en ondulant doucement ; le nez suit la trajectoire
+  const float tau = ecoule + e.phase;
+  const float cz = e.fz0 + ecoule * V3_CY_VITESSE;   // (par rapport a la case de depart)
+  const float cx = 0.2f * sinf(tau * 0.17f) + 0.07f * sinf(tau * 0.43f + 1.3f);
+  const float vx = 0.2f * 0.17f * cosf(tau * 0.17f) + 0.07f * 0.43f * cosf(tau * 0.43f + 1.3f);
+  const float cy = 2.7f + 0.5f * sinf(tau * 0.11f + 0.7f) + 0.12f * sinf(tau * 0.31f);
+  const float cap = 1.4f * vx / V3_CY_VITESSE, sc = sinf(cap), cc = cosf(cap);
+  const float hz = 27.0f + 1.5f * sinf(tau * 0.09f);
+  memset(e.lum, 0, sizeof e.lum);
+  memset(e.pris, 0, sizeof e.pris);
+  // la brume : sa fenetre glisse
+  const float box = t * 1.3f, boy = t * 0.4f;
+  const int bix = (int)floorf(box), biy = (int)floorf(boy);
+  const float bfx = box - bix, bfy = boy - biy;
+  // le sol (la rue, noyee de brume) et le ciel ne dependent que de la ligne
+  float sg_l[64], tsol_l[64], ciel_l[64][3];
+  for (int y = 0; y < 64; y++) {
+    const float yc = y + 0.5f, kc = v3_01(yc / v3_mx(hz, 1.0f));
+    ciel_l[y][0] = 14 + 82 * kc; ciel_l[y][1] = 7 + 25 * kc; ciel_l[y][2] = 32 + 72 * kc;
+    sg_l[y] = cy * F / v3_mx(yc - hz, 0.5f); tsol_l[y] = expf(-sg_l[y] / 8.0f);
+  }
+  const float fcx = floorf(cx), fcz = floorf(cz);
+  for (int col = 0; col < 64; col++) {
+    const float sx = col - 31.5f;
+    const float dx = sc + cc * sx / F, dz = cc - sc * sx / F, dxs = fabsf(dx) < 1e-6f ? 1e-6f : dx;
+    const float lg = sqrtf(dx * dx + dz * dz);
+    // les rayons, de case en case : les traversees de lignes x et z, dans l'ordre (a egalite, x d'abord)
+    const int pas = dx > 0 ? 1 : -1;
+    float ex = (fcx + (pas > 0) - cx) / dxs, ez = (fcz + 1 - cz) / dz;
+    const float pex = fabsf(1 / dxs), pez = 1 / dz;
+    int ix = (int)fcx, iz = (int)fcz, nx = 0;
+    struct Case { float s, h, haut, bas; int32_t ix, iz; bool cote; } cs[V3_CY_K];
+    float S = ex <= ez ? ex : ez;
+    uint8_t quelle[64];
+    int cur = 64;
+    float m = 1e30f;
+    for (int k = 0; k < V3_CY_K; k++) {
+      const bool cote = ex <= ez && nx <= V3_CY_K;
+      if (cote) { ix += pas; ex += pex; nx++; } else { iz += 1; ez += pez; }
+      const float s_out = ex <= ez ? ex : ez;
+      Case &c = cs[k];
+      c.ix = ix; c.iz = iz; c.cote = cote;
+      c.s = v3_mx(S, 0.05f);
+      c.h = v3_cy_hauteur(e, ix, iz + e.bz0);
+      c.haut = hz - (c.h - cy) * F / c.s;
+      c.bas = hz + cy * F / c.s;   // le pied des tours, qui remonte au loin
+      if (c.h > 0) m = v3_mn(m, v3_mn(c.haut, hz - (c.h - cy) * F / s_out));   // avec le toit s'il est sous nous
+      S = s_out;
+      const float q = m - 0.5f;
+      const int r = q <= 0 ? 0 : q >= 64 ? 64 : (int)q + ((float)(int)q < q ? 1 : 0);
+      while (cur > r) quelle[--cur] = (uint8_t)k;
+    }
+    // ce qui ne depend que de la tour vue : calcule a sa premiere ligne dans cette colonne
+    int kc = -1;
+    float u = 0, pied_v = 0, pied_u = 0, forme_u = 0, dens = 0, net = 0, arete_u = 0, face = 1, latt = 1;
+    int32_t tx = 0, tz = 0, bxa = 0, bza = 0;
+    const float *teinte_t = V3_CY_VITRES[0];
+    bool mur = false, ecran = false;
+    float ne_c[2][3], ne_hn[2], ne_h[2], ne_v0[2], ne_vert[2], ec_c[3], ec_in = 0;
+    for (int y = 0; y < 64; y++) {
+      const float yc = y + 0.5f;
+      float *p = scene[y][col];
+      const int k = y >= cur ? quelle[y] : -1;
+      if (k < 0 || yc >= cs[k].bas) {   // pas de tour : le ciel, ou la rue tout en bas et ses files de feux
+        if (yc > hz + 0.5f) {
+          const float sg = sg_l[y], ts = tsol_l[y], gx = cx + dx * sg, gz = cz + dz * sg, pg = sg / F;
+          const float xl = floorf((gx + 1) / 0.5f) * 0.5f - 0.75f;   // quatre voies
+          float feux = 0;
+          if (fabsf(gx) < 1) {
+            const float lat = v3_01(1 - fabsf(gx - xl) / v3_mx(pg * 1.2f, 0.06f));
+            const float sens = xl < 0 ? 1.0f : -1.0f, ph = gz * 0.9f + sens * t * 2.2f + xl * 7.3f, fp = ph - floorf(ph);
+            feux = lat * (0.3f + 0.7f * v3_01(1 - fabsf(fp - 0.5f) / v3_mx(0.12f, pg * sg / cy * 0.9f)));
+          }
+          const float fr = xl < 0 ? 255.0f : 255.0f, fg = xl < 0 ? 235.0f : 45.0f, fb = xl < 0 ? 200.0f : 55.0f;
+          p[0] = (18 + feux * fr * 0.55f) * ts + 110 * (1 - ts);
+          p[1] = (9 + feux * fg * 0.55f) * ts + 30 * (1 - ts);
+          p[2] = (26 + feux * fb * 0.55f) * ts + 100 * (1 - ts);
+          if (feux > 0) v3_cy_lueur(e, y, col, feux * fr * 0.3f * ts, feux * fg * 0.3f * ts, feux * fb * 0.3f * ts);
+          e.zbuf[y][col] = sg;
+        } else {
+          p[0] = ciel_l[y][0]; p[1] = ciel_l[y][1]; p[2] = ciel_l[y][2];
+          e.zbuf[y][col] = 1e9f;
+        }
+        continue;
+      }
+      const Case &c = cs[k];
+      const float s = c.s, h = c.h;
+      e.zbuf[y][col] = s;
+      if (k != kc) {
+        kc = k;
+        bxa = c.ix; bza = c.iz + e.bz0;
+        const uint32_t hb = v3_bits(bxa, bza, g + 3);   // un tirage par tour, decline
+        u = c.cote ? cz + dz * s - c.iz : cx + dx * s - c.ix;   // ou l'on est sur la facade
+        pied_v = s / F;
+        pied_u = pied_v * lg / v3_mx((c.cote ? fabsf(dx) : fabsf(dz)) / lg, 0.06f);
+        const int nf = 3 + (int)(v3_u(hb) * 4);
+        dens = 0.1f + 0.3f * v3_frac(hb, 8);
+        const float fu = u * nf;
+        forme_u = v3_creneau(fu, 0.6f, pied_u * nf);
+        net = v3_01(2.0f - 2.0f * v3_mx(pied_v / 0.2f, pied_u * nf));
+        tx = bxa * 1009 + (int32_t)floorf(fu) * 7 + (c.cote ? 3 : 0); tz = bza * 4099;
+        teinte_t = V3_CY_VITRES[(int)(v3_frac(hb, 16) * 3)];
+        face = c.cote ? 1.0f : 1.4f;
+        arete_u = v3_01(1 - v3_mn(u, 1 - u) / v3_mx(pied_u, 0.02f)) * 0.6f;   // les coins des tours
+        latt = v3_exp(-s / 18.0f);
+        // les tubes de neon sur les murs de l'avenue
+        mur = c.cote && (bxa == -2 || bxa == 1);
+        if (mur)
+          for (int j = 0; j < 2; j++) {
+            const uint32_t r = v3_bits(bxa * 31 + j, bza, g + 8 + j);
+            const float rv = v3_u(r);
+            const float *nc = V3_CY_NEONS[(int)(v3_frac(r, 8) * 6)];
+            for (int q = 0; q < 3; q++) ne_c[j][q] = nc[q];
+            ne_hn[j] = 0.6f + v3_frac(r, 16) * v3_mx(h - 1.0f, 0.2f);
+            ne_h[j] = rv < 0.45f ? 1.0f : 0.0f;
+            const float u0 = 0.15f + 0.7f * v3_frac(r, 12);
+            ne_v0[j] = 0.5f + v3_frac(r, 20) * v3_mx(h - 2.2f, 0.1f);
+            ne_vert[j] = rv > 0.62f ? v3_01(1 - fabsf(u - u0) / v3_mx(pied_u, 0.03f)) * borne(0.06f / pied_v, 0.35f, 1) : 0;
+          }
+        // les ecrans geants sur les faces qui nous regardent, au bout des rues en travers
+        ecran = !c.cote && v3_frac(hb, 12) < 0.3f && fabsf(u - 0.5f) < 0.38f;
+        if (ecran) {
+          const float *nc = V3_CY_NEONS[(int)(v3_frac(hb, 20) * 6)];
+          for (int q = 0; q < 3; q++) ec_c[q] = nc[q];
+          ec_in = -t * 0.6f + bxa * 2.1f + v3_sin(u * 3 + t * 0.4f) * 1.5f;
+        }
+      }
+      const float v = cy - (yc - hz) * s / F;   // la hauteur dans le monde
+      // la brume mange le lointain : rose pres de la rue, violette en haut
+      const int bx = (col + bix) & 63, by = (y + biy) & 63, bx1 = (bx + 1) & 63, by1 = (by + 1) & 63;
+      const float b0 = e.brume[by * 64 + bx] + (e.brume[by * 64 + bx1] - (float)e.brume[by * 64 + bx]) * bfx;
+      const float b1 = e.brume[by1 * 64 + bx] + (e.brume[by1 * 64 + bx1] - (float)e.brume[by1 * 64 + bx]) * bfx;
+      const float brume = (b0 + (b1 - b0) * bfy) * (1.0f / 65535);
+      const float transp = v3_exp(-s / (12.0f * (0.8f + 0.4f * brume))), hv = v3_01(v / 7.0f);
+      float surf[3], lum[3] = {0, 0, 0};
+      if (yc < c.haut) { surf[0] = 14; surf[1] = 10; surf[2] = 26; }   // le toit
+      else {
+        // les fenetres : allumees au hasard ; fondues en une lueur moyenne quand elles deviennent trop petites
+        const float fv = v * 5, fl = floorf(fv);
+        const uint32_t tn = v3_bits(tx, tz + (int32_t)fl, g + 4);
+        const float tirage = v3_u(tn);
+        float fen = tirage < dens ? v3_creneau(fv, 0.5f, pied_v * 5) * forme_u * (0.45f + 0.55f * v3_frac(tn, 8)) : 0;
+        fen = dens * 0.216f + (fen - dens * 0.216f) * net;
+        const float *te = v3_frac(tn, 16) < 0.25f ? V3_CY_VITRES[3] : teinte_t;
+        const float lu = v3_exp(-v3_mx(v, 0) / 1.4f);
+        const float arete = v3_mx(arete_u, v3_01(1 - (h - v) / pied_v));   // et leur sommet
+        surf[0] = 7 * face + lu * 38 + fen * te[0] * 0.8f + arete * 34;
+        surf[1] = 5 * face + lu * 8 + fen * te[1] * 0.8f + arete * 18;
+        surf[2] = 15 * face + lu * 44 + fen * te[2] * 0.8f + arete * 52;
+        if (mur)
+          for (int j = 0; j < 2; j++) {
+            float a = 0;
+            if (ne_h[j] > 0) {
+              const float cv = v3_mx(0.0f, v3_mn(ne_hn[j] + 0.035f, v + pied_v / 2) - v3_mx(ne_hn[j] - 0.035f, v - pied_v / 2)) / pied_v;
+              a = v3_mn(cv * 1.4f, 1);
+            }
+            if (ne_vert[j] > 0 && v > ne_v0[j] && v < ne_v0[j] + 1.5f) a += ne_vert[j];
+            if (a > 0) { lum[0] += a * ne_c[j][0]; lum[1] += a * ne_c[j][1]; lum[2] += a * ne_c[j][2]; }
+          }
+        if (ecran && v > h * 0.45f && v < h * 0.45f + 1.1f) {
+          const float d = 0.5f + 0.5f * v3_sin(v * 5 + ec_in);
+          for (int q = 0; q < 3; q++) lum[q] += (ec_c[q] * d + V3_CY_NEONS[1][q] * (1 - d)) * 0.55f;
+        }
+      }
+      const float cb[3] = {110 * (1 - hv) + 58 * hv, 30 * (1 - hv) + 22 * hv, 100 * (1 - hv) + 84 * hv};
+      for (int q = 0; q < 3; q++) p[q] = surf[q] * transp + cb[q] * (1 - transp) + lum[q] * latt;
+      if (lum[0] + lum[1] + lum[2] > 0) v3_cy_lueur(e, y, col, lum[0] * latt, lum[1] * latt, lum[2] * latt);
+    }
+  }
+  // les passerelles au-dessus de l'avenue, et les enseignes en drapeau accrochees aux murs
+  V3Objet obj[48];
+  int nobj = 0;
+  const int32_t iz0 = (int32_t)fcz;
+  for (int n = 0; n < 22; n++) {
+    const int32_t rang = iz0 + n, ra = rang + e.bz0;
+    for (int m2 = 0; m2 < 2; m2++) {
+      const int32_t bxm = m2 ? 1 : -2;
+      const float xm = m2 ? 1.0f : -1.0f, sens = m2 ? -1.0f : 1.0f;
+      const float hm = v3_cy_hauteur(e, bxm, ra);
+      const uint32_t qn = v3_bits(bxm * 13 + 1, ra, g + 20);
+      const float q = v3_u(qn);
+      if (!(q < 0.6f && hm > 2.0f) || nobj >= 48) continue;
+      const float q1 = v3_frac(qn, 6), q2 = v3_frac(qn, 12), q3 = v3_frac(qn, 18), q4 = v3_frac(qn, 24);
+      const float v0 = 0.7f + q2 * v3_mn(hm - 1.9f, 3.4f), v1 = v3_mn(v0 + 0.7f + 1.1f * q3, hm - 0.1f);
+      const float *nc = V3_CY_NEONS[(int)(q3 * 97) % 6];
+      obj[nobj++] = {rang + 0.2f + 0.6f * q1, xm, xm + sens * (0.24f + 0.16f * q4), v0, v1, {nc[0], nc[1], nc[2]}, q1, ra * 2 + bxm, 0};
+    }
+    const uint32_t qn = v3_bits(ra, 5, g + 23);
+    const float q = v3_u(qn);
+    if (q < 0.09f && nobj < 48) {
+      const float r1 = v3_frac(qn, 8), r2 = v3_frac(qn, 16), v0 = r2 < 0.75f ? 4.4f + 1.2f * r1 : 0.9f;
+      const float *nc = V3_CY_NEONS[(int)(r1 * 97) % 6];
+      obj[nobj++] = {rang + 0.5f, -1.0f, 1.0f, v0, v0 + 0.22f, {nc[0], nc[1], nc[2]}, r2, ra, 1};
+    }
+  }
+  for (int i = 1; i < nobj; i++)   // du plus proche au plus loin : le plus proche l'emporte sur chaque pixel
+    for (int j = i; j > 0 && obj[j].zs < obj[j - 1].zs; j--) { const V3Objet o = obj[j]; obj[j] = obj[j - 1]; obj[j - 1] = o; }
+  for (int i = 0; i < nobj; i++) {
+    const V3Objet &o = obj[i];
+    const float rza = o.zs - cz;
+    float ca = 32 + ((o.xa - cx) * cc - rza * sc) * F / v3_mx((o.xa - cx) * sc + rza * cc, 1e-3f), da = (o.xa - cx) * sc + rza * cc;
+    float cb = 32 + ((o.xb - cx) * cc - rza * sc) * F / v3_mx((o.xb - cx) * sc + rza * cc, 1e-3f), db = (o.xb - cx) * sc + rza * cc;
+    const bool ret = ca > cb;
+    if (ret) { float w = ca; ca = cb; cb = w; w = da; da = db; db = w; }
+    if (!(da > 0.35f && db > 0.35f)) continue;
+    const int c0 = (int)borne(floorf(ca - 0.5f), 0, 64), c1 = (int)borne(ceilf(cb - 0.5f), -1, 63);
+    const float hs = o.v1 - o.v0, larg = fabsf(o.xb - o.xa), nr = v3_mx(2.0f, rintf(hs / 0.17f));
+    const float souffle = 0.88f + 0.12f * sinf(t * (0.6f + o.q) + o.q * 20);   // certaines respirent, doucement
+    for (int col = c0; col <= c1; col++) {
+      const float lam = v3_01((col + 0.5f - ca) / v3_mx(cb - ca, 1e-6f)), inv = (1 - lam) / da + lam / db, d = 1 / inv;
+      float a = (lam / db) / inv;   // en travers, juste en perspective
+      if (ret) a = 1 - a;
+      const float haut = hz - (o.v1 - cy) * F / d, bas = hz - (o.v0 - cy) * F / d;
+      const float kx = v3_01(v3_mn(col + 1.0f, cb) - v3_mx((float)col, ca));
+      if (kx <= 0) continue;
+      const float pied = v3_mx(d / F, 0.02f), brouille = v3_exp(-d / 18.0f);
+      const float bord_a = v3_01(1 - v3_mn(a, 1 - a) * larg / pied);
+      const float netg = v3_01(1.5f - 1.5f * v3_mx(pied * nr / hs, pied * 3 / larg));
+      const float lampe_a = 0.7f + 0.3f * v3_sin(a * 40 + t * 1.5f);
+      for (int y = max(0, (int)floorf(haut)); y < min(64, (int)ceilf(bas) + 1); y++) {
+        const float k = v3_01(v3_mn(y + 1.0f, bas) - v3_mx((float)y, haut)) * kx;
+        if (k <= 0 || !(d < e.zbuf[y][col]) || (e.pris[y] >> col & 1)) continue;
+        e.pris[y] |= (uint64_t)1 << col;
+        const float b = v3_01((y + 0.5f - haut) / v3_mx(bas - haut, 1e-3f));
+        float coul[3], em[3];
+        if (o.genre == 1) {   // une passerelle : sombre, une rangee de lampes
+          const float l = v3_01(1 - fabsf(b - 0.75f) * 0.22f / pied) * lampe_a * 0.9f * brouille;
+          static const float sombre[3] = {10, 8, 20}, loin[3] = {40, 16, 60};
+          for (int q = 0; q < 3; q++) { em[q] = l * o.c[q]; coul[q] = em[q] + sombre[q] * brouille + (1 - brouille) * loin[q]; }
+        } else {   // une enseigne : son cadre vif, ses lignes de caracteres
+          const float bord = v3_mx(bord_a, v3_01(1 - v3_mn(b, 1 - b) * hs / pied));
+          const float j = floorf(b * nr);
+          const float glyphe = v3_hasard(o.ident * 64 + (int32_t)j, (int32_t)(a * 3), g + 22) > 0.4f ? v3_01((0.4f - fabsf(b * nr - j - 0.5f)) / 0.1f + 0.5f) : 0;
+          const float force = v3_mx(bord, (0.42f + (glyphe - 0.42f) * netg) * 0.85f) * souffle;
+          for (int q = 0; q < 3; q++) em[q] = coul[q] = (o.c[q] * (0.15f + 0.85f * force) + 80 * bord * bord * souffle) * brouille;
+        }
+        float *p = scene[y][col];
+        for (int q = 0; q < 3; q++) p[q] = p[q] * (1 - k) + coul[q] * k;
+        v3_cy_lueur(e, y, col, em[0] * k * 0.9f, em[1] * k * 0.9f, em[2] * k * 0.9f);
+        if (k > 0.5f) e.zbuf[y][col] = d;
+      }
+    }
+  }
+  // les voitures volantes : deux qui traversent l'avenue par les rues en travers, deux qui la suivent
+  for (int i = 0; i < 4; i++) {
+    V3Auto &a = e.autos[i];
+    if (a.vie < 0) {
+      if (a.genre == 0) {
+        int32_t rues[14];
+        int n = 0;
+        for (int32_t r = (int32_t)cz + 6; r < (int32_t)cz + 20; r++)
+          if (v3_hasard(r + e.bz0, 7, g + 2) < 0.16f) rues[n++] = r;
+        const float zr = n ? rues[min(n - 1, (int)hasard(0, (float)n))] + 0.5f : cz + 12;
+        const float sens = hasard(0, 1) < 0.5f ? -1.0f : 1.0f;
+        a.x = -9.0f * sens; a.y = hasard(1.8f, 4.2f); a.z = zr; a.vx = sens * hasard(1.6f, 2.4f); a.vz = 0; a.vie = 0;
+      } else {
+        const bool vient = hasard(0, 1) < 0.5f;
+        a.x = hasard(-0.6f, 0.6f); a.y = cy + hasard(-0.8f, 0.9f); a.vx = 0; a.vie = 0;
+        a.z = cz + (vient ? 24.0f : -1.5f);
+        a.vz = vient ? -hasard(0.8f, 1.6f) : V3_CY_VITESSE + hasard(0.5f, 1.0f);
+      }
+    }
+    a.vie += dt; a.x += a.vx * dt; a.z += a.vz * dt;
+    const float prof = (a.x - cx) * sc + (a.z - cz) * cc;
+    if (fabsf(a.x) > 9.5f || prof > 26 || (prof < 0.3f && a.vie > 1) || a.vie > 40) { a.vie = -1; continue; }
+    float pts[7][6];   // x, dy, couleur, force
+    int np = 0;
+    if (a.genre == 0) {   // vue de cote : phare devant, feu derriere, et sa trainee
+      const float sg = a.vx > 0 ? 1.0f : -1.0f;
+      const float p0[3][6] = {{a.x + 0.16f * sg, 0, 255, 245, 225, 1.0f}, {a.x - 0.16f * sg, 0, 255, 40, 50, 0.8f}, {a.x, -0.05f, 60, 140, 255, 0.5f}};
+      for (int q = 0; q < 3; q++) memcpy(pts[np++], p0[q], sizeof p0[q]);
+      for (int k = 1; k < 4; k++) { const float tr[6] = {a.x - (0.16f + 0.12f * k) * sg, 0, 255, 40, 50, 0.35f / k}; memcpy(pts[np++], tr, sizeof tr); }
+    } else {
+      const bool face = a.vz < 0;
+      const float p0[3][6] = {{a.x - 0.11f, 0, 255, face ? 245.0f : 35.0f, face ? 225.0f : 45.0f, 1.0f},
+                              {a.x + 0.11f, 0, 255, face ? 245.0f : 35.0f, face ? 225.0f : 45.0f, 1.0f}, {a.x, -0.06f, 60, 140, 255, 0.4f}};
+      for (int q = 0; q < 3; q++) memcpy(pts[np++], p0[q], sizeof p0[q]);
+    }
+    for (int q = 0; q < np; q++) {
+      const float rx = pts[q][0] - cx, rz = a.z - cz, d = rx * sc + rz * cc;
+      if (d < 0.3f) continue;
+      const float sxp = 32 + (rx * cc - rz * sc) * F / d, syp = hz - (a.y + pts[q][1] - cy) * F / d;
+      const int iy = (int)floorf(syp), ix = (int)floorf(sxp);
+      if (iy >= 0 && iy < 64 && ix >= 0 && ix < 64 && e.zbuf[iy][ix] < d) continue;
+      const float rayon = borne(0.05f * F / d, 0.45f, 1.3f);
+      const float f = pts[q][5] * v3_exp(-d / 18.0f) * v3_mn(1.0f, 0.25f + 0.25f * a.vie) * v3_mn(1.0f, d / 1.5f)
+                      * v3_mn(1.0f, v3_mx(0.0f, (26.0f - prof) / 4));   // elle s'efface avant de disparaitre
+      v3_tache(&scene[0][0][0], 0, 64, syp, sxp, rayon, pts[q][2], pts[q][3], pts[q][4], f);
+      // et sa lueur, dans la demi-image
+      const int rr = (int)(rayon * 2.2f) + 1;
+      const float qq = 1.0f / (2 * rayon * rayon);
+      for (int yy = max(0, (int)syp - rr); yy < min(64, (int)syp + rr + 2); yy++)
+        for (int xx = max(0, (int)sxp - rr); xx < min(64, (int)sxp + rr + 2); xx++) {
+          const float ddy = yy + 0.5f - syp, ddx = xx + 0.5f - sxp, w = v3_exp(-(ddx * ddx + ddy * ddy) * qq) * f * 0.6f;
+          v3_cy_lueur(e, yy, xx, w * pts[q][2], w * pts[q][3], w * pts[q][4]);
+        }
+    }
+  }
+  // la lueur des neons : la demi-image floutee, relue en bilineaire
+  v3_flou(&e.lum[0][0][0], 32, 32, 1, 3);
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      float l[3];
+      v3_relire(e.lum, e.relire, y, x, l);
+      scene[y][x][0] += l[0] * 0.75f; scene[y][x][1] += l[1] * 0.75f; scene[y][x][2] += l[2] * 0.75f;
+    }
+  // la pluie fine, qui s'allume dans les neons
+  for (int i = 0; i < 55; i++) {
+    e.py[i] += e.pv[i] * dt;
+    e.px[i] += e.pv[i] * 0.12f * dt;
+    e.py[i] = v3_fmod(e.py[i] + 4, 70) - 4;
+    e.px[i] = v3_fmod(e.px[i], 64);
+    for (int j = 0; j < 3; j++) {
+      const int yy = (int)(e.py[i] - j), xx = v3_mod((int)(e.px[i] - j * 0.12f), 64);
+      if (yy < 0 || yy >= 64) continue;
+      float *p = scene[yy][xx];
+      const float ecl = borne((p[0] + p[1] + p[2]) / 3, 0, 160) * 0.35f, k = 1 - j * 0.3f;
+      p[0] += (24 + ecl) * k; p[1] += (26 + ecl) * k; p[2] += (40 + ecl) * k;
+    }
+  }
+}
+
+// --- 2. le survol de la ville ---------------------------------------------------------------
+// La meme idee de rayons par colonne, vue d'en haut : chaque case est un pate de maisons (un bloc en
+// retrait, la rue autour). On voit les toits, les facades tournees vers nous, et dans les rues les
+// files de phares et de feux arriere sous les reverberes ; un horizon brumeux, ambre.
+
+const int V3_SV_K = 44;
+struct E_survol {
+  float lumiere[64][64][3];   // ce qui brille, pour la lueur
+  V3Noyau noyau;
+  float puiss[257];           // r^1,6
+  float phase, fx0, fz0;
+  int32_t g, bx0, bz0;        // le hasard de la ville, la case de depart (les positions restent petites)
+};
+inline float v3_sv_hauteur(const E_survol &e, int32_t ix, int32_t iz) {   // _survol_hauteurs (0 : un parc)
+  const uint32_t n = v3_bits(ix, iz, e.g);
+  if (v3_frac(n, 16) < 0.07f) return 0;
+  if (v3_frac(n, 12) > 0.93f) return 1.3f + 0.9f * v3_frac(n, 8);
+  return 0.2f + 0.75f * v3_lire(e.puiss, v3_u(n), 256, 256);
+}
+
 void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
   E_survol &e = etat_ecran<E_survol>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)dt;
+  const float F = 30, marge = 0.16f, hz = 10;
+  if (debut) {
+    e.g = (int32_t)(aleatoire() >> 12);
+    const float z0 = hasard(0, 3000), x0 = hasard(-500, 500);
+    e.bz0 = (int32_t)floorf(z0); e.fz0 = z0 - e.bz0;
+    e.bx0 = (int32_t)floorf(x0); e.fx0 = x0 - e.bx0;
+    e.phase = hasard(0, 100);
+    for (int i = 0; i <= 256; i++) e.puiss[i] = i ? expf(1.6f * logf(i / 256.0f)) : 0;
+    v3_noyau_prep(e.noyau);
+  }
+  const int32_t g = e.g;
+  const float tau = ecoule + e.phase;
+  const float cx = e.fx0 + 0.3f * sinf(tau * 0.05f), cz = e.fz0 + ecoule * 0.42f;   // (par rapport a la case de depart)
+  const float cy = 3.4f + 0.2f * sinf(tau * 0.07f);
+  const float cap = 0.32f * sinf(tau * 0.031f) + 0.1f * sinf(tau * 0.083f), sc = sinf(cap), cc = cosf(cap);
+  const float s0 = 0.85f * cy * F / (64 - hz);   // rien de plus pres n'est a l'ecran
+  // le sol ne depend que de la ligne : sa distance, la largeur d'un pixel, la brume
+  struct Sol { float sg, pied, pz, ipied, ipz, ilat, ilg_ns, ilg_ew, k_ns, k_ew, voile, ke, cb[3]; } sol[64];
+  for (int y = 0; y < 64; y++) {
+    Sol &q = sol[y];
+    const float yc = y + 0.5f, sg = v3_mx(cy * F / v3_mx(yc - hz, 0.3f), s0);
+    q.sg = sg; q.pied = sg / F; q.pz = q.pied * sg / cy; q.ipied = 1 / q.pied; q.ipz = 1 / q.pz;
+    q.ilat = 1 / v3_mx(q.pied * 1.1f, 0.03f);
+    const float lns = v3_mx(0.1f, q.pz * 1.6f), lew = v3_mx(0.1f, q.pied * 1.6f);
+    q.ilg_ns = 1 / lns; q.ilg_ew = 1 / lew; q.k_ns = v3_mn(1.0f, 0.16f / lns); q.k_ew = v3_mn(1.0f, 0.16f / lew);
+    q.voile = 1 - expf(-sg / 14.0f); q.ke = expf(-sg / 24.0f);
+    const float a = v3_01((sg - 9.0f) / 16), ph = a * sqrtf(a);
+    q.cb[0] = 16 + 84 * ph; q.cb[1] = 20 + 48 * ph; q.cb[2] = 42 + 12 * ph;
+  }
+  struct File { int32_t ident; float v, d; } files[4];
+  for (int l = 0; l < 4; l++) files[l].ident = INT32_MIN;
+  struct Feu { int32_t x, z; float h; } feux[48];
+  int nfeux = 0;
+  for (int col = 0; col < 64; col++) {
+    const float sx = col - 31.5f;
+    const float dx = sc + cc * sx / F, dz = cc - sc * sx / F, dxs = fabsf(dx) < 1e-6f ? 1e-6f : dx;
+    const float lg = sqrtf(dx * dx + dz * dz);
+    // les cases traversees, de pres vers le loin (la premiere : la ou le rayon entre a l'ecran)
+    const float x0 = cx + dx * s0, z0 = cz + dz * s0;
+    const int pas = dx > 0 ? 1 : -1;
+    int ix = (int)floorf(x0), iz = (int)floorf(z0);
+    float ex = s0 + ((float)ix + (pas > 0) - x0) / dxs, ez = s0 + ((float)iz + 1 - z0) / dz;
+    const float pex = fabsf(1 / dxs), pez = 1 / dz, idx = 1 / dxs, idz = 1 / dz;
+    int nx = 0, nz = 0;
+    struct Case { float s, h, haut, bas, hb, voile, ke, cb[3]; int32_t ix, iz; bool cote; } cs[V3_SV_K + 1];
+    uint8_t quelle[64];
+    int cur = 64;
+    float m = 1e30f;
+    for (int k = 0; k <= V3_SV_K; k++) {
+      if (k > 0) {   // la traversee suivante (a egalite, celle en x d'abord)
+        if (ex <= ez && nx < V3_SV_K) { ix += pas; ex += pex; nx++; }
+        else { iz += 1; ez += pez; nz++; }
+      }
+      Case &c = cs[k];
+      c.ix = ix; c.iz = iz;
+      const float H = v3_sv_hauteur(e, ix + e.bx0, iz + e.bz0);
+      // le bloc en retrait dans sa case : par ou le rayon entre, par ou il sort
+      const float ax = (ix + marge - cx) * idx, bx_ = (ix + 1 - marge - cx) * idx;
+      const float az = (iz + marge - cz) * idz, bz_ = (iz + 1 - marge - cz) * idz;
+      const float tminx = v3_mn(ax, bx_), tminz = v3_mn(az, bz_);
+      float sa = v3_mx(tminx, tminz);
+      const float sb = v3_mn(v3_mx(ax, bx_), v3_mx(az, bz_));
+      const bool touche = H > 0 && sa < sb && sa > 0.1f;
+      sa = v3_mx(sa, 0.1f);
+      c.s = sa; c.h = H; c.cote = tminx > tminz;
+      c.haut = hz + (cy - H) * F / sa;
+      c.bas = touche ? hz + cy * F / sa : -1e9f;
+      c.hb = v3_hasard(ix + e.bx0, iz + e.bz0, g + 3);
+      if (touche) {
+        c.voile = 1 - v3_exp(-sa / 14.0f); c.ke = v3_exp(-sa / 24.0f);   // la brume, a la distance du bloc
+        const float q = v3_01((sa - 9.0f) / 16), ph = q * sqrtf(q);
+        c.cb[0] = 16 + 84 * ph; c.cb[1] = 20 + 48 * ph; c.cb[2] = 42 + 12 * ph;
+        m = v3_mn(m, v3_mn(c.haut, hz + (cy - H) * F / v3_mx(sb, 0.1f)));
+        if (H > 1.25f && nfeux < 48) {   // le feu rouge au sommet des tours
+          bool deja = false;
+          for (int i = 0; i < nfeux; i++) deja |= feux[i].x == ix && feux[i].z == iz;
+          if (!deja) feux[nfeux++] = {ix, iz, H};
+        }
+      }
+      const float q = m - 0.5f;
+      const int r = q <= 0 ? 0 : q >= 64 ? 64 : (int)q + ((float)(int)q < q ? 1 : 0);
+      while (cur > r) quelle[--cur] = (uint8_t)k;
+    }
+    // ce qui ne depend que de la case vue (pour cette colonne) : calcule a sa premiere ligne
+    int kc = -1;
+    float forme_u = 0, dens = 0, net = 0, pv75 = 0, fface = 1;
+    int32_t tx = 0, tz = 0;
+    int32_t parc_x = 1 << 30, parc_z = 0;
+    bool parc = false;
+    for (int y = 0; y < 64; y++) {
+      const float yc = y + 0.5f;
+      float *p = scene[y][col];
+      if (yc < hz) {   // le ciel
+        const float k = v3_01((hz - yc) / hz), a = (1 - k) * (1 - k) * (1 - k);
+        p[0] = 100 * a + 8 * (1 - a); p[1] = 72 * a + 12 * (1 - a); p[2] = 64 * a + 32 * (1 - a);
+        continue;
+      }
+      float img[3], em[3] = {0, 0, 0};
+      const bool vu = y >= cur && yc < cs[quelle[y]].bas;
+      if (vu) {
+        const Case &c = cs[quelle[y]];
+        const float s = c.s, h = c.h;
+        if (quelle[y] != kc) {
+          kc = quelle[y];
+          const float u = c.cote ? cz + dz * s - c.iz : cx + dx * s - c.ix;
+          const float pied_v = s / F, pied_u = pied_v * lg / v3_mx((c.cote ? fabsf(dx) : fabsf(dz)) / lg, 0.08f);
+          const float fu = (u - marge) / (1 - 2 * marge) * 5, lu = pied_u * 5 / (1 - 2 * marge);
+          pv75 = pied_v / 0.075f;
+          forme_u = v3_creneau(fu, 0.64f, lu);
+          dens = 0.12f + 0.3f * v3_frac(v3_bits(c.ix + e.bx0, c.iz + e.bz0, g + 3), 8);
+          net = v3_01(2.0f - 2.0f * v3_mx(pv75, lu));
+          tx = (c.ix + e.bx0) * 977 + (int32_t)floorf(fu) * 5 + (c.cote ? 2 : 0);
+          tz = (c.iz + e.bz0) * 3001;
+          fface = c.cote ? 1.0f : 1.3f;
+        }
+        if (yc < c.haut) {   // les toits : bleu nuit, leur rebord un peu plus clair
+          const float sr = (cy - h) * F / v3_mx(yc - hz, 0.3f);
+          const float rx = cx + dx * sr - c.ix, rz = cz + dz * sr - c.iz;
+          const float rb = v3_01(1 - v3_mn(v3_mn(rx - marge, 1 - marge - rx), v3_mn(rz - marge, 1 - marge - rz)) / v3_mx(sr / F, 0.02f));
+          const float k = 0.8f + 0.4f * c.hb;
+          img[0] = 9 * k + rb * 16; img[1] = 11 * k + rb * 16; img[2] = 21 * k + rb * 26;
+        } else {   // les facades : des etages de fenetres chaudes, fondues en lueur quand elles sont trop petites
+          img[0] = 14 * fface; img[1] = 14 * fface; img[2] = 26 * fface;
+          const float fv = (cy - (yc - hz) * s / F) * (1 / 0.075f), fl = floorf(fv);
+          float fen = 0;
+          const uint32_t tn = v3_bits(tx, tz + (int32_t)fl, g + 4);
+          if (v3_u(tn) < dens && fl >= 1) fen = v3_creneau(fv - 0.05f, 0.4f, pv75) * forme_u * (0.6f + 0.6f * v3_frac(tn, 8));
+          fen = dens * 0.1f + (fen - dens * 0.1f) * net;
+          if (v3_frac(tn, 16) < 0.1f) { em[0] = fen * 200; em[1] = fen * 215; em[2] = fen * 255; }
+          else { em[0] = fen * 255; em[1] = fen * 175; em[2] = fen * 90; }
+        }
+      } else {   // le sol : les rues, leurs reverberes, et les phares qui coulent
+        const Sol &q = sol[y];
+        const float gx = cx + dx * q.sg, gz = cz + dz * q.sg;
+        const float rgx = rintf(gx), rgz = rintf(gz), fx = gx - rgx, fz = gz - rgz;
+        const int32_t px = (int32_t)floorf(gx), pz = (int32_t)floorf(gz);
+        if (px != parc_x || pz != parc_z) { parc_x = px; parc_z = pz; parc = v3_sv_hauteur(e, px + e.bx0, pz + e.bz0) == 0; }
+        if (parc) { img[0] = 7; img[1] = 14; img[2] = 12; }
+        else {
+          img[0] = 10; img[1] = 10; img[2] = 17;
+          const float afx = fabsf(fx), afz = fabsf(fz);
+          const float b1 = v3_mx(0.0f, v3_mn(marge, afx + q.pied * 0.5f) - v3_mx(-marge, afx - q.pied * 0.5f)) * q.ipied;
+          const float b2 = v3_mx(0.0f, v3_mn(marge, afz + q.pz * 0.5f) - v3_mx(-marge, afz - q.pz * 0.5f)) * q.ipz;
+          const float rv = v3_mx(b1, b2) * 0.42f + b1 * b2 * 0.5f;   // la lumiere orangee des reverberes
+          em[0] = rv * 200; em[1] = rv * 110; em[2] = rv * 40;
+        }
+        for (int l = 0; l < 4; l++) {   // quatre files : deux sens dans les rues nord-sud, deux dans les autres
+          const bool ns = l < 2;
+          const float alat = ns ? fx : fz;
+          if (fabsf(alat) >= marge) continue;
+          const float voie = (l & 1) ? -0.055f : 0.055f, lat = v3_01(1 - fabsf(alat - voie) * q.ilat);
+          if (lat <= 0) continue;
+          const float sens = (l == 0 || l == 3) ? 1.0f : -1.0f;
+          const int32_t ident = (int32_t)(ns ? rgx : rgz) + (ns ? e.bx0 : e.bz0), isens = (int32_t)sens;
+          File &f = files[l];
+          if (f.ident != ident) {   // la vitesse et le decalage de cette file : un tirage par rue
+            f.ident = ident;
+            f.v = sens * t * (0.55f + 0.25f * v3_hasard(ident, isens * 3, g + 9));
+            f.d = v3_hasard(ident, isens, g + 8) * 7;
+          }
+          const float ph = (ns ? gz : gx) * 1.6f - f.v + f.d, fph = ph - floorf(ph);
+          const float il = ns ? q.ilg_ns : q.ilg_ew;
+          float voit = v3_01(1 - fabsf(fph - 0.5f) * il) * (ns ? q.k_ns : q.k_ew);
+          if (voit > 0 && v3_hasard(ident * 7 + (int32_t)floorf(ph), isens, g + 10) >= 0.7f) voit = 0;
+          const float k = lat * (0.12f + 1.1f * voit);
+          if (sens > 0) { em[0] += k * 255; em[1] += k * 240; em[2] += k * 215; }
+          else { em[0] += k * 255; em[1] += k * 45; em[2] += k * 35; }
+        }
+      }
+      // la brume de l'horizon, ambre au loin, bleu nuit en haut
+      float voile, ke;
+      const float *cb;
+      if (vu) { const Case &c = cs[quelle[y]]; voile = c.voile; ke = c.ke; cb = c.cb; }
+      else { voile = sol[y].voile; ke = sol[y].ke; cb = sol[y].cb; }
+      for (int c = 0; c < 3; c++) p[c] = img[c] * (1 - voile) + cb[c] * voile + em[c] * ke;
+    }
+  }
+  for (int i = 0; i < nfeux; i++) {   // le feu rouge au sommet des tours, qui respire
+    const float rx = feux[i].x + 0.5f - cx, rz = feux[i].z + 0.5f - cz, pr = rx * sc + rz * cc;
+    if (pr <= 0.5f) continue;
+    const float colx = 32 + (rx * cc - rz * sc) * F / pr, lig = hz - (feux[i].h + 0.03f - cy) * F / pr;
+    const float f = (0.5f + 0.5f * sinf(t * 1.4f + (feux[i].x + e.bx0) * 1.7f + (feux[i].z + e.bz0))) * expf(-pr / 13.0f);
+    pointer(lig, colx, f * 255, f * 40, f * 30);
+  }
+  // la lueur de ce qui brille (peu de pixels : repandue de chacun)
+  memset(e.lumiere, 0, sizeof e.lumiere);
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const float *p = scene[y][x];
+      if (p[0] > 90 || p[1] > 90 || p[2] > 90)
+        v3_repandre(e.lumiere, e.noyau, y, x, v3_mx(p[0] - 90, 0) * 0.7f, v3_mx(p[1] - 90, 0) * 0.7f, v3_mx(p[2] - 90, 0) * 0.7f);
+    }
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++)
+      for (int c = 0; c < 3; c++) scene[y][x][c] += e.lumiere[y][x][c];
 }
 
 // --- 3. la ruelle neon sous la pluie ----------------------------------------------------------
@@ -1709,14 +2348,6 @@ struct E_ocean {
   float expn[513];      // exp(-x), x de 0 a 32
   uint8_t ey[50], ex[50];
 };
-
-// une table lue en interpolant (x * echelle entre 0 et n)
-inline float v3_lire(const float *tab, float x, float echelle, int n) {
-  const float f = x * echelle;
-  if (f >= n) return tab[n];
-  const int i = (int)f;
-  return tab[i] + (tab[i + 1] - tab[i]) * (f - i);
-}
 
 // le ciel de l'ocean dans une direction (azimut, hauteur), en radians
 inline void v3_ocean_ciel(const E_ocean &e, float az, float el, float *c) {

@@ -366,6 +366,7 @@ struct E_manta {
   uint8_t sable[64 * 64][3];
   float ombre[64 * 64];
   float fx[7], fy[7], fp[7];
+  float sA1[64], cA1[64], sA2[64], cA2[64], sI[64], cI[64], sP1[64], cP1[64], sP2[64], cP2[64], sR[64], cR[64];   // par colonne
 };
 void s_manta(int humeur, bool debut, float t, float ecoule, float dt) {
   E_manta &e = etat_ecran<E_manta>(debut);
@@ -414,7 +415,8 @@ void s_manta(int humeur, bool debut, float t, float ecoule, float dt) {
       }
   }
   // le fond : le sable, les caustiques (trois ondes croisees, deformees, plus vives par plaques), les rayons
-  float sA1[64], cA1[64], sA2[64], cA2[64], sI[64], cI[64], sP1[64], cP1[64], sP2[64], cP2[64], sR[64], cR[64];
+  float *sA1 = e.sA1, *cA1 = e.cA1, *sA2 = e.sA2, *cA2 = e.cA2, *sI = e.sI, *cI = e.cI;
+  float *sP1 = e.sP1, *cP1 = e.cP1, *sP2 = e.sP2, *cP2 = e.cP2, *sR = e.sR, *cR = e.cR;
   for (int x = 0; x < 64; x++) {
     sA1[x] = sinf(x * 0.42f + t * 0.6f); cA1[x] = cosf(x * 0.42f + t * 0.6f);
     const float a2 = -0.21f * x + sinf(x * 0.15f - t * 0.4f) * 1.6f - t * 0.5f;
