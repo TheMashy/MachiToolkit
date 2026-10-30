@@ -1335,11 +1335,14 @@ void s_village_neige(int humeur, bool debut, float t, float ecoule, float dt) {
       const float k = fminf(40.0f, (y - e.sol[x]) * 3);
       peindre(y, x, 120 + k, 132 + k, 170 + k);
     }
-  for (int i = 0; i < 5; i++) {   // des sapins (leurs etages de neige ne s'allument jamais dans le numpy : sommet n'est pas entier)
+  for (int i = 0; i < 5; i++) {   // des sapins, la neige sur leurs branches (une rangee sur trois, des la cime)
     const float sx = VP_SAPINS_VILLAGE[i][0], base = e.sol[(int)sx], sommet = base - VP_SAPINS_VILLAGE[i][1];
-    for (int y = max(0, (int)ceilf(sommet)); y <= (int)floorf(base); y++) {
+    const int cime = (int)ceilf(sommet);
+    for (int y = max(0, cime); y <= (int)floorf(base); y++) {
       const float l = (y - sommet) * 0.4f + 0.5f;
-      for (int x = max(0, (int)ceilf(sx - l)); x <= min(W - 1, (int)floorf(sx + l)); x++) peindre(y, x, 14, 30, 32);
+      const bool neige = (y - cime) % 3 == 0;
+      for (int x = max(0, (int)ceilf(sx - l)); x <= min(W - 1, (int)floorf(sx + l)); x++)
+        peindre(y, x, neige ? 150 : 14, neige ? 165 : 30, neige ? 200 : 32);
     }
   }
   float chx[4], chy[4], fx[8], fy[8], fc[8];

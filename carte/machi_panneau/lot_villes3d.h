@@ -110,6 +110,32 @@ inline void v3_flou(float *a, int larg, int haut, int r, int n) { v3_flou_t<floa
 // le meme sur des entiers (uint16, a l'echelle qu'on veut) : deux fois moins de memoire
 inline void v3_flou16(uint16_t *a, int larg, int haut, int r, int n) { v3_flou_t<uint16_t>(a, larg, haut, r, n); }
 
+// Les grands flous (une boite de 9) se font sur une demi-image : la scene reduite (2 x 2 -> 1), deux
+// boites de 3, puis relue en bilineaire -- un ecart-type de 2,6 pixels, celui de la boite de 9.
+void v3_reduire(float (*d)[32][3]) {
+  for (int j = 0; j < 32; j++)
+    for (int i = 0; i < 32; i++)
+      for (int c = 0; c < 3; c++)
+        d[j][i][c] = 0.25f * (scene[2 * j][2 * i][c] + scene[2 * j][2 * i + 1][c] + scene[2 * j + 1][2 * i][c] + scene[2 * j + 1][2 * i + 1][c]);
+  v3_flou(&d[0][0][0], 32, 32, 1, 2);
+}
+struct V3Relire { uint8_t a[64], b[64]; float w[64]; };   // pour chaque ligne (ou colonne) : ses deux voisines et leur poids
+inline void v3_relire_prep(V3Relire &r) {
+  for (int i = 0; i < 64; i++) {
+    const float f = i * 0.5f - 0.25f;
+    const int a = (int)floorf(f);
+    r.a[i] = (uint8_t)max(0, a); r.b[i] = (uint8_t)min(31, a + 1); r.w[i] = f - a;
+  }
+}
+inline void v3_relire(const float (*d)[32][3], const V3Relire &r, int y, int x, float *o) {
+  const float *p00 = d[r.a[y]][r.a[x]], *p01 = d[r.a[y]][r.b[x]], *p10 = d[r.b[y]][r.a[x]], *p11 = d[r.b[y]][r.b[x]];
+  const float wy = r.w[y], wx = r.w[x];
+  for (int c = 0; c < 3; c++) {
+    const float h = p00[c] + (p01[c] - p00[c]) * wx, b = p10[c] + (p11[c] - p10[c]) * wx;
+    o[c] = h + (b - h) * wy;
+  }
+}
+
 // _v3d_tache : une lumiere ronde et douce (gaussienne) ajoutee a img, une image 64 colonnes x 3 dont
 // la premiere ligne est y_lo et qui a nl lignes (pour peindre dans une demi-image)
 void v3_tache(float *img, int y_lo, int nl, float y, float x, float rayon, float cr, float cg, float cb, float force) {
@@ -194,11 +220,530 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
   degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
 }
 
-struct E_ruelle { char rien; };
+// --- 3. la ruelle neon sous la pluie ----------------------------------------------------------
+// La camera ne bouge pas : toute la geometrie (les deux murs, le sol, le bout de la rue), l'eclairage
+// fixe et les enseignes (leur dessin, leur halo, la lumiere qu'elles jettent) sont calcules a la
+// premiere image. A chaque image : les enseignes qui gresillent, le sol mouille qui les reflete (le
+// reflet d'un mur dans le sol, c'est le mur retourne autour de son pied), les ronds des gouttes, la
+// vapeur, un passant, la pluie.
+
+const float V3_RL_F = 32, V3_RL_HZ = 29, V3_RL_CX = 0.15f, V3_RL_CY = 0.8f, V3_RL_XG = -1.0f, V3_RL_XD = 1.1f, V3_RL_BOUT = 9.0f;
+// les enseignes en drapeau : z, x du mur, saillie, y bas, y haut, couleur, defaillante
+const float V3_RL_DRAPEAUX[4][9] = {{3.4f, -1.0f, 0.45f, 1.05f, 2.35f, 255, 45, 160, 0}, {2.3f, 1.1f, -0.42f, 1.35f, 2.75f, 255, 185, 50, 0},
+                                    {5.4f, 1.1f, -0.36f, 0.95f, 1.9f, 50, 220, 255, 1}, {6.9f, -1.0f, 0.32f, 1.45f, 2.4f, 170, 90, 255, 0}};
+// les enseignes a plat sur les murs : mur, z0, z1, y0, y1, couleur, defaillante
+const float V3_RL_PLATES[3][9] = {{0, 4.6f, 6.0f, 1.6f, 2.0f, 40, 230, 255, 0}, {1, 3.1f, 4.5f, 2.4f, 2.8f, 255, 60, 150, 1},
+                                  {0, 7.7f, 8.6f, 1.15f, 1.45f, 255, 120, 60, 0}};
+const float V3_RL_ALBEDO[6][3] = {{0, 0, 0}, {0.62f, 0.45f, 0.55f}, {0.5f, 0.45f, 0.62f}, {1.0f, 0.9f, 1.1f}, {0.42f, 0.4f, 0.48f}, {0.55f, 0.5f, 0.55f}};
+const float V3_RL_GMAX = 2.2f;   // le plus fort eclairage d'une enseigne (fois l'albedo) : l'echelle des tables
+
+struct V3RlGeo {   // ce que voit un pixel de la ruelle
+  bool gauche, mur, face, sol;
+  float sx, sy, s_mur, y_mur, haut_mur, s_sol, y_face, x_face, gx, gz, pied, P[3], N[3];
+};
+void v3_rl_geo(int y, int x, V3RlGeo &g) {
+  const float F = V3_RL_F, cx = V3_RL_CX, cy = V3_RL_CY;
+  g.sx = x + 0.5f - 32; g.sy = y + 0.5f - V3_RL_HZ;
+  g.gauche = g.sx < 0;
+  g.s_mur = g.gauche ? (cx - V3_RL_XG) * F / fmaxf(-g.sx, 1e-6f) : (V3_RL_XD - cx) * F / fmaxf(g.sx, 1e-6f);
+  g.y_mur = cy - g.sy * g.s_mur / F;
+  g.haut_mur = g.gauche ? (g.s_mur < 6 ? 3.6f : 3.0f) : (g.s_mur < 4.2f ? 4.3f : 3.7f);
+  g.mur = g.s_mur < V3_RL_BOUT && g.y_mur < g.haut_mur && g.y_mur > -0.01f;
+  g.s_sol = g.sy > 0 ? cy * F / fmaxf(g.sy, 1e-6f) : 1e9f;
+  const float s_face = V3_RL_BOUT + 1.5f;
+  g.y_face = cy - g.sy * s_face / F; g.x_face = cx + g.sx * s_face / F;
+  g.face = !g.mur && g.y_face < 4.6f && g.y_face >= 0 && s_face < g.s_sol;
+  g.sol = !g.mur && !g.face && g.sy > 0;
+  g.gx = cx + g.sx * g.s_sol / F; g.gz = g.s_sol;
+  g.N[0] = g.N[1] = g.N[2] = 0;
+  if (g.mur) { g.P[0] = g.gauche ? V3_RL_XG : V3_RL_XD; g.P[1] = g.y_mur; g.P[2] = g.s_mur; g.N[0] = g.gauche ? 1 : -1; }
+  else if (g.face) { g.P[0] = g.x_face; g.P[1] = g.y_face; g.P[2] = s_face; g.N[2] = -1; }
+  else { g.P[0] = g.gx; g.P[1] = 0; g.P[2] = fminf(g.gz, 60); if (g.sol) g.N[1] = 1; }
+  g.pied = (g.mur ? g.s_mur : g.sol ? g.s_sol : s_face) / F;
+}
+// _ruelle_lumiere : ce qu'une lampe en L donne au point du pixel (sans sa couleur)
+inline float v3_rl_lumiere(const V3RlGeo &g, float lx, float ly, float lz, float force, float rayon) {
+  const float d[3] = {lx - g.P[0], ly - g.P[1], lz - g.P[2]};
+  const float d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+  const float face = v3_01((d[0] * g.N[0] + d[1] * g.N[1] + d[2] * g.N[2]) / sqrtf(d2 + 1e-6f)) * 0.75f + 0.25f;
+  return force * face * expf(-1.3f * logf(1 + d2 / (rayon * rayon)));
+}
+
+struct V3Boite { int16_t x0, y0, w, h; uint16_t off; };   // un petit rectangle de l'ecran, range dans la reserve
+struct E_ruelle {
+  uint8_t base[64][64][3];      // l'eclairage fixe, les fenetres, le ciel, les fils, la bouche d'egout
+  uint8_t genre[64][64];        // 0 ciel, 1 mur gauche, 2 mur droit, 3 corniche, 4 sol, 5 facade du bout
+  uint8_t jet[7][64][64];       // la lumiere que chaque enseigne jette (fois l'albedo), racine, sur 255
+  uint8_t flaque[64][64];       // 0-255
+  uint8_t brume[64][64];        // la vapeur
+  int16_t bloc[37][64][3];      // le reflet du sol (lignes 27 a 63), puis le flou sous la vapeur
+  uint8_t reserve[16384];       // les enseignes (couverture, dessin, halo), les lampes, les reflets fixes
+  V3Boite ens[7], emis, refl;
+  uint16_t couverts[600];       // les pixels qu'une enseigne couvre
+  float yref[64];               // le pied des murs, par colonne : y_reflet = arrondi(yref - y - 0.5)
+  float gouttes[14][4];         // x, z, naissance, force
+  float px[50], py[50], pv[50];
+  float suivante;
+  int ncouverts, libre;
+};
+
+// range une boite (x0, y0, w, h) de `octets` par pixel dans la reserve
+bool v3_rl_ranger(E_ruelle &e, V3Boite &b, int x0, int y0, int x1, int y1, int octets) {
+  x0 = max(0, x0); y0 = max(0, y0); x1 = min(64, x1); y1 = min(64, y1);
+  b.x0 = x0; b.y0 = y0; b.w = max(0, x1 - x0); b.h = max(0, y1 - y0); b.off = e.libre;
+  const int n = b.w * b.h * octets;
+  if (e.libre + n > (int)sizeof e.reserve) { b.w = b.h = 0; return false; }
+  e.libre += n;
+  return true;
+}
+// la plus petite boite des pixels non nuls de la scene (servant de brouillon)
+void v3_rl_cadre(int &x0, int &y0, int &x1, int &y1) {
+  x0 = 64; y0 = 64; x1 = 0; y1 = 0;
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++)
+      if (scene[y][x][0] > 0.5f || scene[y][x][1] > 0.5f || scene[y][x][2] > 0.5f) { x0 = min(x0, x); x1 = max(x1, x + 1); y0 = min(y0, y); y1 = max(y1, y + 1); }
+}
+
+void v3_rl_preparer(E_ruelle &e) {
+  const float F = V3_RL_F, hz = V3_RL_HZ, cx = V3_RL_CX, cy = V3_RL_CY;
+  // les deux champs de hasard : les taches des murs et du sol, les flaques (brouillon : la scene)
+  uint16_t *tache = (uint16_t *)&scene[0][0][0], *flaques = tache + 4096;
+  brume_n(tache, 64, 4);
+  brume_n(flaques, 64, 6);
+  static const float lampes[3][8] = {{-0.93f, 1.35f, 2.5f, 255, 165, 80, 1.6f, 0.6f}, {1.03f, 1.3f, 7.45f, 255, 165, 80, 1.4f, 0.6f},
+                                     {0.05f, 0.9f, 10.3f, 230, 165, 110, 1.5f, 2.0f}};
+  static const float fenetres[7][4] = {{6.3f, 2.5f, 1, 1}, {3.0f, 3.2f, 0, 1}, {8.1f, 2.2f, 1, 1}, {2.6f, 2.95f, 1, 0}, {6.0f, 2.6f, 1, 0},
+                                       {8.3f, 2.7f, 0, 0}, {4.1f, 3.5f, 1, 0}};
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      V3RlGeo g;
+      v3_rl_geo(y, x, g);
+      const float tc = tache[y * 64 + x] * (1.0f / 65535);
+      // les matieres : brique sombre, taches, portes en retrait ; l'asphalte ; la facade d'en face
+      const float yv = g.y_mur, z = g.s_mur;
+      const float brique = 0.92f + 0.08f * borne(sinf(yv * 2 * V3_PI / 0.16f) * 3, -1, 1) * v3_01(1 - g.pied / 0.06f);
+      int genre = g.mur ? (g.gauche ? 1 : 2) : g.sol ? 4 : g.face ? 5 : 0;
+      float a = brique * (0.7f + 0.6f * tc);
+      if (g.mur && ((g.gauche && fabsf(z - 2.5f) < 0.32f) || (!g.gauche && fabsf(z - 7.45f) < 0.28f)) && yv < 1.15f) a *= 0.3f;   // les portes
+      if (g.mur && fabsf(yv - g.haut_mur + 0.06f) < fmaxf(g.pied * 0.7f, 0.05f)) { genre = 3; a = 1; }                       // la corniche
+      if (g.sol) a = 0.75f + 0.5f * tc;
+      if (g.face) a = 1;
+      e.genre[y][x] = genre;
+      const float *alb = V3_RL_ALBEDO[genre == 0 ? (g.gauche ? 1 : 2) : genre];
+      // l'eclairage fixe : la lueur du ciel, les lampes des portes, la lumiere du bout de la rue
+      float ecl[3];
+      const float amb = 1.15f - 0.55f * v3_01(g.P[1] / 4);
+      ecl[0] = 44 * amb; ecl[1] = 32 * amb; ecl[2] = 66 * amb;
+      for (int l = 0; l < 3; l++) {
+        const float k = v3_rl_lumiere(g, lampes[l][0], lampes[l][1], lampes[l][2], lampes[l][6], lampes[l][7]);
+        for (int c = 0; c < 3; c++) ecl[c] += k * lampes[l][3 + c];
+      }
+      float img[3];
+      for (int c = 0; c < 3; c++) img[c] = alb[c] * a * ecl[c];
+      for (int f = 0; f < 7; f++) {   // les fenetres : sombres
+        const bool cote = fenetres[f][3] > 0;
+        if (g.mur && g.gauche == cote && fabsf(z - fenetres[f][0]) < 0.3f && fabsf(yv - fenetres[f][1]) < 0.28f) { img[0] = 6; img[1] = 5; img[2] = 10; }
+      }
+      if (genre == 0) {   // le ciel : une bande etroite entre les toits, rougie par la ville
+        const float kc = v3_01(y / 22.0f);
+        img[0] = 14 + 56 * kc; img[1] = 10 + 24 * kc; img[2] = 30 + 50 * kc;
+      }
+      float fl = 0;
+      if (g.sol) {   // les flaques, la bouche d'egout
+        const int fy = (int)v3_fmod(g.gz * 5, 64) % 64, fx = (int)v3_fmod(g.gx * 9, 64) % 64;
+        fl = v3_01((flaques[fy * 64 + fx] * (1.0f / 65535) - 0.42f) / 0.08f);
+        const float u = (g.gx - 0.35f) / 0.32f, v = (g.gz - 3.2f) / 0.22f, trou = u * u + v * v;
+        if (trou < 1) {
+          for (int c = 0; c < 3; c++) img[c] *= 0.45f;
+          if (trou > 0.6f) { img[0] += 14; img[1] += 12; img[2] += 18; }
+        }
+        if (trou < 1.2f) fl = 0;
+      }
+      e.flaque[y][x] = (uint8_t)(fl * 255 + 0.5f);
+      for (int c = 0; c < 3; c++) e.base[y][x][c] = (uint8_t)borne(img[c] + 0.5f, 0, 255);
+      // la lumiere de chaque enseigne sur ce pixel (fois son albedo), en racine sur 255
+      for (int k = 0; k < 7; k++) {
+        float L[3], force, rayon;
+        if (k < 4) {
+          const float *d = V3_RL_DRAPEAUX[k];
+          L[0] = d[1] + d[2] / 2; L[1] = (d[3] + d[4]) / 2; L[2] = d[0]; force = 1.6f; rayon = 0.95f;
+        } else {
+          const float *d = V3_RL_PLATES[k - 4];
+          L[0] = d[0] == 0 ? V3_RL_XG + 0.15f : V3_RL_XD - 0.15f; L[1] = (d[3] + d[4]) / 2; L[2] = (d[1] + d[2]) / 2; force = 1.3f; rayon = 0.9f;
+        }
+        const float j = genre ? v3_rl_lumiere(g, L[0], L[1], L[2], force, rayon) * a : 0;
+        e.jet[k][y][x] = (uint8_t)(sqrtf(v3_01(j / V3_RL_GMAX)) * 255 + 0.5f);
+      }
+    }
+  // les fils qui traversent le ciel (chaque pixel assombri une fois par fil)
+  static const float fils[2][6] = {{-1.0f, 3.3f, 1.1f, 3.6f, 0.4f, 3.9f}, {-1.0f, 2.9f, 1.1f, 3.1f, 0.25f, 7.8f}};
+  for (int f = 0; f < 2; f++) {
+    uint8_t vu[64][8];
+    memset(vu, 0, sizeof vu);
+    for (int i = 0; i < 120; i++) {
+      const float k = i / 119.0f, wx = fils[f][0] + (fils[f][2] - fils[f][0]) * k;
+      const float wy = fils[f][1] + (fils[f][3] - fils[f][1]) * k - fils[f][4] * 4 * k * (1 - k), zf = fils[f][5];
+      const int c = (int)(32 + (wx - cx) * F / zf), r = (int)(hz - (wy - cy) * F / zf);
+      if (r < 0 || r >= 64 || c < 0 || c >= 64 || (vu[r][c >> 3] >> (c & 7) & 1)) continue;
+      vu[r][c >> 3] |= 1 << (c & 7);
+      V3RlGeo g;
+      v3_rl_geo(r, c, g);
+      if (e.genre[r][c] == 0 || g.s_mur > zf)
+        for (int q = 0; q < 3; q++) e.base[r][c][q] = (uint8_t)(e.base[r][c][q] * 0.45f + 4 + 0.5f);
+    }
+  }
+  // le pied des murs, par colonne (le reflet retourne l'image autour de lui)
+  for (int x = 0; x < 64; x++) {
+    V3RlGeo g;
+    v3_rl_geo(40, x, g);
+    const float s_pied = g.s_mur < V3_RL_BOUT ? g.s_mur : V3_RL_BOUT + 1.5f;
+    e.yref[x] = 2 * (hz + cy * F / s_pied) - 0.5f;
+  }
+  // ce qui brille sans bouger : les fenetres allumees, les ampoules, la vitrine du bout, la guirlande
+  memset(scene, 0, sizeof(float) * 64 * 64 * 3);
+  float *img = &scene[0][0][0];
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      V3RlGeo g;
+      v3_rl_geo(y, x, g);
+      float *p = scene[y][x];
+      for (int f = 0; f < 7; f++) {
+        const bool cote = fenetres[f][3] > 0;
+        if (fenetres[f][2] > 0 && g.mur && g.gauche == cote && fabsf(g.s_mur - fenetres[f][0]) < 0.3f && fabsf(g.y_mur - fenetres[f][1]) < 0.28f) {
+          const float store = 0.7f + 0.3f * (sinf(g.y_mur * 2 * V3_PI / 0.1f) > 0 ? 1 : 0) * v3_01(1 - g.pied / 0.05f);
+          p[0] = 255 * 0.55f * store; p[1] = 165 * 0.55f * store; p[2] = 85 * 0.55f * store;
+        }
+      }
+    }
+  for (int l = 0; l < 2; l++)   // les ampoules des portes
+    v3_tache(img, 0, 64, hz - (lampes[l][1] - cy) * F / lampes[l][2], 32 + (lampes[l][0] - cx) * F / lampes[l][2], 0.6f, 255, 200, 130, 1.0f);
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      V3RlGeo g;
+      v3_rl_geo(y, x, g);
+      if (!g.face) continue;
+      float *p = scene[y][x];
+      const float xf = g.x_face, yf = g.y_face;
+      if (fabsf(xf - 0.05f) < 0.8f && yf > 0.15f && yf < 1.0f) { p[0] = 220; p[1] = 160; p[2] = 100; }
+      if (fabsf(yf - 1.35f) < 0.08f && fabsf(xf - 0.05f) < 0.6f) { p[0] = 60; p[1] = 230; p[2] = 200; }
+      if (fabsf(v3_fmod(yf - 2, 0.8f) - 0.3f) < 0.18f && fabsf(v3_fmod(xf + 2, 0.7f) - 0.35f) < 0.15f && yf > 1.8f && sinf(xf * 9.1f + yf * 3.7f) > 0.2f) {
+        p[0] = 110; p[1] = 85; p[2] = 60;
+      }
+    }
+  static const float guirlande[3][3] = {{255, 200, 120}, {255, 120, 160}, {140, 220, 255}};
+  for (int i = 0; i < 9; i++) {   // la guirlande d'ampoules, en travers de la ruelle
+    const float kk = 0.06f + 0.88f * i / 8, wx = V3_RL_XG + (V3_RL_XD - V3_RL_XG) * kk, wy = 2.75f - 0.32f * 4 * kk * (1 - kk), wz = 4.4f + 0.3f * kk;
+    v3_tache(img, 0, 64, hz - (wy - cy) * F / wz, 32 + (wx - cx) * F / wz, 0.55f, guirlande[i % 3][0], guirlande[i % 3][1], guirlande[i % 3][2], 0.9f);
+  }
+  int x0, y0, x1, y1;
+  v3_rl_cadre(x0, y0, x1, y1);
+  if (v3_rl_ranger(e, e.emis, x0, y0, x1, y1, 3))
+    for (int y = 0; y < e.emis.h; y++)
+      for (int x = 0; x < e.emis.w; x++)
+        for (int c = 0; c < 3; c++) e.reserve[e.emis.off + (y * e.emis.w + x) * 3 + c] = (uint8_t)borne(scene[y + e.emis.y0][x + e.emis.x0][c] + 0.5f, 0, 255);
+  memset(scene, 0, sizeof(float) * 64 * 64 * 3);
+  for (int i = 0; i < 9; i++) {   // et son reflet dans le sol mouille
+    const float kk = 0.06f + 0.88f * i / 8, wx = V3_RL_XG + (V3_RL_XD - V3_RL_XG) * kk, wy = 2.75f - 0.32f * 4 * kk * (1 - kk), wz = 4.4f + 0.3f * kk;
+    v3_tache(img, 0, 64, hz + (wy + cy) * F / wz, 32 + (wx - cx) * F / wz, 0.7f, guirlande[i % 3][0], guirlande[i % 3][1], guirlande[i % 3][2], 0.35f);
+  }
+  v3_rl_cadre(x0, y0, x1, y1);
+  if (v3_rl_ranger(e, e.refl, x0, y0, x1, y1, 3))
+    for (int y = 0; y < e.refl.h; y++)
+      for (int x = 0; x < e.refl.w; x++)
+        for (int c = 0; c < 3; c++) e.reserve[e.refl.off + (y * e.refl.w + x) * 3 + c] = (uint8_t)borne(scene[y + e.refl.y0][x + e.refl.x0][c] + 0.5f, 0, 255);
+  // les enseignes : leur couverture, leur dessin, leur halo (le dessin flou) -- chacune a part
+  e.ncouverts = 0;
+  for (int k = 0; k < 7; k++) {
+    memset(scene, 0, sizeof(float) * 64 * 64 * 3);
+    uint8_t couv[64][64];
+    memset(couv, 0, sizeof couv);
+    int cx0 = 64, cy0 = 64, cx1 = 0, cy1 = 0;
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 64; x++) {
+        V3RlGeo g;
+        float cv = 0, d[3] = {0, 0, 0};
+        if (k < 4) {
+          const float *q = V3_RL_DRAPEAUX[k], zs = q[0];
+          const float xa = fminf(q[1], q[1] + q[2]), xb = fmaxf(q[1], q[1] + q[2]);
+          const float ca = 32 + (xa - cx) * F / zs, cb = 32 + (xb - cx) * F / zs, ha = hz - (q[4] - cy) * F / zs, ba = hz - (q[3] - cy) * F / zs;
+          cv = v3_01(fminf(x + 1.0f, cb) - fmaxf((float)x, ca)) * v3_01(fminf(y + 1.0f, ba) - fmaxf((float)y, ha));
+          if (cv <= 0) continue;
+          v3_rl_geo(y, x, g);
+          if (g.mur && !(zs < g.s_mur)) continue;
+          const float a = v3_01((x + 0.5f - ca) / (cb - ca)), b = v3_01((y + 0.5f - ha) / (ba - ha));
+          const float bord = fmaxf(v3_01(1.5f - fminf(a, 1 - a) * (cb - ca)), v3_01(1.5f - fminf(b, 1 - b) * (ba - ha)));
+          const float nr = fmaxf(3.0f, rintf((q[4] - q[3]) / 0.2f)), j = floorf(b * nr);
+          const float glyphe = (v3_hasard((int32_t)(j + zs * 100), (int32_t)(a * 3), 31) > 0.35f && fabsf(b * nr - j - 0.5f) < 0.32f) ? 1 : 0;
+          for (int c = 0; c < 3; c++) d[c] = (q[5 + c] * (0.12f + 0.8f * fmaxf(bord, glyphe * 0.9f)) + 70 * bord * bord) * cv;
+        } else {
+          const float *q = V3_RL_PLATES[k - 4];
+          v3_rl_geo(y, x, g);
+          const float z = g.s_mur, yv = g.y_mur;
+          if (!(g.mur && g.gauche == (q[0] == 0) && z > q[1] && z < q[2] && yv > q[3] && yv < q[4])) continue;
+          cv = 1;
+          const float pz = g.pied * fmaxf(fabsf(g.sx) / 4, 1);
+          const bool bord = fminf(z - q[1], q[2] - z) < fmaxf(pz, 0.05f) || fminf(yv - q[3], q[4] - yv) < fmaxf(g.pied, 0.04f);
+          const bool lettres = sinf((z - q[1]) * 2 * V3_PI / 0.22f) > 0.1f && fabsf(yv - (q[3] + q[4]) / 2) < (q[4] - q[3]) * 0.28f;
+          const float m = fmaxf(bord ? 1.0f : 0.0f, lettres ? borne(1.5f - pz / 0.08f, 0.3f, 1) : 0.0f);
+          for (int c = 0; c < 3; c++) d[c] = q[5 + c] * (0.15f + 0.85f * m) + (bord ? 50 : 0);
+        }
+        couv[y][x] = (uint8_t)(cv * 255 + 0.5f);
+        for (int c = 0; c < 3; c++) scene[y][x][c] = d[c];
+        cx0 = min(cx0, x); cy0 = min(cy0, y); cx1 = max(cx1, x + 1); cy1 = max(cy1, y + 1);
+      }
+    V3Boite &b = e.ens[k];
+    if (cx1 <= cx0 || !v3_rl_ranger(e, b, cx0 - 4, cy0 - 4, cx1 + 4, cy1 + 4, 7)) { b.w = b.h = 0; continue; }
+    uint8_t *r = e.reserve + b.off;
+    const int n = b.w * b.h;
+    for (int y = 0; y < b.h; y++)
+      for (int x = 0; x < b.w; x++) {
+        const int i = y * b.w + x, Y = y + b.y0, X = x + b.x0;
+        r[i] = couv[Y][X];
+        for (int c = 0; c < 3; c++) r[n + i * 3 + c] = (uint8_t)borne(scene[Y][X][c] * 0.8f + 0.5f, 0, 255);
+        if (couv[Y][X]) {
+          bool deja = false;
+          for (int j = 0; j < e.ncouverts; j++) deja |= e.couverts[j] == Y * 64 + X;
+          if (!deja && e.ncouverts < 600) e.couverts[e.ncouverts++] = Y * 64 + X;
+        }
+      }
+    v3_flou(img, 64, 64, 2, 2);   // le halo
+    for (int y = 0; y < b.h; y++)
+      for (int x = 0; x < b.w; x++)
+        for (int c = 0; c < 3; c++) r[4 * n + (y * b.w + x) * 3 + c] = (uint8_t)borne(scene[y + b.y0][x + b.x0][c] * 0.8f + 0.5f, 0, 255);
+  }
+  // la vapeur
+  uint16_t *v = (uint16_t *)&scene[0][0][0];
+  brume_n(v, 64, 4);
+  for (int i = 0; i < 4096; i++) e.brume[i >> 6][i & 63] = (uint8_t)(v[i] >> 8);
+}
+
 void s_ruelle(int humeur, bool debut, float t, float ecoule, float dt) {
   E_ruelle &e = etat_ecran<E_ruelle>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur;
+  const float F = V3_RL_F, hz = V3_RL_HZ, cx = V3_RL_CX, cy = V3_RL_CY;
+  if (debut) {
+    e.libre = 0;
+    v3_rl_preparer(e);
+    for (int i = 0; i < 14; i++) e.gouttes[i][2] = -100;
+    for (int i = 0; i < 50; i++) { e.px[i] = hasard(0, 64); e.py[i] = hasard(0, 64); e.pv[i] = hasard(50, 75); }
+    e.suivante = 0;
+  }
+  // les enseignes qui gresillent ; deux faiblissent par moments, en douceur
+  float f[7], fc[7][3];
+  for (int i = 0; i < 7; i++) {
+    f[i] = 0.9f + 0.05f * sinf(t * 1.3f + i * 2.1f) + 0.03f * sinf(t * 7.9f + i) + 0.02f * sinf(t * 13.1f + i * 3);
+    const float *q = i < 4 ? V3_RL_DRAPEAUX[i] : V3_RL_PLATES[i - 4];
+    if (q[8] > 0) {
+      const float ph = v3_fmod(t / (6.3f + i) + i * 0.37f, 1);
+      const float a = sinf(V3_PI * v3_01(ph / 0.07f)), b = sinf(V3_PI * v3_01((ph - 0.09f) / 0.05f));
+      f[i] *= 1 - 0.5f * a * a - 0.3f * b * b;
+    }
+    for (int c = 0; c < 3; c++) fc[i][c] = f[i] * q[5 + c] * (V3_RL_GMAX / 65025.0f);
+  }
+  // l'eclairage fixe, et la lumiere des enseignes (racine -> carre)
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      float acc[3] = {0, 0, 0};
+      for (int k = 0; k < 7; k++) {
+        const int q = e.jet[k][y][x];
+        if (!q) continue;
+        const float w = (float)(q * q);
+        acc[0] += w * fc[k][0]; acc[1] += w * fc[k][1]; acc[2] += w * fc[k][2];
+      }
+      const float *alb = V3_RL_ALBEDO[e.genre[y][x]];
+      for (int c = 0; c < 3; c++) scene[y][x][c] = e.base[y][x][c] + alb[c] * acc[c];
+    }
+  for (int k = 0; k < 7; k++) {   // les halos
+    const V3Boite &b = e.ens[k];
+    const uint8_t *h = e.reserve + b.off + 4 * b.w * b.h;
+    const float g = f[k] * 1.25f;
+    for (int y = 0; y < b.h; y++)
+      for (int x = 0; x < b.w; x++)
+        for (int c = 0; c < 3; c++) scene[y + b.y0][x + b.x0][c] += h[(y * b.w + x) * 3 + c] * g;
+  }
+  for (int i = 0; i < e.ncouverts; i++) {   // sous les enseignes : dans l'ordre, chacune couvre ce qui est derriere
+    const int Y = e.couverts[i] >> 6, X = e.couverts[i] & 63;
+    const float *alb = V3_RL_ALBEDO[e.genre[Y][X]];
+    float v[3] = {(float)e.base[Y][X][0], (float)e.base[Y][X][1], (float)e.base[Y][X][2]};
+    for (int k = 0; k < 7; k++) {
+      const float w = (float)(e.jet[k][Y][X] * e.jet[k][Y][X]);
+      for (int c = 0; c < 3; c++) v[c] += alb[c] * w * fc[k][c];
+      const V3Boite &b = e.ens[k];
+      const int x = X - b.x0, y = Y - b.y0;
+      if (x < 0 || y < 0 || x >= b.w || y >= b.h) continue;
+      const int n = b.w * b.h, j = y * b.w + x;
+      const uint8_t *r = e.reserve + b.off;
+      const float cv = r[j] * (1.0f / 255), g = f[k] * 1.25f;
+      for (int c = 0; c < 3; c++) v[c] = v[c] * (1 - cv) + (r[n + j * 3 + c] + r[4 * n + j * 3 + c]) * g;
+    }
+    for (int c = 0; c < 3; c++) scene[Y][X][c] = v[c];
+  }
+  {   // ce qui brille sans bouger
+    const V3Boite &b = e.emis;
+    const uint8_t *r = e.reserve + b.off;
+    for (int y = 0; y < b.h; y++)
+      for (int x = 0; x < b.w; x++)
+        for (int c = 0; c < 3; c++) scene[y + b.y0][x + b.x0][c] += r[(y * b.w + x) * 3 + c];
+  }
+  // un passant sous son parapluie, de temps en temps, dans la rue du bout
+  const float cycle = v3_fmod(t / 34.0f, 1);
+  if (cycle < 0.62f) {
+    const float wx = -2.2f + cycle / 0.62f * 4.6f, wz = V3_RL_BOUT + 0.9f;
+    const float col = 32 + (wx - cx) * F / wz, k = F / wz, pas = sinf(t * 5.0f) * 0.04f;
+    for (int y = max(0, (int)(hz - 1.6f * k)); y < min(64, (int)(hz + k) + 2); y++)
+      for (int x = max(0, (int)(col - 0.4f * k) - 1); x < min(64, (int)(col + 0.4f * k) + 2); x++) {
+        const float X = x + 0.5f, Y = y + 0.5f, u = (X - col) / (0.34f * k), v = (Y - (hz - (1.2f - cy) * k)) / (0.16f * k);
+        const bool corps = fabsf(X - col) < 0.13f * k + 0.25f && Y > hz - (1.0f - cy) * k && Y < hz + cy * k - pas * k;
+        const bool pluie_ = u * u + v * v < 1 && Y > hz - (1.36f - cy) * k;
+        const int gn = e.genre[y][x];
+        const bool loin = gn != 1 && gn != 2 && gn != 3 && !(gn == 4 && y + 0.5f - hz >= cy * F / 9.6f);
+        if ((corps || pluie_) && loin) {
+          float *p = scene[y][x];
+          p[0] = p[0] * 0.12f + 6; p[1] = p[1] * 0.12f + 5; p[2] = p[2] * 0.12f + 10;
+        }
+      }
+  }
+  // les ronds des gouttes dans les flaques
+  if (ecoule >= e.suivante) {
+    e.suivante = ecoule + hasard(0.08f, 0.22f);
+    int i = 0;
+    for (int j = 1; j < 14; j++) if (e.gouttes[j][2] < e.gouttes[i][2]) i = j;
+    e.gouttes[i][0] = hasard(-0.9f, 1.0f); e.gouttes[i][1] = hasard(1.0f, 6.5f); e.gouttes[i][2] = t; e.gouttes[i][3] = hasard(0.6f, 1.0f);
+  }
+  // l'onde du sol (dans le premier canal du bloc, x 8192) : la pluie fine, plus les ronds. Le long d'une
+  // ligne, gx avance d'un pas fixe : on tourne le sinus au lieu de le recalculer
+  const float O = 8192;
+  for (int y = 27; y < 64; y++) {
+    const float sy = y + 0.5f - hz;
+    if (sy <= 0) { for (int x = 0; x < 64; x++) e.bloc[y - 27][x][0] = 0; continue; }
+    const float gz = cy * F / sy, a = 0.3f * v3_sin(gz * 6 + t * 1.3f) * O;
+    const float p0 = (cx + (0.5f - 32) * gz / F) * 7 - t * 0.9f, dp = 7 * gz / F;
+    float sn = v3_sin(p0), cs = v3_cos(p0);
+    const float sd = v3_sin(dp), cd = v3_cos(dp);
+    for (int x = 0; x < 64; x++) {
+      e.bloc[y - 27][x][0] = (int16_t)(a * sn);
+      const float s2 = sn * cd + cs * sd;
+      cs = cs * cd - sn * sd;
+      sn = s2;
+    }
+  }
+  for (int i = 0; i < 14; i++) {
+    const float x0 = e.gouttes[i][0], z0 = e.gouttes[i][1], age = t - e.gouttes[i][2], a0 = e.gouttes[i][3];
+    if (!(age >= 0 && age < 1.4f)) continue;
+    const float R = age * 0.35f + 0.25f, amp = a0 * (1 - age / 1.4f);
+    const int ya = max(27, (int)(hz + cy * F / (z0 + R)) - 1), yb = min(64, (int)(hz + cy * F / fmaxf(z0 - R, 0.3f)) + 2);
+    for (int y = ya; y < yb; y++) {
+      const float sy = y + 0.5f - hz;
+      if (sy <= 0) continue;
+      const float gz = cy * F / sy;
+      if (fabsf(gz - z0) > R) continue;
+      const int xa = max(0, (int)((x0 - R - cx) * F / gz + 32) - 1), xb = min(64, (int)((x0 + R - cx) * F / gz + 32) + 2);
+      for (int x = xa; x < xb; x++) {
+        const float gx = cx + (x + 0.5f - 32) * gz / F, d = hypotf(gx - x0, gz - z0) - age * 0.35f, q = d / 0.06f;
+        if (q * q > 12) continue;
+        const float o = e.bloc[y - 27][x][0] + amp * v3_sin(d * 40) * v3_exp(-q * q) * O;
+        e.bloc[y - 27][x][0] = (int16_t)borne(o, -32000, 32000);
+      }
+    }
+  }
+  // le reflet dans le sol mouille : l'image retournee autour du pied des murs, que l'onde fait onduler
+  float dra[4][4];   // le reflet de chaque drapeau : ses lignes et ses colonnes a l'ecran
+  for (int k = 0; k < 4; k++) {
+    const float *q = V3_RL_DRAPEAUX[k], zs = q[0];
+    dra[k][0] = hz + (q[3] + cy) * F / zs; dra[k][1] = hz + (q[4] + cy) * F / zs;
+    dra[k][2] = 32 + (v3_mn(q[1], q[1] + q[2]) - cx) * F / zs; dra[k][3] = 32 + (v3_mx(q[1], q[1] + q[2]) - cx) * F / zs;
+  }
+  for (int y = 27; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const float onde = e.bloc[y - 27][x][0] * (1 / O);
+      const int dy = (int)rintf(onde * 1.3f), dxp = (int)rintf(onde * 0.8f);
+      const int yr = (int)borne(rintf(e.yref[x] - y - 0.5f), -1, 63) + dy, xr = min(63, max(0, x + dxp));
+      float r[3];
+      if (yr >= 0) {
+        const int yc = min(63, yr);
+        if (e.genre[yc][xr] == 4) r[0] = r[1] = r[2] = 0;
+        else { r[0] = scene[yc][xr][0]; r[1] = scene[yc][xr][1]; r[2] = scene[yc][xr][2]; }
+      } else { r[0] = 40; r[1] = 20; r[2] = 50; }
+      const int ys = min(63, max(0, y + dy));   // et les reflets des enseignes, de la guirlande
+      const V3Boite &b = e.refl;
+      if (ys >= b.y0 && ys < b.y0 + b.h && xr >= b.x0 && xr < b.x0 + b.w) {
+        const uint8_t *q = e.reserve + b.off + ((ys - b.y0) * b.w + xr - b.x0) * 3;
+        r[0] += q[0]; r[1] += q[1]; r[2] += q[2];
+      }
+      if (e.genre[ys][xr] == 4)
+        for (int k = 0; k < 4; k++) {
+          const float ky = v3_mn(ys + 1.0f, dra[k][1]) - v3_mx((float)ys, dra[k][0]);
+          if (ky <= 0) continue;
+          const float kx = v3_mn(xr + 1.0f, dra[k][3]) - v3_mx((float)xr, dra[k][2]);
+          if (kx <= 0) continue;
+          const float *q = V3_RL_DRAPEAUX[k], k2 = v3_mn(ky, 1) * v3_mn(kx, 1) * 0.5625f * f[k];
+          r[0] += q[5] * k2; r[1] += q[6] * k2; r[2] += q[7] * k2;
+        }
+      for (int c = 0; c < 3; c++) e.bloc[y - 27][x][c] = (int16_t)borne(r[c] * 32, 0, 32000);
+      if (e.genre[y][x] == 4) {
+        const float k = e.flaque[y][x] * (0.7f / 255);
+        for (int c = 0; c < 3; c++) scene[y][x][c] += r[c] * k;
+      }
+    }
+  v3_flou16((uint16_t *)&e.bloc[0][0][0], 64, 37, 1, 2);
+  for (int y = 29; y < 64; y++)
+    for (int x = 0; x < 64; x++)
+      if (e.genre[y][x] == 4) {
+        const float k = (1 - e.flaque[y][x] * (1.0f / 255)) * (0.2f / 32);
+        for (int c = 0; c < 3; c++) scene[y][x][c] += e.bloc[y - 27][x][c] * k;
+      }
+  // la vapeur qui monte de la bouche d'egout, eclairee par les neons
+  const float bx = 32 + (0.35f - cx) * F / 3.2f, by = hz + cy * F / 3.2f;
+  float v_centre[23], v_larg[23], v_haut[23];   // le panache, ligne par ligne (14 a 36)
+  int vx0 = 64, vx1 = 0;
+  for (int y = 14; y < 37; y++) {
+    const float hauteur = v3_01((by - y) / 24.0f);
+    v_haut[y - 14] = (y >= by || hauteur >= 1) ? 0 : expf(1.1f * logf(1 - hauteur));
+    v_larg[y - 14] = 1.8f + hauteur * 9;
+    v_centre[y - 14] = bx + sinf(y * 0.15f - t * 0.6f) * hauteur * 3 + hauteur * 5;
+    if (v_haut[y - 14] <= 0) continue;
+    vx0 = min(vx0, max(0, (int)(v_centre[y - 14] - 1.7f * v_larg[y - 14])));
+    vx1 = max(vx1, min(64, (int)(v_centre[y - 14] + 1.7f * v_larg[y - 14]) + 2));
+  }
+  // l'image un peu floue sous la vapeur (dans le bloc, x 32), seulement la ou elle passe (et 2 de marge)
+  const int bx0 = max(0, vx0 - 2), bx1 = min(64, vx1 + 2), bw = max(1, bx1 - bx0);
+  int16_t *bl = &e.bloc[0][0][0];
+  for (int y = 12; y < 39; y++)
+    for (int x = bx0; x < bx1; x++)
+      for (int c = 0; c < 3; c++) bl[((y - 12) * bw + x - bx0) * 3 + c] = (int16_t)borne(scene[y][x][c] * 32, 0, 32000);
+  if (bx1 > bx0) v3_flou16((uint16_t *)bl, bw, 27, 2, 1);
+  const float ox = t * 0.6f, oy = t * 6.0f, fx = ox - floorf(ox), fy = oy - floorf(oy);
+  const int ix = (int)floorf(ox), iy = (int)floorf(oy);
+  for (int y = 14; y < 37; y++) {
+    const float haut = v_haut[y - 14], larg = v_larg[y - 14], centre = v_centre[y - 14];
+    if (haut <= 0) continue;
+    for (int x = max(vx0, (int)(centre - 1.7f * larg)); x < min(vx1, (int)(centre + 1.7f * larg) + 2); x++) {
+      const float u = (x - centre) / larg, panache = v3_exp(-u * u) * haut;
+      const float b00 = e.brume[(y + iy) & 63][(x + ix) & 63], b01 = e.brume[(y + iy) & 63][(x + ix + 1) & 63];
+      const float b10 = e.brume[(y + iy + 1) & 63][(x + ix) & 63], b11 = e.brume[(y + iy + 1) & 63][(x + ix + 1) & 63];
+      const float br = ((b00 * (1 - fx) + b01 * fx) * (1 - fy) + (b10 * (1 - fx) + b11 * fx) * fy) * (1.0f / 255);
+      const float vap = borne(panache * (0.35f + br) - 0.08f, 0, 0.9f);
+      if (vap <= 0) continue;
+      float *p = scene[y][x];
+      static const float teinte_v[3] = {84, 74, 100};
+      const int16_t *q = bl + ((y - 12) * bw + x - bx0) * 3;
+      for (int c = 0; c < 3; c++) p[c] = p[c] * (1 - vap * 0.55f) + (teinte_v[c] + q[c] * (0.8f / 32)) * vap * 0.9f;
+    }
+  }
+  // la pluie, qu'on ne voit que dans la lumiere
+  for (int i = 0; i < 50; i++) {
+    e.py[i] += e.pv[i] * dt;
+    e.px[i] += e.pv[i] * 0.08f * dt;
+    e.py[i] = v3_fmod(e.py[i] + 4, 70) - 4;
+    e.px[i] = v3_fmod(e.px[i], 64);
+    for (int j = 0; j < 3; j++) {
+      const int yy = (int)(e.py[i] - j), xx = v3_mod((int)(e.px[i] - j * 0.08f), 64);
+      if (yy < 0 || yy >= 64) continue;
+      float *p = scene[yy][xx];
+      const float eclaire = fminf(150.0f, fmaxf(0.0f, (p[0] + p[1] + p[2]) / 3)) * 0.45f, k = 1 - j * 0.3f;
+      p[0] += (14 + eclaire) * k; p[1] += (15 + eclaire) * k; p[2] += (22 + eclaire) * k;
+    }
+  }
 }
 
 // --- 4. le pare-brise sous la pluie ----------------------------------------------------------
@@ -208,7 +753,10 @@ void s_ruelle(int humeur, bool debut, float t, float ecoule, float dt) {
 
 struct E_pare_brise {
   uint8_t eau[64][64], film[64][64], hi[64][64], rim[64][64];   // 0-255
-  uint16_t flou[64][64][3], large[64][64][3];                   // x32
+  float flou[64][64][3];                                        // le fond un peu flou (ce que voit le film d'eau)
+  float large[32][32][3];                                       // tres flou, en demi-image (ce que voit une goutte)
+  float lueur[4][64], bord[64];                                 // le tableau de bord
+  V3Relire relire;
   float vx[26], vy[26], vr[26], vp[26];
   float angle, phase;
 };
@@ -247,6 +795,12 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
     e.phase = hasard(0, 60);
     for (int i = 0; i < 30; i++) v3_pb_goutte(e);   // la pluie a deja commence
     for (int i = 0; i < 26; i++) { e.vx[i] = hasard(0, 64); e.vy[i] = hasard(10, 31); e.vr[i] = hasard(0.8f, 1.8f); e.vp[i] = hasard(0, 6); }
+    v3_relire_prep(e.relire);
+    for (int i = 0; i < 64; i++) {
+      const float a = (i - 16) / 8.0f, b = (i - 59) / 3.0f, c = (i - 36) / 5.0f, d = (i - 59) / 2.5f;
+      e.lueur[0][i] = expf(-a * a); e.lueur[1][i] = expf(-b * b); e.lueur[2][i] = 0.6f * expf(-c * c); e.lueur[3][i] = expf(-d * d);
+      e.bord[i] = 55.5f - 2.0f * sinf(v3_01((i + 0.5f) / 64) * V3_PI);
+    }
   }
   dt = fminf(dt, 0.5f);
   const float tau = ecoule + e.phase;
@@ -305,7 +859,7 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
     const float ir = 1 / q.r;
     for (int y = ya; y < yb; y++)   // un bokeh : un disque net, au bord plus vif
       for (int x = xa; x < xb; x++) {
-        const float dd = hypotf(x + 0.5f - q.x, y + 0.5f - q.y), u = dd * ir;
+        const float ddx = x + 0.5f - q.x, ddy = y + 0.5f - q.y, dd = sqrtf(ddx * ddx + ddy * ddy), u = dd * ir;
         const float k = v3_01((q.r - dd) / 0.9f + 0.5f) * (0.75f + 0.25f * u * u) * q.f;
         if (k <= 0) continue;
         float *p = scene[y][x];
@@ -328,13 +882,13 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
     }
   }
   // un peu de flou leve la lumiere
+  v3_reduire(e.large);
   for (int y = 0; y < 64; y++)
-    for (int x = 0; x < 64; x++)
-      for (int c = 0; c < 3; c++) e.large[y][x][c] = (uint16_t)(scene[y][x][c] * 32 + 0.5f);
-  v3_flou16(&e.large[0][0][0], 64, 64, 4, 1);
-  for (int y = 0; y < 64; y++)
-    for (int x = 0; x < 64; x++)
-      for (int c = 0; c < 3; c++) scene[y][x][c] += e.large[y][x][c] * (0.3f / 32);
+    for (int x = 0; x < 64; x++) {
+      float l[3];
+      v3_relire(e.large, e.relire, y, x, l);
+      for (int c = 0; c < 3; c++) scene[y][x][c] += l[c] * 0.3f;
+    }
   // la pluie qui arrive sur la vitre (Poisson, 7 par seconde)
   if (dt > 0) {
     const float seuil = expf(-7 * dt);
@@ -365,11 +919,9 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
       }
     }
   }
-  for (int y = 0; y < 64; y++)
-    for (int x = 0; x < 64; x++)
-      for (int c = 0; c < 3; c++) e.flou[y][x][c] = e.large[y][x][c] = (uint16_t)(scene[y][x][c] * 32 + 0.5f);
-  v3_flou16(&e.flou[0][0][0], 64, 64, 1, 2);
-  v3_flou16(&e.large[0][0][0], 64, 64, 4, 1);   // une goutte voit large : elle ramasse la lumiere
+  memcpy(e.flou, scene, sizeof e.flou);
+  v3_flou(&e.flou[0][0][0], 64, 64, 1, 2);
+  v3_reduire(e.large);   // une goutte voit large : elle ramasse la lumiere
   // les balais (leur angle), la lueur du tableau de bord
   const float ca = cosf(a1), sa = -sinf(a1);
   float lueur_x[64], lueur_y[64];
@@ -380,14 +932,18 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
   for (int y = 0; y < 64; y++)
     for (int x = 0; x < 64; x++) {
       float *p = scene[y][x];
-      const float g = e.eau[y][x] * (1.0f / 255), h = e.hi[y][x] * (1.0f / 255), rim = e.rim[y][x] * (1.0f / 255);
-      const float f = e.film[y][x] * (1.0f / 255);
-      const float base[3] = {5, 5, 9}, eclat[3] = {16, 17, 24}, fil[3] = {8, 8, 12};
-      for (int c = 0; c < 3; c++) {
-        const float lg = e.large[y][x][c] * (1.0f / 32);
-        float v = p[c] * (1 - g) + (lg * 1.5f + base[c]) * g + h * (lg * 2.4f + eclat[c]);
-        v *= 1 - rim * 0.5f;
-        p[c] = v * (1 - f * 0.3f) + e.flou[y][x][c] * (1.0f / 32) * f * 0.3f + f * fil[c];
+      const uint8_t g8 = e.eau[y][x], h8 = e.hi[y][x], r8 = e.rim[y][x], f8 = e.film[y][x];
+      if (g8 | h8 | r8 | f8) {   // la vitre seche ne change rien
+        const float g = g8 * (1.0f / 255), h = h8 * (1.0f / 255), rim = r8 * (1.0f / 255), f = f8 * (1.0f / 255);
+        const float base[3] = {5, 5, 9}, eclat[3] = {16, 17, 24}, fil[3] = {8, 8, 12};
+        float lg[3];
+        if (g8 | h8) v3_relire(e.large, e.relire, y, x, lg);
+        else lg[0] = lg[1] = lg[2] = 0;
+        for (int c = 0; c < 3; c++) {
+          float v = p[c] * (1 - g) + (lg[c] * 1.5f + base[c]) * g + h * (lg[c] * 2.4f + eclat[c]);
+          v *= 1 - rim * 0.5f;
+          p[c] = v * (1 - f * 0.3f) + e.flou[y][x][c] * f * 0.3f + f * fil[c];
+        }
       }
       for (int b = 0; b < 2; b++) {
         const float dx = x + 0.5f - pivots[b][0], dy = y + 0.5f - pivots[b][1];
@@ -412,10 +968,9 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
         p[0] = 6; p[1] = 6; p[2] = 9;
       }
       if (r3 * r3 + r4 * r4 < 1) { p[0] = 22; p[1] = 16; p[2] = 28; }   // ce que le retroviseur voit
-      const float bord = 55.5f - 2.0f * sinf(v3_01(X / 64) * V3_PI);
+      const float bord = e.bord[x];
       if (Y > bord) {
-        const float a = (x - 16) / 8.0f, b = (y - 59) / 3.0f, c = (x - 36) / 5.0f, dd = (y - 59) / 2.5f;
-        const float lueur = expf(-a * a - b * b) + 0.6f * expf(-c * c - dd * dd);
+        const float lueur = e.lueur[0][x] * e.lueur[1][y] + e.lueur[2][x] * e.lueur[3][y];
         p[0] = 8 + lueur * 30; p[1] = 8 + lueur * 110; p[2] = 12 + lueur * 140;
         if (Y < bord + 1) { p[0] += 14; p[1] += 18; p[2] += 26; }   // le rebord, qui accroche la lumiere
       }

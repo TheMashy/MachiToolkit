@@ -16668,7 +16668,7 @@ def _scene_village_neige(p, e, t, ecoule, dt):
         sommet = base - sh
         corps = (Y >= sommet) & (Y <= base) & (np.abs(X - sx) <= (Y - sommet) * 0.4 + 0.5)
         img[corps] = (14, 30, 32)
-        etages = corps & (((Y - sommet) % 3) == 0)
+        etages = corps & (((Y - np.ceil(sommet)) % 3) == 0)        # une rangee sur trois, des la cime
         img[etages] = (150, 165, 200)
     allumees = []
     for mx, larg, haut, ph in e["maisons"]:
