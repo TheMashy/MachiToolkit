@@ -4277,7 +4277,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.ECRANS["boreale_montagnes"][0], presets[0][1], "le meme reglage d'une fois sur l'autre")
         # des familles, sur la page : chaque decor dans une seule ; les ambiances et les jeux de lumiere a part
         self.assertEqual([f[0] for f in m.FAMILLES_ECRANS],
-                         ["sous_l_eau", "ciel_et_eau", "villes", "paysages", "espace", "boreales", "tunnels"])
+                         ["sous_l_eau", "ciel_et_eau", "villes", "paysages", "cocon", "reveries", "espace", "boreales", "tunnels"])
         membres = [n for f in m.FAMILLES_ECRANS for n in f[2]]
         self.assertEqual(len(membres), len(set(membres)), "chaque decor dans une seule famille")
         self.assertEqual(tuple(membres), m.ECRANS_DECORS)

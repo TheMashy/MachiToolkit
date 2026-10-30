@@ -612,15 +612,15 @@ class AL_Ecran(unittest.TestCase):
             self.assertTrue(M.PANNEAU.pop("ecran_demande"))
             # lesquels : une case par ecran, une par famille de decors, « Tous », « Les ambiances et les decors »
             self.assertEqual(set(p.vars_ecrans), set(M.ECRANS) - set(M.ECRANS_DECORS))
-            self.assertEqual(set(p.vars_familles), {"sous_l_eau", "ciel_et_eau", "villes", "paysages", "espace",
+            self.assertEqual(set(p.vars_familles), {"sous_l_eau", "ciel_et_eau", "villes", "paysages", "cocon", "reveries", "espace",
                                                     "boreales", "tunnels"})
             p.vars_ecrans["matrice"].set(0)
             p.choisir_ecrans()
             self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"])
             p.vars_familles["tunnels"][0].set(0)
             p.choisir_ecrans()
-            self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"] + [n for n in M.ECRANS_AURORES if n.startswith("tunnel_")],
-                             "une famille decochee : ses cinq tunnels")
+            self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"] + [n for n in M.ECRANS_AURORES if n.startswith("tunnel_")]
+                             + ["vortex"], "une famille decochee : ses six tunnels")
             p.choisir_ecrans(list(M.ECRANS_AMBIANCES) + list(M.ECRANS_DECORS))
             self.assertEqual(M.ecrans_permis(M.CFG), list(M.ECRANS_AMBIANCES) + list(M.ECRANS_DECORS))
             self.assertEqual(p.vars_familles["tunnels"][0].get(), 1)

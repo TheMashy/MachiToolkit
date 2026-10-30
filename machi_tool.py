@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.125.0"
+VERSION = "1.126.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -16632,6 +16632,1644 @@ def _scene_galaxie(p, e, t, ecoule, dt):
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
+# LE COCON. « Fais-moi 100 screen savers, tous differents, tous bien
+# peaufines, bases sur des scenes d'ambiance relaxantes ; il faut qu'ils
+# soient parfaitement adaptes a un rendu de panneau 64 x 64. » Des scenes
+# d'interieur chaleureuses et les lampes qu'on regarde ; un village sous la
+# neige. Chacune une seule ambiance : elles ignorent p["humeur"].
+
+
+def _scene_village_neige(p, e, t, ecoule, dt):
+    """Un village sous la neige, la nuit : des maisons aux fenetres chaudes, la fumee des cheminees,
+    des sapins enneiges, la neige qui tombe doucement."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    img = _degrade((8, 12, 32), (44, 52, 90), 0, 44)
+    if "maisons" not in e:
+        x = np.arange(64.0)
+        e["colline"] = 40 + 4 * np.sin(x * 0.07 + 0.5) + 2 * np.sin(x * 0.19 + 2)
+        e["sol"] = 50 + 2 * np.sin(x * 0.11 + 1) + np.sin(x * 0.31)
+        e["maisons"] = [(10, 9, 7, 0.0), (24, 7, 6, 1.7), (39, 10, 8, 3.1), (54, 8, 6, 4.4)]   # (x, largeur, hauteur, phase)
+        e["sapins"] = [(3, 9), (16, 7), (30, 10), (46, 8), (60, 11)]
+        e["fumee"] = [rng.uniform(0, 1, 40), rng.uniform(0, 1, 40), rng.uniform(0, 6, 40)]
+        e["flocons"] = [rng.uniform(0, 64, 70), rng.uniform(0, 64, 70), rng.uniform(0, 1, 70), rng.uniform(0, 6, 70)]
+    _etoiles_du_ciel(e, img, t, 50, 36)
+    _halo(img, 50, 9, 2.2, (120, 120, 110), 0.9)                 # la lune et son halo
+    img[np.hypot(X - 50, Y - 9) <= 3] = (235, 235, 215)
+    _peindre_sous(img, e["colline"], (70, 80, 112))              # la colline au loin, enneigee dans la nuit
+    sol = e["sol"]
+    neige = Y >= sol[None, :]
+    img[neige] = (np.array([120, 132, 170]) + np.clip((Y - sol[None, :]) * 3, 0, 40)[..., None])[neige]
+    for sx, sh in e["sapins"]:                                   # des sapins, la neige sur leurs branches
+        base = sol[int(sx)]
+        sommet = base - sh
+        corps = (Y >= sommet) & (Y <= base) & (np.abs(X - sx) <= (Y - sommet) * 0.4 + 0.5)
+        img[corps] = (14, 30, 32)
+        etages = corps & (((Y - sommet) % 3) == 0)
+        img[etages] = (150, 165, 200)
+    allumees = []
+    for mx, larg, haut, ph in e["maisons"]:
+        base = int(sol[int(mx)]) + 1
+        murs = (np.abs(X - mx) <= larg / 2) & (Y >= base - haut) & (Y < base)
+        img[murs] = (52, 40, 48)
+        toit_haut = base - haut - larg * 0.55
+        toit = (Y >= toit_haut) & (Y < base - haut + 1) & (np.abs(X - mx) <= (Y - toit_haut) * 1.05 + 0.6)
+        img[toit] = (205, 215, 235)                              # le toit sous la neige
+        img[toit & (Y >= base - haut)] = (150, 160, 190)
+        cx = mx + larg * 0.25                                    # la cheminee
+        img[(np.abs(X - cx) <= 0.6) & (Y >= toit_haut + 1) & (Y < base - haut - 1)] = (60, 44, 44)
+        chaud = 0.85 + 0.1 * np.sin(t * 1.3 + ph) + 0.05 * np.sin(t * 3.7 + ph * 2)   # le feu dedans, qui vit
+        for fx in (mx - larg * 0.25, mx + larg * 0.25):
+            fy = base - haut * 0.55
+            img[int(fy) - 1:int(fy) + 1, int(fx):int(fx) + 1] = np.array([255, 190, 100]) * chaud
+            allumees.append((fx + 0.5, fy - 0.5, chaud))
+        e.setdefault("cheminees", {})[mx] = (cx, toit_haut)
+    for fx, fy, chaud in allumees:
+        _halo(img, fx, fy, 1.6, (255, 150, 60), 0.5 * chaud)
+        _halo(img, fx, fy + 4, 1.2, (255, 150, 60), 0.15 * chaud, aplati=0.5)   # leur reflet sur la neige
+    fa, fv, fp = e["fumee"]                                      # la fumee : elle monte, s'elargit, s'efface
+    age = (fa + t * 0.07 * (0.7 + 0.6 * fv)) % 1.0
+    cheminees = list(e["cheminees"].values())
+    qui = (np.arange(len(fa)) % len(cheminees))
+    cx = np.array([cheminees[i][0] for i in qui])
+    cy = np.array([cheminees[i][1] for i in qui])
+    sy = cy - age * 22
+    sx = cx + age * 9 + np.sin(age * 6 + fp) * age * 2.5
+    gris = ((1 - age) ** 1.5 * 0.55)[:, None] * np.array([150, 150, 165])
+    _pointer(img, sy, sx, gris)
+    _pointer(img, sy, sx + 1, gris * 0.6)
+    gx, gy, gz, gp = e["flocons"]                                # la neige : deux profondeurs
+    gy += (4 + gz * 7) * dt
+    gx += np.sin(t * 0.7 + gp) * (0.3 + gz * 0.5) * dt * 4
+    gy %= 64
+    gx %= 64
+    _pointer(img, gy, gx, ((0.45 + gz * 0.55)[:, None] * np.array([235, 240, 255])))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# LE COCON. Des scenes d'interieur chaleureuses, et les lampes qu'on regarde : des bougies, une cheminee, un the
+# sous la pluie, la poussiere dans un rayon de soleil, une lampe a fibres, une boule plasma, un vinyle qui tourne.
+
+
+def _cocon_flou(a, n=1):
+    """Un flou doux [1 2 1] sur les deux axes, n fois (les bords ne se raccordent pas)."""
+    for _ in range(n):
+        b = a * 2.0
+        b[1:] += a[:-1]
+        b[:-1] += a[1:]
+        a = b * 0.25
+        b = a * 2.0
+        b[:, 1:] += a[:, :-1]
+        b[:, :-1] += a[:, 1:]
+        a = b * 0.25
+    return a
+
+
+def _cocon_tamponner(buf, ys, xs, vals):
+    """Ajoute des points poses entre les pixels (partages sur les quatre voisins) : ils glissent sans sauter."""
+    import numpy as np
+    h, l = buf.shape[0], buf.shape[1]
+    ys, xs = np.asarray(ys, float).ravel(), np.asarray(xs, float).ravel()
+    if not len(ys):
+        return
+    y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+    fy, fx = ys - y0, xs - x0
+    vals = np.broadcast_to(np.asarray(vals, float), (len(ys),) + buf.shape[2:]).reshape(len(ys), -1)
+    plat = buf.reshape(h * l, -1)
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        ok = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < l)
+        if ok.any():
+            i, ww = (yy * l + xx)[ok], w[ok]
+            for c in range(plat.shape[1]):
+                plat[:, c] += np.bincount(i, ww * vals[ok, c], minlength=h * l)
+
+
+def _cocon_palette(v, pas, couleurs):
+    """Une valeur (0..1) -> une couleur, le long d'une suite de couleurs."""
+    import numpy as np
+    v = np.asarray(v, float)
+    c = np.asarray(couleurs, float)
+    return np.stack([np.interp(v, pas, c[:, k]) for k in range(3)], -1)
+
+
+# --- Bougies ---------------------------------------------------------------------------------------------------
+
+COCON_BOUGIES = (   # (x de la meche, demi-largeur, haut de la cire, pied, couleur de la cire)
+    (12.5, 3.5, 31.0, 57.0, (236, 214, 178)),
+    (25.5, 4.5, 41.0, 59.0, (238, 196, 168)),
+    (39.0, 3.0, 23.0, 56.0, (238, 222, 192)),
+    (51.5, 4.0, 36.0, 58.0, (232, 172, 96)),
+)
+
+
+def _bougies_flamme(Y, X, x, y, h, w, pente):
+    """Une flamme en goutte : le pied en (x, y), haute de h, large de w, la pointe qui penche de `pente`.
+    Rend (intensite 0..1, hauteur relative s, axe, demi-largeur)."""
+    import numpy as np
+    s = (y - Y) / h                                      # 0 au pied, 1 a la pointe
+    q = np.clip((s + 0.25) / 1.25, 0, 1)
+    larg = w * 2.6 * np.sqrt(q) * (1 - q) + 1e-3          # ronde en bas, effilee en haut
+    axe = x + pente * np.clip(s, 0, 1) ** 2 * h
+    inten = np.clip(1.15 - np.abs(X - axe) / larg, 0, 1) * (q > 0) * (q < 1)
+    return inten, s, axe, larg
+
+
+def _scene_bougies(p, e, t, ecoule, dt):
+    """Des bougies dans le noir : leurs flammes qui vacillent chacune a son rythme, leur halo chaud, la cire qui
+    brille sous la flamme, et de temps en temps un mince filet de fumee."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "bougies" not in e:
+        e["bougies"] = [(rng.uniform((1.1, 2.4, 4.4, 0.35, 1.3), (1.7, 3.3, 6.0, 0.6, 2.0)), rng.uniform(0, 2 * np.pi, 6),
+                         rng.uniform(0.05, 0.085), rng.uniform(0, 2 * np.pi)) for _ in COCON_BOUGIES]
+        grain = _brume(rng, 2, 64)
+        coin = np.clip(1 - np.hypot((X - 32) / 44, (Y - 40) / 52), 0, 1)          # les coins plus sombres
+        fond = _degrade((5, 3, 4), (13, 8, 8), 0, 53) * ((0.85 + 0.3 * grain) * (0.55 + 0.45 * coin))[..., None]
+        table = Y >= 53
+        bois = _degrade((28, 16, 10), (11, 6, 4), 53, 64) * (0.88 + 0.12 * np.sin(Y * 2.3 + np.sin(X * 0.13) * 2))[..., None]
+        fond[table] = bois[table]
+        fond[Y == 53] = (30, 18, 12)                       # le bord de la table, contre le mur
+        e["fond"] = fond
+        loin = ((5.0, 20.0, 3.2), (33.0, 9.0, 2.6), (58.0, 15.0, 3.6), (46.0, 26.0, 2.4))     # d'autres bougies, loin, floues
+        e["lointaines"] = (np.stack([np.clip((r - np.hypot(X - x, Y - y)) / 1.6, 0, 1) for x, y, r in loin]),
+                           rng.uniform(0, 2 * np.pi, 4), rng.uniform(0.25, 0.5, 4))
+    vent = 0.22 * np.sin(t * 0.19) * max(0.0, np.sin(t * 0.083 + 1.0)) ** 2      # un courant d'air, parfois
+    lum = np.zeros((64, 64))
+    etats = []
+    for (cx, hw, haut, pied, cire), (f, ph, fs, ps) in zip(COCON_BOUGIES, e["bougies"]):
+        fumee = float(np.clip((np.sin(t * fs + ps) - 0.74) / 0.26, 0, 1))          # de temps en temps elle fume
+        vie = 1 + 0.07 * np.sin(t * f[0] + ph[0]) + 0.045 * np.sin(t * f[1] + ph[1]) + 0.025 * np.sin(t * f[2] + ph[2])
+        h = (6.0 + hw * 0.6) * vie * (1 - 0.15 * fumee)
+        pente = 0.12 * np.sin(t * f[3] + ph[3]) + 0.06 * np.sin(t * f[4] + ph[4]) + vent
+        eclat = vie * (1 - 0.12 * fumee)
+        yf = haut - 1.2
+        yc = yf - h * 0.35
+        lum += eclat * 0.45 * np.exp(-np.hypot(X - cx - pente * h * 0.2, Y - yc) / 10.0)
+        lum[53:] += eclat * 0.45 * np.exp(-np.hypot((X[53:] - cx) * 0.55, (Y[53:] - pied) * 1.6) / 6.0)   # sur la table
+        etats.append((cx, hw, haut, pied, np.asarray(cire, float), h, pente, eclat, fumee, yf, yc, ph[5]))
+    img = e["fond"] * (1 + 5 * lum)[..., None] + lum[..., None] * np.array([255, 125, 50]) * 0.42
+    disques, ph, vit = e["lointaines"]
+    img += np.tensordot(disques, 0.11 + 0.025 * np.sin(t * vit + ph), axes=(0, 0))[..., None] * np.array([255, 150, 70])
+    fumees = np.zeros((64, 64, 3))
+    for cx, hw, haut, pied, cire, h, pente, eclat, fumee, yf, yc, phf in etats:
+        y0, x0 = max(0, int(yf - h * 1.3) - 2), max(0, int(cx - hw - 4))
+        y1, x1 = int(pied) + 1, min(64, int(cx + hw + 5))
+        Yw, Xw, w = Y[y0:y1, x0:x1], X[y0:y1, x0:x1], img[y0:y1, x0:x1]     # on ne travaille que pres de la bougie
+        d = np.hypot(Xw - cx - pente * h * 0.2, Yw - yc)
+        w += (eclat * 0.4 * np.exp(-d / 2.6))[..., None] * np.array([255, 150, 60])   # l'eclat autour de la flamme
+        xn = (Xw - cx) / hw                              # le corps : un cylindre de cire
+        cyl = np.sqrt(np.clip(1 - xn ** 2, 0, 1))
+        corps = (np.abs(xn) <= 1.0) & (Yw >= haut) & (Yw <= pied)
+        dessous = np.exp(-(Yw - haut) / 6.0) * eclat       # la cire s'allume sous la flamme, par transparence
+        c = cire * np.array([0.95, 0.72, 0.5]) * (0.12 + 0.24 * cyl)[..., None] \
+            + (dessous * (0.25 + 0.75 * cyl ** 1.5))[..., None] * np.array([255, 160, 75]) * 0.9
+        w[corps] = c[corps]
+        bord = (xn ** 2 + ((Yw - haut) / 1.3) ** 2 <= 1) & (Yw < haut + 0.5)
+        w[bord] = cire * np.array([1.0, 0.86, 0.7]) * (0.62 + 0.2 * eclat)
+        cuvette = ((Xw - cx) / (hw - 1.0)) ** 2 + ((Yw - haut) / 0.7) ** 2 <= 1      # la cire fondue, qui brille
+        w[cuvette] = np.array([255, 190, 100]) * (0.8 + 0.2 * eclat)
+        inten, s, axe, larg = _bougies_flamme(Yw, Xw, cx, yf, h, 1.2 + hw * 0.13, pente)
+        m = np.clip(inten * 1.4 - 0.25 - np.clip(s, 0, 1) * 0.5, 0, 1)[..., None]
+        col = (np.array([255, 115, 25]) * (1 - m) + np.array([255, 205, 100]) * m) * inten[..., None]
+        coeur = np.clip(1.0 - np.abs(Xw - axe) / (larg * 0.55 + 0.3), 0, 1) * np.clip((0.62 - s) / 0.3, 0, 1) \
+            * np.clip((s + 0.05) / 0.2, 0, 1)
+        col += coeur[..., None] * np.array([255, 245, 220]) * 0.8
+        w *= 1 - 0.7 * inten[..., None]
+        w += col
+        if fumee > 0.01:                                 # un filet de fumee qui monte en ondulant
+            k = np.arange(28, dtype=float)
+            ys = yf - h * 0.98 - 0.5 - k * 0.9
+            xs = cx + pente * h + np.sin(k * 0.27 - t * 1.3 + phf) * (0.15 + k * 0.07) + k * k * 0.006 * (vent * 4 + 0.3)
+            force = fumee * (1 - k / 28) ** 1.3 * (0.6 + 0.4 * np.sin(k * 0.45 - t * 2.0 + phf)) * np.clip(k / 3, 0, 1)
+            proche = np.exp(-k / 6)[:, None]
+            teinte = np.array([150, 112, 84]) * proche + np.array([80, 80, 92]) * (1 - proche)
+            _cocon_tamponner(fumees, ys, xs, teinte * force[:, None])
+    img += fumees
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Cheminee --------------------------------------------------------------------------------------------------
+
+COCON_BUCHES = (((17.0, 47.5), (47.0, 46.5), 3.0), ((16.0, 54.0), (42.0, 51.0), 2.9),    # (le bout coupe, l'autre, rayon)
+                ((48.0, 55.0), (35.0, 49.0), 2.2))
+COCON_FEU = ((0.0, 0.16, 0.38, 0.6, 0.8, 1.0),
+             ((0, 0, 0), (110, 14, 2), (220, 60, 6), (255, 140, 30), (255, 200, 80), (255, 236, 160)))
+
+
+def _cheminee_preparer(e, rng):
+    """Ce qui ne bouge pas : les pierres, le manteau, l'atre, les buches (leur forme, leurs fentes)."""
+    import numpy as np
+    Y, X = _xy()
+    albedo = np.zeros((64, 64, 3)) + np.array([26, 18, 16])            # le mur, au-dessus du manteau
+    joint = np.zeros((64, 64), bool)
+    y = 14
+    while y < 64:                                                       # des assises de pierres, des blocs decales
+        hh = int(rng.integers(5, 8))
+        x0 = -float(rng.uniform(0, 9))
+        while x0 < 64:
+            w = float(rng.uniform(6, 13))
+            m = (X >= x0) & (X < x0 + w) & (Y >= y) & (Y < y + hh)
+            k = rng.uniform(0, 1)
+            albedo[m] = (np.array([122, 112, 102]) * (1 - k) + np.array([134, 104, 82]) * k) * rng.uniform(0.68, 1.12)
+            albedo[m & (Y == y + 1)] *= 1.15
+            albedo[m & (Y == y + hh - 1)] *= 0.8
+            for cy in (y + 1, y + hh - 1):                             # des coins arrondis
+                for cx in (int(np.ceil(x0)) + 1, int(np.ceil(x0 + w)) - 1):
+                    if 0 <= cy < 64 and 0 <= cx < 64:
+                        joint[cy, cx] = True
+            joint |= (Y >= y) & (Y < y + hh) & (X == int(np.ceil(x0)))
+            x0 += w
+        joint |= Y == y
+        y += hh
+    albedo[14:] *= (0.85 + 0.3 * _brume(rng, 1, 64))[14:, :, None]
+    albedo[joint & (Y >= 14)] = (44, 38, 34)
+    manteau = (Y >= 8) & (Y <= 13)                                      # le manteau, une poutre
+    albedo[manteau] = (np.array([84, 50, 28]) * (0.82 + 0.18 * np.sin(X * 0.7 + np.sin(Y * 1.9) * 2))[..., None])[manteau]
+    albedo[Y == 8] = (120, 76, 44)
+    albedo[Y == 13] = (60, 36, 20)
+    objets = np.zeros((64, 64), bool)                                   # sur le manteau : une pendule, un vase, un cadre
+    pendule = ((np.abs(X - 32) <= 3) & (Y >= 3) & (Y <= 7)) | ((((X - 32) / 3.2) ** 2 + ((Y - 3.2) / 2.4) ** 2) <= 1)
+    albedo[pendule] = (92, 58, 34)
+    albedo[np.hypot(X - 32, Y - 3.6) <= 1.7] = (200, 186, 150)
+    albedo[(Y == 3) & (X == 32)] = (60, 40, 30)
+    vase = ((np.hypot(X - 12, (Y - 5.5) * 1.2) <= 2.2) | ((np.abs(X - 12) <= 0.8) & (Y >= 2) & (Y <= 4))) & (Y <= 7)
+    albedo[vase] = (70, 96, 104)
+    for bx, by in ((10, 0), (11, 1), (13, 0), (14, 1), (12, 0)):        # quelques branches seches
+        albedo[by, bx] = (110, 80, 50)
+        objets[by, bx] = True
+    cadre = (X >= 48) & (X <= 54) & (Y >= 2) & (Y <= 7)
+    albedo[cadre] = (130, 100, 56)
+    albedo[(X >= 49) & (X <= 53) & (Y >= 3) & (Y <= 6)] = (56, 60, 70)
+    objets |= pendule | vase | cadre
+    haut_ouv = 22 + 4.5 * ((X - 32) / 18.5) ** 4
+    ouverture = (np.abs(X - 32) <= 18.5) & (Y >= haut_ouv) & (Y <= 57)
+    dalle = (Y >= 58) & (np.abs(X - 32) <= 30)
+    albedo[dalle] = (150, 136, 122)
+    albedo[dalle & (Y >= 60)] = (96, 86, 78)
+    albedo[(Y >= 58) & ~dalle] = (16, 12, 11)
+    fond = _degrade((12, 7, 6), (24, 13, 9), 22, 57)                    # le fond de l'atre, noirci
+    briques = ((Y % 3) == 0) | (((X + ((Y // 3) % 2) * 3) % 6) == 0)
+    fond[briques] *= 0.7
+    joues = np.clip(np.abs(X - 32) / 18.5, 0, 1)                        # les cotes de l'atre, dans l'ombre
+    fond *= (1 - 0.6 * joues ** 3)[..., None]
+    pres = _cocon_flou(ouverture.astype(float), 2) * ~ouverture          # les pierres au bord de l'atre
+    d = np.hypot((X - 32) * 0.75, (Y - 46) * 0.95)
+    e["atre"] = dict(albedo=albedo, ouverture=ouverture, fond=fond, haut_ouv=haut_ouv,
+                     lp=np.exp(-d / 13.0) + 0.3 * np.exp(-d / 34.0) + pres * 1.3 + (Y == 13) * 0.35 + objets * 0.3
+                     + (Y < 8) * 0.08,
+                     li=np.exp(-np.hypot(X - 32, (Y - 49) * 1.3) / 9.0),
+                     braises=_brume(rng, 1, 64), souffle=_brume(rng, 5, 64),
+                     flamA=_brume(rng, 5), flamB=_brume(rng, 2),
+                     lit=(Y >= 54.5 + 2 * ((X - 32) / 17) ** 2) & (Y <= 57.5) & (np.abs(X - 32) <= 18))
+    buches = []
+    fentes = _brume(rng, 1, 64)
+    for (ax, ay), (bx, by), r in COCON_BUCHES:
+        vx, vy = bx - ax, by - ay
+        l2 = vx * vx + vy * vy
+        u = np.clip(((X - ax) * vx + (Y - ay) * vy) / l2, 0, 1)
+        px, py = X - (ax + u * vx), Y - (ay + u * vy)
+        d = np.hypot(px, py)
+        ny = np.clip(py / r, -1, 1)                                     # -1 : le dessus ; 1 : le dessous
+        cyl = np.sqrt(np.clip(1 - (d / r) ** 2, 0, 1))
+        sillons = 0.75 + 0.25 * np.sin(ny * 5.5 + np.sin(u * np.sqrt(l2) * 0.35) * 1.3)      # l'ecorce, en long
+        ecorce = np.array([74, 44, 24]) * ((0.35 + 0.65 * cyl) * sillons)[..., None]
+        bout = np.hypot((X - ax) * 1.25, Y - ay) <= r * 1.02             # le bout coupe, avec ses cernes
+        rb = np.hypot((X - ax) * 1.25, Y - ay) / r
+        buches.append(dict(dedans=(d <= r) | bout, ny=ny, ecorce=ecorce, fente=(fentes > 0.66) & (ny > 0.05) & (d <= r),
+                           bout=bout, cerne=bout & ((np.abs(rb - 0.55) < 0.17) | (rb < 0.15)), rb=rb))
+    e["buches"] = buches
+    e["etincelles"] = np.zeros((0, 6))
+
+
+def _cheminee_etincelles(e, rng, dt):
+    """Des etincelles qui montent en voletant, s'eteignent, et repartent des buches."""
+    import numpy as np
+    n = 11
+    s = e["etincelles"]
+    if not len(s):
+        vie = rng.uniform(1.2, 2.6, n)
+        age = rng.uniform(0, 1, n) * vie
+        vy = -rng.uniform(8, 15, n)
+        s = np.stack([rng.uniform(22, 42, n), rng.uniform(45, 49, n) + vy * age, vy, age, vie, rng.uniform(0, 6, n)], 1)
+    reste = min(dt, 1.0)
+    while reste > 1e-6:
+        h = min(reste, 0.05)
+        reste -= h
+        s[:, 0] += np.sin(s[:, 3] * 3.1 + s[:, 5]) * 5.0 * h
+        s[:, 1] += s[:, 2] * h
+        s[:, 2] *= np.exp(-h * 0.35)
+        s[:, 3] += h
+    finies = s[:, 3] >= s[:, 4]
+    k = int(finies.sum())
+    if k:
+        s[finies] = np.stack([rng.uniform(22, 42, k), rng.uniform(45, 49, k), -rng.uniform(8, 15, k), np.zeros(k),
+                              rng.uniform(1.2, 2.6, k), rng.uniform(0, 6, k)], 1)
+    e["etincelles"] = s
+    return s
+
+
+def _scene_cheminee(p, e, t, ecoule, dt):
+    """Un feu de bois dans l'atre d'une cheminee en pierre : les buches, les flammes qui dansent, les braises qui
+    rougeoient et respirent, des etincelles qui montent, la lueur sur les pierres."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "atre" not in e:
+        _cheminee_preparer(e, rng)
+    a = e["atre"]
+    vif = 0.84 + 0.07 * np.sin(t * 2.3) + 0.05 * np.sin(t * 3.7 + 1.3) + 0.04 * np.sin(t * 6.1 + 0.4)
+    chaud = np.array([1.55, 0.78, 0.36])
+    img = a["albedo"] * (np.array([0.11, 0.1, 0.11]) + (a["lp"] * vif)[..., None] * chaud)
+    o = a["ouverture"]
+    img[o] = (a["fond"] * (0.6 + (a["li"] * vif * 3.2)[..., None] * chaud))[o]
+    souffle = _fenetre(a["souffle"], t * 2.2, t * 1.4)                 # les braises respirent, par vagues
+    braise = np.clip((a["braises"] - 0.28) * 1.9, 0, 1) * (0.35 + 0.8 * souffle)
+    lit = a["lit"]
+    img[lit] = _cocon_palette(braise[lit] * 0.85, *COCON_FEU) + np.array([34, 6, 2])
+    b = e["buches"]
+
+    def buche(g):
+        coul = g["ecorce"] + (np.clip(-g["ny"] - 0.2, 0, 1) * vif)[..., None] * np.array([255, 125, 45]) * 0.85 \
+            + (np.clip(g["ny"] - 0.2, 0, 1) * souffle)[..., None] * np.array([255, 80, 15]) * 0.55
+        fente = g["fente"]
+        coul[fente] = (np.array([255, 110, 25]) * (0.3 + 0.7 * souffle)[..., None])[fente]
+        bout = g["bout"]                                                # le bout coupe, clair, et ses cernes
+        coul[bout] = (np.array([170, 110, 62]) * (0.75 + 0.25 * vif) * (1.05 - 0.35 * g["rb"])[..., None])[bout]
+        coul[g["cerne"]] *= 0.6
+        img[g["dedans"]] = coul[g["dedans"]]
+
+    buche(b[0])
+    # les flammes : des langues qui montent des buches, rongees par un bruit qui file vers le haut
+    zy, zx = slice(18, 54), slice(13, 52)
+    Yz, Xz = Y[zy, zx], X[zy, zx]
+    xs = np.arange(64.0)
+    haut = np.zeros(64)
+    for j, (c0, h0, w0) in enumerate(((21, 14, 3.2), (26, 22, 3.6), (31.5, 27, 4.0), (37, 21, 3.6), (42.5, 14, 3.2))):
+        c = c0 + 1.5 * np.sin(t * (0.5 + 0.13 * j) + j * 1.7)
+        hj = h0 * (0.74 + 0.15 * np.sin(t * (1.7 + 0.31 * j) + j * 2.3) + 0.11 * np.sin(t * (3.9 + 0.43 * j) + j))
+        haut = np.maximum(haut, hj * np.exp(-((xs - c) / w0) ** 2))
+    hgt = 50.5 - Yz
+    xd = Xz + (1.3 * np.sin(Yz * 0.42 + t * 3.1) + 0.6 * np.sin(Yz * 0.9 - t * 5.3)) * np.clip(hgt / 14, 0, 1)
+    hx = np.interp(xd, xs, haut)
+    r = hgt / (hx + 0.6)
+    n1 = _fenetre(a["flamA"], 10 + np.sin(t * 0.3) * 4, 30 + t * 15)[zy, zx]
+    n2 = _fenetre(a["flamB"], 50, 70 + t * 24)[zy, zx]
+    f = (1 - r) * 1.25 - (0.55 * n1 + 0.45 * n2) * (0.25 + 0.9 * np.clip(r, 0, 1))
+    flamme = np.clip(f, 0, 1) * o[zy, zx] * np.clip(hx / 7, 0, 1)      # rien au bout des buches
+    z = img[zy, zx]
+    z *= (1 - 0.5 * np.clip(flamme * 2, 0, 1))[..., None]
+    z += _cocon_palette(flamme * 0.97, *COCON_FEU)
+    buche(b[1])
+    buche(b[2])
+    s = _cheminee_etincelles(e, rng, dt)
+    vie = np.clip((1 - s[:, 3] / s[:, 4]) * 2.5, 0, 1) * (0.85 + 0.15 * np.sin(s[:, 3] * 9 + s[:, 5]))
+    sous = s[:, 1] > a["haut_ouv"][0, np.clip(s[:, 0].astype(int), 0, 63)] + 1
+    _pointer(img, s[sous, 1] + 1, s[sous, 0], vie[sous, None] * np.array([200, 90, 30]))     # une courte trainee
+    _pointer(img, s[sous, 1], s[sous, 0], vie[sous, None] * np.array([255, 205, 120]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- The sous la pluie -----------------------------------------------------------------------------------------
+
+COCON_THE_LUMIERES = ((255, 170, 70), (255, 214, 160), (70, 190, 215), (255, 96, 120), (150, 130, 255))
+
+
+def _the_preparer(e, rng):
+    """Ce qui ne bouge pas : la ville floue derriere la vitre, la buee, le cadre, le rebord, la lampe, la tasse."""
+    import numpy as np
+    Y, X = _xy()
+    dehors = _degrade((7, 9, 24), (34, 24, 46), 0, 43)                 # le ciel de ville, plus clair en bas
+    toits = np.full(64, 64.0)
+    x0 = -3
+    while x0 < 64:                                                      # des immeubles au loin
+        l = int(rng.integers(5, 11))
+        toits[max(0, x0):max(0, x0 + l)] = rng.uniform(15, 30)
+        x0 += l
+    immeuble = Y >= toits[None, :]
+    dehors[immeuble] = (np.array([14, 13, 28]) + (Y[immeuble] - 16)[:, None] * np.array([0.3, 0.2, 0.3]))
+    fen = immeuble & (Y % 3 == 0) & (X % 3 == 1) & (rng.random((64, 64)) < 0.35)
+    dehors[fen] = np.where(rng.random((64, 64, 1)) < 0.75, np.array([200, 140, 70]), np.array([110, 150, 190]))[fen]
+    dehors = _cocon_flou(dehors, 2)                                     # tout est flou, derriere la buee
+    n = 13
+    bx, by = rng.uniform(4, 62, n), rng.uniform(20, 43, n)
+    br = rng.uniform(2.0, 4.2, n)
+    pile = np.stack([np.clip((br[i] - np.hypot(X - bx[i], Y - by[i])) / 1.4, 0, 1) for i in range(n)])
+    halo = np.exp(-np.hypot(X - 12, (Y - 32) * 1.1) / 11.0)            # la lumiere de la lampe
+    buee = np.clip(0.3 + 0.5 * _brume(rng, 4, 64) + 0.3 * np.clip((Y - 20) / 23, 0, 1), 0, 1)
+    vitre = (Y <= 43) & (X >= 3)
+    cadre = (Y <= 43) & ((X <= 2) | ((X >= 27) & (X <= 28)) | ((Y >= 15) & (Y <= 16)))
+    # l'interieur : le cadre, le rebord profond (vu d'en haut), son chant, le mur dessous
+    dedans = np.zeros((64, 64, 3))
+    bois = np.array([70, 42, 24]) * (0.9 + 0.1 * np.sin(X * 0.8 + Y * 0.3))[..., None]
+    dedans[cadre] = (bois * (0.25 + 0.9 * halo)[..., None])[cadre]
+    lum_r = 0.1 + 1.25 * np.exp(-np.hypot((X - 12) * 0.85, (Y - 47) * 1.2) / 10.0) + 0.35 * np.exp(-np.hypot(X - 20, Y - 50) / 22)
+    rebord = (Y >= 44) & (Y <= 55)
+    planche = np.array([118, 74, 42]) * (0.9 + 0.1 * np.sin(Y * 2.6 + np.sin(X * 0.2) * 1.5))[..., None]
+    dedans[rebord] = (planche * lum_r[..., None])[rebord]
+    dedans[Y == 44] *= 0.55                                             # la ou le rebord rencontre la vitre
+    chant = (Y >= 56) & (Y <= 58)
+    dedans[chant] = (np.array([84, 52, 30]) * (0.75 * lum_r)[..., None])[chant]
+    dedans[Y == 56] *= 1.3
+    mur = Y >= 59
+    dedans[mur] = (np.array([40, 26, 22]) * (0.18 + 0.4 * np.exp(-np.hypot(X - 12, Y - 52) / 12.0))[..., None])[mur]
+    ombre = rebord & (((X - 52) / 8.0) ** 2 + ((Y - 53) / 2.2) ** 2 <= 1)        # l'ombre de la tasse
+    dedans[ombre] *= 0.5
+    for x0, y0, y1, couv in ((52, 50, 54, (34, 74, 70)), (54, 46, 49, (118, 34, 34))):     # deux livres, dans le coin
+        livre = (X >= x0) & (Y >= y0) & (Y <= y1)
+        coul = np.zeros((64, 64, 3)) + np.array(couv)
+        coul[Y == y0] = (150, 130, 100)                                 # la tranche des pages, vue d'en haut
+        coul[(Y == y0 + 2) & (X > x0 + 1)] = np.array(couv) * 0.6 + np.array([90, 70, 20])   # un filet dore
+        dedans[livre] = (coul * (lum_r * 1.1 + 0.08)[..., None])[livre]
+    # la lampe, au fond du rebord : un abat-jour qui luit, un pied fin
+    rel = (Y - 27) / 8.0
+    abat = (rel >= 0) & (rel <= 1) & (np.abs(X - 12) <= 3.5 + rel * 2.6)
+    tissu = np.array([255, 172, 88]) * ((0.55 + 0.45 * rel) * (0.92 + 0.08 * np.sin(X * 1.9)))[..., None]
+    pied = ((np.abs(X - 12) < 0.6) & (Y > 35) & (Y < 46)) | ((((X - 12) / 3.2) ** 2 + ((Y - 46.3) / 1.1) ** 2) <= 1)
+    # la tasse, devant : un cylindre creme eclaire de la gauche, son anse, sa soucoupe, le the dedans
+    cx, haut, bas, hw = 42.5, 42.0, 53.0, 5.6
+    xn = (X - cx) / hw
+    lam = np.clip(-0.75 * xn + 0.66 * np.sqrt(np.clip(1 - xn ** 2, 0, 1)), 0, 1)
+    creme = np.array([232, 214, 186])
+    tasse = np.zeros((64, 64, 3))
+    corps = (np.abs(xn) <= 1) & (Y >= haut) & (Y <= bas)
+    tasse[corps] = (creme * (0.12 + 0.66 * lam - 0.06 * (Y - haut) / (bas - haut))[..., None])[corps]
+    reflet = corps & (np.abs(xn + 0.45) < 0.1) & (Y >= haut + 1) & (Y <= bas - 3)
+    tasse[reflet] = creme * 0.97
+    anse = ((X - (cx + hw + 1.4)) / 2.9) ** 2 + ((Y - 47) / 3.1) ** 2
+    anse = (anse <= 1) & (anse >= 0.3) & (X > cx + hw - 0.5)
+    tasse[anse] = creme * 0.2
+    soucoupe = (((X - cx) / 8.6) ** 2 + ((Y - bas - 0.4) / 1.5) ** 2 <= 1) & ~corps
+    tasse[soucoupe] = (creme * (0.16 + 0.42 * np.clip(-(X - cx) / 8.6 + 0.5, 0, 1))[..., None])[soucoupe]
+    bord = (xn ** 2 + ((Y - haut) / 1.45) ** 2 <= 1)
+    tasse[bord] = (creme * (0.32 + 0.55 * np.clip(0.6 - xn, 0, 1))[..., None])[bord]
+    the = ((X - cx) / (hw - 1.1)) ** 2 + ((Y - haut) / 0.8) ** 2 <= 1
+    tasse[the] = (96, 46, 16)
+    tasse[int(haut), int(cx) - 2] = (220, 150, 80)                      # la lampe dans le the
+    objet = corps | anse | soucoupe | bord
+    e["the"] = dict(dehors=dehors, pile=pile, bc=np.asarray(COCON_THE_LUMIERES, float)[rng.integers(0, 5, n)]
+                    * rng.uniform(0.3, 0.5, n)[:, None], bp=rng.uniform(0, 6, n), halo=halo, buee=buee, vitre=vitre,
+                    cadre=cadre, dedans=dedans, interieur=~vitre | cadre, abat=abat, tissu=tissu, pied=pied,
+                    tasse=tasse, objet=objet, volutes=_brume(rng, 3, 64), source=(cx, haut - 0.5),
+                    gouttes=(rng.uniform(4, 62, 16), rng.uniform(1, 42, 16), rng.uniform(0.35, 0.7, 16)),
+                    trace=np.zeros((64, 64)), glisse=[], prochaine=0.0)
+
+
+def _scene_the(p, e, t, ecoule, dt):
+    """Un coin de fenetre la nuit : dehors la pluie et les lumieres floues de la ville ; sur le rebord, une petite
+    lampe et une tasse de the dont la vapeur monte en volutes ; la buee et les gouttes sur la vitre."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "the" not in e:
+        _the_preparer(e, rng)
+    a = e["the"]
+    dehors = a["dehors"].copy()
+    poids = a["bc"] * (0.8 + 0.2 * np.sin(t * 0.4 + a["bp"]))[:, None]  # les lumieres floues qui respirent
+    dehors += np.tensordot(a["pile"], poids, axes=(0, 0))
+    for periode, y, sens, couleur in ((23.0, 38.0, 1, (255, 225, 170)), (31.0, 40.5, -1, (255, 60, 50))):
+        k = (t / periode) % 1.0                                         # une voiture passe, en bas, de temps en temps
+        x = -12 + k * 100 if sens > 0 else 76 - k * 100
+        for dx in (0.0, 5.0):
+            d = np.hypot(X - x - dx, Y - y)
+            dehors += (np.clip((2.4 - d) / 1.3, 0, 1) * 0.42)[..., None] * np.array(couleur)
+    _pluie(e, dehors, t, dt, 40, (46, 52, 78), 0.12, "the_pluie")
+    # la buee : elle voile et eclaircit la ville ; la lampe l'eclaire ; les gouttes qui glissent la nettoient
+    trace = a["trace"]
+    trace *= np.exp(-min(dt, 1.0) / 18.0)
+    if ecoule >= a["prochaine"] and len(a["glisse"]) < 3:
+        a["prochaine"] = ecoule + rng.uniform(2.5, 7.0)
+        a["glisse"].append([rng.uniform(5, 62), rng.uniform(2, 24), rng.uniform(3.5, 7.0), rng.uniform(0, 6)])
+    restent = []
+    for g in a["glisse"]:
+        y0 = g[1]
+        g[1] += g[2] * min(dt, 1.0)
+        g[0] += np.sin(g[1] * 0.6 + g[3]) * 0.08
+        ys = np.arange(int(y0), int(g[1]) + 1)
+        ok = (ys >= 0) & (ys <= 43)
+        trace[ys[ok], int(round(g[0])) % 64] = 1.0
+        if g[1] < 43:
+            restent.append(g)
+    a["glisse"] = restent
+    buee = a["buee"] * (1 - 0.8 * trace)
+    lueur = np.array([18, 18, 28]) + a["halo"][..., None] * np.array([170, 105, 60]) * 0.55
+    vitre = dehors * (1 - 0.6 * buee)[..., None] + lueur * buee[..., None]
+    gx, gy, gl = a["gouttes"]                                           # les gouttes posees sur la vitre
+    _pointer(vitre, gy, gx, (gl[:, None] * (np.array([70, 72, 90]) + a["halo"][gy.astype(int), gx.astype(int)][:, None]
+                                             * np.array([200, 130, 70]))))
+    for g in a["glisse"]:
+        _pointer(vitre, [g[1], g[1] + 1], [g[0], g[0]], [[150, 155, 175], [90, 95, 120]])
+    img = np.where(a["interieur"][..., None], a["dedans"], vitre)
+    img[a["abat"]] = a["tissu"][a["abat"]]
+    img[a["pied"]] = (60, 40, 24)
+    img += (a["halo"] * 0.22)[..., None] * np.array([255, 160, 80])
+    img[a["objet"]] = a["tasse"][a["objet"]]
+    # la vapeur : deux volutes qui montent en ondulant, s'elargissent et s'effacent
+    sx, sy = a["source"]
+    zy, zx = slice(2, int(sy) + 1), slice(24, 62)
+    Yz, Xz = Y[zy, zx], X[zy, zx]
+    hh = sy - Yz
+    vap = np.zeros(hh.shape)
+    for j, (x0, ph, v) in enumerate(((sx - 1.5, 0.0, 3.4), (sx + 1.5, 2.1, 2.9))):
+        phase = hh - v * t
+        xc = x0 + (0.4 + hh * 0.12) * np.sin(phase * 0.26 + ph) + hh * 0.07 * np.sin(t * 0.11 + j * 2)
+        dens = np.exp(-((Xz - xc) / (0.9 + hh * 0.05)) ** 2) * np.clip(hh / 2.0, 0, 1) * np.exp(-hh / 15.0)
+        bouffee = np.maximum(np.clip(0.35 + 0.8 * np.sin(phase * 0.3 + ph * 1.7), 0, 1), np.clip(1 - hh / 6, 0, 1) * 0.85)
+        vap += dens * bouffee * (0.75 + 0.25 * np.sin(t * 0.3 + j * 1.3))
+    vap *= 0.55 + 0.6 * _fenetre(a["volutes"], 7, 40 + t * 3.1)[zy, zx]
+    img[zy, zx] += np.clip(vap, 0, 1.3)[..., None] * np.array([215, 200, 185]) * 1.1
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Poussiere dans la lumiere ---------------------------------------------------------------------------------
+
+COCON_FENETRE = (7.0, 6.0, 16.0, 23.0)       # la vitre : x, y, largeur, hauteur
+
+
+def _poussiere_sol(u, v):
+    """Ou tombe, sur le plancher, le soleil passe par le point (u, v) de la vitre (0..1, de haut en bas)."""
+    fy = 62 - v * 15                                                   # le haut de la vitre eclaire loin de la fenetre
+    return 22 + (fy - 47) * 0.9 + u * (15 + (fy - 47) * 0.6), fy
+
+
+def _poussiere_preparer(e, rng):
+    """Ce qui ne bouge pas : la piece, la fenetre (et sa plante), le rayon et la tache de soleil au sol."""
+    import numpy as np
+    Y, X = _xy()
+    fx, fy, fl, fh = COCON_FENETRE
+
+    def jour(x, y):                                                    # la vitre laisse-t-elle passer le soleil en (x, y) ?
+        dedans = (x >= fx) & (x < fx + fl) & (y >= fy) & (y < fy + fh)
+        croisillon = ((x >= 14) & (x < 16)) | ((y >= 16) & (y < 18))
+        vase = (np.hypot(x - 19.5, (y - 25.6) * 1.1) <= 2.5) | ((np.abs(x - 19.5) <= 0.8) & (y >= 20.5)) \
+            | ((np.abs(x - 19.5) <= 1.3) & (y >= 20.2) & (y < 21.2))          # un vase a long col, sur l'appui
+        return dedans & ~croisillon & ~vase
+
+    # le rayon : chaque point de la vitre, tire jusqu'a sa tache au sol ; ce qui s'empile fait la densite
+    u, v = np.meshgrid(np.linspace(0, 1, 56), np.linspace(0, 1, 80))
+    wx, wy = fx + u * fl, fy + v * fh
+    ok = jour(wx, wy)
+    sx, sy = _poussiere_sol(u, v)
+    wx, wy, sx, sy = wx[ok], wy[ok], sx[ok], sy[ok]
+    s = np.linspace(0.02, 0.98, 40)[:, None]
+    rayon = np.zeros((64, 64))
+    _cocon_tamponner(rayon, wy + s * (sy - wy), wx + s * (sx - wx), 1.0)
+    rayon = _cocon_flou(rayon, 1)
+    rayon = np.clip(rayon / np.percentile(rayon[rayon > 0], 92), 0, 1.2)
+    # la tache au sol : pour chaque pixel du plancher, le point de la vitre qu'il voit (sur-echantillonne)
+    tache = np.zeros((64, 64))
+    for oy in (-0.33, 0.0, 0.33):
+        for ox in (-0.33, 0.0, 0.33):
+            yy, xx = Y + oy, X + ox
+            vv = (62 - yy) / 15
+            x0 = 22 + (yy - 47) * 0.9
+            uu = (xx - x0) / np.maximum(15 + (yy - 47) * 0.6, 1.0)
+            tache += jour(fx + uu * fl, fy + vv * fh) * (yy >= 44) / 9.0
+    vitre = jour(X, Y)
+    # la piece : un mur a rayures discretes, une plinthe, un plancher dont les lames filent vers le fond
+    mur = _degrade((24, 17, 15), (30, 21, 17), 0, 42) * (0.95 + 0.05 * np.sin(X * 1.25))[..., None]
+    vy = 6.0
+    pas = 7.0 * np.maximum(Y - vy, 1.0) / (44 - vy)
+    k = (X - 33) / pas
+    lame = np.floor(k + 0.5)
+    joint = np.abs(k - lame) * pas < 0.5
+    teinte = 0.85 + 0.15 * np.sin(lame * 12.9898) ** 2
+    sol = np.array([62, 38, 22]) * (teinte * (1 - 0.45 * joint))[..., None]
+    piece = np.where((Y >= 44)[..., None], sol, mur)
+    piece[(Y >= 41) & (Y <= 43)] = (40, 28, 22)                        # la plinthe
+    piece[Y == 41] = (52, 38, 30)
+    cadre = (X >= fx - 1) & (X <= fx + fl) & (Y >= fy - 1) & (Y <= fy + fh) & ~vitre
+    piece[cadre] = (44, 28, 18)
+    piece[(Y >= fy + fh) & (Y <= fy + fh + 1) & (X >= fx - 3) & (X <= fx + fl + 2)] = (70, 48, 30)   # l'appui
+    rideau = (X <= 4.5 - 0.06 * np.clip(Y - 30, 0, None)) & (Y >= 3) & (Y <= 42)
+    plis = 0.75 + 0.25 * np.sin(X * 1.5 + 0.5 + np.sin(Y * 0.15) * 0.6)
+    piece[rideau] = (np.array([96, 40, 44]) * plis[..., None])[rideau]
+    piece[(Y == 3) & (X <= 26)] = (60, 44, 30)                         # la tringle
+    tableau = (X >= 45) & (X <= 56) & (Y >= 11) & (Y <= 21)            # un petit tableau dans la penombre
+    piece[tableau] = (48, 34, 22)
+    toile = (X >= 46) & (X <= 55) & (Y >= 12) & (Y <= 20)
+    piece[toile] = _degrade((40, 52, 64), (54, 58, 40), 12, 20)[toile]
+    piece[toile & (Y >= 17) & (Y <= 18 + np.sin(X * 0.9))] = (70, 64, 40)
+    e["poussiere"] = dict(piece=piece, rayon=rayon, rayon_doux=_cocon_flou(rayon, 2), tache=tache,
+                          tache_douce=_cocon_flou(tache, 1), vitre=vitre,
+                          rebond=_cocon_flou(tache, 6), rideau=rideau,
+                          clarte=0.5 * np.exp(-np.hypot(X - 15, Y - 18) / 16.0))     # le jour autour de la fenetre
+    n = 130
+    e["grains"] = np.stack([rng.uniform(-4, 70, n), rng.uniform(0, 66, n), rng.uniform(0, 2 * np.pi, n),
+                            rng.uniform(0.4, 2.4, n), rng.uniform(0.12, 0.45, n) * rng.choice([-1, 1], n),
+                            rng.uniform(0.4, 1.3, n), rng.uniform(0.35, 1.0, n)], 1)
+
+
+def _scene_poussiere(p, e, t, ecoule, dt):
+    """Une piece dans la penombre ; un rayon de soleil oblique entre par la fenetre et dessine la vitre au sol ;
+    des poussieres dorees tournoient lentement dans le rayon ; un nuage passe, la lumiere baisse et revient."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "poussiere" not in e:
+        _poussiere_preparer(e, rng)
+    a = e["poussiere"]
+    v = np.sin(t * 0.105 + 1.0) * 0.6 + np.sin(t * 0.043 + 2.0) * 0.4
+    nuage = float(np.clip((v - 0.3) / 0.45, 0, 1))
+    nuage = nuage * nuage * (3 - 2 * nuage)                            # un nuage passe devant le soleil
+    soleil = 1 - 0.62 * nuage
+    tache = a["tache"] * (1 - nuage) + a["tache_douce"] * nuage         # sous le nuage, l'ombre s'adoucit
+    rayon = a["rayon"] * (1 - nuage) + a["rayon_doux"] * nuage
+    lum = 0.62 + a["clarte"] * soleil + (tache * 2.2 + a["rebond"] * 0.9) * soleil
+    img = a["piece"] * lum[..., None] * np.array([1.0, 0.93, 0.82])
+    img += (tache * soleil)[..., None] * np.array([40, 30, 14])
+    r = a["rideau"]
+    img[r] *= (1 + 1.2 * soleil * np.exp(-(4.5 - X[r]) / 1.5))[:, None]   # le bord du rideau, dans le jour
+    img += (rayon ** 0.9 * 0.3 * soleil)[..., None] * np.array([255, 214, 150])
+    ciel = np.array([236, 214, 170]) * (1 - nuage) + np.array([160, 166, 184]) * nuage
+    vitre = a["vitre"]
+    img[vitre] = (ciel * (0.62 + 0.38 * soleil) * (0.9 + 0.1 * (Y[vitre] - 6) / 23.0)[:, None])
+    g = e["grains"]                                                    # les poussieres : elles derivent et tournoient
+    pas = min(dt, 0.5)
+    g[:, 0] += (0.7 * np.sin(g[:, 1] * 0.11 + t * 0.09 + g[:, 2]) + 0.3 * np.sin(t * 0.05 + g[:, 2] * 3)) * pas
+    g[:, 1] += (0.5 * np.cos(g[:, 0] * 0.09 - t * 0.07 + g[:, 2]) + 0.12) * pas
+    g[:, 0] = (g[:, 0] + 4) % 74 - 4
+    g[:, 1] %= 66
+    px = g[:, 0] + g[:, 3] * np.cos(t * g[:, 4] + g[:, 2])
+    py = g[:, 1] + g[:, 3] * np.sin(t * g[:, 4] * 1.1 + g[:, 2]) * 0.8
+    yi, xi = np.clip(py.astype(int), 0, 63), np.clip(px.astype(int), 0, 63)
+    dans = (px >= 0) & (px < 64) & (py >= 0) & (py < 64)
+    vu = np.clip((rayon[yi, xi] - 0.1) * 2.2, 0, 1) * dans * ~vitre[yi, xi]
+    eclat = g[:, 6] * vu * soleil * (0.5 + 0.5 * np.sin(t * g[:, 5] + g[:, 2] * 2)) ** 2
+    grains = np.zeros((64, 64, 3))
+    _cocon_tamponner(grains, py, px, eclat[:, None] * np.array([255, 226, 165]) * 1.25)
+    img += grains
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Lampe a fibres optiques -----------------------------------------------------------------------------------
+
+def _scene_fibres(p, e, t, ecoule, dt):
+    """Une lampe a fibres optiques : un bouquet de fibres fines qui jaillit d'un socle, chacune terminee par un point
+    de lumiere ; le bouquet ondule doucement, un degrade arc-en-ciel tourne lentement sur les pointes."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "fibres" not in e:
+        n = 72
+        r = np.clip(np.linspace(-1, 1, n) + rng.uniform(-0.6, 0.6, n) / n * 2, -1, 1)   # reparties, un peu au hasard
+        th = np.sign(r) * np.abs(r) ** 0.8 * 1.3                         # plus de fibres au centre
+        rng.shuffle(th)
+        lmax = 41 - 11 * np.abs(th) / 1.3
+        e["fibres"] = dict(th=th, l=lmax * rng.uniform(0.5, 1.0, n) ** 0.7, ph=rng.uniform(0, 2 * np.pi, n),
+                           u=(th + 1.3) / 2.6 + rng.uniform(-0.05, 0.05, n), x0=rng.uniform(-1, 1, n))
+        fond = _degrade((4, 3, 10), (10, 8, 18), 0, 56)
+        table = Y >= 58
+        fond[table] = _degrade((18, 15, 24), (7, 6, 10), 58, 64)[table]
+        fond[Y == 58] = (26, 22, 32)
+        rel = (Y - 50.0) / 8.0                                          # le socle : un dome noir et brillant
+        larg = 2.2 + 4.4 * np.sqrt(np.clip(rel, 0, 1))
+        socle = (rel >= 0) & (rel <= 1) & (np.abs(X - 32) <= larg)
+        e["socle"] = (fond, socle, rel, (X - 32) / larg)
+    f = e["fibres"]
+    fond, socle, rel, xr = e["socle"]
+    th = f["th"] + 0.05 * np.sin(t * 0.5 + f["th"] * 2.5) + 0.025 * np.sin(t * 0.83 + f["ph"]) + 0.04 * np.sin(t * 0.27)
+    s = np.linspace(0, 1, 30)[None, :]
+    phi = th[:, None] * (0.06 + 2.1 * s ** 1.4)                         # elles partent droites, puis s'ouvrent et retombent
+    pas = f["l"][:, None] / 30
+    xs = 32 + f["x0"][:, None] * 0.5 + np.cumsum(np.sin(phi) * pas, axis=1)
+    ys = 49.8 - np.cumsum(np.cos(phi) * pas, axis=1)
+    teinte = (f["u"] * 0.85 + t * 0.025) % 1.0                           # le degrade arc-en-ciel, qui tourne
+    couleurs = _teintes(teinte, 0.72, 1.0).astype(float)
+    img = fond.copy()
+    pointes = np.zeros((64, 64, 3))
+    eclat = 0.8 + 0.2 * np.sin(t * 1.1 + f["ph"] * 3)
+    _cocon_tamponner(pointes, ys[:, -1], xs[:, -1], couleurs * eclat[:, None])
+    halo = _cocon_flou(pointes, 1)
+    brume = _cocon_flou(halo, 5)                                         # la couleur qui baigne la piece
+    fils = np.zeros((64, 64, 3))                                         # les fibres : fines, sombres, plus claires au pied
+    long = 0.035 + 0.12 * (1 - s[0]) ** 3
+    _cocon_tamponner(fils, ys[:, :-1].ravel(), xs[:, :-1].ravel(),
+                     (couleurs[:, None, :] * long[None, :-1, None]).reshape(-1, 3))
+    img += np.minimum(fils, 55) + brume * 2.4 + halo * 0.9 + pointes * 1.25
+    moy = couleurs.mean(axis=0)                                          # la lumiere du socle : la couleur du moment
+    img[socle] = (np.array([14, 12, 20]) + np.array([70, 70, 80]) * np.exp(-((xr + 0.42) / 0.16) ** 2)[..., None]
+                  + moy * 0.3 * np.clip(1 - rel * 1.5, 0, 1)[..., None])[socle]
+    img += (np.exp(-np.hypot(X - 32, (Y - 50) * 1.8) / 2.0) * 0.8)[..., None] * (moy * 0.6 + 90)
+    sous = np.exp(-np.hypot((X - 32) / 3.2, (Y - 59.5) / 0.8) / 2.6) * (Y >= 58)
+    img += (sous * 0.7)[..., None] * moy
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Boule plasma ----------------------------------------------------------------------------------------------
+
+COCON_PLASMA = (32.0, 28.0, 21.5)            # le centre de la boule, son rayon
+
+
+def _boule_plasma_main(t):
+    """La main invisible : (force 0..1, angle) ; elle se pose sur le verre de temps en temps, d'un cote ou de l'autre."""
+    import numpy as np
+    periode = 38.0
+    k = np.floor(t / periode)
+    f = t / periode - k
+    h = (np.sin(k * 12.9898) * 43758.5453) % 1.0                       # chaque passage tire son cote
+    if h > 0.5:
+        return 0.0, 0.0
+    monte = np.clip((f - 0.25) / 0.15, 0, 1)
+    descend = np.clip((0.75 - f) / 0.15, 0, 1)
+    a = min(monte, descend)
+    return float(a * a * (3 - 2 * a)), (-0.35, -2.75, -1.0, 0.35, -2.2, 2.9, -0.7)[int(h * 14) % 7]
+
+
+def _scene_boule_plasma(p, e, t, ecoule, dt):
+    """Une boule plasma : l'electrode au centre, des filaments roses et violets ramifies qui vont doucement jusqu'au
+    verre, un point de lumiere la ou ils le touchent ; parfois une main invisible les attire d'un cote."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    cx, cy, R = COCON_PLASMA
+    if "plasma" not in e:
+        k = 7
+        d = np.hypot(X - cx, Y - cy)
+        fond = _degrade((5, 3, 11), (9, 5, 16), 0, 60) + (np.exp(-np.clip(d - R, 0, None) / 7.0) * (d > R))[..., None] \
+            * np.array([34, 12, 50])
+        gaz = (d < R)[..., None] * (np.array([14, 4, 26]) + (np.clip(1 - d / R, 0, 1) * 1.0)[..., None] * np.array([16, 6, 26]))
+        fond = np.where((d < R)[..., None], gaz, fond)
+        ang = np.arctan2(Y - cy, X - cx)
+        verre = np.clip(1 - np.abs(d - R + 0.3) / 1.1, 0, 1)
+        reflet = np.clip(1 - np.abs(d - R + 2.6) / 1.0, 0, 1) * np.clip(1 - np.abs(ang + 2.3) / 0.38, 0, 1)
+        fond += verre[..., None] * np.array([60, 44, 96]) + reflet[..., None] * np.array([150, 140, 190]) * 0.6
+        fond[(np.abs(X - cx) < 0.7) & (Y > cy + 3) & (Y < 48)] = (34, 22, 44)            # la tige de verre
+        rel = (Y - 46.0) / 15.0                                         # le socle noir
+        socle = (rel >= 0) & (rel <= 1) & (np.abs(X - cx) <= 8.5 + rel * 6)
+        xr = (X - cx) / (8.5 + rel * 6)
+        brille = (1 - 0.35 * rel) * (0.7 + 0.5 * np.exp(-((xr + 0.45) / 0.2) ** 2))
+        fond[socle] = (np.array([20, 15, 28]) * brille[..., None])[socle]
+        fond[socle & (Y <= 47)] = (58, 36, 82)                         # le col du socle, eclaire par la boule
+        fond[socle & (np.abs(X - cx - 5) < 0.8) & (np.abs(Y - 55) < 0.8)] = (90, 50, 120)   # le bouton
+        fond[Y >= 61] = (10, 7, 14)
+        e["plasma"] = dict(fond=fond, d=d, socle=socle,
+                           a0=np.linspace(0, 2 * np.pi, k, endpoint=False) + rng.uniform(-0.3, 0.3, k),
+                           w=rng.uniform((0.07, 0.22), (0.16, 0.4), (k, 2)), ph=rng.uniform(0, 2 * np.pi, (k, 8)),
+                           br=rng.uniform((0.45, 0.12), (0.75, 0.32), (k, 2, 2)))   # ou partent les branches, leur ecart
+        e["plasma"]["br"][:, 1, 1] *= -1                                 # une branche de chaque cote
+    a = e["plasma"]
+    k = len(a["a0"])
+    force, cote = _boule_plasma_main(t)
+    alpha = a["a0"] + 0.55 * np.sin(t * a["w"][:, 0] + a["ph"][:, 0]) + 0.3 * np.sin(t * a["w"][:, 1] + a["ph"][:, 1])
+    ecart = (cote - alpha + np.pi) % (2 * np.pi) - np.pi
+    tire = force * np.clip(1.2 - np.abs(ecart) / 1.5, 0, 1)             # la main tire les filaments les plus proches
+    alpha = alpha + ecart * tire * 0.95
+    r0, r1 = 3.4, R - 1.2
+    s = np.linspace(0, 1, 46)[None, :]
+    ph = a["ph"]
+    ondule = np.sin(np.pi * s) ** 0.7 * (2.0 * np.sin(s * 4.1 + t * 0.55 + ph[:, 2:3])       # des filaments qui serpentent
+                                         + 1.0 * np.sin(s * 9.3 - t * 1.0 + ph[:, 3:4])
+                                         + 0.45 * np.sin(s * 19.0 + t * 1.7 + ph[:, 4:5])) * (1 - 0.7 * tire[:, None])
+    ca, sa = np.cos(alpha)[:, None], np.sin(alpha)[:, None]
+    rr = r0 + s * (r1 - r0)
+    fx, fy = cx + rr * ca - ondule * sa, cy + rr * sa + ondule * ca
+    poids = (0.2 + 0.24 * s ** 2) * (1 + 0.35 * tire[:, None]) * np.ones_like(fx)
+    xs, ys, ws = [fx], [fy], [poids]
+    bouts = [(fx[:, -1], fy[:, -1], 1.3 + 2.0 * tire)]
+    for j in range(2):                                                  # les ramifications, pres du verre
+        sb, db = a["br"][:, j, 0], a["br"][:, j, 1] * (1 - 0.7 * tire)
+        i0 = (sb * 45).astype(int)
+        bx, by = fx[np.arange(k), i0], fy[np.arange(k), i0]
+        ex, ey = cx + r1 * np.cos(alpha + db), cy + r1 * np.sin(alpha + db)
+        q = np.linspace(0, 1, 18)[None, :]
+        tort = np.sin(np.pi * q) * 0.9 * np.sin(q * 7 + t * 0.9 + ph[:, 5 + j:6 + j])
+        nx, ny = -(ey - by)[:, None], (ex - bx)[:, None]
+        ln = np.hypot(nx, ny) + 1e-6
+        xs.append(bx[:, None] + (ex - bx)[:, None] * q + tort * nx / ln)
+        ys.append(by[:, None] + (ey - by)[:, None] * q + tort * ny / ln)
+        ws.append(np.ones((k, 18)) * 0.2 * (0.5 + 0.5 * q) * (1 - 0.5 * tire[:, None]))
+        bouts.append((ex, ey, 0.6 * (1 - 0.6 * tire)))
+    fil = np.zeros((64, 64))
+    _cocon_tamponner(fil, np.concatenate([v.ravel() for v in ys]), np.concatenate([v.ravel() for v in xs]),
+                     np.concatenate([v.ravel() for v in ws]))
+    impact = np.zeros((64, 64))
+    _cocon_tamponner(impact, np.concatenate([b[1] for b in bouts]), np.concatenate([b[0] for b in bouts]),
+                     np.concatenate([b[2] for b in bouts]) * (0.85 + 0.15 * np.sin(t * 1.3 + np.arange(k * 3))))
+    dedans = (a["d"] < R - 0.4)[..., None]
+    g1 = _cocon_flou(fil, 1)
+    g2 = _cocon_flou(g1, 3)
+    imp = _cocon_flou(impact, 1)
+    lum = np.clip(fil, 0, 1.2)[..., None] * np.array([255, 185, 255]) * 0.7 + g1[..., None] * np.array([200, 80, 255]) * 0.75 \
+        + g2[..., None] * np.array([140, 36, 225]) * 2.0 + imp[..., None] * np.array([255, 190, 250]) * 1.5 \
+        + _cocon_flou(imp, 2)[..., None] * np.array([255, 70, 190]) * 2.4
+    img = a["fond"] + lum * dedans
+    d = a["d"]
+    boule = np.clip(3.6 - d, 0, 1)                                      # l'electrode, une bille qui luit
+    img = img * (1 - boule[..., None]) + boule[..., None] * (np.array([200, 120, 255]) + np.clip(1 - d / 2.6, 0, 1)[..., None]
+                                                             * np.array([55, 120, 0]))
+    img += (np.exp(-d / 4.5) * 0.45)[..., None] * np.array([210, 120, 255])
+    img[a["socle"]] = a["fond"][a["socle"]] + (force * 12)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Vinyle ----------------------------------------------------------------------------------------------------
+
+COCON_DISQUE = (27.0, 35.0, 0.56)            # le centre du plateau, l'aplatissement (vu en legere plongee)
+COCON_NOTE = ((0, 1), (0, 2), (1, 1), (2, 1), (3, 0), (3, 1), (4, 0), (4, 1))   # une croche, en pixels (y, x)
+
+
+def _vinyle_preparer(e, rng):
+    """Ce qui ne bouge pas : la piece, la lampe, le socle en bois, le plateau, le bras."""
+    import numpy as np
+    Y, X = _xy()
+    cx, cy, k = COCON_DISQUE
+    lampe = 0.16 + 1.0 * np.exp(-np.hypot(X - 5, Y - 5) / 24.0)
+    img = _degrade((10, 7, 10), (14, 9, 10), 0, 64)
+    img += (np.exp(-np.hypot(X - 5, (Y - 7) * 1.2) / 9.0) * 0.5)[..., None] * np.array([255, 150, 70])
+    cone = np.clip(1 - np.abs((X - 4) - (Y - 10) * 0.55) / (2 + (Y - 10) * 0.45), 0, 1) * (Y > 10) * np.exp(-(Y - 10) / 14)
+    img += (cone * 0.22)[..., None] * np.array([255, 170, 90])         # la lumiere qui tombe de l'abat-jour
+    rel = np.clip((Y - 15) / 39.0, 0, 1)                               # le socle : un plateau de noyer en perspective
+    dessus = (Y >= 15) & (Y <= 54) & (X >= 8 - rel * 6) & (X <= 58 + rel * 4)
+    grain = 0.86 + 0.14 * np.sin(Y * 1.7 + np.sin(X * 0.21 + Y * 0.1) * 2.2)
+    img[dessus] = (np.array([96, 58, 32]) * (grain * lampe)[..., None])[dessus]
+    img[dessus & (Y == 15)] *= 1.3
+    face = (Y >= 55) & (Y <= 60) & (X >= 2) & (X <= 62)
+    img[face] = (np.array([46, 28, 16]) * (0.45 + 0.4 * lampe)[..., None])[face]
+    img[face & (Y == 55)] = (120, 80, 48)
+    img[(Y >= 60) & ~face] = (8, 6, 8)
+    abat = (Y >= 1) & (Y <= 9) & (X <= 7.5 + (Y - 1) * 0.75)            # l'abat-jour de la lampe, dans le coin
+    img[abat] = (np.array([255, 176, 92]) * ((0.55 + 0.45 * (Y / 9.0)) * (0.9 + 0.1 * np.sin(X * 2.1)))[..., None])[abat]
+    img[abat & (Y == 9)] = (255, 220, 160)
+    img[abat & (Y == 1)] = (150, 90, 50)
+    img[(Y == 0) & (X >= 3) & (X <= 4)] = (40, 30, 26)                 # sa tige
+    u, v = X - cx, (Y - cy) / k
+    r, th = np.hypot(u, v), np.arctan2(v, u)
+    cote = (np.hypot(u, (Y - cy - 1.6) / k) <= 23.0) & (r > 23.0)       # l'epaisseur du plateau, devant
+    img[cote] = (34, 34, 38)
+    jante = (r <= 23.0) & (r > 21.3)
+    img[jante] = (np.array([120, 120, 126]) * (0.55 + 0.45 * np.clip(-np.sin(th + 0.9), 0, 1) + 0.25 * lampe)[..., None])[jante]
+    img[jante & (np.abs(th - 1.0) < 0.06)] = (255, 120, 60)            # le petit point du stroboscope
+    # le bras : un pivot, un contrepoids, un tube fin jusqu'a la tete de lecture
+    px, py = 52.5, 20.5
+    hx, hy = cx + 16.0 * np.cos(0.22), cy + 16.0 * k * np.sin(0.22)
+    lx, ly = hx - px, hy - py
+    lg = np.hypot(lx, ly)
+    q = np.clip(((X - px) * lx + (Y - py) * ly) / lg ** 2, 0, 1)
+    dbras = np.hypot(X - px - q * lx, Y - py - q * ly)
+    bras = np.clip(1.25 - dbras, 0, 1) * (q > 0.08)
+    ombre = np.clip(1.2 - np.hypot(X - px - q * lx + 1.5, Y - py - q * ly - 2.2), 0, 1) * (q > 0.15)
+    tete = (np.abs((X - hx) * lx + (Y - hy) * ly) / lg <= 1.6) & (np.abs((X - hx) * ly - (Y - hy) * lx) / lg <= 1.3)
+    pivot = np.hypot(X - px, (Y - py) * 1.2) <= 3.2
+    poids = np.hypot(X - px - 3.2, (Y - py + 3.6) * 1.2) <= 2.1
+    e["vinyle"] = dict(fond=img, r=r, th=th, lampe=lampe, bras=bras, ombre=ombre, tete=tete, pivot=pivot, poids=poids,
+                       eq=rng.uniform((0.6, 1.3, 0), (1.2, 2.4, 2 * np.pi), (7, 3)), glint=rng.uniform(0, 2 * np.pi, 3))
+
+
+def _scene_vinyle(p, e, t, ecoule, dt):
+    """Un vinyle sur sa platine, dans une piece sombre : le disque noir tourne, ses sillons accrochent la lumiere
+    de la lampe ; l'etiquette coloree tourne avec lui, le bras est pose ; un petit egaliseur, des notes qui flottent."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "vinyle" not in e:
+        _vinyle_preparer(e, rng)
+    a = e["vinyle"]
+    cx, cy, k = COCON_DISQUE
+    img = a["fond"].copy()
+    r, th = a["r"], a["th"]
+    tour = th - t * 2.3                                                 # l'angle, dans le repere du disque qui tourne
+    disque = r <= 21.3
+    sillons = 0.9 + 0.1 * np.sin(r * 3.3) + 0.1 * (np.abs(r - 12) < 0.5) + 0.1 * (np.abs(r - 16) < 0.5) \
+        + 0.12 * (r > 20.4)
+    lum = np.array([14, 13, 17]) * sillons[..., None]
+    angle_l = -1.94                                                     # la lampe, vue du centre du disque
+    ecart = (th - angle_l + np.pi) % (2 * np.pi) - np.pi
+    noeud = np.exp(-(ecart / 0.22) ** 2) + 0.6 * np.exp(-((np.abs(ecart) - np.pi) / 0.22) ** 2)   # le reflet en noeud papillon
+    lustre = np.exp(-(ecart / 0.7) ** 2) + 0.6 * np.exp(-((np.abs(ecart) - np.pi) / 0.7) ** 2)
+    sillon = 0.45 + 0.55 * np.sin(r * 3.3 + 0.9 * np.sin(tour * 2 + r * 0.4)) ** 2           # les sillons, qui frissonnent
+    reflet = (noeud * sillon + 0.18 * lustre) * (0.35 + 0.65 * np.clip((r - 7) / 14, 0, 1)) * (r > 7.3)
+    lum = lum + reflet[..., None] * np.array([214, 172, 128]) * 0.72
+    glints = np.zeros((64, 64))
+    for j, rg in enumerate((9.5, 14.0, 18.5)):                           # des poussieres qui brillent au passage du reflet
+        ag = a["glint"][j] + t * 2.3
+        gx, gy = cx + rg * np.cos(ag), cy + rg * k * np.sin(ag)
+        passe = np.exp(-(((ag - angle_l + np.pi) % (2 * np.pi) - np.pi) / 0.5) ** 2) + 0.15
+        glints += np.exp(-((X - gx) ** 2 + (Y - gy) ** 2) / 1.2) * passe
+    lum = lum + (glints * disque)[..., None] * np.array([220, 190, 150]) * 0.6
+    etiquette = r <= 7.0                                                 # l'etiquette, qui tourne avec le disque
+    secteur = ((tour % (2 * np.pi)) < 1.1) & (r > 2.0)
+    texte = (np.abs(r - 4.6) < 0.55) & ((tour * 5 / np.pi) % 2 < 0.8)
+    et = np.where(secteur[..., None], np.array([236, 200, 140]), np.array([196, 66, 44]))
+    et = np.where(texte[..., None], et * 0.6, et)
+    et = np.where((np.abs(r - 6.4) < 0.5)[..., None], np.array([236, 200, 140]) * 0.8, et)
+    lum = np.where(etiquette[..., None], et * (0.5 + 0.35 * a["lampe"])[..., None], lum)
+    lum = np.where((r < 0.9)[..., None], np.array([200, 200, 205]), lum)
+    img[disque] = lum[disque]
+    img *= (1 - 0.55 * a["ombre"])[..., None]                           # l'ombre du bras sur le disque
+    b = a["bras"][..., None]
+    img = img * (1 - b) + b * np.array([186, 184, 190]) * (0.6 + 0.4 * a["lampe"])[..., None]
+    img[a["tete"]] = (150, 148, 156)
+    img[a["pivot"]] = (96, 96, 104)
+    img[a["poids"]] = (60, 60, 66)
+    img[a["pivot"] & (Y < 20) & (X < 52)] = (170, 170, 178)
+    eq = a["eq"]                                                        # le petit egaliseur, sur la facade
+    niv = np.clip(0.45 + 0.25 * np.sin(t * eq[:, 0] + eq[:, 2]) + 0.2 * np.sin(t * eq[:, 1] * 1.7 + eq[:, 2] * 2)
+                  + 0.25 * (0.5 + 0.5 * np.sin(t * 2 * np.pi * 1.55)) ** 6 * (np.arange(7) < 3), 0.05, 1) * 4
+    for j in range(7):
+        x = 44 + 2 * j
+        for i in range(4):
+            allume = float(np.clip(niv[j] - i, 0, 1))
+            c = np.array([60, 210, 150]) if i < 2 else (np.array([230, 200, 70]) if i < 3 else np.array([255, 120, 50]))
+            img[59 - i, x] = np.maximum(img[59 - i, x], c * (0.12 + 0.68 * allume))
+    notes = np.zeros((64, 64, 3))                                       # des notes qui montent, tres discretes
+    for j in range(2):
+        cycle = t / 9.0 + j * 0.5
+        n = np.floor(cycle)
+        f = cycle - n
+        x0 = 10 + ((np.sin(n * 78.233 + j * 3.1) * 43758.5453) % 1.0) * 26 + np.sin(f * 5 + j) * 1.5
+        y0 = 24 - f * 18
+        force = np.sin(np.pi * f) ** 2 * 0.5
+        pts = np.array(COCON_NOTE, float)
+        _cocon_tamponner(notes, y0 + pts[:, 0], x0 + pts[:, 1], np.array([255, 196, 130]) * force)
+    img += notes
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# LES REVERIES. Des ecrans abstraits, hypnotiques et apaisants : des rubans
+# de soie, de l'encre dans l'eau, des courants de lumiere, un kaleidoscope,
+# un pendule de sable, un flocon qui pousse -- et un vortex, un vrai tunnel
+# de lumiere (« tunnels de lumiere [...] j'aimais beaucoup les propositions
+# du tout tout debut »).
+
+
+# LES REVERIES ET LES TUNNELS DE LUMIERE. Des ecrans abstraits, lents et
+# hypnotiques : des rubans de soie, de l'encre dans l'eau, des courants de
+# lumiere, un kaleidoscope, un pendule qui dessine dans le sable, un flocon qui
+# pousse, un vortex d'etincelles. Le noir, et ce qui y brille.
+
+
+def _reveries_coins(ys, xs):
+    """Les quatre pixels voisins de chaque point (dans un panneau borde d'un pixel, 66 x 66), et leurs poids."""
+    import numpy as np
+    ys = np.clip(np.asarray(ys, float).ravel(), -1, 63.99999)            # hors du panneau : tout dans la bordure
+    xs = np.clip(np.asarray(xs, float).ravel(), -1, 63.99999)
+    y0, x0 = np.floor(ys), np.floor(xs)
+    fy, fx = ys - y0, xs - x0
+    i = (y0.astype(np.intp) + 1) * 66 + x0.astype(np.intp) + 1
+    gy = 1 - fy
+    return (np.concatenate((i, i + 1, i + 66, i + 67)),
+            np.concatenate((gy * (1 - fx), gy * fx, fy * (1 - fx), fy * fx)))
+
+
+def _reveries_semer(ys, xs, couleurs):
+    """Des points a des positions non entieres, chacun reparti sur ses quatre pixels voisins : une lumiere
+    qui glisse sans sauter d'un pixel a l'autre. Rend une image (64, 64, 3) flottante, a ajouter."""
+    import numpy as np
+    idx, w = _reveries_coins(ys, xs)
+    c = np.broadcast_to(np.asarray(couleurs, float), (len(idx) // 4, 3))
+    out = np.empty((4356, 3))
+    for k in range(3):
+        ck = c[:, k]
+        out[:, k] = np.bincount(idx, w * np.concatenate((ck, ck, ck, ck)), minlength=4356)
+    return out.reshape(66, 66, 3)[1:65, 1:65]
+
+
+def _reveries_semer1(ys, xs, poids):
+    """Comme _reveries_semer, d'une seule couleur : rend une image (64, 64) de poids."""
+    import numpy as np
+    idx, w = _reveries_coins(ys, xs)
+    p = np.broadcast_to(np.asarray(poids, float), (len(idx) // 4,))
+    return np.bincount(idx, w * np.concatenate((p, p, p, p)), minlength=4356).reshape(66, 66)[1:65, 1:65]
+
+
+def _reveries_flou(a, n=1):
+    """Un flou doux (1-2-1 sur les lignes puis sur les colonnes, n fois), les bords recopies : pour les halos."""
+    for _ in range(n):
+        b = a * 2.0
+        b[1:] += a[:-1]
+        b[:1] += a[:1]
+        b[:-1] += a[1:]
+        b[-1:] += a[-1:]
+        a = b * 0.25
+        b = a * 2.0
+        b[:, 1:] += a[:, :-1]
+        b[:, :1] += a[:, :1]
+        b[:, :-1] += a[:, 1:]
+        b[:, -1:] += a[:, -1:]
+        a = b * 0.25
+    return a
+
+
+def _reveries_halo(a, n=2):
+    """Un grand halo, pas cher : a demi-taille, flou, puis remis a la taille du panneau."""
+    import numpy as np
+    petit = a.reshape((32, 2, 32, 2) + a.shape[2:]).mean(axis=(1, 3))
+    petit = _reveries_flou(petit, n)
+    return _reveries_flou(np.repeat(np.repeat(petit, 2, 0), 2, 1), 1)
+
+
+def _reveries_lumiere(l, k=150.0):
+    """De la lumiere qui s'additionne -> des couleurs : elle sature en douceur, sans virer au blanc."""
+    import numpy as np
+    m = l.max(axis=-1, keepdims=True)
+    return l * (255.0 * (1 - np.exp(-m / k)) / np.maximum(m, 1e-6))
+
+
+def _reveries_phase(t, w, decal=0.0):
+    """La phase t * w + decal, ramenee entre 0 et 2 pi : t vaut ~1.8e9, et np.sin d'un tableau d'arguments
+    geants prend un chemin vingt fois plus lent (et perd en precision). On reduit d'abord le scalaire."""
+    import math
+    return math.fmod(t * w + decal, 2 * math.pi)
+
+
+def _reveries_palette(couleurs, k, doux=True):
+    """Une palette en boucle (k entre 0 et 1, et au-dela) : d'une couleur a la suivante, sans couture."""
+    import numpy as np
+    pal = np.asarray(couleurs, float)
+    n = len(pal)
+    k = np.mod(k, 1.0) * n
+    i = np.floor(k).astype(int) % n
+    f = (k - np.floor(k))[..., None]
+    if doux:
+        f = f * f * (3 - 2 * f)
+    return pal[i] * (1 - f) + pal[(i + 1) % n] * f
+
+
+# ---------------------------------------------------------------- les rubans de soie
+
+RUBANS_SOIE = (   # (la face, le reflet qui glisse le long, le revers, phase, angle moyen, demi-largeur)
+    ((255, 95, 140), (255, 170, 90), (130, 45, 120), 0.0, -0.40, 6.5),
+    ((50, 180, 255), (90, 250, 210), (50, 60, 190), 2.2, 0.32, 6.0),
+    ((180, 110, 255), (255, 140, 215), (80, 50, 160), 4.1, 0.02, 5.5),
+)
+
+
+def _scene_rubans(p, e, t, ecoule, dt):
+    """Des rubans de soie qui ondulent lentement dans le noir, se croisent et se tordent : on voit leur face,
+    leur revers, et leur tranche qui brille."""
+    import numpy as np
+    Y, X = _xy()
+    n = len(RUBANS_SOIE)
+    poids = np.empty((64, 64, 3 * n))                                    # par ruban : face, reflet, revers
+    A, Z = [], []
+    for i, (face, glisse, revers, ph, ang0, w) in enumerate(RUBANS_SOIE):
+        ang = ang0 + 0.3 * np.sin(t * 0.043 + ph)                        # le ruban pivote, tres lentement
+        ca, sa = np.cos(ang), np.sin(ang)
+        ox = 32 + 8 * np.sin(t * 0.047 + ph)
+        oy = 32 + 13 * np.sin(t * 0.061 + ph * 1.3)
+        U = (X - ox) * ca + (Y - oy) * sa                                # le long du ruban
+        V = (Y - oy) * ca - (X - ox) * sa                                # en travers
+        k1, k2 = 0.075 + 0.012 * i, 0.16 - 0.018 * i
+        p1, p2 = U * k1 - _reveries_phase(t, 0.26, -ph), U * k2 + _reveries_phase(t, 0.17, 2 * ph)
+        f = 7.0 * np.sin(p1) + 2.5 * np.sin(p2)                          # sa ligne, qui ondule
+        fp = 7.0 * k1 * np.cos(p1) + 2.5 * k2 * np.cos(p2)
+        tors = (U * 0.05 + 1.3 * np.sin(U * 0.04 - _reveries_phase(t, 0.18, -ph))
+                + _reveries_phase(t, 0.15, ph))                          # la torsion, qui court le long
+        ct, st = np.cos(tors), np.sin(tors)
+        act = np.abs(ct)
+        h = w * act * np.sqrt(1 + fp * fp)                               # de face : large ; par la tranche : un fil
+        dv = V - f
+        A.append(np.clip(h + 0.6 - np.abs(dv), 0, 1) * 0.92)
+        v = np.clip(dv / (h + 0.3), -1, 1)
+        q = v - 0.75 * st
+        reflet = np.exp(-q * q * 6.25) * act                             # le lustre de la soie, qui suit la torsion
+        tr = 1 - act
+        tr = tr * tr * tr
+        z = np.sin(U * 0.035 + _reveries_phase(t, 0.09, ph * 2))        # devant, derriere : ca change le long
+        lum = ((0.3 + 0.7 * act) * (1 - 0.25 * v * v) + 0.55 * reflet + 0.6 * tr * tr) * (0.8 + 0.2 * z)
+        g = 0.5 + 0.5 * np.sin(U * 0.06 - _reveries_phase(t, 0.18, -ph))
+        dessus = lum * (ct >= 0)
+        poids[..., 3 * i] = dessus * (1 - g)
+        poids[..., 3 * i + 1] = dessus * g
+        poids[..., 3 * i + 2] = lum - dessus
+        Z.append(z)
+    palette = np.array([c for r in RUBANS_SOIE for c in r[:3]], float)
+    vus = []
+    for i in range(n):                                                   # ce qu'on voit : ceux devant cachent
+        vu = A[i].copy()
+        for j in range(n):
+            if j != i:
+                vu *= 1 - A[j] * (Z[j] > Z[i])
+        vus.append(vu)
+    fond = 1.0
+    for a in A:
+        fond = fond * (1 - a)
+    couvre = np.repeat(np.stack(A, -1), 3, axis=-1)
+    halo = (poids * couvre).reshape(-1, 3 * n) @ palette
+    img = (_degrade((7, 4, 16), (3, 3, 10)) + 0.4 * _reveries_halo(halo.reshape(64, 64, 3), 2)) * fond[..., None]
+    img += (poids * np.repeat(np.stack(vus, -1), 3, axis=-1)).reshape(-1, 3 * n).dot(palette).reshape(64, 64, 3)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- l'encre dans l'eau
+
+ENCRE_COULEURS = ((255, 60, 150), (90, 200, 255), (255, 160, 40), (150, 80, 255), (40, 235, 170), (255, 90, 70))
+
+
+def _encre_lire(m, sx, sy, bornes=False):
+    """L'encre lue a des positions non entieres (melange des quatre voisines) ; avec, si demande, le plus petit
+    et le plus grand de ces quatre voisins."""
+    import numpy as np
+    dehors = np.maximum(np.maximum(-sx, sx - 63), np.maximum(-sy, sy - 63))
+    eau = np.clip(1 - dehors, 0, 1).reshape(4096, 1)                     # hors du panneau : de l'eau claire
+    sx, sy = np.clip(sx, 0, 62.99999), np.clip(sy, 0, 62.99999)
+    x0, y0 = sx.astype(np.intp), sy.astype(np.intp)
+    fx, fy = (sx - x0).reshape(4096, 1), (sy - y0).reshape(4096, 1)
+    i = (y0 * 64 + x0).ravel()
+    mf = m.reshape(4096, 3)
+    a, b, c, d = mf.take(i, 0), mf.take(i + 1, 0), mf.take(i + 64, 0), mf.take(i + 65, 0)
+    ab = a + (b - a) * fx
+    cd = c + (d - c) * fx
+    v = ((ab + (cd - ab) * fy) * eau).reshape(64, 64, 3)
+    if bornes:
+        return (v, (np.minimum(np.minimum(a, b), np.minimum(c, d)) * eau).reshape(64, 64, 3),
+                np.maximum(np.maximum(a, b), np.maximum(c, d)).reshape(64, 64, 3))
+    return v
+
+
+def _encre_pas(e, h):
+    """Un pas de l'eau : les gouttes tombent et s'enroulent, l'encre suit le courant, et se dilue."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    e["horloge"] += h
+    c = e["horloge"]
+    if c >= e["prochaine"]:                                              # une goutte d'une autre couleur
+        e["prochaine"] = c + rng.uniform(5.5, 8.0)
+        e["teinte"] = (e["teinte"] + int(rng.integers(1, len(ENCRE_COULEURS)))) % len(ENCRE_COULEURS)
+        v0 = rng.uniform(13, 17)
+        e["gouttes"].append({"x": rng.uniform(18, 46), "y": -1.5, "v": v0, "v0": v0, "age": 0.0,
+                             "ph": rng.uniform(0, 6.3), "c": np.asarray(ENCRE_COULEURS[e["teinte"]], float) / 255.0})
+    a, b = e["courant"]
+    psi = e["force"] * (_fenetre(a, 30 + c * 0.55, 10 + c * 0.3) - _fenetre(b, 70 - c * 0.4, 50 + c * 0.5))
+    psi = psi + e["tourne"] * np.sin(c * 0.05)                           # l'eau tournoie, puis dans l'autre sens
+    for g in e["gouttes"]:                                               # chaque goutte : un anneau de tourbillons
+        s = 3.4 + 2.8 * (1 - g["v"] / g["v0"])                           # il s'elargit en ralentissant
+        g["vi"] = g["v"] + 2.8 * np.exp(-g["age"] / 6.0)                 # il tourne encore un peu quand il a freine
+        r2g = (X - g["x"] + s) ** 2 + (Y - g["y"]) ** 2 + 3.0
+        r2d = (X - g["x"] - s) ** 2 + (Y - g["y"]) ** 2 + 3.0
+        psi = psi + s * g["vi"] * np.log(r2d / r2g)
+    vx, vy = np.gradient(psi)                                            # un courant sans source ni puits
+    vy = -vy
+    for g in e["gouttes"]:
+        if g["age"] < 0.55:                                              # elle lache son encre en entrant
+            e["encre"] += (np.exp(-((X - g["x"]) ** 2 + (Y - g["y"]) ** 2) / 6.0) * 46.0 * h
+                           * (1 - g["age"] / 0.55) ** 2)[..., None] * g["c"]
+        g["y"] += g["vi"] * h
+        g["x"] += np.sin(g["age"] * 2.2 + g["ph"]) * 2.5 * h             # elle ne tombe pas tout a fait droit
+        g["v"] *= np.exp(-h / 2.6)
+        g["age"] += h
+    e["gouttes"] = [g for g in e["gouttes"] if g["age"] < 14]
+    m = e["encre"]                                                       # on remonte le courant, puis on corrige
+    avant, bas, haut = _encre_lire(m, X - vx * h, Y - vy * h, True)      # l'aller-retour (MacCormack) : les filaments
+    retour = _encre_lire(avant, X + vx * h, Y + vy * h)                  # restent fins au lieu de s'estomper
+    m = np.clip(avant + (m - retour) * 0.5, bas, haut)
+    e["encre"] = np.maximum(m * np.exp(-h / 17.0) - 0.01 * h, 0)         # tres diluee, elle disparait : pas de voile
+
+
+def _scene_encre(p, e, t, ecoule, dt):
+    """Des gouttes d'encre lumineuse tombent dans l'eau noire et s'epanouissent en volutes, en filaments
+    qui tournoient puis se diluent ; une autre goutte, d'une autre couleur, arrive de temps en temps."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "encre" not in e:
+        a, b = _brume(rng, 22), _brume(rng, 34)
+        gy, gx = np.gradient(a)
+        r2 = (X - 32) ** 2 + (Y - 32) ** 2
+        e.update(encre=np.zeros((64, 64, 3)), gouttes=[], horloge=0.0, prochaine=0.0, courant=(a, b),
+                 teinte=int(rng.integers(0, len(ENCRE_COULEURS))), tourne=0.04 * r2 * np.exp(-r2 / 900),
+                 force=2.5 / max(1e-6, float(np.hypot(gx, gy).std() * 2)))
+        for _ in range(26):                                              # la premiere goutte est deja entree
+            _encre_pas(e, 0.12)
+    reste = min(dt, 0.5)
+    n = int(np.ceil(reste / (1 / 15.0)))
+    for _ in range(n):
+        _encre_pas(e, reste / n)
+    fond = _degrade((10, 16, 34), (3, 5, 13))
+    rais = (0.5 + 0.5 * np.sin(X * 0.2 + Y * 0.08 + _reveries_phase(t, 0.2))) ** 4   # un peu de jour, d'en haut
+    fond += (np.exp(-Y / 14) * rais)[..., None] * np.array([10, 18, 26])
+    lum = _reveries_lumiere(e["encre"] * 255, 120)
+    img = fond + 0.7 * lum + 0.35 * _reveries_flou(lum, 1) + 0.2 * _reveries_flou(lum, 3)
+    for g in e["gouttes"]:                                               # la goutte, encore ronde, qui tombe
+        if g["age"] < 0.7:
+            _pointer(img, [g["y"]], [g["x"]], [np.minimum(255, g["c"] * 255 + 90) * (1 - g["age"] / 0.7)])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- les courants de lumiere
+
+COURANTS_PALETTE = ((30, 200, 190), (60, 130, 255), (170, 90, 255), (255, 100, 170))
+COURANTS_VAGUES = ((1, 0), (0, 1), (1, 1), (1, -1), (2, 1), (1, 2), (2, -1), (1, -2))   # raccordees sur le panneau
+COURANTS_EFFACE = 0.55                                                   # les trainees s'effacent (par seconde)
+
+
+def _courants_vitesse(e, x, y, t):
+    """Le courant en (x, y) a l'instant t : quelques grandes vagues de tourbillons qui glissent chacune a son
+    rythme. Sans source ni puits (on derive une fonction de courant), et raccorde sur les bords du panneau."""
+    import numpy as np
+    kx, ky, amp, w, ph = e["fvagues"]
+    c = np.cos((x * (2 * np.pi / 64))[:, None] * kx + (y * (2 * np.pi / 64))[:, None] * ky
+               + np.mod(w * t + ph, 2 * np.pi)) * amp
+    ux = c @ (ky * (2 * np.pi / 64))
+    uy = -(c @ (kx * (2 * np.pi / 64)))
+    v = np.hypot(ux, uy)
+    k = (3.0 + 15.0 * np.tanh(v / 12.0)) / np.maximum(v, 1e-6)          # jamais tout a fait immobile
+    return ux * k, uy * k
+
+
+def _courants_pas(e, t, h):
+    """Les particules suivent le courant d'un pas, et deposent leur lumiere."""
+    import numpy as np
+    rng = e["rng"]
+    x, y = e["fx"], e["fy"]
+    ux, uy = _courants_vitesse(e, x, y, t)
+    x += ux * h
+    y += uy * h
+    x %= 64                                                              # le courant se raccorde sur les bords
+    y %= 64
+    e["fage"] += h
+    vitesse = np.hypot(ux, uy)
+    vie = np.clip(np.minimum(e["fage"] / 1.5, (e["fvie"] - e["fage"]) / 1.5), 0, 1)   # nees et eteintes en fondu
+    teinte = np.arctan2(uy, ux) / (2 * np.pi) + e["fdecal"]              # la couleur dit ou va le courant
+    poids = (vie * np.clip((vitesse / 12.0) ** 1.8, 0.04, 1.8) * e["fdepot"] * h)[:, None]   # les vifs brillent
+    e["trace"] *= np.exp(-h * COURANTS_EFFACE)
+    e["trace"] += _reveries_semer(y, x, _reveries_palette(COURANTS_PALETTE, teinte) * poids)
+    finies = e["fage"] > e["fvie"]
+    k = int(finies.sum())
+    if k:
+        x[finies], y[finies] = rng.uniform(0, 64, k), rng.uniform(0, 64, k)
+        e["fage"][finies], e["fvie"][finies] = 0.0, rng.uniform(6, 12, k)
+
+
+
+def _scene_flux(p, e, t, ecoule, dt):
+    """Des centaines de particules suivent un courant doux qui change lentement, et laissent des trainees qui
+    s'effacent : des courants soyeux de couleur qui se forment et se defont."""
+    import numpy as np
+    rng = e["rng"]
+    if "fx" not in e:
+        n = 450
+        k = np.array(COURANTS_VAGUES, float)
+        kx, ky = k[:, 0], k[:, 1]
+        amp = rng.uniform(0.6, 1.0, len(k)) / np.hypot(kx, ky) ** 1.3 * rng.choice([-1, 1], len(k))
+        e.update(fx=rng.uniform(0, 64, n), fy=rng.uniform(0, 64, n), fage=rng.uniform(0, 10, n),
+                 fvie=rng.uniform(6, 12, n), fdecal=0.0, trace=np.zeros((64, 64, 3)), fdepot=1.5 / 255,
+                 fvagues=[kx, ky, amp, rng.uniform(0.05, 0.12, len(k)) * rng.choice([-1, 1], len(k)),
+                          rng.uniform(0, 2 * np.pi, len(k))])
+        gy, gx = (g.ravel() * (2 * np.pi / 64) for g in np.mgrid[0:64:4, 0:64:4].astype(float))
+        c = np.cos(gx[:, None] * kx + gy[:, None] * ky + e["fvagues"][4]) * amp
+        brut = np.hypot(c @ (ky * 2 * np.pi / 64), c @ (kx * 2 * np.pi / 64))
+        e["fvagues"][2] = amp * 11.0 / max(1e-6, float(np.sqrt((brut ** 2).mean())))   # une vitesse moyenne choisie
+        e["fage"] = np.minimum(e["fage"], e["fvie"] - 0.5)
+        for j in range(36):                                              # les trainees sont deja la
+            _courants_pas(e, t - 3.0 + j / 12, 1 / 12)
+    e["fdecal"] = 0.06 * np.sin(_reveries_phase(t, 0.021)) + (t * 0.004) % 1.0
+    reste = min(dt, 0.5)
+    n = int(np.ceil(reste / (1 / 30.0)))
+    for j in range(n):
+        _courants_pas(e, t - reste + (j + 1) * reste / n, reste / n)
+    lum = _reveries_lumiere(e["trace"] * 255, 150)
+    img = _degrade((4, 5, 14), (6, 4, 14)) + lum + 0.15 * _reveries_halo(lum, 1)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- le kaleidoscope
+
+KALEIDO_VERRES = ((235, 40, 80), (255, 150, 30), (250, 210, 60), (40, 190, 110), (30, 140, 230), (120, 70, 230),
+                  (220, 60, 190))                                       # rubis, ambre, or, emeraude, saphir...
+KALEIDO_ROSACE = 30.0                                                    # la rosace du centre a plus de place
+
+
+def _scene_kaleidoscope(p, e, t, ecoule, dt):
+    """Un kaleidoscope a six miroirs : des verres colores sertis de plomb, comme un vitrail vivant, qui
+    tournent et se transforment lentement."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    n = 6
+    if "graines" not in e:
+        k = 7
+        e["graines"] = (np.linspace(7, 40, k) + rng.uniform(-2, 2, k), rng.uniform(2.5, 6, k),     # ou, combien,
+                        rng.uniform(0.04, 0.08, k), rng.uniform(0, 2 * np.pi, k),                # a quel rythme,
+                        rng.uniform(0.03, 0.065, k), rng.uniform(0, 2 * np.pi, k),               # de quel cote,
+                        rng.permutation(k) / k + rng.uniform(0, 0.05, k))                        # de quel verre
+    r0, ra, wr, pr, wa, pa, h0 = e["graines"]
+    dx, dy = X - 31.5, Y - 31.5
+    r = np.hypot(dx, dy)
+    s = 2 * np.pi / n
+    a = np.abs(np.mod(np.arctan2(dy, dx) - _reveries_phase(t, 0.025), s) - s / 2)   # replie dans un secteur, en miroir
+    u, w = r * np.cos(a), r * np.sin(a)
+    sr = np.maximum(4.0, r0 + ra * np.sin(t * wr + pr))                  # les verres glissent entre les miroirs
+    sa = s / 2 * (0.5 + 0.47 * np.sin(t * wa + pa))
+    su, sw = sr * np.cos(sa), sr * np.sin(sa)
+    su, sw = np.append(su, 0.0), np.append(sw, 0.0)                      # et la rosace du centre, plus large
+    D = (u[None] - su[:, None, None]) ** 2 + (w[None] - sw[:, None, None]) ** 2
+    D[-1] -= KALEIDO_ROSACE
+    proches = np.argpartition(D, 1, axis=0)[:2]
+    d = np.take_along_axis(D, proches, 0)
+    premier = np.where(d[0] <= d[1], proches[0], proches[1])
+    second = np.where(d[0] <= d[1], proches[1], proches[0])
+    d1, d2 = d.min(axis=0), d.max(axis=0)
+    bord = (d2 - d1) / (2 * np.maximum(np.hypot(su[premier] - su[second], sw[premier] - sw[second]), 1e-3))
+    plomb = np.clip((bord - 0.3) / 0.8, 0, 1)                            # le plomb, sur la frontiere de deux verres
+    teintes = np.append(h0, 0.37) + (t * 0.005) % 1.0
+    verre = _reveries_palette(KALEIDO_VERRES, teintes)[premier]
+    eclat = 0.55 + 0.45 * np.exp(-np.sqrt(np.maximum(d1 + KALEIDO_ROSACE * (premier == len(su) - 1), 0)) / 7.0)
+    vague = 0.78 + 0.22 * np.sin(r * 0.16 - _reveries_phase(t, 0.3))   # la lumiere derriere, qui respire
+    img = verre * (eclat * vague * plomb)[..., None] + np.array([6, 5, 9]) * (1 - plomb)[..., None]
+    img *= np.clip(1.25 - r / 44.0, 0.45, 1)[..., None]                  # les coins dans l'ombre du tube
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- le pendule de sable
+
+PENDULE_DESSINS = (   # (rapport des deux mouvements, sens du second, desaccord, part du premier, rotation lente)
+    (4, -1, 0.05, 0.6, 0.0), (5, -1, 0.08, 0.65, 0.0), (3, -1, 0.12, 0.55, 0.0), (4, -1, 0.0, 0.6, 0.09),
+    (5, -1, 0.0, 0.65, 0.07), (3.5, -1, 0.04, 0.55, 0.0), (4, -1, 0.1, 0.6, 0.0), (6, -1, 0.035, 0.7, 0.0),
+)
+PENDULE_TEINTES = ((255, 196, 120), (255, 140, 170), (120, 205, 255), (190, 160, 255), (140, 240, 190))
+PENDULE_DUREE = 44.0
+
+
+def _pendule_nouveau(e):
+    """Un nouveau dessin : ses deux mouvements, leur desaccord, leur amortissement, sa couleur."""
+    import numpy as np
+    rng = e["rng"]
+    rapport, sens, desaccord, part, rot = PENDULE_DESSINS[e["pdessin"] % len(PENDULE_DESSINS)]
+    e["pdessin"] += 1 + int(rng.integers(0, 2))
+    w = rng.uniform(0.6, 0.7)
+    e["pmesures"] = {
+        "w": w * np.array([1.0, rapport * (1 + desaccord * rng.uniform(0.8, 1.2))]),
+        "a": 27.5 * np.array([part, 1 - part]),
+        "p": rng.uniform(0, 2 * np.pi, 2),
+        "s": np.array([1.0, sens]) * np.pi / 2,
+        "d": np.array([0.026, 0.04]) * rng.uniform(0.9, 1.1),
+        "rot": rot * rng.choice([-1, 1]),
+        "c": np.asarray(PENDULE_TEINTES[e["pteinte"] % len(PENDULE_TEINTES)], float),
+    }
+    e["pteinte"] += 1
+    e["ptau"] = -1.5                                                      # une pause : l'ancien commence a s'effacer
+    e["ptrace"] = np.zeros((64, 64))
+
+
+def _pendule_point(m, tau):
+    """Ou tombe le sable a l'instant tau : deux mouvements en rond qui s'amortissent, et le tout qui tourne."""
+    import numpy as np
+    tau = np.asarray(tau, float)[..., None]
+    env = m["a"] * np.exp(-m["d"] * tau)
+    ph = m["w"] * tau + m["p"]
+    x = (env * np.sin(ph)).sum(-1)
+    y = (env * np.sin(ph + m["s"])).sum(-1)
+    c, s = np.cos(m["rot"] * tau[..., 0]), np.sin(m["rot"] * tau[..., 0])
+    return 31.5 + x * s + y * c, 31.5 + x * c - y * s
+
+
+def _pendule_tracer(e, jusqu_a):
+    """Le sable coule du pendule de ptau jusqu'a jusqu_a : un trait continu, sans trous."""
+    import numpy as np
+    m = e["pmesures"]
+    debut = max(0.0, e["ptau"])
+    if jusqu_a <= debut:
+        e["ptau"] = jusqu_a
+        return
+    vmax = float(np.sum(m["a"] * m["w"])) + 30 * abs(m["rot"])          # la plus grande vitesse possible
+    n = int(np.ceil((jusqu_a - debut) * vmax / 0.35)) + 1
+    tau = np.linspace(debut, jusqu_a, n + 1)
+    y, x = _pendule_point(m, tau)
+    pas = np.hypot(np.diff(y), np.diff(x))
+    trait = _reveries_semer1(y[1:], x[1:], pas)
+    e["ptrace"] += trait
+    e["pfrais"] += trait
+    e["ptau"] = jusqu_a
+
+
+def _scene_pendule(p, e, t, ecoule, dt):
+    """Un pendule qu'on ne voit pas laisse couler un fil de sable lumineux : une rosace qui se dessine en
+    s'amortissant, puis s'efface doucement pendant qu'un nouveau dessin commence."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "ptrace" not in e:
+        e.update(pdessin=int(rng.integers(0, len(PENDULE_DESSINS))), pteinte=int(rng.integers(0, len(PENDULE_TEINTES))),
+                 pancien=None, pfrais=np.zeros((64, 64)))
+        _pendule_nouveau(e)
+        _pendule_tracer(e, 12.0)                                          # le dessin a deja commence
+        e["pfrais"][:] = 0
+        sable = _brume(rng, 4, 64)
+        r = np.hypot(X - 31.5, Y - 31.5)
+        lampe = np.clip(1 - r / 50, 0, 1) ** 1.5
+        e["psable"] = ((np.array([10, 8, 8]) + lampe[..., None] * np.array([34, 24, 15]))   # le sable, sous une lampe
+                       * (0.8 + 0.4 * sable)[..., None])
+    pas = min(dt, 0.5)
+    if e["ptau"] + pas > PENDULE_DUREE:                                   # fini : il s'efface, un autre commence
+        e["pancien"] = (e["ptrace"], e["pmesures"]["c"])
+        _pendule_nouveau(e)
+    e["pfrais"] *= np.exp(-pas * 1.6)
+    _pendule_tracer(e, e["ptau"] + pas)
+    m = e["pmesures"]
+    img = e["psable"].copy()
+    fondu = min(1.0, max(0.0, e["ptau"]) / 2.0)
+    img += _reveries_lumiere((e["ptrace"] * 0.6 + e["pfrais"] * 0.9)[..., None] * m["c"] * fondu, 170)
+    if e["pancien"] is not None:
+        trace, c = e["pancien"]
+        trace *= np.exp(-pas * 0.5)
+        img += _reveries_lumiere(trace[..., None] * 0.6 * c, 170)
+        if trace.max() < 0.02:
+            e["pancien"] = None
+    y, x = _pendule_point(m, max(0.0, e["ptau"]))                         # la ou le sable tombe : une petite lueur
+    d2 = (X - float(x)) ** 2 + (Y - float(y)) ** 2
+    img += (np.exp(-d2 / 5.0) * 0.35 * fondu)[..., None] * np.minimum(255, m["c"] * 0.6 + 100)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- le flocon qui pousse
+
+FLOCON_CYCLE, FLOCON_POUSSE, FLOCON_FONTE = 42.0, 24.0, 34.0              # il pousse, il brille, il fond
+FLOCON_TEINTES = ((150, 210, 255), (130, 190, 255), (170, 200, 255), (120, 225, 255))   # des bleus de glace
+
+
+def _flocon_nouveau(rng, naissance):
+    """Les mesures d'un flocon : la longueur de ses bras, ses branches, leurs rameaux, sa plaque."""
+    import numpy as np
+    R = rng.uniform(23.5, 27.5)
+    genre = int(rng.integers(0, 4))                                       # sapin, fougere, etoile, plume
+    plaque = rng.uniform(5.0, 7.0) if genre == 2 else rng.uniform(2.5, 5.5)   # l'etoile : une large plaque au coeur
+    nb = int(rng.integers(3, 6)) if genre != 2 else int(rng.integers(3, 5))
+    pos = np.linspace(plaque + 3, R - 4, nb) + rng.uniform(-1, 1, nb)
+    if genre == 0:
+        L = (R - pos) * rng.uniform(0.6, 0.8)
+    elif genre == 1:
+        L = np.sin(np.pi * (pos - plaque) / (R - plaque)) * R * rng.uniform(0.35, 0.45)
+    elif genre == 2:
+        L = rng.uniform(3.0, 6.0, nb)
+    else:
+        L = pos * rng.uniform(0.45, 0.6) * np.ones(nb)
+    L = np.minimum(L, pos * 0.9)
+    rameaux = []
+    if genre != 2:
+        for k in range(nb):
+            for m in (0.45, 0.75):
+                if L[k] * m > 3:
+                    rameaux.append((k, L[k] * m, L[k] * rng.uniform(0.22, 0.32)))
+    return {"naissance": naissance, "R": R, "plaque": plaque, "pos": pos, "L": L, "rameaux": rameaux,
+            "bout": rng.uniform(2.2, 3.0) if genre == 2 else (rng.uniform(1.5, 2.4) if rng.random() < 0.35 else 0.0),
+            "epais": rng.uniform(0.45, 0.75), "rot": rng.uniform(0, np.pi / 3),
+            "teinte": np.array(FLOCON_TEINTES[int(rng.integers(0, len(FLOCON_TEINTES)))], float),
+            "eclats": rng.uniform(0, 2 * np.pi, 6)}
+
+
+def _flocon_hexagone(u, w, cx, r):
+    """La distance (signee) a un hexagone pointe le long du bras, centre en (cx, 0)."""
+    import numpy as np
+    px, py = np.abs(u - cx), np.abs(w)
+    k = np.minimum(-0.866025 * px + 0.5 * py, 0)                          # replie sur un sixieme d'hexagone
+    px, py = px + 2 * k * 0.866025, py - 2 * k * 0.5
+    qx = px - np.clip(px, -0.57735 * r, 0.57735 * r)
+    return np.hypot(qx, py - r) * np.sign(py - r)
+
+
+def _flocon_segment(u, w, x0, y0, dx, dy, L):
+    """La distance a un segment, partant de (x0, y0) dans la direction (dx, dy), long de L."""
+    import numpy as np
+    q = np.clip((u - x0) * dx + (w - y0) * dy, 0, L)
+    return np.hypot(u - x0 - q * dx, w - y0 - q * dy)
+
+
+def _flocon_dessin(f, age, t, Y, X):
+    """Un flocon a son age : (son intensite, son halo), et la position de ses pointes."""
+    import numpy as np
+    pousse = 1 - (1 - np.clip(age / FLOCON_POUSSE, 0, 1)) ** 2.2           # vite au debut, puis il ralentit
+    fonte = np.clip((age - FLOCON_FONTE) / (FLOCON_CYCLE - FLOCON_FONTE), 0, 1)
+    rot = f["rot"] + _reveries_phase(t, 0.012)
+    dx, dy = X - 31.5, Y - 31.5
+    r = np.hypot(dx, dy)
+    s = np.pi / 3
+    a = s / 2 - np.abs(np.mod(np.arctan2(dy, dx) - rot, s) - s / 2)       # 0 sur un bras, pi/6 entre deux bras
+    u, w = r * np.cos(a), r * np.sin(a)
+    retrait = 1 - 0.25 * fonte
+    R = max(0.5, f["R"] * pousse * retrait)
+    ep = f["epais"] * (1 - 0.55 * fonte)
+    d = _flocon_segment(u, w, 0, 0, 1.0, 0.0, R) - ep * (1.15 - 0.4 * np.clip(u / max(R, 1), 0, 1))
+    longueurs = np.clip((f["R"] * pousse - f["pos"]) / (f["L"] * 1.1 + 1.5), 0, 1) ** 0.8 * f["L"] * retrait
+    for k in range(len(f["pos"])):
+        if longueurs[k] > 0.05:
+            d = np.minimum(d, _flocon_segment(u, w, f["pos"][k] * retrait, 0, 0.5, 0.866025, longueurs[k]) - ep * 0.8)
+    for k, m, l in f["rameaux"]:
+        lk = np.clip((longueurs[k] / retrait - m) / (l * 1.1 + 1.0), 0, 1) * l * retrait
+        if lk > 0.05:
+            x0 = f["pos"][k] * retrait + 0.5 * m * retrait
+            d = np.minimum(d, _flocon_segment(u, w, x0, 0.866025 * m * retrait, 1.0, 0.0, lk) - ep * 0.6)
+    plaque = f["plaque"] * min(1.0, age / 3.0 + 0.15) * retrait
+    hp = _flocon_hexagone(u, w, 0, plaque)
+    d = np.minimum(d, np.abs(hp) - ep * 0.7)                              # le bord de la plaque
+    arete = np.clip(1 - np.abs(_flocon_hexagone(u, w, 0, plaque * 0.5)) / 0.8, 0, 1)   # un hexagone dans la plaque
+    remplir = np.clip(0.5 - hp, 0, 1) * (0.32 + 0.25 * arete)
+    if f["bout"] > 0 and pousse > 0.6:
+        b = f["bout"] * np.clip((pousse - 0.6) / 0.3, 0, 1) * retrait
+        hb = _flocon_hexagone(u, w, R, b)
+        d = np.minimum(d, np.abs(hb) - ep * 0.6)
+        remplir = np.maximum(remplir, np.clip(0.5 - hb, 0, 1) * 0.35)
+    trait = np.maximum(np.clip(0.5 - d, 0, 1), remplir)
+    halo = np.exp(-np.maximum(d, 0) / (1.6 + 2.5 * fonte)) * (0.55 + 0.6 * fonte)
+    vie = (1 - fonte) ** 1.4
+    pointes = [(31.5 + R * np.sin(rot + j * s), 31.5 + R * np.cos(rot + j * s)) for j in range(6)]
+    return trait * vie, halo * vie * (0.5 + 0.5 * pousse), pointes, vie, R
+
+
+def _scene_flocon(p, e, t, ecoule, dt):
+    """Un cristal de neige pousse lentement au milieu de la nuit : ses six bras, leurs branches, leurs rameaux ;
+    il scintille, puis fond doucement, et un autre, different, se met a pousser."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "flocons" not in e:
+        e.update(fhorloge=14.0, flocons=[_flocon_nouveau(rng, 0.0)],
+                 fneige=(rng.uniform(0, 64, 22), rng.uniform(0, 64, 22), rng.uniform(1.0, 2.5, 22)))
+    e["fhorloge"] += min(dt, 0.5)
+    c = e["fhorloge"]
+    if c - e["flocons"][-1]["naissance"] >= FLOCON_CYCLE - 2.0:          # le suivant pousse quand l'autre a fondu
+        e["flocons"].append(_flocon_nouveau(rng, c))
+    e["flocons"] = [f for f in e["flocons"] if c - f["naissance"] < FLOCON_CYCLE]
+    img = _degrade((3, 6, 20), (8, 12, 32))
+    nx, ny, nv = e["fneige"]                                              # quelques flocons flous, au loin
+    ny += nv * min(dt, 0.5)
+    ny %= 66
+    loin = _reveries_semer(ny - 1, (nx + 2 * np.sin(_reveries_phase(t, 0.3) + nx)) % 64, [[40, 55, 80]])
+    img += _reveries_flou(loin, 1)
+    for f in e["flocons"]:
+        age = c - f["naissance"]
+        trait, halo, pointes, vie, R = _flocon_dessin(f, age, t, Y, X)
+        coul = f["teinte"]
+        balaye = np.mod(np.arctan2(Y - 31.5, X - 31.5) - age * 0.45, 2 * np.pi)   # un reflet qui fait le tour
+        reflet = 1 + 0.55 * np.exp(-((balaye - np.pi) / 0.5) ** 2)
+        img += halo[..., None] * coul * 0.28
+        img += (trait * reflet)[..., None] * (coul * 0.75 + np.array([60, 60, 60]) * trait[..., None])
+        for j, (py, px) in enumerate(pointes):                            # les pointes scintillent, chacune a son tour
+            k = np.clip(np.sin(t * 0.8 + f["eclats"][j]), 0, 1) ** 10 * vie * min(1.0, R / 15)
+            if k > 0.02:
+                img += _reveries_semer([py, py - 1, py + 1, py, py], [px, px, px, px - 1, px + 1],
+                                       np.array([[255, 255, 255]] + [[150, 200, 255]] * 4) * k)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- le vortex de lumiere
+
+VORTEX_COULEURS = ((80, 140, 255), (170, 80, 255), (255, 80, 170), (255, 180, 80), (60, 220, 230))
+VORTEX_LOIN, VORTEX_PRES, VORTEX_VITESSE = 16.0, 0.4, 0.08                # profondeurs, et tours de tunnel par seconde
+VORTEX_TRAINEE = tuple((k * 0.05, (1 - k / 12.0) ** 1.5) for k in range(12))   # (retard, eclat) le long de la trainee
+
+
+def _scene_vortex(p, e, t, ecoule, dt):
+    """Un vortex de lumiere : des milliers d'etincelles tournent en spirale et filent vers nous depuis le fond,
+    des anneaux de couleur passent, une lueur brille tout au bout."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "vortex" not in e:
+        n = 1200
+        e["vortex"] = (rng.uniform(0, 2 * np.pi, n), np.clip(1 + rng.normal(0, 0.16, n), 0.45, 1.5),   # angle, rayon,
+                       rng.uniform(0, 1, n), rng.uniform(0.85, 1.15, n),                              # ou, vitesse,
+                       rng.uniform(0.3, 1.0, n) ** 1.5)                                               # eclat
+    a0, rr, q0, vk, lum0 = e["vortex"]
+    etendue = np.log(VORTEX_PRES / VORTEX_LOIN)
+    bx, by = 9 * np.sin(_reveries_phase(t, 0.071)), 7 * np.sin(_reveries_phase(t, 0.053, 1.0))   # le tunnel se courbe
+    avance = (t * VORTEX_VITESSE) % 1.0
+    q = np.mod(q0 + avance + (t * VORTEX_VITESSE * (vk - 1)) % 1.0, 1.0)  # chacune a sa vitesse, sans saut au bouclage
+    bande = q - avance                                                    # la place dans le tunnel : les anneaux
+    derive = (t * 0.013) % 1.0                                            # les couleurs glissent : jamais le meme tour
+    coul = _reveries_palette(VORTEX_COULEURS, bande * 2.0 + derive)
+    anneau = 0.15 + 0.85 * (0.5 + 0.5 * np.cos(2 * np.pi * bande * 5)) ** 4   # les etincelles vont par anneaux
+    fondu = np.clip((q - 0.33) / 0.32, 0, 1) ** 1.5 * np.clip((1 - q) / 0.06, 0, 1)   # au fond : la lueur seule
+    base = lum0 * fondu * anneau
+    tour = _reveries_phase(t, 0.15)
+    ys, xs, ls = [], [], []
+    for retard, poids in VORTEX_TRAINEE:                                  # chaque etincelle et sa trainee
+        qj = q - retard * VORTEX_VITESSE * vk
+        z = VORTEX_LOIN * np.exp(qj * etendue)
+        th = a0 + tour - retard * 0.15 - 1.0 * np.log(z)                  # une spirale, plus serree au fond
+        k = (1 - VORTEX_PRES / z) ** 1.5
+        rayon = 14.0 * rr / z
+        ys.append(31.5 + by * k + rayon * np.sin(th))
+        xs.append(31.5 + bx * k + rayon * np.cos(th))
+        ls.append(base * np.clip((2.0 / z) ** 1.3, 0, 2.5) * poids * (qj >= 0))   # de pres plus vives ; pas de trainee
+    l = np.concatenate(ls)                                                # a travers le bouclage
+    couleurs = np.tile(coul, (len(VORTEX_TRAINEE), 1)) * l[:, None] * 0.7
+    img = _reveries_semer(np.concatenate(ys), np.concatenate(xs), couleurs)
+    fx, fy = 31.5 + bx, 31.5 + by
+    d = np.hypot(X - fx, Y - fy)
+    souffle = 0.85 + 0.15 * np.sin(_reveries_phase(t, 0.5))
+    img += (np.exp(-d / 1.6) * 1.4 * souffle)[..., None] * np.array([235, 225, 255])     # la lueur au fond
+    img += (np.exp(-d / 6.0) * 0.35 * souffle)[..., None] * _reveries_palette(VORTEX_COULEURS, -avance * 2.0 + derive)
+    for k in range(5):                                                    # les anneaux de lumiere qui passent
+        qa = (k / 5.0 + avance) % 1.0
+        z = VORTEX_LOIN * np.exp(qa * etendue)
+        kk = (1 - VORTEX_PRES / z) ** 1.5
+        rayon = 14.0 / z
+        da = np.hypot(X - 31.5 - bx * kk, Y - 31.5 - by * kk)
+        large = 0.6 + rayon * 0.05
+        f = np.clip(qa / 0.2, 0, 1) * np.clip((1 - qa) / 0.25, 0, 1) * 0.45
+        teinte = _reveries_palette(VORTEX_COULEURS, k / 5.0 * 2.0 + derive)
+        img += (np.exp(-((da - rayon) / large) ** 2) * f)[..., None] * teinte
+    lum = _reveries_lumiere(img, 200)
+    fond = np.array([3, 2, 10]) + np.exp(-d / 26)[..., None] * np.array([12, 6, 26])
+    out = fond + lum + 0.3 * _reveries_halo(lum, 2)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 # Les ambiances d'abord (la page les montre dans cet ordre), puis les jeux de lumiere.
 ECRANS = {
     "aurore": ("Aurore boreale", _ecran_aurore),
@@ -16660,7 +18298,7 @@ ECRANS_AMBIANCES = ("aurore", "aurore_lac", "coucher", "lucioles", "nebuleuse", 
                     "sillages", "neige")
 
 
-DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur, titre), ...)), ...))
+DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur ou None, titre), ...)), ...))
     ("sous_l_eau", "Sous l'eau : recif, abysses, banc de poissons, kelp, baleine", (
         ("recif", _scene_recif, (("tropical", "Recif de corail"), ("nuit", "Recif la nuit"))),
         ("abysses", _scene_abysses, (("bleu", "Abysses"), ("violet", "Abysses violettes"))),
@@ -16699,7 +18337,25 @@ DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur, ti
         ("cristaux", _scene_cristaux, (("amethyste", "Grotte d'amethyste"), ("emeraude", "Grotte d'emeraude"))),
         ("lave", _scene_lave, (("rouge", "Volcan"), ("bleu", "Volcan au feu bleu"))),
         ("phare", _scene_phare, (("tempete", "Phare dans la tempete"), ("calme", "Phare la nuit"))),
-        ("murmuration", _scene_murmuration, (("coucher", "Etourneaux au couchant"), ("ville", "Etourneaux sur la ville"))))),
+        ("murmuration", _scene_murmuration, (("coucher", "Etourneaux au couchant"), ("ville", "Etourneaux sur la ville"))),
+        ("village_neige", _scene_village_neige, ((None, "Village sous la neige"),)))),
+    ("cocon", "Le cocon : bougies, feu de cheminee, the sous la pluie, rayon de soleil, lampe a fibres, boule plasma, "
+              "vinyle", (
+        ("bougies", _scene_bougies, ((None, "Bougies dans le noir"),)),
+        ("cheminee", _scene_cheminee, ((None, "Feu de cheminee"),)),
+        ("the", _scene_the, ((None, "The sous la pluie"),)),
+        ("poussiere", _scene_poussiere, ((None, "Poussiere dans la lumiere"),)),
+        ("fibres", _scene_fibres, ((None, "Lampe a fibres optiques"),)),
+        ("boule_plasma", _scene_boule_plasma, ((None, "Boule plasma"),)),
+        ("vinyle", _scene_vinyle, ((None, "Vinyle qui tourne"),)))),
+    ("reveries", "Les reveries : rubans de soie, encre dans l'eau, courants de lumiere, kaleidoscope, pendule de "
+                 "sable, flocon qui pousse", (
+        ("rubans", _scene_rubans, ((None, "Rubans de soie"),)),
+        ("encre", _scene_encre, ((None, "Encre dans l'eau"),)),
+        ("flux", _scene_flux, ((None, "Courants de lumiere"),)),
+        ("kaleidoscope", _scene_kaleidoscope, ((None, "Kaleidoscope"),)),
+        ("pendule", _scene_pendule, ((None, "Pendule de sable"),)),
+        ("flocon", _scene_flocon, ((None, "Flocon qui pousse"),)))),
     ("espace", "L'espace : planete a anneaux, trou noir, galaxie", (
         ("planete", _scene_planete, (("saturne", "Planete a anneaux"), ("glace", "Planete de glace"))),
         ("trou_noir", _scene_trou_noir, (("or", "Trou noir"), ("bleu", "Trou noir bleu"))),
@@ -16722,8 +18378,9 @@ for _famille, _texte, _scenes in DECORS:
     _noms = []
     for _scene, _moteur, _humeurs in _scenes:
         for _humeur, _titre in _humeurs:
-            ECRANS[_scene + "_" + _humeur] = (_titre, _scene_selon(_moteur, _humeur))
-            _noms.append(_scene + "_" + _humeur)
+            _cle = _scene if _humeur is None else _scene + "_" + _humeur       # une seule ambiance : le nom de la scene
+            ECRANS[_cle] = (_titre, _scene_selon(_moteur, _humeur))
+            _noms.append(_cle)
     FAMILLES_ECRANS.append((_famille, "%s (%d)" % (_texte, len(_noms)), tuple(_noms)))
 for _cle, _titre, _reglages in _presets_boreaux():
     ECRANS[_cle] = (_titre, _ecran_selon(_reglages))
@@ -16731,8 +18388,9 @@ ECRANS_AURORES = tuple(cle for cle, _, _ in _presets_boreaux())
 FAMILLES_ECRANS.append(("boreales", "Les aurores boreales : montagnes, lac, fjord, mer, banquise, foret, cabane, phare, "
                                     "village, igloo, volcan, sommet, ciel (16)",
                         tuple(c for c in ECRANS_AURORES if c.startswith("boreale_"))))
-FAMILLES_ECRANS.append(("tunnels", "Les tunnels boreaux : rond, carre, en spirale, d'anneaux, vermoulu (5)",
-                        tuple(c for c in ECRANS_AURORES if c.startswith("tunnel_"))))
+ECRANS["vortex"] = ("Vortex de lumiere", _scene_selon(_scene_vortex, None))
+FAMILLES_ECRANS.append(("tunnels", "Les tunnels de lumiere : rond, carre, en spirale, d'anneaux, vermoulu, vortex (6)",
+                        tuple(c for c in ECRANS_AURORES if c.startswith("tunnel_")) + ("vortex",)))
 FAMILLES_ECRANS = tuple(FAMILLES_ECRANS)
 ECRANS_DECORS = tuple(n for _, _, noms in FAMILLES_ECRANS for n in noms)
 
