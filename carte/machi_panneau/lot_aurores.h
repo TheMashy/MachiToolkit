@@ -187,10 +187,10 @@ void bor_faites(const float *crete, int bas, float r, float v, float b) {
 }
 
 // la crete de cretes() dans _paysage_boreal
-void bor_cretes(float *crete, float h0, float amp, float f, bool pointu = true, float graine = 0.0f) {
-  for (int x = 0; x < W; x++) {
-    const float s = sinf(x * f + 1.3f + graine);
-    crete[x] = h0 - amp * (pointu ? fabsf(s) : 0.5f + 0.5f * s) - amp * 0.35f * sinf(x * f * 2.7f + graine);
+void bor_cretes(float *crete, float h0, float amp, float f, bool pointu = true, float decal = 0.0f) {
+  for (int x = 0; x < W; x++) {   // (decal : le parametre `graine` de cretes())
+    const float s = sinf(x * f + 1.3f + decal);
+    crete[x] = h0 - amp * (pointu ? fabsf(s) : 0.5f + 0.5f * s) - amp * 0.35f * sinf(x * f * 2.7f + decal);
   }
 }
 

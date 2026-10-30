@@ -1113,25 +1113,431 @@ void s_poussiere(int humeur, bool debut, float t, float ecoule, float dt) {
   }
 }
 
-struct E_fibres { char rien; };
+// --- la lampe a fibres optiques ----------------------------------------------------------------------------------
+
+// humeurs : 0 = (une seule ambiance)
+struct E_fibres {
+  float th[72], l[72], ph[72], u[72], x0[72];   // chaque fibre : son angle, sa longueur, sa teinte, son pied
+  float s14[30], longs[30];                     // le long d'une fibre : sa courbure, son eclat
+  float px[72][30], py[72][30];                 // ses points, a cette image
+  float p[4096 * 3];                            // les pointes, puis leur halo, puis les fils
+};
 void s_fibres(int humeur, bool debut, float t, float ecoule, float dt) {
   E_fibres &e = etat_ecran<E_fibres>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)ecoule; (void)dt;
+  if (debut) {
+    for (int i = 0; i < 72; i++) {                       // reparties, un peu au hasard, plus nombreuses au centre
+      const float r = fmaxf(-1.0f, fminf(1.0f, -1 + 2.0f * i / 71 + hasard(-0.6f, 0.6f) / 72 * 2));
+      e.th[i] = (r < 0 ? -1 : r > 0 ? 1 : 0) * powf(fabsf(r), 0.8f) * 1.3f;
+    }
+    for (int i = 71; i > 0; i--) {
+      const int j = aleatoire() % (i + 1);
+      const float c = e.th[i]; e.th[i] = e.th[j]; e.th[j] = c;
+    }
+    for (int i = 0; i < 72; i++) {
+      e.l[i] = (41 - 11 * fabsf(e.th[i]) / 1.3f) * powf(hasard(0.5f, 1.0f), 0.7f);
+      e.ph[i] = hasard(0, PI2);
+      e.u[i] = (e.th[i] + 1.3f) / 2.6f + hasard(-0.05f, 0.05f);
+      e.x0[i] = hasard(-1, 1);
+    }
+    for (int k = 0; k < 30; k++) {
+      const float s = k / 29.0f;
+      e.s14[k] = 0.06f + 2.1f * powf(s, 1.4f);            // elles partent droites, puis s'ouvrent et retombent
+      e.longs[k] = 0.035f + 0.12f * (1 - s) * (1 - s) * (1 - s);
+    }
+  }
+  float coul[72][3], moy[3] = {0, 0, 0};
+  const float oscille = 0.04f * sinf(t * 0.27f);
+  for (int i = 0; i < 72; i++) {
+    const float th = e.th[i] + 0.05f * cr_sin(t * 0.5f + e.th[i] * 2.5f) + 0.025f * cr_sin(t * 0.83f + e.ph[i]) + oscille;
+    const float pas = e.l[i] / 30;
+    float x = 32 + e.x0[i] * 0.5f, y = 49.8f;
+    for (int k = 0; k < 30; k++) {
+      const float phi = th * e.s14[k];
+      x += cr_sin(phi) * pas; y -= cr_cos(phi) * pas;
+      e.px[i][k] = x; e.py[i][k] = y;
+    }
+    float h = e.u[i] * 0.85f + t * 0.025f;               // le degrade arc-en-ciel, qui tourne
+    float r, g, b;
+    teinte(h - floorf(h), 0.72f, 1.0f, r, g, b);
+    coul[i][0] = floorf(r); coul[i][1] = floorf(g); coul[i][2] = floorf(b);
+    for (int c = 0; c < 3; c++) moy[c] += coul[i][c] / 72;
+  }
+  for (int y = 0; y < 64; y++) {
+    float f[3];
+    if (y < 58) { const float k = fminf(1.0f, y / 56.0f); f[0] = 4 + 6 * k; f[1] = 3 + 5 * k; f[2] = 10 + 8 * k; }
+    else if (y == 58) { f[0] = 26; f[1] = 22; f[2] = 32; }
+    else { const float k = (y - 58) / 6.0f; f[0] = 18 - 11 * k; f[1] = 15 - 9 * k; f[2] = 24 - 14 * k; }
+    for (int x = 0; x < 64; x++) peindre(y, x, f[0], f[1], f[2]);
+  }
+  // les pointes : un point de lumiere (1.25), son halo (le flou [1 2 1], 0.9), la couleur qui baigne la piece
+  // (six flous, 2.4) -- chaque pointe posee d'un coup avec ce noyau (separable terme a terme) : pas de flou a faire
+  static const float B2[3] = {0.25f, 0.5f, 0.25f};
+  static const float B12[13] = {1 / 4096.0f, 12 / 4096.0f, 66 / 4096.0f, 220 / 4096.0f, 495 / 4096.0f, 792 / 4096.0f, 924 / 4096.0f,
+                                792 / 4096.0f, 495 / 4096.0f, 220 / 4096.0f, 66 / 4096.0f, 12 / 4096.0f, 1 / 4096.0f};
+  for (int i = 0; i < 72; i++) {
+    const float k = 0.8f + 0.2f * cr_sin(t * 1.1f + e.ph[i] * 3);
+    const float x = e.px[i][29], y = e.py[i][29];
+    const float fy0 = floorf(y), fx0 = floorf(x);
+    const int y0 = (int)fy0, x0 = (int)fx0;
+    const float fy = y - fy0, fx = x - fx0;
+    float v[3][14], h[3][14];                            // les profils (lignes y0-6 .. y0+7), pour chaque terme
+    for (int j = 0; j < 14; j++) {
+      for (int m = 0; m < 3; m++) v[m][j] = h[m][j] = 0;
+      const int o = j - 6;                               // decalage par rapport a y0
+      if (o == 0) { v[0][j] = 1 - fy; h[0][j] = 1 - fx; }
+      if (o == 1) { v[0][j] = fy; h[0][j] = fx; }
+      if (o >= -1 && o <= 1) { v[1][j] += (1 - fy) * B2[o + 1]; h[1][j] += (1 - fx) * B2[o + 1]; }
+      if (o >= 0 && o <= 2) { v[1][j] += fy * B2[o]; h[1][j] += fx * B2[o]; }
+      if (o >= -6 && o <= 6) { v[2][j] += (1 - fy) * B12[o + 6]; h[2][j] += (1 - fx) * B12[o + 6]; }
+      if (o >= -5 && o <= 7) { v[2][j] += fy * B12[o + 5]; h[2][j] += fx * B12[o + 5]; }
+    }
+    const float r = coul[i][0] * k, g = coul[i][1] * k, b = coul[i][2] * k;
+    for (int j = 0; j < 14; j++) {
+      const int yy = y0 - 6 + j;
+      if (yy < 0 || yy > 63) continue;
+      const float a0 = 1.25f * v[0][j], a1 = 0.9f * v[1][j], a2 = 2.4f * v[2][j];
+      for (int m = 0; m < 14; m++) {
+        const int xx = x0 - 6 + m;
+        if (xx < 0 || xx > 63) continue;
+        const float s = a0 * h[0][m] + a1 * h[1][m] + a2 * h[2][m];
+        float *p = scene[yy][xx];
+        p[0] += s * r; p[1] += s * g; p[2] += s * b;
+      }
+    }
+  }
+  // les fibres : fines, sombres, plus claires au pied
+  for (int i = 0; i < 4096 * 3; i++) e.p[i] = 0;
+  for (int i = 0; i < 72; i++)
+    for (int k = 0; k < 29; k++)
+      cr_tamponner3(e.p, e.py[i][k], e.px[i][k], coul[i][0] * e.longs[k], coul[i][1] * e.longs[k], coul[i][2] * e.longs[k]);
+  for (int i = 0; i < 4096 * 3; i++) (&scene[0][0][0])[i] += fminf(e.p[i], 55.0f);
+  // le socle : un dome noir et brillant, eclaire de la couleur du moment
+  for (int y = 50; y <= 58; y++) {
+    const float rel = (y - 50) / 8.0f, larg = 2.2f + 4.4f * sqrtf(rel), dome = 0.3f * cr_clip01(1 - rel * 1.5f);
+    for (int x = 0; x < 64; x++) {
+      if (fabsf(x - 32.0f) > larg) continue;
+      const float q = ((x - 32) / larg + 0.42f) / 0.16f, l = expf(-q * q);
+      peindre(y, x, 14 + 70 * l + moy[0] * dome, 12 + 70 * l + moy[1] * dome, 20 + 80 * l + moy[2] * dome);
+    }
+  }
+  for (int y = 42; y <= 58; y++)                          // la lumiere du socle
+    for (int x = 18; x <= 46; x++) {
+      const float k = 0.8f * cr_exp(-hypotf(x - 32.0f, (y - 50) * 1.8f) / 2.0f);
+      ajouter(y, x, k, moy[0] * 0.6f + 90, moy[1] * 0.6f + 90, moy[2] * 0.6f + 90);
+    }
+  for (int y = 58; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const float k = 0.7f * cr_exp(-hypotf((x - 32) / 3.2f, (y - 59.5f) / 0.8f) / 2.6f);
+      ajouter(y, x, k, moy[0], moy[1], moy[2]);
+    }
 }
 
-struct E_boule_plasma { char rien; };
+// --- la boule plasma ---------------------------------------------------------------------------------------------
+
+static const float CR_PLASMA_CX = 32.0f, CR_PLASMA_CY = 28.0f, CR_PLASMA_R = 21.5f;
+
+// humeurs : 0 = (une seule ambiance)
+struct E_boule_plasma {
+  uint8_t fond[4096][3];                   // le fond, le verre, le socle, et la lueur de l'electrode (hors socle)
+  uint8_t genre[4096];                     // 1 dans la boule, 2 le socle, 4 pres de l'electrode
+  float a0[7], w[7][2], ph[7][8], br[7][2][2];
+  float fil[4096], impact[4096];
+};
+
+// la main invisible : (force 0..1, angle) ; elle se pose sur le verre de temps en temps
+inline float cr_plasma_main(float t, float &cote) {
+  const float k = floorf(t / 38.0f), f = t / 38.0f - k;
+  float h = sinf(k * 12.9898f) * 43758.5453f;
+  h -= floorf(h);
+  cote = 0;
+  if (h > 0.5f) return 0;
+  static const float cotes[7] = {-0.35f, -2.75f, -1.0f, 0.35f, -2.2f, 2.9f, -0.7f};
+  const float a = fminf(cr_clip01((f - 0.25f) / 0.15f), cr_clip01((0.75f - f) / 0.15f));
+  cote = cotes[(int)(h * 14) % 7];
+  return a * a * (3 - 2 * a);
+}
+
 void s_boule_plasma(int humeur, bool debut, float t, float ecoule, float dt) {
   E_boule_plasma &e = etat_ecran<E_boule_plasma>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)ecoule; (void)dt;
+  const float cx = CR_PLASMA_CX, cy = CR_PLASMA_CY, R = CR_PLASMA_R;
+  if (debut) {
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 64; x++) {
+        const int i = y * 64 + x;
+        const float d = hypotf(x - cx, y - cy), k = y / 60.0f > 1 ? 1.0f : y / 60.0f;
+        float c[3];
+        if (d < R) {                                     // le gaz, un peu plus clair au centre
+          const float g = cr_clip01(1 - d / R);
+          c[0] = 14 + 16 * g; c[1] = 4 + 6 * g; c[2] = 26 + 26 * g;
+        } else {
+          const float g = expf(-(d - R) / 7.0f);
+          c[0] = 5 + 4 * k + 34 * g; c[1] = 3 + 2 * k + 12 * g; c[2] = 11 + 5 * k + 50 * g;
+        }
+        const float ang = atan2f(y - cy, x - cx);
+        const float verre = cr_clip01(1 - fabsf(d - R + 0.3f) / 1.1f);
+        const float reflet = cr_clip01(1 - fabsf(d - R + 2.6f)) * cr_clip01(1 - fabsf(ang + 2.3f) / 0.38f);
+        c[0] += verre * 60 + reflet * 90; c[1] += verre * 44 + reflet * 84; c[2] += verre * 96 + reflet * 114;
+        if (fabsf(x - cx) < 0.7f && y > cy + 3 && y < 48) { c[0] = 34; c[1] = 22; c[2] = 44; }   // la tige de verre
+        const float rel = (y - 46) / 15.0f, lg = 8.5f + rel * 6;
+        const bool socle = rel >= 0 && rel <= 1 && fabsf(x - cx) <= lg;
+        if (socle) {                                     // le socle noir
+          const float q = ((x - cx) / lg + 0.45f) / 0.2f;
+          const float b = (1 - 0.35f * rel) * (0.7f + 0.5f * expf(-q * q));
+          c[0] = 20 * b; c[1] = 15 * b; c[2] = 28 * b;
+          if (y <= 47) { c[0] = 58; c[1] = 36; c[2] = 82; }   // le col, eclaire par la boule
+          if (fabsf(x - cx - 5) < 0.8f && fabsf(y - 55.0f) < 0.8f) { c[0] = 90; c[1] = 50; c[2] = 120; }   // le bouton
+        }
+        if (y >= 61) { c[0] = 10; c[1] = 7; c[2] = 14; }
+        e.genre[i] = (d < R - 0.4f ? 1 : 0) | (socle ? 2 : 0) | (d < 3.6f ? 4 : 0);
+        if (!socle) {                                    // la lueur de l'electrode
+          const float g = expf(-d / 4.5f) * 0.45f;
+          c[0] += g * 210; c[1] += g * 120; c[2] += g * 255;
+        }
+        for (int j = 0; j < 3; j++) e.fond[i][j] = (uint8_t)fminf(255.0f, c[j] + 0.5f);
+      }
+    for (int k = 0; k < 7; k++) {
+      e.a0[k] = PI2 * k / 7 + hasard(-0.3f, 0.3f);
+      e.w[k][0] = hasard(0.07f, 0.16f); e.w[k][1] = hasard(0.22f, 0.4f);
+      for (int j = 0; j < 8; j++) e.ph[k][j] = hasard(0, PI2);
+      for (int j = 0; j < 2; j++) { e.br[k][j][0] = hasard(0.45f, 0.75f); e.br[k][j][1] = hasard(0.12f, 0.32f); }
+      e.br[k][1][1] *= -1;                               // une branche de chaque cote
+    }
+  }
+  float cote;
+  const float force = cr_plasma_main(t, cote);
+  for (int i = 0; i < 4096; i++) e.fil[i] = e.impact[i] = 0;
+  const float r0 = 3.4f, r1 = R - 1.2f;
+  for (int k = 0; k < 7; k++) {
+    float alpha = e.a0[k] + 0.55f * sinf(t * e.w[k][0] + e.ph[k][0]) + 0.3f * sinf(t * e.w[k][1] + e.ph[k][1]);
+    float ecart = cote - alpha + 3.14159265f;
+    ecart = ecart - PI2 * floorf(ecart / PI2) - 3.14159265f;
+    const float tire = force * cr_clip01(1.2f - fabsf(ecart) / 1.5f);   // la main tire les filaments les plus proches
+    alpha += ecart * tire * 0.95f;
+    const float ca = cosf(alpha), sa = sinf(alpha);
+    float fx[46], fy[46];
+    for (int j = 0; j < 46; j++) {                       // des filaments qui serpentent
+      const float s = j / 45.0f;
+      const float sp = cr_sin(3.14159265f * s);
+      const float ondule = (sp > 0 ? powf(sp, 0.7f) : 0.0f)
+          * (2.0f * cr_sin(s * 4.1f + t * 0.55f + e.ph[k][2]) + 1.0f * cr_sin(s * 9.3f - t * 1.0f + e.ph[k][3])
+             + 0.45f * cr_sin(s * 19.0f + t * 1.7f + e.ph[k][4])) * (1 - 0.7f * tire);
+      const float rr = r0 + s * (r1 - r0);
+      fx[j] = cx + rr * ca - ondule * sa; fy[j] = cy + rr * sa + ondule * ca;
+      cr_tamponner1(e.fil, fy[j], fx[j], (0.2f + 0.24f * s * s) * (1 + 0.35f * tire));
+    }
+    cr_tamponner1(e.impact, fy[45], fx[45], (1.3f + 2.0f * tire) * (0.85f + 0.15f * sinf(t * 1.3f + k)));
+    for (int j = 0; j < 2; j++) {                        // les ramifications, pres du verre
+      const float db = e.br[k][j][1] * (1 - 0.7f * tire);
+      const int i0 = (int)(e.br[k][j][0] * 45);
+      const float bx = fx[i0], by = fy[i0];
+      const float ex = cx + r1 * cosf(alpha + db), ey = cy + r1 * sinf(alpha + db);
+      const float nx = -(ey - by), ny = ex - bx, ln = hypotf(nx, ny) + 1e-6f;
+      for (int m = 0; m < 18; m++) {
+        const float q = m / 17.0f;
+        const float tort = cr_sin(3.14159265f * q) * 0.9f * cr_sin(q * 7 + t * 0.9f + e.ph[k][5 + j]);
+        cr_tamponner1(e.fil, by + (ey - by) * q + tort * ny / ln, bx + (ex - bx) * q + tort * nx / ln,
+                      0.2f * (0.5f + 0.5f * q) * (1 - 0.5f * tire));
+      }
+      cr_tamponner1(e.impact, ey, ex, 0.6f * (1 - 0.6f * tire) * (0.85f + 0.15f * sinf(t * 1.3f + (j + 1) * 7 + k)));
+    }
+  }
+  for (int i = 0; i < 4096; i++) {
+    float *p = &scene[0][0][0] + 3 * i;
+    p[0] = e.fond[i][0]; p[1] = e.fond[i][1]; p[2] = e.fond[i][2];
+    if ((e.genre[i] & 3) == 1) {
+      const float f = fminf(e.fil[i], 1.2f) * 0.7f;
+      p[0] += f * 255; p[1] += f * 185; p[2] += f * 255;
+    }
+  }
+  // les halos : le filament flou, puis tres flou ; l'impact, et sa lueur
+  const int y0 = 1, y1 = 56, x0 = 5, x1 = 60;
+  static const float halos[4][4] = {{200 * 0.75f, 80 * 0.75f, 255 * 0.75f, 1}, {280, 72, 450, 3},
+                                    {255 * 1.5f, 190 * 1.5f, 250 * 1.5f, 1}, {255 * 2.4f, 70 * 2.4f, 190 * 2.4f, 2}};
+  for (int h = 0; h < 4; h++) {
+    float *buf = h < 2 ? e.fil : e.impact;
+    cr_flou_cocon(buf, 1, (int)halos[h][3], y0, y1, x0, x1);
+    for (int y = y0; y < y1; y++)
+      for (int x = x0; x < x1; x++) {
+        const int i = y * 64 + x;
+        if ((e.genre[i] & 3) == 1) ajouter(y, x, buf[i], halos[h][0], halos[h][1], halos[h][2]);
+      }
+  }
+  for (int y = 24; y <= 32; y++)                          // l'electrode, une bille qui luit
+    for (int x = 28; x <= 36; x++) {
+      const int i = y * 64 + x;
+      if (!(e.genre[i] & 4)) continue;
+      const float d = hypotf(x - cx, y - cy), b = cr_clip01(3.6f - d), g = expf(-d / 4.5f) * 0.45f;
+      const float c = cr_clip01(1 - d / 2.6f);
+      float *p = scene[y][x];
+      p[0] = (p[0] - g * 210) * (1 - b) + b * (200 + 55 * c) + g * 210;
+      p[1] = (p[1] - g * 120) * (1 - b) + b * (120 + 120 * c) + g * 120;
+      p[2] = (p[2] - g * 255) * (1 - b) + b * 255 + g * 255;
+    }
+  if (force > 0)
+    for (int i = 0; i < 4096; i++)
+      if (e.genre[i] & 2) { float *p = &scene[0][0][0] + 3 * i; p[0] += force * 12; p[1] += force * 12; p[2] += force * 12; }
 }
 
-struct E_vinyle { char rien; };
+// --- le vinyle ---------------------------------------------------------------------------------------------------
+
+static const float CR_DISQUE_CX = 27.0f, CR_DISQUE_CY = 35.0f, CR_DISQUE_K = 0.56f;
+static const int8_t CR_NOTE[8][2] = {{0, 1}, {0, 2}, {1, 1}, {2, 1}, {3, 0}, {3, 1}, {4, 0}, {4, 1}};   // une croche
+
+struct CR_Sillon { uint16_t i; uint8_t ajout[3]; float r, th, a, b, sill, mul, lampe; };
+
+// humeurs : 0 = (une seule ambiance)
+struct E_vinyle {
+  uint8_t fixe[4096][3];                   // tout ce qui ne tourne pas
+  CR_Sillon d[900];                        // le disque, pixel par pixel
+  int nd;
+  float eq[7][3], glint[3];
+};
+
 void s_vinyle(int humeur, bool debut, float t, float ecoule, float dt) {
   E_vinyle &e = etat_ecran<E_vinyle>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)ecoule; (void)dt;
+  const float cx = CR_DISQUE_CX, cy = CR_DISQUE_CY, kd = CR_DISQUE_K, angle_l = -1.94f;
+  if (debut) {
+    const float px = 52.5f, py = 20.5f;                  // le bras : un pivot, un contrepoids, un tube fin
+    const float hx = cx + 16.0f * cosf(0.22f), hy = cy + 16.0f * kd * sinf(0.22f);
+    const float lx = hx - px, ly = hy - py, lg = hypotf(lx, ly);
+    e.nd = 0;
+    for (int y = 0; y < 64; y++)
+      for (int x = 0; x < 64; x++) {
+        const int i = y * 64 + x;
+        const float lampe = 0.16f + expf(-hypotf(x - 5.0f, y - 5.0f) / 24.0f);
+        const float k = y / 64.0f;
+        float c[3] = {10 + 4 * k, 7 + 2 * k, 10};
+        const float a = expf(-hypotf(x - 5.0f, (y - 7) * 1.2f) / 9.0f) * 0.5f;
+        c[0] += a * 255; c[1] += a * 150; c[2] += a * 70;
+        if (y > 10) {                                    // la lumiere qui tombe de l'abat-jour
+          const float cone = cr_clip01(1 - fabsf((x - 4) - (y - 10) * 0.55f) / (2 + (y - 10) * 0.45f)) * expf(-(y - 10) / 14.0f) * 0.22f;
+          c[0] += cone * 255; c[1] += cone * 170; c[2] += cone * 90;
+        }
+        const float rel = cr_clip01((y - 15) / 39.0f);   // le socle : un plateau de noyer en perspective
+        if (y >= 15 && y <= 54 && x >= 8 - rel * 6 && x <= 58 + rel * 4) {
+          const float g = (0.86f + 0.14f * sinf(y * 1.7f + sinf(x * 0.21f + y * 0.1f) * 2.2f)) * lampe * (y == 15 ? 1.3f : 1.0f);
+          c[0] = 96 * g; c[1] = 58 * g; c[2] = 32 * g;
+        }
+        const bool face = y >= 55 && y <= 60 && x >= 2 && x <= 62;
+        if (face) {
+          const float g = 0.45f + 0.4f * lampe;
+          c[0] = 46 * g; c[1] = 28 * g; c[2] = 16 * g;
+          if (y == 55) { c[0] = 120; c[1] = 80; c[2] = 48; }
+        }
+        if (y >= 60 && !face) { c[0] = 8; c[1] = 6; c[2] = 8; }
+        if (y >= 1 && y <= 9 && x <= 7.5f + (y - 1) * 0.75f) {   // l'abat-jour de la lampe, dans le coin
+          const float g = (0.55f + 0.45f * (y / 9.0f)) * (0.9f + 0.1f * sinf(x * 2.1f));
+          c[0] = 255 * g; c[1] = 176 * g; c[2] = 92 * g;
+          if (y == 9) { c[0] = 255; c[1] = 220; c[2] = 160; }
+          if (y == 1) { c[0] = 150; c[1] = 90; c[2] = 50; }
+        }
+        if (y == 0 && x >= 3 && x <= 4) { c[0] = 40; c[1] = 30; c[2] = 26; }   // sa tige
+        const float u = x - cx, v = (y - cy) / kd, r = hypotf(u, v), th = atan2f(v, u);
+        if (hypotf(u, (y - cy - 1.6f) / kd) <= 23.0f && r > 23.0f) { c[0] = 34; c[1] = 34; c[2] = 38; }   // l'epaisseur
+        if (r <= 23.0f && r > 21.3f) {                   // la jante
+          const float g = 0.55f + 0.45f * cr_clip01(-sinf(th + 0.9f)) + 0.25f * lampe;
+          c[0] = 120 * g; c[1] = 120 * g; c[2] = 126 * g;
+          if (fabsf(th - 1.0f) < 0.06f) { c[0] = 255; c[1] = 120; c[2] = 60; }   // le point du stroboscope
+        }
+        const float q = cr_clip01(((x - px) * lx + (y - py) * ly) / (lg * lg));
+        const float bras = cr_clip01(1.25f - hypotf(x - px - q * lx, y - py - q * ly)) * (q > 0.08f);
+        const float ombre = cr_clip01(1.2f - hypotf(x - px - q * lx + 1.5f, y - py - q * ly - 2.2f)) * (q > 0.15f);
+        const bool tete = fabsf((x - hx) * lx + (y - hy) * ly) / lg <= 1.6f && fabsf((x - hx) * ly - (y - hy) * lx) / lg <= 1.3f;
+        const bool pivot = hypotf(x - px, (y - py) * 1.2f) <= 3.2f;
+        const bool poids = hypotf(x - px - 3.2f, (y - py + 3.6f) * 1.2f) <= 2.1f;
+        const float mul = (1 - 0.55f * ombre) * (1 - bras), bl = 0.6f + 0.4f * lampe;
+        const float ajout[3] = {bras * 186 * bl, bras * 184 * bl, bras * 190 * bl};
+        for (int j = 0; j < 3; j++) c[j] = c[j] * mul + ajout[j];
+        const bool fige = tete || pivot || poids;
+        if (tete) { c[0] = 150; c[1] = 148; c[2] = 156; }
+        if (pivot) { c[0] = 96; c[1] = 96; c[2] = 104; }
+        if (poids) { c[0] = 60; c[1] = 60; c[2] = 66; }
+        if (pivot && y < 20 && x < 52) { c[0] = 170; c[1] = 170; c[2] = 178; }
+        for (int j = 0; j < 3; j++) e.fixe[i][j] = (uint8_t)fminf(255.0f, c[j] + 0.5f);
+        if (r <= 21.3f && !fige && e.nd < 900) {           // le disque : ce qui tourne
+          CR_Sillon &s = e.d[e.nd++];
+          s.i = (uint16_t)i; s.r = r; s.th = th; s.mul = mul; s.lampe = lampe;
+          for (int j = 0; j < 3; j++) s.ajout[j] = (uint8_t)fminf(255.0f, ajout[j] + 0.5f);
+          s.sill = 0.9f + 0.1f * sinf(r * 3.3f) + 0.1f * (fabsf(r - 12) < 0.5f) + 0.1f * (fabsf(r - 16) < 0.5f) + 0.12f * (r > 20.4f);
+          float ecart = th - angle_l + 3.14159265f;
+          ecart = ecart - PI2 * floorf(ecart / PI2) - 3.14159265f;
+          const float e1 = ecart / 0.22f, e2 = (fabsf(ecart) - 3.14159265f) / 0.22f;
+          const float l1 = ecart / 0.7f, l2 = (fabsf(ecart) - 3.14159265f) / 0.7f;
+          const float noeud = expf(-e1 * e1) + 0.6f * expf(-e2 * e2);   // le reflet en noeud papillon
+          const float lustre = expf(-l1 * l1) + 0.6f * expf(-l2 * l2);
+          const float radial = (0.35f + 0.65f * cr_clip01((r - 7) / 14)) * (r > 7.3f);
+          s.a = noeud * radial; s.b = 0.18f * lustre * radial;
+        }
+      }
+    for (auto &q : e.eq) { q[0] = hasard(0.6f, 1.2f); q[1] = hasard(1.3f, 2.4f); q[2] = hasard(0, PI2); }
+    for (auto &g : e.glint) g = hasard(0, PI2);
+  }
+  for (int i = 0; i < 4096; i++) {
+    float *p = &scene[0][0][0] + 3 * i;
+    p[0] = e.fixe[i][0]; p[1] = e.fixe[i][1]; p[2] = e.fixe[i][2];
+  }
+  float gx[3], gy[3], gp[3];                             // des poussieres qui brillent au passage du reflet
+  static const float rayons_g[3] = {9.5f, 14.0f, 18.5f};
+  for (int j = 0; j < 3; j++) {
+    const float ag = e.glint[j] + t * 2.3f;
+    gx[j] = cx + rayons_g[j] * cosf(ag); gy[j] = cy + rayons_g[j] * kd * sinf(ag);
+    float ec = ag - angle_l + 3.14159265f;
+    ec = (ec - PI2 * floorf(ec / PI2) - 3.14159265f) / 0.5f;
+    gp[j] = expf(-ec * ec) + 0.15f;
+  }
+  const float tt = t * 2.3f;
+  for (int n = 0; n < e.nd; n++) {
+    const CR_Sillon &s = e.d[n];
+    const int y = s.i >> 6, x = s.i & 63;
+    const float tour = s.th - tt;                        // l'angle, dans le repere du disque qui tourne
+    float c[3];
+    if (s.r < 0.9f) { c[0] = 200; c[1] = 200; c[2] = 205; }
+    else if (s.r <= 7.0f) {                              // l'etiquette, qui tourne avec le disque
+      const float tm = tour - PI2 * floorf(tour / PI2);
+      const bool secteur = tm < 1.1f && s.r > 2.0f;
+      float tx = tour * 5 / 3.14159265f;
+      tx -= 2 * floorf(tx / 2);
+      const bool texte = fabsf(s.r - 4.6f) < 0.55f && tx < 0.8f;
+      if (secteur) { c[0] = 236; c[1] = 200; c[2] = 140; } else { c[0] = 196; c[1] = 66; c[2] = 44; }
+      if (texte) for (int j = 0; j < 3; j++) c[j] *= 0.6f;
+      if (fabsf(s.r - 6.4f) < 0.5f) { c[0] = 236 * 0.8f; c[1] = 200 * 0.8f; c[2] = 140 * 0.8f; }
+      const float l = 0.5f + 0.35f * s.lampe;
+      for (int j = 0; j < 3; j++) c[j] *= l;
+    } else {
+      const float sn = cr_sin(s.r * 3.3f + 0.9f * cr_sin(tour * 2 + s.r * 0.4f));   // les sillons, qui frissonnent
+      const float reflet = (s.a * (0.45f + 0.55f * sn * sn) + s.b) * 0.72f;
+      c[0] = 14 * s.sill + reflet * 214; c[1] = 13 * s.sill + reflet * 172; c[2] = 17 * s.sill + reflet * 128;
+      float g = 0;
+      for (int j = 0; j < 3; j++) {
+        const float dx = x - gx[j], dy = y - gy[j];
+        if (fabsf(dx) < 4.5f && fabsf(dy) < 4.5f) g += cr_exp(-(dx * dx + dy * dy) / 1.2f) * gp[j];
+      }
+      c[0] += g * 132; c[1] += g * 114; c[2] += g * 90;
+    }
+    peindre(y, x, c[0] * s.mul + s.ajout[0], c[1] * s.mul + s.ajout[1], c[2] * s.mul + s.ajout[2]);
+  }
+  for (int j = 0; j < 7; j++) {                          // le petit egaliseur, sur la facade
+    const float bat = 0.5f + 0.5f * sinf(t * PI2 * 1.55f), b2 = bat * bat, b6 = b2 * b2 * b2;
+    const float niv = fmaxf(0.05f, fminf(1.0f, 0.45f + 0.25f * sinf(t * e.eq[j][0] + e.eq[j][2])
+                         + 0.2f * sinf(t * e.eq[j][1] * 1.7f + e.eq[j][2] * 2) + 0.25f * b6 * (j < 3))) * 4;
+    for (int i = 0; i < 4; i++) {
+      const float k = 0.12f + 0.68f * cr_clip01(niv - i);
+      if (i < 2) pointer(59 - i, 44 + 2 * j, 60 * k, 210 * k, 150 * k);
+      else if (i < 3) pointer(59 - i, 44 + 2 * j, 230 * k, 200 * k, 70 * k);
+      else pointer(59 - i, 44 + 2 * j, 255 * k, 120 * k, 50 * k);
+    }
+  }
+  for (int j = 0; j < 2; j++) {                          // des notes qui montent, tres discretes
+    const float cycle = t / 9.0f + j * 0.5f, n = floorf(cycle), f = cycle - n;
+    float h = sinf(n * 78.233f + j * 3.1f) * 43758.5453f;
+    h -= floorf(h);
+    const float x0 = 10 + h * 26 + sinf(f * 5 + j) * 1.5f, y0 = 24 - f * 18;
+    const float s = sinf(3.14159265f * f), force = s * s * 0.5f;
+    for (auto &p : CR_NOTE) cr_tamponner(y0 + p[0], x0 + p[1], 255 * force, 196 * force, 130 * force);
+  }
 }
 
 struct E_rubans { char rien; };

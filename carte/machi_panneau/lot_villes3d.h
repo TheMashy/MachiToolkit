@@ -22,8 +22,32 @@ inline float v3_u(uint32_t n) { return (n >> 8) * (1.0f / 16777216.0f); }
 inline float v3_frac(uint32_t n, int k) { return ((n << k) >> 8) * (1.0f / 16777216.0f); }
 inline float v3_hasard(int32_t a, int32_t b, int32_t c) { return v3_u(v3_bits(a, b, c)); }
 inline float v3_01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+inline float v3_mn(float a, float b) { return a < b ? a : b; }   // fminf/fmaxf sans leurs NaN : plus vites
+inline float v3_mx(float a, float b) { return a > b ? a : b; }
 inline int v3_mod(int a, int n) { return ((a % n) + n) % n; }
 inline float v3_fmod(float a, float n) { return a - floorf(a / n) * n; }   // le % de Python (positif)
+
+// sinus et exponentielle rapides (erreur ~1e-5) : sinf et expf coutent cher sur la carte
+inline float v3_sin(float x) {
+  x -= 6.28318531f * floorf(x * 0.15915494f + 0.5f);   // dans [-pi, pi]
+  if (x > 1.57079633f) x = V3_PI - x;
+  else if (x < -1.57079633f) x = -V3_PI - x;
+  const float z = x * x;
+  return x * (1 + z * (-0.16666667f + z * (0.0083333333f + z * (-0.00019841270f + z * 2.7557319e-6f))));
+}
+inline float v3_cos(float x) { return v3_sin(x + 1.57079633f); }
+inline float v3_exp(float x) {
+  if (x < -80) return 0;
+  if (x > 80) x = 80;
+  const float y = x * 1.44269504f, fi = floorf(y), f = y - fi;
+  const float p = 1 + f * (0.69314718f + f * (0.24022651f + f * (0.055504109f + f * (0.0096181291f + f * (0.0013333558f + f * 0.00015403530f)))));
+  int32_t b;
+  memcpy(&b, &p, 4);
+  b += (int32_t)((uint32_t)(int32_t)fi << 23);
+  float r;
+  memcpy(&r, &b, 4);
+  return r;
+}
 
 // atan et atan2 rapides (erreur ~1e-5 rad) : l'ocean en fait deux par pixel
 inline float v3_atan(float x) {   // |x| <= 1
@@ -32,9 +56,9 @@ inline float v3_atan(float x) {   // |x| <= 1
 }
 inline float v3_atan2(float y, float x) {
   const float ax = fabsf(x), ay = fabsf(y);
-  const float mx = fmaxf(ax, ay);
+  const float mx = ax > ay ? ax : ay, mn = ax > ay ? ay : ax;
   if (mx <= 0) return 0;
-  float a = v3_atan(fminf(ax, ay) / mx);
+  float a = v3_atan(mn / mx);
   if (ay > ax) a = 1.57079633f - a;
   if (x < 0) a = V3_PI - a;
   return y < 0 ? -a : a;
@@ -177,11 +201,228 @@ void s_ruelle(int humeur, bool debut, float t, float ecoule, float dt) {
   degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
 }
 
-struct E_pare_brise { char rien; };
+// --- 4. le pare-brise sous la pluie ----------------------------------------------------------
+// Derriere la vitre, la ville floue (des disques de lumiere et leurs reflets sur la chaussee) ; sur la
+// vitre, une carte de l'eau (chaque goutte y pose son disque, son reflet vif, son bord sombre) que
+// l'essuie-glace efface la ou il passe, en laissant un film d'eau un instant.
+
+struct E_pare_brise {
+  uint8_t eau[64][64], film[64][64], hi[64][64], rim[64][64];   // 0-255
+  uint16_t flou[64][64][3], large[64][64][3];                   // x32
+  float vx[26], vy[26], vr[26], vp[26];
+  float angle, phase;
+};
+
+inline float v3_pb_angle(float ecoule) {   // les essuie-glaces : au repos couches a droite, un aller-retour de 3,2 s
+  const float ph = v3_fmod(ecoule, 8.0f);
+  if (ph >= 3.2f) return 0.12f;
+  const float s = sinf(V3_PI * ph / 3.2f);
+  return 0.12f + (2.75f - 0.12f) * s * s;
+}
+
+void v3_pb_goutte(E_pare_brise &e) {   // une goutte se pose : son disque, son reflet vif en haut a gauche, son bord sombre
+  const float x0 = hasard(0, 64), y0 = hasard(0, 56), r = hasard(0.9f, 2.1f);
+  const int ya = max(0, (int)(y0 - r - 1)), yb = min(64, (int)(y0 + r + 2));
+  const int xa = max(0, (int)(x0 - r - 1)), xb = min(64, (int)(x0 + r + 2));
+  for (int y = ya; y < yb; y++)
+    for (int x = xa; x < xb; x++) {
+      const float yy = y + 0.5f, xx = x + 0.5f, d = hypotf(xx - x0, yy - y0);
+      const float disque = v3_01(r - d + 0.5f);
+      const float hi = v3_01(1 - hypotf(xx - x0 + r * 0.35f, yy - y0 + r * 0.35f) / 0.8f);
+      const float rim = disque * v3_01((yy - y0) / r * 1.4f - 0.3f) * v3_01(1 - (r - d) / 1.2f);
+      e.eau[y][x] = max(e.eau[y][x], (uint8_t)(disque * 255 + 0.5f));
+      e.hi[y][x] = max(e.hi[y][x], (uint8_t)(hi * 255 + 0.5f));
+      e.rim[y][x] = max(e.rim[y][x], (uint8_t)(rim * 255 + 0.5f));
+    }
+}
+
+struct V3Disque { float x, y, r, c[3], f; };
+
 void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
   E_pare_brise &e = etat_ecran<E_pare_brise>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur;
+  const float hz = 33;
+  if (debut) {
+    e.angle = v3_pb_angle(ecoule);
+    e.phase = hasard(0, 60);
+    for (int i = 0; i < 30; i++) v3_pb_goutte(e);   // la pluie a deja commence
+    for (int i = 0; i < 26; i++) { e.vx[i] = hasard(0, 64); e.vy[i] = hasard(10, 31); e.vr[i] = hasard(0.8f, 1.8f); e.vp[i] = hasard(0, 6); }
+  }
+  dt = fminf(dt, 0.5f);
+  const float tau = ecoule + e.phase;
+  // derriere la vitre : la rue de nuit, floue
+  for (int y = 0; y < 64; y++) {
+    const float k = borne(y / hz, 0, 1);
+    const float r = y < hz ? 8 + 26 * k : 14, g = y < hz ? 8 + 12 * k : 11, b = y < hz ? 22 + 18 * k : 22;
+    for (int x = 0; x < 64; x++) { scene[y][x][0] = r; scene[y][x][1] = g; scene[y][x][2] = b; }
+  }
+  const float feu = v3_fmod(tau / 46.0f, 1);   // le feu : rouge longtemps, puis vert, orange
+  const float rouge = v3_01(feu / 0.02f) * v3_01((0.62f - feu) / 0.02f);
+  const float vert = v3_01((feu - 0.63f) / 0.02f) * v3_01((0.92f - feu) / 0.02f);
+  const float orange = v3_01((feu - 0.93f) / 0.01f) * v3_01((1.0f - feu) / 0.02f);
+  V3Disque d[52];
+  int n = 0;
+  for (int i = 0; i < 26; i++) {   // des fenetres floues, loin
+    const bool chaud = e.vp[i] < 4;
+    d[n++] = {e.vx[i], e.vy[i], e.vr[i], {chaud ? 255.0f : 150.0f, chaud ? 190.0f : 200.0f, chaud ? 120.0f : 255.0f},
+              0.13f + 0.03f * sinf(t * 0.3f + e.vp[i])};
+  }
+  static const float fixes[9][7] = {{5, 5, 4.2f, 255, 150, 60, 0.6f}, {15, 13, 3.0f, 255, 150, 60, 0.55f}, {22, 19, 2.1f, 255, 160, 70, 0.5f},
+                                    {27, 23, 1.5f, 255, 160, 70, 0.45f}, {60, 4, 4.5f, 255, 150, 60, 0.6f}, {50, 12, 3.2f, 255, 150, 60, 0.55f},
+                                    {3, 27, 5.5f, 255, 40, 150, 0.4f}, {61, 24, 5.0f, 40, 200, 255, 0.4f}, {55, 29, 3.0f, 170, 80, 255, 0.35f}};
+  for (int i = 0; i < 9; i++) d[n++] = {fixes[i][0], fixes[i][1], fixes[i][2], {fixes[i][3], fixes[i][4], fixes[i][5]}, fixes[i][6]};
+  d[n++] = {44, 6, 2.4f, {255, 40, 40}, 0.95f * rouge + 0.07f};
+  d[n++] = {44, 11.5f, 2.4f, {255, 170, 30}, 0.95f * orange + 0.05f};
+  d[n++] = {44, 17, 2.4f, {40, 255, 140}, 0.95f * vert + 0.05f};
+  for (int k = 0; k < 3; k++) {   // les voitures qui croisent, pendant notre rouge
+    const float cyc = v3_fmod(tau / 9.0f + k / 3.0f, 1);
+    const float sens = k % 2 ? 1.0f : -1.0f, x = sens > 0 ? -14 + cyc * 92 : 78 - cyc * 92, y = 31.0f + k % 2;
+    const float sn = fmaxf(0.0f, sinf(V3_PI * cyc)), f = rouge * (sn > 0 ? expf(0.3f * logf(sn)) : 0);
+    d[n++] = {x, y, 2.2f, {255, 245, 220}, 0.75f * f};
+    d[n++] = {x - 5 * sens, y, 1.9f, {255, 245, 220}, 0.65f * f};
+    d[n++] = {x - 17 * sens, y, 1.6f, {255, 40, 40}, 0.4f * f};
+  }
+  const float freins = 0.5f + 0.5f * v3_01(1 - vert * 1.5f);   // la voiture devant : ses feux stop
+  const int n_avant = n;
+  d[n++] = {23, 36, 3.0f, {255, 30, 30}, 0.9f * freins};
+  d[n++] = {41, 36, 3.0f, {255, 30, 30}, 0.9f * freins};
+  d[n++] = {32, 39, 1.4f, {230, 220, 200}, 0.2f};
+  for (int i = 0; i < n; i++) {
+    if (i == n_avant)   // la caisse de la voiture devant
+      for (int y = 27; y < 42; y++) {
+        const float demi = 13 - fmaxf(31.0f - y, 0) * 0.8f, ar = (y - 36) / 4.0f, stop = 30 * freins * expf(-ar * ar);
+        for (int x = 0; x < 64; x++)
+          if (fabsf(x + 0.5f - 32) < demi) {
+            float *p = scene[y][x];
+            p[0] = p[0] * 0.25f + 14 + stop; p[1] = p[1] * 0.25f + 10 + stop * (8.0f / 30); p[2] = p[2] * 0.25f + 20 + stop * (10.0f / 30);
+          }
+      }
+    const V3Disque &q = d[i];
+    if (q.f <= 0.01f) continue;
+    const int xa = max(0, (int)(q.x - q.r - 2)), xb = min(64, (int)(q.x + q.r + 3));
+    const int ya = max(0, (int)(q.y - q.r - 2)), yb = min(64, (int)(q.y + q.r + 3));
+    if (xa >= xb) continue;
+    const float ir = 1 / q.r;
+    for (int y = ya; y < yb; y++)   // un bokeh : un disque net, au bord plus vif
+      for (int x = xa; x < xb; x++) {
+        const float dd = hypotf(x + 0.5f - q.x, y + 0.5f - q.y), u = dd * ir;
+        const float k = v3_01((q.r - dd) / 0.9f + 0.5f) * (0.75f + 0.25f * u * u) * q.f;
+        if (k <= 0) continue;
+        float *p = scene[y][x];
+        p[0] += k * q.c[0]; p[1] += k * q.c[1]; p[2] += k * q.c[2];
+      }
+    if (q.f > 0.15f && q.r > 1.4f) {   // son reflet sur la chaussee mouillee
+      const float y1 = q.y > hz - 6 ? fmaxf(q.y + q.r + 1, hz + 1) : hz + (hz - q.y) * 0.35f, lg = 3 + q.r * 1.6f;
+      const int ra = (int)fmaxf(hz, y1 - 1), rb = (int)fminf(54, y1 + lg * 2.2f);
+      float kx[24];
+      for (int x = xa; x < xb && x - xa < 24; x++) { const float u = (x + 0.5f - q.x) / (0.55f * q.r); kx[x - xa] = expf(-u * u); }
+      for (int y = ra; y < rb; y++) {
+        const float ys = y + 0.5f, v = (ys - y1) / lg;
+        const float ky = expf(-v * v) * (0.75f + 0.25f * sinf(ys * 1.7f + t * 2.0f + q.x)) * q.f * 0.4f;
+        for (int x = xa; x < xb && x - xa < 24; x++) {
+          const float k = ky * kx[x - xa];
+          float *p = scene[y][x];
+          p[0] += k * q.c[0]; p[1] += k * q.c[1]; p[2] += k * q.c[2];
+        }
+      }
+    }
+  }
+  // un peu de flou leve la lumiere
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++)
+      for (int c = 0; c < 3; c++) e.large[y][x][c] = (uint16_t)(scene[y][x][c] * 32 + 0.5f);
+  v3_flou16(&e.large[0][0][0], 64, 64, 4, 1);
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++)
+      for (int c = 0; c < 3; c++) scene[y][x][c] += e.large[y][x][c] * (0.3f / 32);
+  // la pluie qui arrive sur la vitre (Poisson, 7 par seconde)
+  if (dt > 0) {
+    const float seuil = expf(-7 * dt);
+    float p = hasard(0, 1);
+    while (p > seuil) { v3_pb_goutte(e); p *= hasard(0, 1); }
+  }
+  // l'essuie-glace efface l'eau la ou il passe, et laisse un film
+  const float a0 = e.angle, a1 = v3_pb_angle(ecoule);
+  e.angle = a1;
+  const float fondu = expf(-dt / 0.5f);
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) e.film[y][x] = (uint8_t)(e.film[y][x] * fondu);
+  static const float pivots[2][3] = {{14, 71, 50}, {44, 70, 42}};
+  if (fabsf(a1 - a0) > 1e-4f) {
+    const float lo = fminf(a0, a1) - 0.03f, hi = fmaxf(a0, a1) + 0.03f;
+    const float cl = cosf(lo), sl = sinf(lo), ch = cosf(hi), sh = sinf(hi);
+    for (int p = 0; p < 2; p++) {
+      const float px = pivots[p][0], py = pivots[p][1], L = pivots[p][2];
+      for (int y = 0; y < 64; y++) {
+        const float dy = py - (y + 0.5f);   // toujours > 0 : les angles restent entre 0 et pi
+        for (int x = 0; x < 64; x++) {
+          const float dx = x + 0.5f - px, r2 = dx * dx + dy * dy;
+          if (r2 >= (L + 1) * (L + 1) || r2 <= 64) continue;
+          if (cl * dy - sl * dx < 0 || ch * dy - sh * dx > 0) continue;   // ang >= lo et ang <= hi
+          e.eau[y][x] = e.hi[y][x] = e.rim[y][x] = 0;
+          e.film[y][x] = 255;
+        }
+      }
+    }
+  }
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++)
+      for (int c = 0; c < 3; c++) e.flou[y][x][c] = e.large[y][x][c] = (uint16_t)(scene[y][x][c] * 32 + 0.5f);
+  v3_flou16(&e.flou[0][0][0], 64, 64, 1, 2);
+  v3_flou16(&e.large[0][0][0], 64, 64, 4, 1);   // une goutte voit large : elle ramasse la lumiere
+  // les balais (leur angle), la lueur du tableau de bord
+  const float ca = cosf(a1), sa = -sinf(a1);
+  float lueur_x[64], lueur_y[64];
+  for (int i = 0; i < 64; i++) {
+    const float u = (i - 18) / 14.0f, v = (i - 52) / 3.0f;
+    lueur_x[i] = expf(-u * u); lueur_y[i] = expf(-v * v) * 0.22f;
+  }
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      float *p = scene[y][x];
+      const float g = e.eau[y][x] * (1.0f / 255), h = e.hi[y][x] * (1.0f / 255), rim = e.rim[y][x] * (1.0f / 255);
+      const float f = e.film[y][x] * (1.0f / 255);
+      const float base[3] = {5, 5, 9}, eclat[3] = {16, 17, 24}, fil[3] = {8, 8, 12};
+      for (int c = 0; c < 3; c++) {
+        const float lg = e.large[y][x][c] * (1.0f / 32);
+        float v = p[c] * (1 - g) + (lg * 1.5f + base[c]) * g + h * (lg * 2.4f + eclat[c]);
+        v *= 1 - rim * 0.5f;
+        p[c] = v * (1 - f * 0.3f) + e.flou[y][x][c] * (1.0f / 32) * f * 0.3f + f * fil[c];
+      }
+      for (int b = 0; b < 2; b++) {
+        const float dx = x + 0.5f - pivots[b][0], dy = y + 0.5f - pivots[b][1];
+        const float u = dx * ca + dy * sa;   // le long du balai
+        if (u <= 9 || u >= pivots[b][2]) continue;
+        const float v = -dx * sa + dy * ca;   // en travers
+        const float balai = v3_01(1.6f - fabsf(v + 0.3f)), reflet = v3_01(1 - fabsf(v - 1.2f)) * 0.25f;
+        p[0] = p[0] * (1 - balai * 0.93f) + balai * 8 + reflet * 40;
+        p[1] = p[1] * (1 - balai * 0.93f) + balai * 8 + reflet * 40;
+        p[2] = p[2] * (1 - balai * 0.93f) + balai * 12 + reflet * 52;
+      }
+      const float l = lueur_y[y] * lueur_x[x];
+      p[0] += l * 60; p[1] += l * 160; p[2] += l * 200;
+    }
+  // l'habitacle : le haut du pare-brise et le retroviseur, les montants, le tableau de bord et sa lueur
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const float X = x + 0.5f, Y = y + 0.5f, u = (X - 32) / 32;
+      const float r1 = (X - 33) / 6.0f, r2 = (Y - 3.0f) / 3.6f, r3 = (X - 33) / 4.8f, r4 = (Y - 3.3f) / 2.5f;
+      float *p = scene[y][x];
+      if (Y < 1.6f + u * u * 2.5f || X < (64 - y) * 0.05f || X > 64 - (64 - y) * 0.05f || r1 * r1 + r2 * r2 < 1) {
+        p[0] = 6; p[1] = 6; p[2] = 9;
+      }
+      if (r3 * r3 + r4 * r4 < 1) { p[0] = 22; p[1] = 16; p[2] = 28; }   // ce que le retroviseur voit
+      const float bord = 55.5f - 2.0f * sinf(v3_01(X / 64) * V3_PI);
+      if (Y > bord) {
+        const float a = (x - 16) / 8.0f, b = (y - 59) / 3.0f, c = (x - 36) / 5.0f, dd = (y - 59) / 2.5f;
+        const float lueur = expf(-a * a - b * b) + 0.6f * expf(-c * c - dd * dd);
+        p[0] = 8 + lueur * 30; p[1] = 8 + lueur * 110; p[2] = 12 + lueur * 140;
+        if (Y < bord + 1) { p[0] += 14; p[1] += 18; p[2] += 26; }   // le rebord, qui accroche la lumiere
+      }
+    }
+  pointer(59, 13, 120, 230, 255);
+  pointer(59, 19, 120, 230, 255);
+  pointer(60, 36, 255, 170, 80);
 }
 
 // --- 5. le pont suspendu ------------------------------------------------------------------
@@ -654,16 +895,29 @@ void s_voxel(int humeur, bool debut, float t, float ecoule, float dt) {
 struct E_ocean {
   float kx[10], kz[10], amp[10], om[10], ph[10];
   float ep[50], el[50];
+  float halo[257][2];   // le halo de la lune selon l'ecart angulaire d (0 a 0,9 rad) : les deux exponentielles
+  float expn[513];      // exp(-x), x de 0 a 32
   uint8_t ey[50], ex[50];
 };
 
+// une table lue en interpolant (x * echelle entre 0 et n)
+inline float v3_lire(const float *tab, float x, float echelle, int n) {
+  const float f = x * echelle;
+  if (f >= n) return tab[n];
+  const int i = (int)f;
+  return tab[i] + (tab[i + 1] - tab[i]) * (f - i);
+}
+
 // le ciel de l'ocean dans une direction (azimut, hauteur), en radians
-inline void v3_ocean_ciel(float az, float el, float *c) {
-  const float k = v3_01(el / 0.5f), a = (1 - k) * (1 - k);
-  c[0] = 30 * a + 5 * (1 - a); c[1] = 40 * a + 7 * (1 - a); c[2] = 72 * a + 20 * (1 - a);
+inline void v3_ocean_ciel(const E_ocean &e, float az, float el, float *c) {
+  const float k = v3_01(el * 2), a = (1 - k) * (1 - k);
+  c[0] = 5 + 25 * a; c[1] = 7 + 33 * a; c[2] = 20 + 52 * a;
   const float da = az - 0.13f, de = el - 0.24f, d2 = da * da + de * de;
-  if (d2 < 1.0f) {
-    const float d = sqrtf(d2), h = expf(-d / 0.12f), l = expf(-d / 0.035f) * 40;
+  if (d2 < 0.81f) {                                           // au-dela, le halo ne compte plus
+    const float f = sqrtf(d2) * (256 / 0.9f);
+    const int i = min(255, (int)f);
+    const float q = f - i, h = e.halo[i][0] + (e.halo[i + 1][0] - e.halo[i][0]) * q;
+    const float l = e.halo[i][1] + (e.halo[i + 1][1] - e.halo[i][1]) * q;
     c[0] += h * 40 + l; c[1] += h * 46 + l; c[2] += h * 60 + l;
   }
 }
@@ -681,6 +935,11 @@ void s_ocean(int humeur, bool debut, float t, float ecoule, float dt) {
       e.amp[i] = lam * hasard(0.011f, 0.02f); e.om[i] = sqrtf(3.2f * k); e.ph[i] = hasard(0, 2 * V3_PI);
     }
     for (int i = 0; i < 50; i++) { e.ey[i] = aleatoire() % 22; e.ex[i] = aleatoire() % 64; e.ep[i] = hasard(0, 6); e.el[i] = hasard(0.3f, 1); }
+    for (int i = 0; i <= 256; i++) {
+      const float d = i * (0.9f / 256);
+      e.halo[i][0] = expf(-d / 0.12f); e.halo[i][1] = expf(-d / 0.035f) * 40;
+    }
+    for (int i = 0; i <= 512; i++) e.expn[i] = expf(-i / 16.0f);
   }
   const float cy = 3.0f + 0.12f * sinf(t * 0.37f), hz = 25.0f + 0.5f * sinf(t * 0.29f);
   // le ciel : bleu nuit, plus clair vers l'horizon ; la lune et son halo
@@ -689,7 +948,7 @@ void s_ocean(int humeur, bool debut, float t, float ecoule, float dt) {
     const float dx = (x + 0.5f - 32) / F, az = v3_atan(dx), hc = 1.0f / sqrtf(dx * dx + 1);
     for (int y = 0; y < min(64, (int)hz + 1); y++) {
       const float el = v3_atan(-(y + 0.5f - hz) / F * hc);
-      v3_ocean_ciel(az, el, scene[y][x]);
+      v3_ocean_ciel(e, az, el, scene[y][x]);
     }
   }
   for (int i = 0; i < 50; i++) {
@@ -713,8 +972,8 @@ void s_ocean(int humeur, bool debut, float t, float ecoule, float dt) {
     const float s = cy * F / fmaxf(sy, 0.05f), pied_x = s / F, pied_z = s * s / (F * cy);
     const float couv = v3_01(sy + 0.5f);
     // les vagues qui tiennent dans un pixel : leur phase au bord gauche et son pas d'une colonne a l'autre
-    float A[10], co[10], si[10], cd[10], sd[10], var_x = 0, var_z = 0;
-    int na = 0, idx[10];
+    float akx[10], akz[10], co[10], si[10], cd[10], sd[10], var_x = 0, var_z = 0;
+    int na = 0;
     for (int i = 0; i < 10; i++) {
       const float alias = (fabsf(e.kx[i]) * pied_x + fabsf(e.kz[i]) * pied_z) / 2.2f;
       const float garde = alias < 5 ? expf(-alias * alias) : 0;
@@ -722,10 +981,11 @@ void s_ocean(int humeur, bool debut, float t, float ecoule, float dt) {
       var_x += perdu * e.kx[i] * e.kx[i];
       var_z += perdu * e.kz[i] * e.kz[i];
       const float a = e.amp[i] * garde;
-      if (a * (fabsf(e.kx[i]) + fabsf(e.kz[i])) < 1e-4f) continue;
+      if (a * (fabsf(e.kx[i]) + fabsf(e.kz[i])) < 2e-3f) continue;   // une pente de 0,002 : rien a l'ecran
       const float pas = e.kx[i] * s / F;
       const float p0 = e.kx[i] * (0.5f - 32) * s / F + e.kz[i] * s - e.om[i] * t + e.ph[i];
-      A[na] = a; co[na] = cosf(p0); si[na] = sinf(p0); cd[na] = cosf(pas); sd[na] = sinf(pas); idx[na] = i;
+      akx[na] = a * e.kx[i]; akz[na] = a * e.kz[i];
+      co[na] = cosf(p0); si[na] = sinf(p0); cd[na] = cosf(pas); sd[na] = sinf(pas);
       na++;
     }
     const float sa = 0.0011f + 4 * var_x, se = 0.0045f + 4 * var_z;
@@ -735,12 +995,11 @@ void s_ocean(int humeur, bool debut, float t, float ecoule, float dt) {
       const float sx = x + 0.5f - 32;
       float dhx = 0, dhz = 0;
       for (int j = 0; j < na; j++) {
-        const float c = co[j] * A[j];
-        dhx += c * e.kx[idx[j]];
-        dhz += c * e.kz[idx[j]];
-        const float c2 = co[j] * cd[j] - si[j] * sd[j];
-        si[j] = si[j] * cd[j] + co[j] * sd[j];
-        co[j] = c2;
+        const float c = co[j], sn = si[j];
+        dhx += c * akx[j];
+        dhz += c * akz[j];
+        co[j] = c * cd[j] - sn * sd[j];
+        si[j] = sn * cd[j] + c * sd[j];
       }
       const float inv = 1.0f / sqrtf(dhx * dhx + 1 + dhz * dhz);
       const float nx = -dhx * inv, ny = inv, nz = -dhz * inv;
@@ -749,20 +1008,26 @@ void s_ocean(int humeur, bool debut, float t, float ecoule, float dt) {
       const float dn = vx * nx + vy * ny + vz * nz;
       const float rx = vx - 2 * dn * nx, ry = fabsf(vy - 2 * dn * ny), rz = vz - 2 * dn * nz;
       const float q = v3_01(1 + dn), q2 = q * q, fres = 0.02f + 0.98f * q2 * q2 * q;
-      const float az = v3_atan2(rx, rz), el = v3_atan2(ry, sqrtf(rx * rx + rz * rz));
+      // le rayon est unitaire : sa hauteur est asin(ry) (un polynome tant qu'il reste bas)
+      const float az = rz > fabsf(rx) ? v3_atan(rx / rz) : v3_atan2(rx, rz);
+      const float r2 = ry * ry;
+      const float el = ry < 0.5f ? ry * (1 + r2 * (0.16666667f + r2 * (0.075f + r2 * (0.044642857f + r2 * 0.030381944f))))
+                                 : v3_atan2(ry, sqrtf(rx * rx + rz * rz));
       float ciel[3];
-      v3_ocean_ciel(az, el, ciel);
+      v3_ocean_ciel(e, az, el, ciel);
       const float da = az - ma, de = el - mh, ex = da * da * i2sa + de * de * i2se;
-      float eclat = ex < 30 ? expf(-ex) * norme : 0;
-      if (eclat > 0 && garde_e > 1e-3f) {
+      float eclat = ex < 30 ? v3_lire(e.expn, ex, 16, 512) * norme : 0;
+      if (eclat > 1e-4f && garde_e > 1e-3f) {
         const float gx = sx * s / F;
-        eclat *= 1 + 0.9f * garde_e * sinf(s * 4.5f - t * 1.7f + 2 * sinf(gx * 1.3f + t * 0.6f));
+        eclat *= 1 + 0.9f * garde_e * v3_sin(s * 4.5f - t * 1.7f + 2 * v3_sin(gx * 1.3f + t * 0.6f));
       }
       const float dos = v3_01(-dhz * 3) * 6;   // les dos des vagues, un rien plus clairs
       const float eau[3] = {3 * (1 - fres) + ciel[0] * fres * 0.7f + eclat * 255 * 1.6f + dos * 0.4f,
                             7 * (1 - fres) + ciel[1] * fres * 0.7f + eclat * 240 * 1.6f + dos * 0.7f,
                             18 * (1 - fres) + ciel[2] * fres * 0.7f + eclat * 205 * 1.6f + dos};
-      for (int c = 0; c < 3; c++) scene[y][x][c] = scene[y][x][c] * (1 - couv) + eau[c] * couv;
+      float *p = scene[y][x];
+      if (couv >= 1) { p[0] = eau[0]; p[1] = eau[1]; p[2] = eau[2]; }
+      else for (int c = 0; c < 3; c++) p[c] = p[c] * (1 - couv) + eau[c] * couv;
     }
   }
 }
