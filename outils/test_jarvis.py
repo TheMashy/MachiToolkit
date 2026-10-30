@@ -4169,7 +4169,7 @@ class DansMachiTool(unittest.TestCase):
             with self.subTest(ecran=nom):
                 self.assertTrue(titre)
                 images = []
-                n = 21 if nom in m.ECRANS_AURORES else 91       # les cent aurores : un moteur, une seconde chacune suffit
+                n = 21 if nom in m.ECRANS_DECORS else 91        # les decors et les aurores : une seconde chacun suffit
                 for essai in range(2):
                     e = {"rng": np.random.default_rng(5)}
                     debut = time.perf_counter()
@@ -4264,38 +4264,50 @@ class DansMachiTool(unittest.TestCase):
                         "fini : l'horloge")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
-    def test_les_cent_aurores(self):
-        # « tu peux generer 100 screensavers differents dans un mood des aurores boreales ? j'aime bcp le tunnel aussi »
+    def test_les_decors_et_les_aurores(self):
+        # « fais moins de declinaisons de variations, garde les variations uniques ; pour les autres trouve d'autres
+        # idees, comme de la vie sous l'eau, des nuages qui se forment, une surface d'eau, une ville avec des voitures »
         import numpy as np
         m = self.m
         presets = m._presets_boreaux()
-        self.assertEqual(len(presets), 100)
-        self.assertEqual(len(m.ECRANS_AURORES), 100)
-        self.assertEqual(len({titre for _, titre, _ in presets}), 100, "cent titres differents")
-        self.assertTrue(all(c in m.ECRANS for c in m.ECRANS_AURORES))
-        self.assertEqual(sorted(sum((list(f[2]) for f in m.FAMILLES_ECRANS), [])), sorted(m.ECRANS_AURORES),
-                         "deux familles, qui font les cent")
-        self.assertEqual([len(f[2]) for f in m.FAMILLES_ECRANS], [80, 20], "80 paysages, 20 tunnels")
-        self.assertEqual(m.ECRANS_AURORES[0], "boreale_01", "des noms fixes : la config retient ceux qu'on decoche")
-        self.assertEqual(m.ECRANS["boreale_01"][0], m._presets_boreaux()[0][1], "le meme reglage d'une fois sur l'autre")
+        self.assertEqual(len(presets), 21, "seize aurores, cinq tunnels")
+        self.assertEqual(len({p["paysage"] for _, _, p in presets if "paysage" in p}), 16, "une aurore par paysage")
+        self.assertEqual(len({p["forme"] for _, _, p in presets if "forme" in p}), 5, "un tunnel par forme")
+        self.assertEqual(m.ECRANS_AURORES[0], "boreale_montagnes", "des noms fixes : la config retient ceux qu'on decoche")
+        self.assertEqual(m.ECRANS["boreale_montagnes"][0], presets[0][1], "le meme reglage d'une fois sur l'autre")
+        # des familles, sur la page : chaque decor dans une seule ; les ambiances et les jeux de lumiere a part
+        self.assertEqual([f[0] for f in m.FAMILLES_ECRANS],
+                         ["sous_l_eau", "ciel_et_eau", "villes", "paysages", "espace", "boreales", "tunnels"])
+        membres = [n for f in m.FAMILLES_ECRANS for n in f[2]]
+        self.assertEqual(len(membres), len(set(membres)), "chaque decor dans une seule famille")
+        self.assertEqual(tuple(membres), m.ECRANS_DECORS)
+        self.assertTrue(set(m.ECRANS_AURORES) <= set(m.ECRANS_DECORS) <= set(m.ECRANS))
+        self.assertFalse(set(m.ECRANS_DECORS) & set(m.ECRANS_AMBIANCES), "les ambiances de la carte restent a part")
+        self.assertGreaterEqual(len(m.ECRANS_DECORS) - len(m.ECRANS_AURORES), 60, "plein d'autres idees")
+        titres = [titre for titre, _ in m.ECRANS.values()]
+        self.assertEqual(len(titres), len(set(titres)), "chaque ecran son titre")
+        for f in m.FAMILLES_ECRANS:
+            self.assertIn("(%d)" % len(f[2]), f[1], "la case dit combien")
         # vraiment differents : deux a deux, jamais la meme image
         t0 = 1_800_000_000.0
         images = []
-        for cle in m.ECRANS_AURORES:
+        for cle in m.ECRANS_DECORS:
             e = {"rng": np.random.default_rng(5)}
             images.append(m.ECRANS[cle][1](e, t0 + 6.0, 6.0, 0.0).astype(np.int16).reshape(-1))
         images = np.array(images)
         ecarts = np.array([np.abs(images - im).mean(axis=1) for im in images])
         np.fill_diagonal(ecarts, 255)
-        self.assertGreater(float(ecarts.min()), 2.0, "deux ecrans qui se ressemblent trop")
-        # dans le mood : sombres et colores, ni noirs ni blancs ; et toujours vivants au bout de deux minutes
-        for cle in m.ECRANS_AURORES:
+        i, j = np.unravel_index(int(ecarts.argmin()), ecarts.shape)
+        self.assertGreater(float(ecarts.min()), 2.0, "%s et %s se ressemblent trop" % (m.ECRANS_DECORS[i], m.ECRANS_DECORS[j]))
+        # des scenes, pas des aplats ; ni noires ni blanches ; et toujours vivantes au bout de deux minutes
+        for cle in m.ECRANS_DECORS:
             with self.subTest(ecran=cle):
                 e = {"rng": np.random.default_rng(5)}
                 f = m.ECRANS[cle][1]
                 a, b = f(e, t0 + 125.0, 125.0, 0.0), f(e, t0 + 125.5, 125.5, 0.5)
                 self.assertGreater(int((a.max(axis=2) > 60).sum()), 60, "de la lumiere")
-                self.assertLess(float(a.mean()), 110, "un ciel de nuit, pas un aplat")
+                self.assertGreater(float(a.std()), 8, "une scene, pas un aplat")
+                self.assertLess(float(a.mean()), 200, "pas un ecran blanc")
                 self.assertFalse((a == b).all(), "il bouge encore")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
