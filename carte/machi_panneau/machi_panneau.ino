@@ -1,16 +1,18 @@
-// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 9.
+// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 10.
 // Un panneau 64x64 sur une Adafruit MatrixPortal S3, nourri par USB :
 //   "MG" + 8 192 octets (RGB565, poids fort d'abord) + 2 octets de controle
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 9" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 10" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees),
 //   "MA" + 12 octets + 2 de controle = les reglages des ecrans de veille
 //                    (gardes dans la carte : ils survivent a une coupure),
 //   "MW"           = les ecrans de veille, tout de suite (Windows s'arrete),
 //   "MO"           = au prochain silence, noir et pas d'ecran de veille
-//                    (on a quitte Machi Tool : le panneau s'eteint avec lui).
+//                    (on a quitte Machi Tool : le panneau s'eteint avec lui),
+//   "ME" + 2 octets (n) + n octets + 2 de controle = les ecrans de veille
+//                    permis, par leurs noms separes de virgules (v10).
 //
 // v2 : « ca tombe a 5 fps parfois ». La v1 redessinait les 4 096 pixels a
 // chaque image : a 30 images/s la carte prenait du retard, et le PC attendait
@@ -76,6 +78,17 @@
 // plus volontiers a deux endroits, et elle se tasse avec le temps -- des
 // tas aux pentes douces, la crete claire, le pied plus bleu. La meme que
 // celle de Machi Tool (_ecran_neige).
+//
+// v10 : « tu peux faire un sketch avec tous ces ecrans ? » Les dix ambiances
+// ne sont plus seules : la carte dessine tous les ecrans de Machi Tool -- les
+// aurores et leurs tunnels, les jeux de lumiere, sous l'eau, le ciel et l'eau,
+// les villes (et la ville cyberpunk en 3D), les paysages, le cocon, les
+// reveries, l'espace --, chacun porte de son jumeau en numpy. Ils vivent dans
+// des fichiers a cote (commun.h, les lots, registre.h). Machi Tool lui dit
+// lesquels montrer par leurs noms (« ME ») : une carte plus ancienne ou plus
+// recente que Machi Tool ignore ceux qu'elle ne connait pas. L'etat d'un ecran
+// (ses particules, ses champs) vit dans l'« arene », reservee une fois dans la
+// PSRAM de la carte : un seul ecran tourne a la fois.
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Preferences.h>
 #include <esp_system.h>
@@ -117,7 +130,7 @@ struct Reglages {
 };
 Reglages reglages;
 uint8_t reglages_bruts[12];    // tels que Machi Tool les a envoyes : ce que la carte garde
-const int NB_ECRANS = 10;      // l'ordre des ambiances de Machi Tool (ECRANS_AMBIANCES)
+const int NB_AMBIANCES = 10;   // les bits de « MA » : l'ordre des ambiances de Machi Tool (ECRANS_AMBIANCES)
 Preferences memoire;
 
 void eteindre() {
@@ -695,21 +708,45 @@ void ecran_neige(bool debut, float t, float dt) {
   }
 }
 
-typedef void (*Ecran)(bool, float, float);
-const Ecran ECRANS[NB_ECRANS] = {ecran_aurore, ecran_aurore_lac, ecran_coucher, ecran_lucioles, ecran_nebuleuse,
-                                 ecran_filantes, ecran_meduses, ecran_lanternes, ecran_sillages, ecran_neige};
+// tous les autres ecrans (v10) : leurs outils, les lots, le registre
+#include "commun.h"
+#include "lot_lumiere.h"
+#include "lot_aurores.h"
+#include "lot_eau_ciel.h"
+#include "lot_villes_paysages.h"
+#include "lot_espace.h"
+#include "lot_cocon_reveries.h"
+#include "lot_neufs.h"
+#include "lot_villes3d.h"
+#include "registre.h"
 
 int ecran = -1;
 bool ecran_neuf = false;
 unsigned long ecran_debut = 0, veille_depuis = 0, veille_image = 0;
+float ecran_decalage = 0;      // le « t » d'un ecran : son ecoule, decale au hasard (des flottants petits)
 
-uint16_t masque_veille() { return reglages.masque & ((1u << NB_ECRANS) - 1); }
+uint16_t masque_veille() { return reglages.masque & ((1u << NB_AMBIANCES) - 1); }
+
+// « ME » : les ecrans permis par leurs noms ; sans « ME » (Machi Tool d'avant), les bits de « MA »
+bool me_recu = false;
+uint8_t permis_me[(NB_ECRANS + 7) / 8];
+bool permis(int i) {
+  if (ECRANS[i].taille > arene_taille) return false;   // son etat ne tient pas dans l'arene
+  if (me_recu) return (permis_me[i / 8] >> (i % 8)) & 1;
+  return i < NB_AMBIANCES && ((masque_veille() >> i) & 1);
+}
+int nb_permis() {
+  int n = 0;
+  for (int i = 0; i < NB_ECRANS; i++) n += permis(i);
+  return n;
+}
 
 void prochain_ecran() {
   // chacun son tour, jamais deux fois de suite (s'il y en a plus d'un)
-  int choix[NB_ECRANS], n = 0;
+  static int choix[NB_ECRANS];
+  int n = 0;
   for (int i = 0; i < NB_ECRANS; i++)
-    if ((masque_veille() >> i) & 1) choix[n++] = i;
+    if (permis(i)) choix[n++] = i;
   if (n == 0) return;
   graine ^= millis() * 2654435761u;
   int suivant = choix[aleatoire() % n];
@@ -718,9 +755,10 @@ void prochain_ecran() {
   ecran = suivant;
   ecran_neuf = true;
   ecran_debut = millis();
+  ecran_decalage = (float)((graine >> 7) % 600);   // sans tirer : le hasard des ecrans reste le meme
 }
 
-bool veille_possible() { return veille_permise && reglages.actif && masque_veille(); }
+bool veille_possible() { return veille_permise && reglages.actif && nb_permis() > 0; }
 
 void commencer_veille() {
   etat = VEILLE;
@@ -764,7 +802,8 @@ void veiller(unsigned long maintenant) {
   const float ecoule = (maintenant - ecran_debut) / 1000.0f;
   const bool debut = ecran_neuf;
   ecran_neuf = false;
-  ECRANS[ecran](debut, ecoule, debut ? 0.0f : dt);
+  if (ecran < 0) return;
+  ECRANS[ecran].dessin(ECRANS[ecran].humeur, debut, ecran_decalage + ecoule, ecoule, debut ? 0.0f : dt);
   poser_scene(fminf(1.0f, fminf(ecoule / 1.0f, (duree - ecoule) / 1.0f)));
 }
 
@@ -784,6 +823,46 @@ void decoder(const uint8_t *d) {
   reglages.vert = min((uint8_t)100, d[10]);
   reglages.bleu = min((uint8_t)100, d[11]);
   preparer_lut();
+}
+
+// la signature des noms du registre : des ecrans permis gardes par une autre version du croquis sont oublies
+uint16_t signature_registre() {
+  uint16_t a = 0, b = 0;
+  for (int i = 0; i < NB_ECRANS; i++)
+    for (const char *c = ECRANS[i].nom; *c; c++) { a = (a + (uint8_t)*c) % 255; b = (b + a) % 255; }
+  return (b << 8) | a;
+}
+
+// « ME » : 2 octets (n), n octets de noms separes de virgules, leur Fletcher-16
+bool lire_ecrans() {
+  static uint8_t noms[4096];
+  uint8_t d[2];
+  if (lire(d, 2) != 2) return false;
+  const size_t n = d[0] << 8 | d[1];
+  if (n > sizeof noms || lire(noms, n) != n || lire(d, 2) != 2) return false;
+  if (fletcher16(noms, n) != (uint16_t)(d[0] << 8 | d[1])) return false;
+  uint8_t neufs[sizeof permis_me];
+  memset(neufs, 0, sizeof neufs);
+  for (size_t debut = 0; debut < n;) {
+    size_t fin = debut;
+    while (fin < n && noms[fin] != ',') fin++;
+    for (int i = 0; i < NB_ECRANS; i++)
+      if (strlen(ECRANS[i].nom) == fin - debut && !memcmp(ECRANS[i].nom, noms + debut, fin - debut))
+        neufs[i / 8] |= 1 << (i % 8);
+    debut = fin + 1;
+  }
+  if (!me_recu || memcmp(neufs, permis_me, sizeof neufs) != 0) {
+    memcpy(permis_me, neufs, sizeof neufs);
+    me_recu = true;
+    uint8_t garde[sizeof permis_me + 2];   // seulement s'ils changent : la flash s'use
+    const uint16_t sig = signature_registre();
+    garde[0] = sig >> 8;
+    garde[1] = sig & 0xFF;
+    memcpy(garde + 2, permis_me, sizeof permis_me);
+    memoire.putBytes("ecrans", garde, sizeof garde);
+    if (etat == VEILLE && !veille_possible()) eteindre();
+  }
+  return true;
 }
 
 bool lire_reglages() {
@@ -814,9 +893,16 @@ void setup() {
   panneau->setBrightness8(min(lum_pc, PLAFOND));
   eteindre();                  // noir jusqu'a la premiere image : plus de mire
 
+  preparer_arene();
   memoire.begin("machi", false);
   if (memoire.getBytes("veille", reglages_bruts, 12) == 12 && reglages_bruts[0] == 1) decoder(reglages_bruts);
   else memset(reglages_bruts, 0, 12);
+  uint8_t garde[sizeof permis_me + 2];
+  const uint16_t sig = signature_registre();
+  if (memoire.getBytes("ecrans", garde, sizeof garde) == sizeof garde && garde[0] == sig >> 8 && garde[1] == (sig & 0xFF)) {
+    memcpy(permis_me, garde + 2, sizeof permis_me);
+    me_recu = true;
+  }
   preparer_lut();
   // redemarree faute de tension (les ecrans de veille sur un USB trop faible) : noire jusqu'au PC
   veille_permise = esp_reset_reason() != ESP_RST_BROWNOUT;
@@ -838,11 +924,13 @@ void loop() {
       if (etat != VEILLE) panneau->setBrightness8(min(b, PLAFOND));
     }
   } else if (genre == 'V') {
-    Serial.println("MACHI 9");
+    Serial.println("MACHI 10");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'A') {
     if (lire_reglages()) Serial.printf("VEILLE %u %u\n", (unsigned)reglages.actif, (unsigned)masque_veille());
+  } else if (genre == 'E') {
+    if (lire_ecrans()) Serial.printf("ECRANS %d\n", nb_permis());
   } else if (genre == 'W') {
     veille_permise = true;     // Windows s'arrete : la carte prend le relais
     if (veille_possible()) commencer_veille();
