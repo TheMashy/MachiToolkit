@@ -57,8 +57,12 @@ inline float cr_atan2(float y, float x) {
 inline float cr_clip01(float v) { return v < 0 ? 0.0f : v > 1 ? 1.0f : v; }
 inline float cr_ramp(float v) { return v < 0 ? 0.0f : v; }
 
+// une valeur qui s'efface (x k), mise a zero quand elle ne compte plus : sinon elle finit en nombre denormal,
+// et chaque operation sur elle coute des centaines de cycles
+inline float cr_efface(float v, float k) { v *= k; return v < 1e-9f ? 0.0f : v; }
+
 // un point pose entre les pixels, partage sur ses quatre voisins (_cocon_tamponner) ; hors du panneau, perdu
-inline void cr_tamponner(float y, float x, float r, float v, float b) {
+__attribute__((always_inline)) inline void cr_tamponner(float y, float x, float r, float v, float b) {
   if (!(y > -1 && y < 64 && x > -1 && x < 64)) return;
   const int y0 = (int)(y + 1.0f) - 1, x0 = (int)(x + 1.0f) - 1;   // floor, pour y > -1
   const float fy = y - y0, fx = x - x0;
@@ -94,10 +98,16 @@ inline void cr_tamponner1(float *buf, float y, float x, float v) {
 }
 // et dans un tampon de trois couleurs (64 x 64 x 3)
 inline void cr_tamponner3(float *buf, float y, float x, float r, float v, float b) {
-  const float fy0 = floorf(y), fx0 = floorf(x);
-  const int y0 = (int)fy0, x0 = (int)fx0;
-  if (y0 < -1 || y0 > 63 || x0 < -1 || x0 > 63) return;
-  const float fy = y - fy0, fx = x - fx0;
+  if (!(y > -1 && y < 64 && x > -1 && x < 64)) return;
+  const int y0 = (int)(y + 1.0f) - 1, x0 = (int)(x + 1.0f) - 1;   // floor, pour y > -1
+  const float fy = y - y0, fx = x - x0;
+  if (y0 >= 0 && y0 < 63 && x0 >= 0 && x0 < 63) {        // les quatre voisins dans le panneau
+    float *p = buf + (y0 * 64 + x0) * 3, *q = p + 192;
+    const float a = (1 - fy) * (1 - fx), c = (1 - fy) * fx, d = fy * (1 - fx), g = fy * fx;
+    p[0] += a * r; p[1] += a * v; p[2] += a * b; p[3] += c * r; p[4] += c * v; p[5] += c * b;
+    q[0] += d * r; q[1] += d * v; q[2] += d * b; q[3] += g * r; q[4] += g * v; q[5] += g * b;
+    return;
+  }
   const float w[4] = {(1 - fy) * (1 - fx), (1 - fy) * fx, fy * (1 - fx), fy * fx};
   for (int k = 0; k < 4; k++) {
     const int yy = y0 + (k >> 1), xx = x0 + (k & 1);
@@ -191,19 +201,20 @@ void cr_halo_rev(const float *src, float *petit, int n, float k) {
   cr_agrandir(petit, k);
 }
 void cr_agrandir(const float *petit, float k, const float *mult) {
-  float ligne[32 * 3];
+  float ligne[34 * 3];                                   // une ligne a demi-taille, ses bouts recopies
   for (int y = 0; y < 64; y++) {
     const int ya = y & 1 ? y >> 1 : max(0, (y >> 1) - 1), yb = y & 1 ? min(31, (y >> 1) + 1) : y >> 1;
     const float wa = (y & 1 ? 0.75f : 0.25f) * k, wb = k - wa;
     const float *p = petit + ya * 96, *q = petit + yb * 96;
-    for (int i = 0; i < 96; i++) ligne[i] = wa * p[i] + wb * q[i];   // d'abord entre les deux lignes
+    for (int i = 0; i < 96; i++) ligne[i + 3] = wa * p[i] + wb * q[i];   // d'abord entre les deux lignes
+    for (int c = 0; c < 3; c++) { ligne[c] = ligne[3 + c]; ligne[99 + c] = ligne[96 + c]; }
     float *o = scene[y][0];
-    for (int x = 0; x < 64; x++, o += 3) {               // puis entre les deux colonnes
-      const int xa = x & 1 ? x >> 1 : (x > 1 ? (x >> 1) - 1 : 0), xb = x & 1 ? (x < 63 ? (x >> 1) + 1 : 31) : x >> 1;
-      const float va = x & 1 ? 0.75f : 0.25f, vb = 1 - va;
-      const float m = mult ? mult[y * 64 + x] : 1.0f;
-      const float *a = ligne + 3 * xa, *b = ligne + 3 * xb;
-      o[0] += m * (va * a[0] + vb * b[0]); o[1] += m * (va * a[1] + vb * b[1]); o[2] += m * (va * a[2] + vb * b[2]);
+    const float *m = mult ? mult + y * 64 : nullptr;
+    for (int i = 0; i < 32; i++, o += 6) {               // puis entre les deux colonnes : 1/4 - 3/4, 3/4 - 1/4
+      const float *g = ligne + 3 * i, *c = g + 3, *d = g + 6;
+      const float ma = m ? m[2 * i] : 1.0f, mb = m ? m[2 * i + 1] : 1.0f;
+      o[0] += ma * (0.25f * g[0] + 0.75f * c[0]); o[1] += ma * (0.25f * g[1] + 0.75f * c[1]); o[2] += ma * (0.25f * g[2] + 0.75f * c[2]);
+      o[3] += mb * (0.75f * c[0] + 0.25f * d[0]); o[4] += mb * (0.75f * c[1] + 0.25f * d[1]); o[5] += mb * (0.75f * c[2] + 0.25f * d[2]);
     }
   }
 }
@@ -878,7 +889,7 @@ void s_the(int humeur, bool debut, float t, float ecoule, float dt) {
   pluie(e.pluie, dt, 46, 52, 78, 0.12f);
   // la buee : elle voile et eclaircit la ville ; la lampe l'eclaire ; les gouttes qui glissent la nettoient
   const float pas = cr_min(dt, 1.0f), efface = expf(-pas / 18.0f);
-  for (int i = 0; i < 44 * 64; i++) e.trace[i] *= efface;
+  for (int i = 0; i < 44 * 64; i++) e.trace[i] = cr_efface(e.trace[i], efface);
   if (ecoule >= e.prochaine && e.nglisse < 3) {
     e.prochaine = ecoule + hasard(2.5f, 7.0f);
     float *g = e.glisse[e.nglisse++];
@@ -1151,6 +1162,7 @@ struct E_fibres {
   float th[72], l[72], ph[72], u[72], x0[72];   // chaque fibre : son angle, sa longueur, sa teinte, son pied
   float s14[30], longs[30];                     // le long d'une fibre : sa courbure, son eclat
   float px[72][30], py[72][30];                 // ses points, a cette image
+  float coul[72][3];                            // sa couleur, a cette image
   float p[4096 * 3];                            // les pointes, puis leur halo, puis les fils
 };
 void s_fibres(int humeur, bool debut, float t, float ecoule, float dt) {
@@ -1177,7 +1189,7 @@ void s_fibres(int humeur, bool debut, float t, float ecoule, float dt) {
       e.longs[k] = 0.035f + 0.12f * (1 - s) * (1 - s) * (1 - s);
     }
   }
-  float coul[72][3], moy[3] = {0, 0, 0};
+  float (*coul)[3] = e.coul, moy[3] = {0, 0, 0};
   const float oscille = 0.04f * sinf(t * 0.27f);
   for (int i = 0; i < 72; i++) {
     const float th = e.th[i] + 0.05f * cr_sin(t * 0.5f + e.th[i] * 2.5f) + 0.025f * cr_sin(t * 0.83f + e.ph[i]) + oscille;
@@ -1976,13 +1988,25 @@ struct E_flux {
 };
 
 // le courant en (x, y) a l'instant t : quelques grandes vagues de tourbillons, raccordees sur les bords
-inline void cr_flux_vitesse(const E_flux &e, const float *phase, float x, float y, float &ux, float &uy) {
+// (cos de kx X + ky Y + phase : la partie reelle de A^kx B^ky e^(i phase), avec A = e^(iX), B = e^(iY) -- les
+// vecteurs d'onde sont de petits entiers : deux sinus au lieu de huit)
+// (co : par vague, cos(phase) amp ky k, sin(phase) amp ky k, cos(phase) amp kx k, sin(phase) amp kx k)
+inline void cr_flux_vitesse(const float (*co)[8], float x, float y, float &ux, float &uy) {
   const float k = PI2 / 64;
+  const float ar = cr_cos(x * k), ai = cr_sin(x * k), br = cr_cos(y * k), bi = cr_sin(y * k);
+  const float a2r = ar * ar - ai * ai, a2i = 2 * ar * ai, b2r = br * br - bi * bi, b2i = 2 * br * bi;
+  float zr[8], zi[8];                                    // A, B, AB, A/B, A2 B, A B2, A2/B, A/B2
+  zr[0] = ar; zi[0] = ai; zr[1] = br; zi[1] = bi;
+  zr[2] = ar * br - ai * bi; zi[2] = ar * bi + ai * br;
+  zr[3] = ar * br + ai * bi; zi[3] = ai * br - ar * bi;
+  zr[4] = a2r * br - a2i * bi; zi[4] = a2r * bi + a2i * br;
+  zr[5] = ar * b2r - ai * b2i; zi[5] = ar * b2i + ai * b2r;
+  zr[6] = a2r * br + a2i * bi; zi[6] = a2i * br - a2r * bi;
+  zr[7] = ar * b2r + ai * b2i; zi[7] = ai * b2r - ar * b2i;
   ux = 0; uy = 0;
   for (int v = 0; v < 8; v++) {
-    const float c = cr_cos((x * CR_VAGUES[v][0] + y * CR_VAGUES[v][1]) * k + phase[v]) * e.amp[v];
-    ux += c * CR_VAGUES[v][1] * k;
-    uy -= c * CR_VAGUES[v][0] * k;
+    ux += zr[v] * co[0][v] - zi[v] * co[1][v];
+    uy -= zr[v] * co[2][v] - zi[v] * co[3][v];
   }
   const float s = sqrtf(ux * ux + uy * uy);
   const float m = 1 - cr_exp(-2 * s / 12.0f);            // tanh(s / 12)
@@ -1990,15 +2014,23 @@ inline void cr_flux_vitesse(const E_flux &e, const float *phase, float x, float 
   ux *= f; uy *= f;
 }
 
-void cr_flux_pas(E_flux &e, float t, float h) {
-  float phase[8];
-  for (int v = 0; v < 8; v++) phase[v] = fmodf(e.w[v] * t + e.ph[v], PI2);
-  const float efface = cr_exp(-h * 0.55f);               // les trainees s'effacent
-  for (int i = 0; i < 4096 * 3; i++) e.trace[i] *= efface;
-  const float depot = 1.5f / 255 * h;
+// un pas : les particules suivent le courant et deposent leur lumiere ; les trainees s'effacent (ou, pendant
+// l'avance du debut, le depot est deja diminue de ce qu'il perdra d'ici la fin de l'avance : le meme resultat)
+void cr_flux_pas(E_flux &e, float t, float h, bool efface = true, float garde = 1.0f) {
+  float co[4][8];
+  for (int v = 0; v < 8; v++) {
+    const float ph = fmodf(e.w[v] * t + e.ph[v], PI2), a = e.amp[v] * (PI2 / 64);
+    co[0][v] = cosf(ph) * a * CR_VAGUES[v][1]; co[1][v] = sinf(ph) * a * CR_VAGUES[v][1];
+    co[2][v] = cosf(ph) * a * CR_VAGUES[v][0]; co[3][v] = sinf(ph) * a * CR_VAGUES[v][0];
+  }
+  if (efface) {
+    const float k = cr_exp(-h * 0.55f);                  // les trainees s'effacent
+    for (int i = 0; i < 4096 * 3; i++) e.trace[i] = cr_efface(e.trace[i], k);
+  }
+  const float depot = 1.5f / 255 * h * garde;
   for (int i = 0; i < CR_FLUX_N; i++) {
     float ux, uy;
-    cr_flux_vitesse(e, phase, e.x[i], e.y[i], ux, uy);
+    cr_flux_vitesse(co, e.x[i], e.y[i], ux, uy);
     float x = e.x[i] + ux * h, y = e.y[i] + uy * h;
     x -= 64 * floorf(x / 64); y -= 64 * floorf(y / 64);  // le courant se raccorde sur les bords
     e.x[i] = x; e.y[i] = y;
@@ -2040,7 +2072,8 @@ void s_flux(int humeur, bool debut, float t, float ecoule, float dt) {
       e.x[i] = hasard(0, 64); e.y[i] = hasard(0, 64); e.age[i] = hasard(0, 10); e.vie[i] = hasard(6, 12);
       e.age[i] = cr_min(e.age[i], e.vie[i] - 0.5f);
     }
-    for (int j = 0; j < 36; j++) cr_flux_pas(e, t - 3.0f + j / 12.0f, 1 / 12.0f);   // les trainees sont deja la
+    for (int j = 0; j < 36; j++)                         // les trainees sont deja la
+      cr_flux_pas(e, t - 3.0f + j / 12.0f, 1 / 12.0f, false, expf(-0.55f / 12 * (35 - j)));
   }
   e.decal = 0.06f * sinf(t * 0.021f) + fmodf(t * 0.004f, 1.0f);
   const float reste = cr_min(dt, 0.5f);
@@ -2225,7 +2258,7 @@ void s_pendule(int humeur, bool debut, float t, float ecoule, float dt) {
     cr_pendule_nouveau(e);
   }
   const float frais = cr_exp(-pas * 1.6f);
-  for (int i = 0; i < 4096; i++) e.frais[i] *= frais;
+  for (int i = 0; i < 4096; i++) e.frais[i] = cr_efface(e.frais[i], frais);
   cr_pendule_tracer(e, e.tau + pas);
   const float fondu = cr_min(1.0f, cr_max(0.0f, e.tau) / 2.0f);
   const float cm = cr_max(e.c[0], cr_max(e.c[1], e.c[2])), k1 = cm / 170, kc = 255 / cm;
@@ -2241,7 +2274,7 @@ void s_pendule(int humeur, bool debut, float t, float ecoule, float dt) {
       o[0] += e.c[0] * v; o[1] += e.c[1] * v; o[2] += e.c[2] * v;
     }
     if (e.ancien) {
-      ancien[i] *= efface;
+      ancien[i] = cr_efface(ancien[i], efface);
       plus = cr_max(plus, ancien[i]);
       const float la = ancien[i] * 0.6f;
       if (la > 0) {
