@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.127.0"
+VERSION = "1.128.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -19120,6 +19120,3379 @@ def _scene_constellations(p, e, t, ecoule, dt):
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
+# LE CIEL, LA MER ET SES BETES. Une mer de nuages au couchant, un hublot de
+# nuit, un arc-en-ciel apres l'averse, un lever de lune sur la mer ; une
+# grande meduse (« meduses »), une raie manta, une tortue de mer. Leurs
+# passages se calent sur `ecoule` : chaque lancement s'ouvre sur son sujet.
+
+
+# LE CIEL, LA MER ET SES BETES. Au-dessus des nuages au couchant, par le
+# hublot la nuit, l'arc-en-ciel apres la pluie, la lune qui se leve sur la
+# mer ; et trois betes de la mer en gros plan : une grande meduse, une raie
+# manta, une tortue. Presque tout ce qui bouge est une fonction douce du temps :
+# pas d'a-coup, et la meme graine donne la meme image.
+
+
+def _ciel_mer_tache(img, ys, xs, couleurs):
+    """Ajoute des points poses entre les pixels : chacun reparti sur ses quatre voisins, ca glisse sans a-coups."""
+    import numpy as np
+    ys = np.asarray(ys, float).ravel()
+    xs = np.asarray(xs, float).ravel()
+    c = np.broadcast_to(np.asarray(couleurs, float), (len(ys), 3))
+    y0, x0 = np.floor(ys), np.floor(xs)
+    fy, fx = ys - y0, xs - x0
+    y0, x0 = y0.astype(int), x0.astype(int)
+    idx, poids, quel = [], [], []
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        ok = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+        idx.append((yy * 64 + xx)[ok])
+        poids.append(w[ok])
+        quel.append(np.nonzero(ok)[0])
+    idx, poids, quel = np.concatenate(idx), np.concatenate(poids), np.concatenate(quel)
+    if len(idx):
+        for k in range(3):
+            img[..., k] += np.bincount(idx, poids * c[quel, k], minlength=4096).reshape(64, 64)
+
+
+def _ciel_mer_peindre(img, ys, xs, couleurs, force=1.0):
+    """Peint des points poses entre les pixels, par-dessus (meme plus sombres que le fond) : chacun couvre ses
+    quatre voisins selon sa part ; la ou ils se chevauchent, leurs couleurs se melangent."""
+    import numpy as np
+    ys = np.asarray(ys, float).ravel()
+    xs = np.asarray(xs, float).ravel()
+    c = np.broadcast_to(np.asarray(couleurs, float), (len(ys), 3))
+    y0, x0 = np.floor(ys), np.floor(xs)
+    fy, fx = ys - y0, xs - x0
+    y0, x0 = y0.astype(int), x0.astype(int)
+    idx, poids, quel = [], [], []
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        ok = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+        idx.append((yy * 64 + xx)[ok])
+        poids.append(w[ok])
+        quel.append(np.nonzero(ok)[0])
+    idx, poids, quel = np.concatenate(idx), np.concatenate(poids), np.concatenate(quel)
+    if not len(idx):
+        return
+    a = np.bincount(idx, poids, minlength=4096).reshape(64, 64)
+    somme = np.stack([np.bincount(idx, poids * c[quel, k], minlength=4096).reshape(64, 64) for k in range(3)], -1)
+    couv = np.clip(a * force, 0, 1)[..., None]
+    img[...] = img * (1 - couv) + somme / np.maximum(a, 1e-6)[..., None] * couv
+
+
+def _ciel_mer_aller_retour(t, traversee, vif=0.35):
+    """Une bete qui traverse puis revient : (aller ?, s de 0 a 1 le long du passage, ds/dq). Plus vive pres des
+    bords (ou elle fait demi-tour, hors champ), plus lente au milieu."""
+    import numpy as np
+    ph = (t / traversee) % 2.0
+    q = ph % 1.0
+    return ph < 1.0, q + vif * np.sin(2 * np.pi * q) / (2 * np.pi), 1 + vif * np.cos(2 * np.pi * q)
+
+
+def _ciel_mer_lire(champ, ys, xs):
+    """Lit un champ qui se raccorde a des positions pas forcement entieres (melange des quatre voisins)."""
+    import numpy as np
+    h, w = champ.shape
+    y0, x0 = np.floor(ys), np.floor(xs)
+    fy, fx = ys - y0, xs - x0
+    y0, x0 = y0.astype(int) % h, x0.astype(int) % w
+    y1, x1 = (y0 + 1) % h, (x0 + 1) % w
+    return (champ[y0, x0] * (1 - fx) + champ[y0, x1] * fx) * (1 - fy) + (champ[y1, x0] * (1 - fx) + champ[y1, x1] * fx) * fy
+
+
+def _ciel_mer_palette(k, cles, couleurs):
+    """Une couleur prise le long d'une palette : k (tableau) entre les cles, couleurs aux cles."""
+    import numpy as np
+    k = np.asarray(k, float)
+    c = np.asarray(couleurs, float)
+    return np.stack([np.interp(k, cles, c[:, i]) for i in range(3)], -1)
+
+
+# --- La mer de nuages -------------------------------------------------------
+
+MER_DE_NUAGES_RANGEES = 40          # rangees de moutons entre nous et l'horizon
+MER_DE_NUAGES_PAS = 0.5             # leur ecart, en profondeur
+
+
+def _mer_de_nuages_bosses(rng):
+    """Un long profil de moutons (des demi-cercles qui se chevauchent, des petits par-dessus), qui se raccorde."""
+    import numpy as np
+    n = 4096                                                    # 64 unites, 64 echantillons par unite
+    h = np.zeros(n)
+
+    def bosse(dessous, c, r, haut):
+        i = np.arange(int((c - r) * 64) - 1, int((c + r) * 64) + 2)
+        d = (i / 64.0 - c) / r
+        m = np.abs(d) < 1
+        j = i[m] % n
+        h[j] = np.maximum(h[j], dessous[j] + r * haut * np.sqrt(1 - d[m] ** 2))
+
+    c, plat = 0.0, np.zeros(n)
+    while c < 64:
+        r = rng.uniform(0.2, 0.62)
+        bosse(plat, c, r, rng.uniform(0.55, 0.95))
+        c += r * rng.uniform(0.9, 1.6)
+    gros = h.copy()
+    for c in rng.uniform(0, 64, 170):                           # le moutonnement, pose sur les gros
+        bosse(gros * 0.92, c, rng.uniform(0.06, 0.15), 0.7)
+    return np.append(h, h[0])
+
+
+def _mer_de_nuages_sommets(rng, hz, sx):
+    """Deux sommets qui percent la mer de nuages, a contre-jour : leur couleur (une image) et
+    [(profondeur, opacite)], du plus loin au plus pres."""
+    import numpy as np
+    Y, X = _xy()
+    image, sommets = np.zeros((64, 64, 3)), []
+    roche = _brume(rng, 5, 64)
+    x = X[0]
+    for x0, y0, z, pg, pd, epaules in ((15.0, 12.0, 11.0, 1.35, 1.0, ((-6, 2.6, 2.5), (5, 1.8, 2.0), (10, 2.4, 3.0))),
+                                       (57.0, 18.5, 6.0, 0.8, 1.3, ((-5, 1.8, 2.5), (-11, 1.4, 3.0)))):
+        base = hz + 40.0 / z                                    # la ou la mer de nuages le coupe
+        crete = y0 + np.where(x < x0, (x0 - x) * pg, (x - x0) * pd)
+        for dx, haut, larg in epaules:                          # des epaules, des breches sur les aretes
+            crete = crete - haut * np.clip(1 - np.abs(x - x0 - dx) / larg, 0, 1)
+        crete = crete + 0.45 * np.sin(x * 2.1 + x0) * np.clip(np.abs(x - x0) / 3, 0, 1)
+        crete = crete[None, :]
+        opacite = np.clip(Y - crete + 0.5, 0, 1) * (Y < base + 4)
+        vers_soleil = 1.0 if x0 < sx else -1.0
+        face = np.clip((X - x0) * vers_soleil * 0.3 + 0.5, 0, 1)   # le versant tourne vers le soleil
+        couloirs = np.clip((roche - 0.45) * 3 + np.sin((X - x0) * 0.9 + Y * 0.45 * vers_soleil) * 0.5, 0, 1)
+        couleur = np.array([42.0, 33, 76]) + (couloirs * np.clip(1 - (Y - crete) / 10, 0, 1))[..., None] * np.array([22.0, 18, 34])
+        couleur += np.clip((Y - y0) / 18, 0, 1)[..., None] * np.array([30.0, 16, 26])      # la brume, plus bas
+        couleur += face[..., None] * np.array([24.0, 10, 12])
+        pente = np.abs(np.gradient(crete[0]))[None, :]
+        fil = np.clip(1.2 + pente * 0.8 - (Y - crete), 0, 1) * (0.2 + 0.8 * face)   # la crete, doree a contre-jour
+        couleur = couleur * (1 - fil[..., None]) + np.array([255.0, 182, 122]) * fil[..., None]
+        loin = 0.12 + 0.25 * min(1.0, z / 12)
+        couleur = couleur * (1 - loin) + np.array([215.0, 130, 135]) * loin
+        image = image * (1 - opacite[..., None]) + couleur * opacite[..., None]
+        sommets.append((z, opacite))
+    sommets.sort(key=lambda s: -s[0])
+    return image, sommets
+
+
+def _scene_mer_de_nuages(p, e, t, ecoule, dt):
+    """Au-dessus d'une mer de nuages au couchant : des rangees de moutons qui s'eloignent, dorees par la tranche,
+    mauves dans l'ombre ; le soleil bas sur l'horizon, deux sommets qui percent ; tout derive lentement."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    hz, sx, sy = 25.0, 40.0, 23.0                               # l'horizon, le soleil
+    if "bosses" not in e:
+        e["bosses"] = _mer_de_nuages_bosses(rng)
+        e["sommets"] = _mer_de_nuages_sommets(rng, hz, sx)
+    prof = e["bosses"]
+    ciel = _ciel_mer_palette(Y / hz, (0.0, 0.5, 0.85, 1.0),
+                             ((14, 18, 54), (96, 52, 118), (225, 120, 110), (255, 170, 105)))
+    d = np.hypot(X - sx, (Y - sy) * 1.7)                        # le halo du soleil, etire sur l'horizon
+    ciel += np.exp(-d / 9.0)[..., None] * np.array([110.0, 75, 25]) + np.exp(-d / 26.0)[..., None] * np.array([40.0, 18, 0])
+    ciel += np.clip(3.4 - np.hypot(X - sx, Y - sy), 0, 1)[..., None] * np.array([255.0, 240, 190])
+    ciel[5, 9] = np.maximum(ciel[5, 9], np.array([230.0, 225, 240]) * (0.75 + 0.25 * np.sin(t * 1.3)))   # l'etoile du berger
+    # les rangees, de la plus lointaine a la plus proche ; on peint des grandeurs (lumiere, tranche, distance),
+    # la couleur vient a la fin, en une fois
+    sous = (Y >= hz).astype(float)
+    couv, roc = sous.copy(), np.zeros((64, 64))
+    corps, tranche, loin = sous * 0.5, np.zeros((64, 64)), sous.copy()
+    n, pas, v = MER_DE_NUAGES_RANGEES, MER_DE_NUAGES_PAS, 0.06
+    s = np.arange(n) - v * t
+    gen = np.floor(s / n)
+    z = 0.55 + (s - gen * n) * pas                              # 0,55 : sous nous ; n x pas : l'horizon
+    u0 = (X[0] - 32.0) / 40.0
+    derive = (t * 0.012) % 64.0
+    image_sommets, sommets = e["sommets"]
+    sommets, devant = list(sommets), []
+    ident = gen.astype(np.int64) * n + np.arange(n)             # la rangee garde son dessin tant qu'elle vit
+    uw = u0[None, :] * z[:, None] + derive
+    h = np.interp((((uw + ((ident * 7919) % 4096)[:, None] / 64.0) % 64.0) * 64.0).ravel(), np.arange(4097), prof)
+    h = h.reshape(n, 64) * (0.75 + 0.25 * np.sin(uw * 0.31 + ident[:, None] * 0.7)) + 0.09 * np.sin(uw * 0.53 - ident[:, None] * 1.3)
+    cretes = hz + 40.0 * (1 - h) / z[:, None]
+    bords = np.pad(cretes, ((0, 0), (2, 2)), mode="edge")
+    lisse = cretes.copy()                                       # la crete sans ses creux : un creux reste dans l'ombre
+    for k in (0, 1, 3, 4):
+        lisse = np.minimum(lisse, bords[:, k:k + 64])
+    ordre = np.argsort(-z)
+    fin = np.minimum.accumulate(np.ceil(cretes[ordre[::-1]].max(axis=1) + 0.5))[::-1]   # dessous : tout couvert
+    fin = np.append(fin[1:], 64).astype(int)
+    for j, i in enumerate(ordre):
+        zi = float(z[i])
+        while sommets and sommets[0][0] > zi:                   # un sommet, entre deux rangees
+            zs, a = sommets.pop(0)
+            couv = couv * (1 - a) + a
+            roc = roc * (1 - a) + a
+            devant.append((zs, a))
+        crete = cretes[i]
+        r0, r1 = max(0, int(crete.min())), min(64, fin[j])
+        if r0 >= r1:
+            continue
+        dy = Y[r0:r1] - crete[None, :]                          # pixels sous la crete
+        a = np.clip(dy + 0.5, 0, 1)
+        for zs, op in devant:                                   # juste devant un sommet : elle apparait doucement
+            if zs - zi < 0.8:
+                a = a * (1 - op[r0:r1] * (1 - (zs - zi) / 0.8))
+        creux = crete - lisse[i]
+        ds = Y[r0:r1] - lisse[i][None, :]
+        b = 1 - a
+        couv[r0:r1] = couv[r0:r1] * b + a
+        roc[r0:r1] *= b
+        corps[r0:r1] = corps[r0:r1] * b + np.exp(-ds * (zi / 40.0 / 0.16)) * a
+        tranche[r0:r1] = tranche[r0:r1] * b + np.exp(-np.maximum(dy, 0) / max(0.9, 2.0 / zi) - creux * 0.6) * a
+        loin[r0:r1] = loin[r0:r1] * b + min(1.0, (zi - 0.55) / 13.0) * a
+    for _, a in sommets:                                        # (un sommet plus proche que toutes les rangees)
+        couv = couv * (1 - a) + a
+        roc = roc * (1 - a) + a
+    g = (loin ** 0.6)[..., None]
+    fond = np.array([46.0, 28, 78]) * (1 - g) + np.array([190.0, 106, 124]) * g
+    milieu = np.array([132.0, 72, 128]) * (1 - g) + np.array([230.0, 138, 128]) * g
+    soleil_x = np.exp(-((X - sx) / 16.0) ** 2)[..., None]
+    rim = np.array([250.0, 140, 160]) * (1 - soleil_x) + np.array([255.0, 208, 140]) * soleil_x
+    nuage = fond + corps[..., None] * (milieu - fond + soleil_x * (1 - 0.5 * g) * np.array([70.0, 42, 8]))
+    tr = tranche[..., None]
+    nuage = nuage * (1 - tr * 0.85) + rim * tr * (0.6 + 0.4 * g)
+    brume = 0.5 * loin[..., None] ** 1.6
+    nuage = nuage * (1 - brume) + np.array([240.0, 155, 125]) * brume
+    img = ciel * (1 - couv[..., None]) + nuage * (couv - roc)[..., None] + image_sommets * roc[..., None]
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Le hublot de nuit -------------------------------------------------------
+
+def _hublot_decor(rng, hz):
+    """Ce qui ne bouge pas : la cabine et le cadre du hublot, l'aile, les etoiles ; et, pour la mer de nuages,
+    des ondes posees a plat en perspective, chacune effacee la ou elle deviendrait plus fine qu'un pixel."""
+    import numpy as np
+    Y, X = _xy()
+    cx, cy, a, b = 33.0, 32.0, 17.0, 23.5
+    q = (np.abs((X - cx) / a) ** 3.2 + np.abs((Y - cy) / b) ** 3.2) ** (1 / 3.2)      # 1 au bord de la vitre
+    vitre = np.clip((1 - q) * 17 + 0.5, 0, 1)
+    cabine = np.zeros((64, 64, 3)) + np.array([17.0, 16, 22]) + (Y / 64.0)[..., None] * np.array([8.0, 6, 4])
+    gy, gx = np.gradient(q)
+    nn = np.hypot(gx, gy) + 1e-9
+    lune = np.clip((gx * 0.55 + gy * 0.65) / nn, 0, 1)          # la tranche du cadre qui voit la lune
+    cadre = (q >= 0.98) & (q < 1.2)
+    biseau = np.clip((1.2 - q) / 0.22, 0, 1)
+    teinte = np.array([30.0, 30, 38]) + (lune * biseau)[..., None] * np.array([50.0, 56, 78])
+    cabine[cadre] = teinte[cadre]
+    cabine[(q >= 1.2) & (q < 1.27)] = (9, 9, 13)                # le joint
+    rebord = (q >= 0.98) & (q < 1.04)
+    cabine[rebord] = cabine[rebord] * 0.7 + np.array([60.0, 62, 76]) * 0.3
+    store = (Y < 12.6) & (q < 1.02)                             # le store, un peu baisse
+    cabine[store] = np.array([36.0, 35, 42]) + ((Y[store] - 8) * 1.2)[:, None]
+    cabine[(Y >= 11.6) & (Y < 12.6) & (q < 1.02)] = (62, 61, 70)
+    cabine[(Y >= 12.6) & (Y < 13.6) & (np.abs(X - cx) < 2.5)] = (54, 53, 62)
+    vitre = vitre * (Y >= 12.6)
+    # l'aile, vue d'au-dessus : le bord d'attaque loin (en haut), le bord de fuite pres (en bas), le bout a gauche
+    attaque = 39.0 + (X - 21.0) * 0.19
+    fuite = 41.4 + (X - 23.0) * 0.6
+    aile = np.clip(np.minimum(np.minimum(Y - attaque, fuite - Y), (X - 20.6) * 2) + 0.5, 0, 1)
+    ailette = np.clip(np.minimum(np.minimum(X - 20.4 - (39.5 - Y) * 0.2, 22.2 - X + (39.5 - Y) * 0.08), Y - 34.0) + 0.5, 0, 1)
+    ailette *= Y < 40
+    aile = np.maximum(aile, ailette)
+    corde = np.clip((Y - attaque) / np.maximum(1.0, fuite - attaque), 0, 1)
+    couleur_aile = _ciel_mer_palette(corde, (0.0, 0.35, 1.0), ((44, 50, 70), (26, 29, 42), (15, 16, 24)))
+    couleur_aile += np.clip(1.1 - np.abs(Y - attaque - 0.3), 0, 1)[..., None] * np.array([70.0, 78, 104])   # le bord d'attaque
+    couleur_aile += (np.clip(1 - np.abs(X - 20.9 - (39.5 - Y) * 0.2), 0, 1) * (Y < 40))[..., None] * np.array([50.0, 56, 76])
+    volet = (np.abs(Y - (fuite - 2.4)) < 0.5) & (X > 28)
+    couleur_aile[volet] *= 0.55
+    n = 16
+    etoiles = (rng.uniform(17, 50, n), rng.uniform(14, hz - 2, n), rng.uniform(0, 2 * np.pi, n), rng.uniform(0.3, 1, n))
+    # la mer de nuages : u (de cote) et z (au loin) de chaque pixel sous l'horizon
+    sous = Y > hz + 0.5
+    z = np.where(sous, 20.0 / np.maximum(Y - hz, 0.5), 40.0)
+    u = (X - 33.0) * z / 40.0
+    k = np.array([2.0, 2.9, 4.2, 6.0, 8.5, 12.0, 17.0, 24.0, 33.0])
+    th = rng.uniform(0, np.pi, len(k))
+    ka, kb = k * np.cos(th), k * np.sin(th) * 0.55             # un peu etirees en profondeur
+    finesse = np.maximum(np.abs(ka)[:, None, None] * (z / 40.0), np.abs(kb)[:, None, None] * (z * z / 20.0)) / (2 * np.pi)
+    amp = k ** -0.45
+    poids = np.clip(1.6 - finesse * 4.0, 0, 1) * sous * amp[:, None, None]    # au-dela d'1/4 de cycle par pixel : effacee
+    phase = ka[:, None, None] * u + kb[:, None, None] * z + rng.uniform(0, 2 * np.pi, len(k))[:, None, None]
+    lumiere = ((-0.5 * ka + 0.85 * kb) / k)[:, None, None] * poids     # la pente vers la lune
+    return {"vitre": vitre, "cabine": cabine, "aile": aile, "couleur_aile": couleur_aile, "etoiles": etoiles,
+            "z": z, "ondes": (phase, poids / amp.sum(), lumiere / amp.sum(), ka)}
+
+
+def _scene_hublot(p, e, t, ecoule, dt):
+    """Par le hublot d'un avion, la nuit : la mer de nuages sous la lune, qui defile lentement ; des etoiles ;
+    le bout de l'aile et son feu rouge qui clignote doucement."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    hz, lx, ly = 30.0, 27.0, 18.5
+    if "vitre" not in e:
+        e.update(_hublot_decor(rng, hz))
+    vue = _ciel_mer_palette(Y, (12.0, hz), ((4, 7, 20), (26, 36, 70)))
+    dl = np.hypot(X - lx, Y - ly)
+    vue += np.exp(-dl / 3.5)[..., None] * np.array([45.0, 50, 66]) + np.exp(-dl / 14.0)[..., None] * np.array([14.0, 18, 32])
+    ex, ey, ep, el = e["etoiles"]
+    vis = el * (0.6 + 0.4 * np.sin(t * 1.7 + ep)) * np.clip((np.hypot(ex - lx, ey - ly) - 4) / 6, 0, 1)
+    _pointer(vue, ey, ex, vis[:, None] * np.array([190.0, 195, 220]))
+    vue += np.clip(3.0 - dl, 0, 1)[..., None] * (np.array([235.0, 235, 215]) - vue)
+    # la mer de nuages, qui glisse vers l'arriere (vers la gauche : le nez est a droite)
+    phase, poids, lumiere, ka = e["ondes"]
+    decal = (ka * (t * 0.05)) % (2 * np.pi)
+    ph = phase + decal[:, None, None]
+    f = 0.5 + (poids * np.sin(ph)).sum(0) * 1.6
+    relief = (lumiere * np.cos(ph)).sum(0)
+    z = e["z"]
+    dens = np.clip((f - 0.44) * 3.5, 0, 1)
+    glade = np.exp(-((X - lx) / (2.0 + np.maximum(Y - hz, 0) * 0.5)) ** 2) * np.clip((Y - hz) / 4, 0, 1)
+    lum = dens ** 0.8 * np.clip(0.55 + relief * 2.0 + 0.4 * glade, 0.15, 1.3)
+    nuage = np.array([7.0, 10, 24]) + lum[..., None] * np.array([120.0, 132, 170])
+    loin = np.clip((z - 2.5) / 7.0, 0, 1)
+    nuage = nuage * (1 - loin[..., None]) + np.array([36.0, 46, 80]) * loin[..., None]
+    sous = (np.clip(Y - hz + 0.5, 0, 1))[..., None]
+    vue = vue * (1 - sous) + nuage * sous
+    # l'aile, et son feu qui clignote doucement
+    aile = e["aile"][..., None]
+    vue = vue * (1 - aile) + e["couleur_aile"] * aile
+    feu = 0.12 + 0.88 * np.exp(-(((t / 2.6) % 1.0 - 0.3) / 0.075) ** 2)
+    df = np.hypot(X - 21.4, Y - 39.6)
+    vue += (feu * (np.exp(-df / 1.4) * 1.4 + np.exp(-df / 5.0) * 0.3))[..., None] * np.array([255.0, 40, 30])
+    vue += (feu * np.exp(-df / 7.0) * e["aile"] * 0.8)[..., None] * np.array([120.0, 14, 10])
+    vitre = e["vitre"][..., None]
+    img = e["cabine"] * (1 - vitre) + vue * vitre
+    img += (vitre[..., 0] * np.clip(1 - np.abs(X - Y * 0.45 - 22) / 3.0, 0, 1) * 0.05)[..., None] * np.array([120.0, 120, 140])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- L'arc-en-ciel ----------------------------------------------------------
+
+ARC_EN_CIEL_COULEURS = ((255, 45, 40), (255, 135, 30), (250, 225, 60), (60, 205, 80), (50, 110, 255), (130, 60, 210))
+
+
+def _arc_en_ciel_decor(rng):
+    """Ce qui ne bouge pas : le ciel et l'averse au loin, les deux arcs (forme et couleurs), la colline et son arbre."""
+    import numpy as np
+    Y, X = _xy()
+    rideau = np.exp(-((Y - 36) / 11.0) ** 2)                    # l'averse qui s'en va, derriere l'arc
+    ciel = _ciel_mer_palette(Y, (0.0, 46.0), ((40, 74, 128), (128, 142, 158))) * (1 - 0.42 * rideau)[..., None]
+    pluie = rideau * 0.1 * np.exp(-((X - 50 + Y * 0.2) / 10.0) ** 2)
+    cx, cy, R, R2 = 32.0, 70.0, 47.0, 58.0
+    r = np.hypot(X - cx, Y - cy)
+    arcs = []
+    for d, largeur, k in ((R - r, 6.0, 1.0), (r - R2, 7.0, 0.34)):   # d : 0 au bord rouge
+        bande = np.clip(d / largeur, 0, 1)
+        env = np.sin(np.pi * bande) ** 0.7 * ((d > 0) & (d < largeur)) * k
+        arcs.append((env, _ciel_mer_palette(bande * 5.0, np.arange(6.0), ARC_EN_CIEL_COULEURS)))
+    dedans = np.clip((R - 6 - r) / 6, 0, 1) * np.clip((r - 25) / 10, 0, 1)          # plus clair sous l'arc
+    entre = ((r > R) & (r < R2)).astype(float)                  # la bande sombre entre les deux arcs
+    x = X[0]
+    loin = 45.0 + 2.2 * np.sin(x * 0.08 + 0.7) + 1.2 * np.sin(x * 0.23 + 2)
+    colline = _ciel_mer_palette(Y - loin[None, :], (0.0, 10.0), ((70, 132, 70), (44, 96, 52)))
+    al = np.clip(Y - loin[None, :] + 0.5, 0, 1)
+    ax, ay = 50.0, loin[50] - 4.0                               # un arbre seul, sur la colline
+    houppe = np.clip(3.3 - np.hypot(X - ax, (Y - ay) * 1.1), 0, 1)
+    feuillage = _ciel_mer_palette(Y - ay, (-3.0, 3.0), ((80, 140, 70), (30, 70, 40)))
+    colline = colline * (1 - houppe[..., None]) + feuillage * houppe[..., None]
+    tronc = (X == 50) & (Y >= int(ay) + 3) & (Y <= loin[50])
+    colline[tronc] = (40, 34, 26)
+    al = np.maximum(np.maximum(al, houppe), tronc)
+    return {"ciel": ciel, "pluie_loin": pluie, "arcs": arcs, "dedans": dedans, "entre": entre,
+            "ang": np.arctan2(X - cx, cy - Y), "colline": (colline, al)}
+
+
+def _scene_arc_en_ciel(p, e, t, ecoule, dt):
+    """Apres la pluie : le ciel gris-bleu se degage, un arc-en-ciel (et son second arc, pale) apparait et respire ;
+    les dernieres gouttes tombent sur une prairie verte et lumineuse."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "nuees" not in e:
+        e["nuees"] = (_brume(rng, 16), _brume(rng, 6))
+        e["gouttes"] = [rng.uniform(0, 64, 14), rng.uniform(-20, 50, 14), rng.uniform(30, 42, 14)]
+        e["fleurs"] = (rng.uniform(2, 62, 16), rng.uniform(56, 63, 16), rng.integers(0, 3, 16))
+        e.update(_arc_en_ciel_decor(rng))
+    soleil = 0.5 + 0.5 * np.sin(t * 0.11)                     # le soleil qui perce, puis se voile un peu (57 s)
+    img = e["ciel"] + (np.clip(np.sin(X * 1.7 + Y * 0.32 - t * 4.0 + np.sin(X * 0.21) * 3), 0, 1) ** 6
+                       * e["pluie_loin"])[..., None] * np.array([150.0, 160, 180])
+    a, b = e["nuees"]
+    f = _fenetre(a, -t * 0.9 + 17, 9) * 0.8 + _fenetre(b, -t * 1.3, 40) * 0.2     # elles s'en vont vers la droite
+    seuil = 0.53 + 0.07 * soleil
+    epais = np.clip((f - seuil) * 4.0, 0, 1) * np.clip(1.25 - Y / 30.0, 0, 1)
+    coeur = np.clip((f - seuil) * 2.2, 0, 1)[..., None]
+    nuee = (np.array([205.0, 208, 218]) * (1 - coeur) + np.array([78.0, 84, 102]) * coeur) * (0.85 + 0.2 * soleil)
+    img = img * (1 - epais[..., None]) + nuee * epais[..., None]
+    # l'arc, puis le second (couleurs inversees, pale), et la bande sombre entre les deux
+    force = (0.4 + 0.6 * soleil) * min(1.0, 0.3 + ecoule / 6.0)
+    souffle = 0.75 + 0.25 * np.sin(e["ang"] * 3.0 - t * 0.21)
+    img *= (1 + force * (0.14 * e["dedans"] - 0.12 * e["entre"]))[..., None]
+    for env, couleur in e["arcs"]:
+        al = (env * souffle * force)[..., None]
+        img = img * (1 - al * 0.45) + couleur * al * 0.85
+    # la prairie : la colline au loin, le pre devant ; l'ombre des nuages qui passe dessus
+    x = X[0]
+    ombre = 0.78 + 0.22 * soleil * (0.5 + 0.5 * np.sin(x * 0.09 - t * 0.25 + np.sin(x * 0.04 + t * 0.05) * 2))
+    colline, al = e["colline"]
+    img = img * (1 - al[..., None]) + colline * (al * ombre[None, :])[..., None]
+    herbe = 0.9 * np.sin(x * 2.3) + 0.6 * np.sin(x * 3.7 + 1) + 0.5 * np.sin(t * 1.4 + x * 0.25)
+    pres = 52.0 + 1.5 * np.sin(x * 0.06 + 2.5) + 0.8 * np.sin(x * 0.31) - np.maximum(herbe, 0) * 0.9
+    al = np.clip(Y - pres[None, :] + 0.5, 0, 1)[..., None]
+    pre = _ciel_mer_palette(Y - pres[None, :], (0.0, 2.0, 12.0), ((140, 205, 80), (92, 172, 58), (56, 124, 42)))
+    img = img * (1 - al) + pre * (ombre[None, :, None] * 1.05) * al
+    fx, fy, fc = e["fleurs"]
+    teintes = np.array([[255.0, 240, 140], [250, 250, 245], [255, 140, 175]])
+    _pointer(img, fy, fx + np.sin(t * 1.4 + fx * 0.25) * 0.6, teintes[fc] * (0.75 + 0.25 * soleil))
+    # les dernieres gouttes
+    gx, gy, gv = e["gouttes"]
+    gy += gv * dt
+    gx += gv * 0.12 * dt
+    finies = gy > 58
+    gy[finies] -= 80
+    gx[finies] = rng.uniform(0, 64, int(finies.sum()))
+    gx %= 64
+    _ciel_mer_tache(img, np.concatenate([gy, gy - 1.2]), np.concatenate([gx, gx - 0.15]),
+                    np.repeat([[140.0, 150, 170], [70, 76, 90]], len(gx), axis=0) * 0.6)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Le lever de lune -------------------------------------------------------
+
+LEVER_DE_LUNE_CYCLE = 110.0         # secondes : elle monte, blanchit, puis tout recommence dans un fondu
+LEVER_DE_LUNE_FONDU = 0.07          # la part du cycle qui sert au fondu
+
+
+def _lever_de_lune_image(e, t, ph):
+    """La scene a la phase ph du lever (0 : la lune affleure ; 1 : elle est haute et blanche)."""
+    import numpy as np
+    Y, X = _xy()
+    hz = 40.0
+    u = min(1.0, ph / (1 - LEVER_DE_LUNE_FONDU))
+    xc, yc, R = 32.0, 45.0 - 30.0 * u ** 0.8, 8.2 - 1.6 * u
+    haut = float(np.clip((hz - yc) / 24.0, 0, 1))
+    tasse = 1 - 0.16 * (1 - haut) ** 3                          # basse, elle s'ecrase un peu
+    lune = _ciel_mer_palette(haut, (0.0, 0.25, 0.55, 1.0), ((255, 118, 40), (255, 165, 80), (252, 214, 150), (236, 236, 222)))
+    lune = lune * (0.82 + 0.18 * haut)
+    ciel, chaud = e["ciel"]
+    img = ciel + chaud * (1 - haut)                             # le bas du ciel, chaud tant qu'elle est basse
+    d = np.hypot(X - xc, (Y - yc) / tasse)
+    img += np.exp(-np.maximum(d - R, 0) / 6.0)[..., None] * lune * (0.32 - 0.12 * haut)
+    img += np.exp(-np.hypot(X - xc, (Y - yc) * 2.0) / 28.0)[..., None] * lune * (0.16 - 0.08 * haut)
+    sx, sy, sp, sl = e["etoiles"]
+    vis = sl * (0.6 + 0.4 * np.sin(t * 1.9 + sp)) * (0.35 + 0.65 * haut) * np.clip((np.hypot(sx - xc, sy - yc) - R - 3) / 12, 0, 1)
+    _pointer(img, sy, sx, vis[:, None] * np.array([200.0, 205, 230]))
+    # le disque, ses mers, son bord plus sombre ; coupe par l'horizon
+    c = (slice(max(0, int(yc - R - 2)), min(int(hz) + 1, int(yc + R + 3))), slice(int(xc - R - 2), int(xc + R + 3)))
+    if c[0].start < c[0].stop:
+        Yc, Xc, dc = Y[c], X[c], d[c]
+        rho = dc / R
+        couv = (np.clip((1 - rho) * R + 0.5, 0, 1) * np.clip(hz - Yc, 0, 1))[..., None]
+        mers = _ciel_mer_lire(e["mers"], 16 + (Yc - yc) / tasse / R * 7, 16 + (Xc - xc) / R * 7)
+        surface = lune * (1 - 0.26 * np.clip((mers - 0.5) * 3, 0, 1) - 0.22 * np.clip(rho, 0, 1) ** 2)[..., None]
+        img[c] = img[c] * (1 - couv) + surface * couv
+    # les nuages fins qui passent devant, eclaires par la lune quand ils la frolent
+    for y0, larg, ep, vit, ph0 in e["voiles"]:
+        tour = 64 + larg + 30
+        cx = (t * vit + ph0) % tour - larg / 2 - 15
+        r = slice(max(0, int(y0 - 4 * ep - 2)), min(64, int(y0 + 4 * ep + 3)))
+        Yr, Xr = Y[r], X[r]
+        voile = np.exp(-((Yr - y0 - 0.9 * np.sin(Xr * 0.13 + ph0)) / ep) ** 2) * np.clip(1 - np.abs(Xr - cx) / (larg / 2), 0, 1) ** 0.6
+        voile *= 0.5 + 0.5 * _fenetre(e["texture"], (t * vit + ph0) % 128, y0 * 3)[r]
+        voile = np.clip(voile, 0, 0.9)[..., None] * 0.8
+        dr = d[r]
+        eclaire = np.exp(-np.maximum(dr - R * 0.6, 0) / 8.0) + 0.12 * np.exp(-np.maximum(dr - R, 0) / 30.0)
+        img[r] = img[r] * (1 - voile) + (np.array([26.0, 24, 50]) + eclaire[..., None] * lune * 0.95) * voile
+    # la mer : sombre, un reflet chaud au loin, le chemin de lumiere sous la lune
+    eau, reflet, z, prof = e["mer"]
+    m = slice(int(hz), 64)
+    houle = 0.85 + 0.15 * np.sin(z * 3.0 - t * 0.9 + np.sin(X[m] * 0.2 / z + t * 0.3) * 1.5)
+    larg = 0.6 + (Y[m] - hz) * (0.18 + 0.32 * haut)
+    sortie = float(np.clip(1.25 - (yc + R - hz) / (2 * R), 0, 1))     # la part de la lune sortie de l'eau
+    force = (0.5 + 0.5 * haut) * (1 - 0.35 * prof) * sortie
+    img[m] = eau + reflet * (1 - haut) + (np.exp(-((X[m] - xc) / larg) ** 2) * force * houle * 0.3)[..., None] * lune
+    gy, go, gp, gf = e["paillettes"]
+    lg = 0.6 + (gy - hz) * (0.18 + 0.32 * haut)
+    gxx = xc + go * lg + np.sin(t * 0.4 + gp) * 0.6
+    fg = (0.5 + 0.5 * np.sin(t * gf + gp)) ** 4 * np.exp(-go ** 2) * (0.5 + 0.5 * haut) * (0.75 - 0.2 * (gy - hz) / 24.0) * sortie
+    cg = fg[:, None] * lune * 1.1
+    _ciel_mer_tache(img, np.concatenate([gy, gy]), np.concatenate([gxx - 0.5, gxx + 0.5]), np.concatenate([cg, cg]))
+    return img
+
+
+def _scene_lever_de_lune(p, e, t, ecoule, dt):
+    """Une grande lune orange se leve lentement sur la mer, blanchit en montant ; son chemin de lumiere scintille,
+    des nuages fins passent devant ; puis tout recommence, dans un fondu."""
+    import numpy as np
+    rng = e["rng"]
+    if "mers" not in e:
+        Y = _xy()[0]
+        hz = 40.0
+        e["mers"] = _brume(rng, 5, 32)
+        e["texture"] = _brume(rng, 6)
+        e["etoiles"] = (rng.uniform(0, 64, 40), rng.uniform(0, 37, 40), rng.uniform(0, 6.3, 40), rng.uniform(0.3, 1, 40))
+        e["voiles"] = [(19.0, 34.0, 1.3, 0.55, rng.uniform(0, 100)), (27.0, 46.0, 1.0, 0.4, rng.uniform(0, 100)),
+                       (33.5, 26.0, 0.9, 0.7, rng.uniform(0, 100))]
+        e["ciel"] = (_ciel_mer_palette(Y, (0.0, hz), ((5, 7, 26), (18, 22, 58))),
+                     (np.clip(Y / hz, 0, 1) ** 1.5)[..., None] * np.array([46.0, 14, 6]))
+        prof = np.clip((Y[40:] - hz) / 24.0, 0, 1)
+        e["mer"] = (_ciel_mer_palette(prof, (0.0, 0.25, 1.0), ((22, 22, 52), (9, 14, 36), (3, 6, 18))),
+                    np.exp(-(Y[40:] - hz) / 2.5)[..., None] * np.array([60.0, 28, 30]),
+                    24.0 / (Y[40:] - hz + 0.5), prof)
+        gy = np.repeat(np.arange(41.0, 64.0), 7)
+        e["paillettes"] = (gy, rng.normal(0, 0.8, len(gy)), rng.uniform(0, 6.3, len(gy)), rng.uniform(1.2, 3.2, len(gy)))
+    ph = ((ecoule + 24.0) / LEVER_DE_LUNE_CYCLE) % 1.0          # l'ecran s'ouvre sur une lune deja sortie de l'eau
+    img = _lever_de_lune_image(e, t, ph)
+    if ph > 1 - LEVER_DE_LUNE_FONDU:                            # le fondu vers le debut du lever suivant
+        k = (ph - 1 + LEVER_DE_LUNE_FONDU) / LEVER_DE_LUNE_FONDU
+        k = k * k * (3 - 2 * k)
+        img = img * (1 - k) + _lever_de_lune_image(e, t, 0.0) * k
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- La grande meduse --------------------------------------------------------
+
+GRANDE_MEDUSE_POULS = 3.2           # secondes par battement
+GRANDE_MEDUSE_PAS = 4.8             # pixels gagnes par battement
+GRANDE_MEDUSE_TOUR = 18             # battements pour sortir par le haut et revenir par le bas
+
+
+def _grande_meduse_battement(t):
+    """(serre, avance, elan) au temps t : serre 0 relachee -> 1 contractee ; avance, la montee depuis le debut du
+    tour, en pixels ; elan, sa vitesse de 0 a 1."""
+    import numpy as np
+    t = np.asarray(t, float)
+    n = np.floor(t / GRANDE_MEDUSE_POULS)
+    ph = t / GRANDE_MEDUSE_POULS - n
+    serre = np.where(ph < 0.3, 0.5 - 0.5 * np.cos(np.pi * ph / 0.3), 0.5 + 0.5 * np.cos(np.pi * (ph - 0.3) / 0.7))
+    g = np.minimum(ph, 0.45)
+    poussee = g / 2 - 0.45 / (4 * np.pi) * np.sin(2 * np.pi * g / 0.45)
+    avance = (np.mod(n, GRANDE_MEDUSE_TOUR) + (0.25 * ph + 1.75 * poussee) / 0.64375) * GRANDE_MEDUSE_PAS
+    elan = np.where(ph < 0.45, np.sin(np.pi * ph / 0.45) ** 2, 0.0)
+    return serre, avance, elan
+
+
+def _grande_meduse_x(t):
+    import numpy as np
+    return 32 + 6.0 * np.sin(t * 0.07) + 2.5 * np.sin(t * 0.19 + 1.3)
+
+
+def _scene_grande_meduse(p, e, t, ecoule, dt):
+    """Une grande meduse, seule, en gros plan : son ombrelle lumineuse pulse et la pousse vers le haut, ses
+    longs tentacules suivent en retard ; elle sort par le haut et revient par le bas."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "neige" not in e:
+        e["neige"] = [rng.uniform(0, 64, 46), rng.uniform(0, 64, 46), rng.uniform(0.2, 0.7, 46), rng.uniform(0, 6.3, 46)]
+        e["fils"] = (rng.uniform(-1.3, 1.3, 11), rng.uniform(26, 38, 11), rng.uniform(0, 6.3, 11))
+    img = _degrade((4, 12, 34), (1, 3, 12))
+    tm = ecoule + 21.0                                          # son horloge : l'ecran s'ouvre sur elle, deja entree
+    serre, avance, _ = (float(v) for v in _grande_meduse_battement(tm))
+    tour = GRANDE_MEDUSE_TOUR * GRANDE_MEDUSE_PAS
+    y0 = 78.0 - avance
+    xc = float(_grande_meduse_x(tm))
+    vx = float(_grande_meduse_x(tm + 0.5) - _grande_meduse_x(tm - 0.5))
+    incl = 0.45 * np.arctan2(vx, 1.5)
+    W, H = 12.5 * (1 - 0.2 * serre), 12.0 * (1 + 0.12 * serre)
+    lum = 0.85 + 0.25 * serre
+    BORD, CORPS, GONADE = np.array([150.0, 215, 255]), np.array([50.0, 60, 165]), np.array([255.0, 120, 205])
+    BRAS, FIL = np.array([235.0, 120, 245]), np.array([110.0, 150, 255])
+    # la neige marine, eclairee quand elle passe pres d'elle
+    nx, ny, nv, npp = e["neige"]
+    ny += nv * dt
+    ny %= 64
+    qx = (nx + np.sin(t * 0.3 + npp) * 1.5) % 64
+    halo = np.zeros((64, 64))
+    for yc in (y0, y0 - tour, y0 + tour):
+        if yc - H - 30 > 64 or yc + 48 < 0:                     # (son halo se voit avant elle)
+            continue
+        ca, sa = np.cos(incl), np.sin(incl)
+        dx, dy = X - xc, Y - yc
+        uu = dx * ca + dy * sa                                  # dans le repere de la meduse
+        vv = -dx * sa + dy * ca
+        halo += np.exp(-np.maximum(np.hypot(uu / W, (vv + H * 0.3) / (H * 1.1)) - 1, 0) * W / 5.0) * lum
+        cadre = (slice(max(0, int(yc - H - 4)), min(64, int(yc + 3))), slice(max(0, int(xc - W - 4)), min(64, int(xc + W + 5))))
+        if cadre[0].start < cadre[0].stop and cadre[1].start < cadre[1].stop:
+            uu, vv = uu[cadre], vv[cadre]                       # l'ombrelle : seulement autour d'elle
+            s = np.clip((vv + H) / H, 0, 1)
+            Wl = W * (1 - 0.32 * serre * s ** 3)                # le bord se resserre quand elle se contracte
+            vh = np.minimum(vv, 0) / H
+            rho = np.hypot(uu / Wl, vh)
+            couv = np.clip((1 - rho) * W * 0.8 + 0.5, 0, 1) * np.clip(0.8 - vv, 0, 1)
+            bord = np.exp(-np.clip(1 - rho, 0, 1) * W / 1.6)
+            m = np.clip(uu / np.maximum(Wl * np.sqrt(np.clip(1 - vh * vh, 0, 1)), 0.5), -1, 1)
+            meridiens = np.abs(np.cos(np.arcsin(m) * 6.0)) ** 8 * (vv < -1)
+            creux = np.hypot(uu / (Wl - 2.2), np.minimum(vv + 0.5, 0) / (H - 4.0)) < 1
+            gon = np.zeros(uu.shape)
+            for k in range(4):                                  # les quatre anneaux, en trefle, vus un peu d'en haut
+                an = np.pi / 4 + k * np.pi / 2
+                rg = np.hypot((uu - np.cos(an) * 0.36 * Wl) / (0.21 * W), (vv + 0.5 * H - np.sin(an) * 0.15 * H) / (0.14 * H))
+                gon += (np.exp(-((rg - 1) / 0.45) ** 2) + 0.3 * np.exp(-rg * rg)) * (0.8 + 0.2 * np.sin(an))
+            frange = np.exp(-(vv / 0.9) ** 2) * (np.abs(uu) < Wl + 0.5) * (0.6 + 0.4 * np.sin(uu * 2.2))
+            corps = (CORPS * (0.55 - 0.25 * creux)[..., None] + BORD * (bord * 0.95 + meridiens * 0.18)[..., None]
+                     + GONADE * np.clip(gon, 0, 1.2)[..., None] * 0.7) * lum
+            img[cadre] += corps * couv[..., None] + (frange * lum * 0.9)[..., None] * BORD
+        # les bras, frises, au centre ; les tentacules fins, depuis le bord : ils suivent en retard
+        ks = np.arange(0.0, 21.0, 0.7)
+        retard = tm - ks * 0.05
+        sr, _, er = _grande_meduse_battement(retard)
+        xr = _grande_meduse_x(retard) - xc
+        ys_, xs_, cs_ = [], [], []
+        for j, bu in enumerate((-2.2, -0.8, 0.8, 2.2)):
+            ox = xr + bu * (1 - 0.25 * sr) * (1 + ks * 0.03) + np.sin(ks * 0.42 - t * 1.3 + j * 1.7) * (0.5 + ks * 0.06)
+            larg = 1.1 * (1 - ks / 26)
+            frise = 0.6 + 0.4 * np.sin(ks * 1.6 + j + t)
+            for cote in (-1, 0, 1):
+                xx = xc + (ox + cote * larg * frise) * ca - (ks - 2) * sa
+                yy = yc + (ox + cote * larg * frise) * sa + (ks - 2) * ca * (0.95 + 0.1 * er)
+                ys_.append(yy)
+                xs_.append(xx)
+                cs_.append(((1 - ks / 23) * (0.3 if cote else 0.42) * lum)[:, None] * BRAS)
+        fu, fl, fp = e["fils"]
+        kt = np.arange(0.0, 38.0, 0.9)
+        retard = tm - kt * 0.055
+        sr, _, er = _grande_meduse_battement(retard)
+        xr = _grande_meduse_x(retard) - xc
+        for bu, longueur, phase in zip(fu, fl, fp):
+            k = kt[kt < longueur]
+            n = len(k)
+            ox = xr[:n] + bu * W / 1.3 * (1 - 0.32 * sr[:n]) * 0.93 + np.sin(k * 0.21 - t * 1.6 + phase) * (k / longueur) * 1.8
+            yy = yc + 0.6 + k * (0.9 + 0.12 * er[:n])
+            xx = xc + ox * ca - (k + 0.6) * sa
+            ys_.append(yy + ox * sa)
+            xs_.append(xx)
+            cs_.append(((1 - k / longueur) ** 1.2 * 0.5 * lum)[:, None] * FIL)
+        _ciel_mer_tache(img, np.concatenate(ys_), np.concatenate(xs_), np.concatenate(cs_))
+    img += np.clip(halo, 0, 1.2)[..., None] * np.array([18.0, 40, 100])
+    eclat = np.clip(_ciel_mer_lire(halo, ny, qx) * 3, 0, 1.4)  # plus vive pres d'elle
+    _ciel_mer_tache(img, ny, qx, (0.18 + 0.8 * eclat)[:, None] * np.array([110.0, 140, 170]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- La raie manta -----------------------------------------------------------
+
+MANTA_TRAVERSEE = 40.0              # secondes pour traverser ; elle revient dans l'autre sens
+MANTA_ENVERGURE = 20.0              # demi-envergure, en pixels
+
+
+def _manta_forme(u, v, battement, souple, queue=True):
+    """La silhouette d'une manta vue de dessus, dans son repere (u vers l'avant, v sur le cote) :
+    (distance au bord en pixels, > 0 dedans ; s : 0 au dos -> 1 au bout de l'aile)."""
+    import numpy as np
+    S = MANTA_ENVERGURE * (1 - 0.12 * np.sin(battement) ** 2)   # l'aile qui monte ou descend parait plus courte
+    s = np.minimum(np.abs(v) / S, 1.2)
+    onde = 2.0 * np.sin(battement - 1.3 * s) * s * s          # l'aile ondule : le bout suit en retard
+    avant = 6.0 - 12.0 * (np.maximum(s - 0.15, 0) / 0.85) ** 1.15 + onde    # la tete large, l'aile en fleche
+    arriere = -9.0 + 16.0 * s - 13.0 * s * s + onde            # le bord de fuite, creuse : la pointe file en arriere
+    dist = np.minimum(np.minimum(u - arriere, avant - u), (1 - s) * S * 0.5)
+    av = np.abs(v)
+    cornes = np.minimum(np.minimum(u - 5.5, 9.0 - u - (av - 2.8) ** 2 * 0.6), np.minimum(av - 1.6, 3.9 - av))
+    dist = np.maximum(dist, cornes)
+    if queue:
+        dist = np.maximum(dist, np.minimum(np.minimum(u + 19.0, -8.0 - u), 0.6 + (u + 8) * 0.02 - np.abs(v - souple * (u + 8) ** 2)))
+    return dist, s
+
+
+def _manta_cadre(x, y, rayon):
+    """Les tranches de lignes et de colonnes autour de (x, y) : ce qu'il faut calculer, pas plus."""
+    y0, y1 = max(0, int(y - rayon)), min(64, int(y + rayon) + 1)
+    x0, x1 = max(0, int(x - rayon)), min(64, int(x + rayon) + 1)
+    return (slice(y0, y1), slice(x0, x1)) if y0 < y1 and x0 < x1 else None
+
+
+def _scene_manta(p, e, t, ecoule, dt):
+    """Une raie manta plane au-dessus d'un fond de sable clair parcouru de caustiques ; ses ailes ondulent, son
+    ombre glisse sur le sable ; des rayons, quelques poissons ; elle traverse, puis revient."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "sable" not in e:
+        rides = np.sin((X * 0.75 + Y * 0.42) * 0.95 + 1.2 * np.sin(Y * 0.13 + X * 0.05))
+        tache = _brume(rng, 6, 64)
+        sable = np.array([136.0, 138, 106]) * (0.9 + 0.08 * rides + 0.18 * (tache - 0.5))[..., None]
+        bord = np.clip(np.hypot((X - 32) / 44, (Y - 32) / 44), 0, 1) ** 2
+        e["sable"] = sable * (1 - 0.5 * bord)[..., None] + np.array([12.0, 44, 74]) * (0.5 * bord)[..., None]
+        e["banc"] = (rng.uniform(-3.5, 3.5, 7), rng.uniform(-2.5, 2.5, 7), rng.uniform(0, 6.3, 7))
+    # les caustiques : trois ondes croisees, deformees, plus vives par plaques
+    w = np.sin(X * 0.42 + np.sin(Y * 0.18 + t * 0.5) * 1.6 + t * 0.6)
+    w += np.sin(X * -0.21 + Y * 0.36 + np.sin(X * 0.15 - t * 0.4) * 1.6 - t * 0.5)
+    w += np.sin(X * -0.21 - Y * 0.36 + np.sin(Y * 0.2 + X * 0.1 + t * 0.3) * 1.4 + t * 0.45)
+    plaques = 0.5 + 0.5 * np.sin(X * 0.09 + Y * 0.06 + t * 0.12) * np.sin(Y * 0.11 - X * 0.04 - t * 0.09)
+    caus = np.clip(1 - np.abs(w), 0, 1) ** 3 * plaques
+    # la manta : son chemin (aller, retour), son cap, son battement
+    aller, q, _ = _ciel_mer_aller_retour(ecoule + 9.0, MANTA_TRAVERSEE)      # l'ecran s'ouvre sur elle
+    if aller:
+        mx, my = -19 + q * 102, 30 + 9 * np.sin(q * np.pi * 1.5 + 0.4)
+        dmx, dmy = 102.0, 9 * np.pi * 1.5 * np.cos(q * np.pi * 1.5 + 0.4)
+    else:
+        mx, my = 83 - q * 102, 34 - 8 * np.sin(q * np.pi * 1.3 + 0.9)
+        dmx, dmy = -102.0, -8 * np.pi * 1.3 * np.cos(q * np.pi * 1.3 + 0.9)
+    cap = np.arctan2(dmy, dmx)
+    cc, ss = np.cos(cap), np.sin(cap)
+    batt = t * 2 * np.pi / 4.4
+    haut = 1.0 + 0.25 * np.sin(t * 0.17)                        # elle monte et descend un peu : l'ombre s'eloigne
+    # son ombre sur le sable : decalee, floue ; elle eteint les caustiques
+    ombre = np.zeros((64, 64))
+    ox, oy = mx + 5.0 * haut, my + 7.0 * haut
+    cadre = _manta_cadre(ox, oy, 25)
+    if cadre:
+        Yc, Xc = Y[cadre], X[cadre]
+        dist, _ = _manta_forme((Xc - ox) * cc + (Yc - oy) * ss, -(Xc - ox) * ss + (Yc - oy) * cc, batt, 0.0, False)
+        ombre[cadre] = np.clip(dist / (2.0 + haut) + 0.5, 0, 1) * 0.62
+    img = e["sable"] * (1 - ombre[..., None]) + (caus * (1 - ombre * 1.3) * 0.55)[..., None] * np.array([120.0, 150, 120])
+    rayons = (0.5 + 0.5 * np.sin(X * 0.16 - Y * 0.1 + t * 0.25 + np.sin(Y * 0.05 + t * 0.1) * 2)) ** 6
+    img += rayons[..., None] * np.array([18.0, 30, 30])
+    # un petit banc de poissons qui passe, et leur ombre
+    fq = (t / 27.0) % 1.0
+    bx, by = 78 - fq * 100, 6 + fq * 46
+    fx, fy, fp = e["banc"]
+    pxs = bx + fx * 2.4 + np.sin(t * 1.5 + fp) * 0.6
+    pys = by + fy * 1.8 + np.cos(t * 1.2 + fp) * 0.6
+    k = np.repeat(np.arange(4.0), len(pxs))
+    f = np.repeat([1.0, 0.95, 0.75, 0.5], len(pxs))[:, None]
+    _ciel_mer_tache(img, np.tile(pys, 4) - 0.4 * k + 2.0, np.tile(pxs, 4) + 0.92 * k + 1.6, f * np.array([-26.0, -28, -24]))
+    _ciel_mer_tache(img, np.tile(pys, 4) - 0.4 * k, np.tile(pxs, 4) + 0.92 * k, f * np.array([176.0, 165, 98]))
+    # la manta
+    cadre = _manta_cadre(mx, my, 23)
+    if cadre:
+        Yc, Xc = Y[cadre], X[cadre]
+        u = (Xc - mx) * cc + (Yc - my) * ss
+        v = -(Xc - mx) * ss + (Yc - my) * cc
+        dist, s = _manta_forme(u, v, batt, 0.004 * np.sin(t * 0.9))
+        couv = np.clip(dist + 0.5, 0, 1)[..., None]
+        vague = 1 + 0.4 * np.sin(batt - 2.2 * s) * s          # la lumiere qui court sur l'aile qui ondule
+        dos = _ciel_mer_palette(s, (0.0, 0.45, 1.0), ((18, 22, 32), (30, 36, 50), (46, 54, 70))) * vague[..., None]
+        dos += np.clip(1.5 - dist, 0, 1)[..., None] * np.array([36.0, 42, 50])
+        av = np.abs(v)
+        corps = np.clip(1.5 - np.hypot((u + 1.5) / 8.0, v / 4.2) * 1.5, 0, 1)    # le corps, plus epais, au milieu
+        dos = dos * (1 - 0.3 * corps[..., None]) + np.clip(1 - np.abs(v) * 1.2, 0, 1)[..., None] * corps[..., None] * np.array([16.0, 18, 22])
+        epaule = np.clip(1.3 - np.hypot((u - 2.2 + (av - 4.0) * 0.6) / 1.3, (av - 5.0) / 2.6), 0, 1) * (av > 2.2)
+        dos = dos * (1 - epaule[..., None] * 0.8) + np.array([165.0, 172, 178]) * epaule[..., None] * 0.8
+        img[cadre] = img[cadre] * (1 - couv) + dos * couv
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- La tortue de mer ---------------------------------------------------------
+
+TORTUE_TRAVERSEE = 46.0             # secondes pour traverser ; elle revient dans l'autre sens
+
+
+def _tortue_nageoire(u, v, pu, pv, angle, longueur, racine, courbe):
+    """Une nageoire effilee qui part de l'epaule (pu, pv) : distance a son bord (pixels, > 0 dedans), et la
+    position le long de la nageoire (0 a l'epaule, 1 au bout)."""
+    import numpy as np
+    du, dv = u - pu, v - pv
+    ca, sa = np.cos(angle), np.sin(angle)
+    a = -du * ca + dv * sa                                      # vers l'arriere, tournee de `angle` (positif : vers le bas)
+    b = du * sa + dv * ca
+    k = np.clip(a / longueur, 0, 1)
+    demi = 0.45 + racine * np.sin(np.pi * k ** 0.6) ** 0.9     # etroite au poignet, large au milieu, en pointe
+    dist = np.minimum(np.minimum(a + 0.5, longueur - a), demi - np.abs(b - courbe * k * k))
+    return dist, k
+
+
+def _scene_tortue(p, e, t, ecoule, dt):
+    """Une tortue de mer nage paisiblement dans le bleu : sa carapace a ecailles, ses nageoires qui battent
+    lentement ; des bulles, des rayons de lumiere, un herbier en bas ; elle traverse, puis revient."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "herbes" not in e:
+        n = 46
+        hx, hh, hp, hs = rng.uniform(-2, 66, n), rng.uniform(5, 14, n), rng.uniform(0, 6.3, n), rng.uniform(0.6, 1.0, n)
+        ks = np.arange(0.0, 14.0, 0.8)
+        brin = [(np.full(int((ks < h).sum()), i), ks[ks < h]) for i, h in enumerate(hh)]
+        i = np.concatenate([b[0] for b in brin])
+        k = np.concatenate([b[1] for b in brin])
+        e["herbes"] = (hx[i], hp[i], k, _ciel_mer_palette(k / hh[i], (0.0, 1.0), ((22, 64, 44), (80, 150, 84))) * hs[i, None])
+        e["bulles"] = [rng.uniform(0, 64, 9), rng.uniform(0, 64, 9), rng.uniform(5, 9, 9), rng.uniform(0, 6.3, 9)]
+        e["souffle"] = [np.full(3, 70.0), np.full(3, 70.0), rng.uniform(0, 6.3, 3), ecoule + np.array([1.0, 1.4, 1.7])]
+        e["fond"] = _ciel_mer_palette(Y, (0.0, 20.0, 64.0), ((34, 120, 160), (14, 70, 112), (4, 26, 52)))
+        e["angle_rayons"] = np.arctan2(X - 8.0, Y + 46.0)
+    img = e["fond"].copy()
+    ang = e["angle_rayons"]
+    rayons = (0.5 + 0.5 * np.sin(ang * 26 + np.sin(ang * 7 + t * 0.23) * 2.2 + t * 0.12)) ** 7 * np.clip(1.1 - Y / 58, 0, 1)
+    img += rayons[..., None] * np.array([33.0, 60, 66])
+    img[0:2] += (0.5 + 0.5 * np.sin(X[0:2] * 0.6 + t * 1.5 + np.sin(X[0:2] * 0.17 - t) * 2))[..., None] * np.array([40.0, 60, 60])
+    # l'herbier, au fond : des brins qui ondulent sous une houle lente
+    hx, hp, k, hc = e["herbes"]
+    plie = (0.05 * np.sin(t * 0.8 - hx * 0.09 + hp * 0.3) + 0.012 * np.sin(t * 2.1 + hp)) * k * k
+    sol = 61.0 + 1.2 * np.sin(X[0] * 0.2) + 0.6 * np.sin(X[0] * 0.53)
+    _peindre_sous(img, sol, (16, 40, 46))
+    _ciel_mer_peindre(img, 63.5 - k, hx + plie, hc, 1.3)
+    # la tortue : son chemin, aller puis retour
+    aller, q, _ = _ciel_mer_aller_retour(ecoule + 13.0, TORTUE_TRAVERSEE, 0.3)   # l'ecran s'ouvre sur elle
+    sens = 1.0 if aller else -1.0
+    om = 2 * np.pi / 3.8
+    xc = (-21 + q * 106) if aller else (85 - q * 106)
+    xc += 0.8 * np.sin(t * om - 0.6) * sens                     # chaque coup de nageoire la pousse un peu
+    yc = (28 + 4 * np.sin(q * np.pi * 1.4)) if aller else (34 - 4 * np.sin(q * np.pi * 1.2 + 0.5))
+    yc += 0.5 * np.sin(t * om + 1.4)
+    tangage = -0.06 * np.cos(q * np.pi * 1.4) * sens + 0.04 * np.cos(t * om + 1.4)
+    tete = (xc + 15.5 * sens, yc - 1.0)
+    cadre = (slice(max(0, int(yc - 11)), min(64, int(yc + 19))), slice(max(0, int(xc - 23)), min(64, int(xc + 24))))
+    if cadre[0].start < cadre[0].stop and cadre[1].start < cadre[1].stop:
+        img[cadre] = _tortue_dessin(img[cadre], X[cadre], Y[cadre], xc, yc, sens, tangage, t * om)
+    # les bulles : de l'herbier, et parfois de son nez
+    bx, by, bv, bp = e["bulles"]
+    by -= bv * dt
+    finies = by < -2
+    by[finies] = rng.uniform(58, 66, int(finies.sum()))
+    bx[finies] = rng.uniform(0, 64, int(finies.sum()))
+    _ciel_mer_tache(img, by, bx + np.sin(t * 2.5 + bp) * 0.7, (0.4 + 0.25 * np.sin(bp))[:, None] * np.array([170.0, 220, 240]))
+    sx, sy, sp, sq = e["souffle"]
+    sy -= 7.0 * dt
+    for j in np.nonzero((sy < -2) & (ecoule >= sq))[0]:
+        if 2 < tete[0] < 62:
+            sx[j], sy[j] = tete[0] + rng.uniform(-0.5, 0.5), tete[1] - rng.uniform(0, 1.5)
+            sq[j] = ecoule + 6.0 + rng.uniform(0, 3)
+    _ciel_mer_tache(img, sy, sx + np.sin(t * 3 + sp) * 0.6, [np.array([150.0, 200, 225]) * 0.55])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _tortue_dessin(img, X, Y, xc, yc, sens, tangage, battement):
+    """La tortue, peinte dans un morceau de l'image (X, Y : les coordonnees de ce morceau)."""
+    import numpy as np
+    dx, dy = (X - xc) * sens, Y - yc
+    ca, sa = np.cos(tangage), np.sin(tangage)
+    u = dx * ca - dy * sa                                       # dans son repere : u vers l'avant, v vers le bas
+    v = dx * sa + dy * ca
+    PEAU, ECAILLE_C, ECAILLE_F, JOINT = (np.array([98.0, 112, 70]), np.array([190.0, 132, 52]),
+                                         np.array([92.0, 60, 28]), np.array([34.0, 24, 14]))
+    angle = 0.15 + 0.75 * np.sin(battement)
+    # la nageoire de l'autre cote, derriere la carapace ; la patte arriere
+    dist, k = _tortue_nageoire(u, v, 6.0, -0.5, angle - 0.15, 12.0, 2.0, 1.4)
+    al = np.clip(dist + 0.5, 0, 1)[..., None]
+    img = img * (1 - al) + PEAU * 0.55 * al
+    dist, k = _tortue_nageoire(u, v, -10.0, 2.2, 0.5 + 0.25 * np.sin(battement + 1.0), 5.5, 1.5, 0.6)
+    al = np.clip(dist + 0.5, 0, 1)[..., None]
+    img = img * (1 - al) + PEAU * 0.85 * al
+    # la tete, le cou, l'oeil
+    hu, hv = 15.0, -0.6 + 0.4 * np.sin(battement * 0.5)
+    tete = np.hypot((u - hu) / 3.8, (v - hv) / 2.5)
+    cou = np.minimum(np.minimum(u - 9.0, 14.0 - u), 1.9 - np.abs(v - 0.3))
+    dist = np.maximum((1 - tete) * 2.5, cou)
+    al = np.clip(dist + 0.5, 0, 1)[..., None]
+    peau = PEAU * (1.15 - 0.3 * np.clip((v - hv + 2.5) / 5, 0, 1))[..., None]
+    plaques = (np.sin(u * 2.2) * np.sin(v * 2.4) > 0.55) & (tete < 0.9)
+    peau[plaques] = peau[plaques] * 0.6 + np.array([190.0, 190, 140]) * 0.4
+    img = img * (1 - al) + peau * al
+    oeil = np.clip(1.0 - np.hypot(u - (hu + 1.4), v - (hv - 0.6)) / 0.75, 0, 1)[..., None]
+    img = img * (1 - oeil) + np.array([12.0, 12, 8]) * oeil
+    # la carapace : un dome, ses ecailles (une rangee sur le dos, une sur les flancs, la bordure)
+    L = 12.5
+    a = np.clip(u / L, -1, 1)
+    dessus = -7.0 * np.clip(1 - a * a, 0, 1) ** 0.55 * (1 + 0.08 * a)
+    dessous = 2.6 * np.clip(1 - a * a, 0, 1) ** 0.5
+    dist = np.minimum(np.minimum(v - dessus, dessous - v), (L - np.abs(u)) * 1.2)
+    al = np.clip(dist + 0.5, 0, 1)[..., None]
+    hauteur = np.maximum(dessous - dessus, 0.5)
+    b = np.clip((v - dessus) / hauteur, 0, 1)
+    centre, joint = np.zeros(u.shape), np.zeros(u.shape)
+    for b0, b1, largeur, decal in ((0.0, 0.34, 0.37, 0.0), (0.34, 0.78, 0.33, 0.165), (0.78, 1.01, 0.14, 0.07)):
+        rang = (b >= b0) & (b < b1)
+        c = (u / L + decal + 0.09 * (b - 0.5)) / largeur
+        fr = c - np.floor(c)
+        dj = np.minimum(fr, 1 - fr) * largeur * L                # distance au joint, en pixels
+        db = np.minimum(b - b0, b1 - b) * hauteur
+        joint[rang] = np.clip(1.2 - (np.minimum(dj, db) if b0 > 0 else dj) * 1.6, 0, 1)[rang]
+        centre[rang] = ((1 - np.abs(fr - 0.5) * 2) * np.clip(db / 2.2, 0, 1))[rang]
+    carapace = ECAILLE_F + (ECAILLE_C - ECAILLE_F) * centre[..., None]
+    carapace *= (1.15 - 0.45 * b)[..., None]
+    carapace = carapace * (1 - joint[..., None] * 0.75) + JOINT * joint[..., None] * 0.75
+    carapace += np.clip(1.3 - (v - dessus), 0, 1)[..., None] * np.array([60.0, 70, 50])    # la lumiere d'en haut
+    img = img * (1 - al) + carapace * al
+    plastron = (np.clip(np.minimum(v - dessous + 0.6, dessous + 1.3 - v) + 0.5, 0, 1) * (np.abs(u) < L - 2))[..., None]
+    img = img * (1 - plastron) + np.array([175.0, 160, 98]) * plastron
+    # la nageoire avant, de ce cote : elle bat devant la carapace
+    dist, k = _tortue_nageoire(u, v, 6.5, 1.2, angle, 14.0, 2.5, 1.6)
+    al = np.clip(dist + 0.5, 0, 1)[..., None]
+    nag = PEAU * (1.1 - 0.35 * k)[..., None] + np.clip(1.2 - dist, 0, 1)[..., None] * np.array([40.0, 44, 30])
+    tachet = (np.sin(u * 2.6 + v * 1.1) * np.sin(v * 2.9 - u * 0.8) > 0.5)
+    nag[tachet] = nag[tachet] * 0.7 + np.array([180.0, 180, 130]) * 0.3
+    return img * (1 - al) + nag * al
+
+
+# LES GRANDS PAYSAGES. « Couchers de soleil, montagne, plaine, herbes » : des
+# herbes au vent, une grande plaine, une montagne et son alpenglow, la
+# savane, des eoliennes, des montgolfieres, un voilier, des rayons en foret,
+# un jardin zen.
+
+
+# LES PAYSAGES (suite). Neuf scenes : les herbes au vent, la grande plaine, la
+# montagne et son alpenglow, la savane, les eoliennes, les montgolfieres, le
+# voilier, les rayons en foret, le jardin zen. Leurs aides communes commencent
+# par _paysages_ : des traits et des points en sous-pixel (rien ne saute d'un
+# pixel a l'autre quand ca bouge), des cretes aux bords adoucis, et la lecture
+# d'un champ doux n'importe ou.
+
+
+def _paysages_brins(couv, xs, ys, demi, pente):
+    """Pose des traits presque verticaux (un echantillon par ligne) dans une couverture a plat (64 * 64) :
+    xs, ys leurs centres, demi leur demi-largeur, pente leur glissement par ligne. Le plus couvrant l'emporte."""
+    import numpy as np
+    a = xs - demi - np.abs(pente) * 0.5
+    b = xs + demi + np.abs(pente) * 0.5
+    dens = np.minimum(1.0, 2 * demi * np.sqrt(1 + pente ** 2) / (b - a))
+    ligne = np.round(ys).astype(int)
+    j0 = np.floor(xs).astype(int)
+    for k in (-2, -1, 0, 1, 2):
+        j = j0 + k
+        part = np.clip(np.minimum(j + 0.5, b) - np.maximum(j - 0.5, a), 0, 1) * dens
+        ok = (part > 0.01) & (j >= 0) & (j < 64) & (ligne >= 0) & (ligne < 64)
+        np.maximum.at(couv, ligne[ok] * 64 + j[ok], part[ok])
+
+
+def _paysages_points(img, ys, xs, couleurs):
+    """Ajoute des points de lumiere en sous-pixel (repartis sur quatre pixels) : ils glissent sans sauter."""
+    import numpy as np
+    ys, xs = np.asarray(ys, float).ravel(), np.asarray(xs, float).ravel()
+    c = np.broadcast_to(np.asarray(couleurs, float), ys.shape + (3,))
+    y0, x0 = np.floor(ys), np.floor(xs)
+    fy, fx = ys - y0, xs - x0
+    y0, x0 = y0.astype(int), x0.astype(int)
+    plat = img.reshape(-1, 3)
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        ok = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+        np.add.at(plat, yy[ok] * 64 + xx[ok], c[ok] * w[ok][:, None])
+
+
+def _paysages_lire(champ, fy, fx):
+    """Lit un champ qui se raccorde (comme ceux de _brume) a des positions flottantes quelconques."""
+    import numpy as np
+    n = champ.shape[0]
+    y0, x0 = np.floor(fy), np.floor(fx)
+    ay, ax = fy - y0, fx - x0
+    y0, x0 = y0.astype(np.int64) % n, x0.astype(np.int64) % n
+    y1, x1 = (y0 + 1) % n, (x0 + 1) % n
+    return (champ[y0, x0] * (1 - ax) + champ[y0, x1] * ax) * (1 - ay) + (champ[y1, x0] * (1 - ax) + champ[y1, x1] * ax) * ay
+
+
+def _paysages_traits(img, traits, couleur, force=1.0):
+    """Peint, dans leur seul cadre, des traits adoucis d'une meme couleur : (y0, x0, y1, x1, demi-largeur au
+    depart, a l'arrivee). Renvoie la couverture posee (ou None si rien n'est dans le panneau)."""
+    import numpy as np
+    Y, X = _xy()
+    tr = np.asarray(traits, float)
+    marge = tr[:, 4:6].max() + 1.5
+    ya = int(max(0, np.floor(min(tr[:, 0].min(), tr[:, 2].min()) - marge)))
+    yb = int(min(64, np.ceil(max(tr[:, 0].max(), tr[:, 2].max()) + marge) + 1))
+    xa = int(max(0, np.floor(min(tr[:, 1].min(), tr[:, 3].min()) - marge)))
+    xb = int(min(64, np.ceil(max(tr[:, 1].max(), tr[:, 3].max()) + marge) + 1))
+    if ya >= yb or xa >= xb:
+        return None
+    yy, xx = Y[ya:yb, xa:xb], X[ya:yb, xa:xb]
+    c = np.zeros(yy.shape)
+    for y0, x0, y1, x1, r0, r1 in tr:
+        dx, dy = x1 - x0, y1 - y0
+        u = np.clip(((xx - x0) * dx + (yy - y0) * dy) / (dx * dx + dy * dy + 1e-9), 0, 1)
+        d = np.hypot(xx - x0 - u * dx, yy - y0 - u * dy)
+        np.maximum(c, np.clip(r0 + (r1 - r0) * u + 0.5 - d, 0, 1), out=c)
+    c = (c * force)[..., None]
+    zone = img[ya:yb, xa:xb]
+    zone[...] = zone * (1 - c) + np.asarray(couleur, float) * c
+    return c
+
+
+def _paysages_sous(img, crete, couleur, force=1.0):
+    """Comme _peindre_sous, mais le bord de la crete est adouci (pas d'escalier) ; renvoie la couverture."""
+    import numpy as np
+    Y, X = _xy()
+    c = np.clip(Y - np.asarray(crete, float)[None, :] + 0.5, 0, 1) * force
+    img *= 1 - c[..., None]
+    img += np.asarray(couleur, float) * c[..., None]
+    return c
+
+
+def _paysages_cimes(rng, n, base, h0, h1, pente, ronds=False):
+    """Une ligne d'arbres au-dessus du sol `base` (une hauteur par colonne) : des sapins en pointe ou des
+    feuillus en boule ; renvoie la nouvelle crete."""
+    import numpy as np
+    x = np.arange(64.0)
+    base = np.broadcast_to(np.asarray(base, float), (64,))
+    xi, hi = rng.uniform(-4, 68, n), rng.uniform(h0, h1, n)
+    pied = base[np.clip(xi, 0, 63).astype(int)]
+    if ronds:                                                             # des domes, un peu plus larges que hauts
+        r = hi * 1.1
+        dx = x[None, :] - xi[:, None]
+        dome = hi[:, None] * np.sqrt(np.clip(1 - (dx / r[:, None]) ** 2, 0, None))
+        crete = np.where(np.abs(dx) < r[:, None], pied[:, None] - dome, 99)
+    else:
+        crete = pied[:, None] - hi[:, None] + np.abs(x[None, :] - xi[:, None]) * pente
+    return np.minimum(base, crete.min(0))
+
+
+def _paysages_nuancier(points, s):
+    """Une couleur prise le long d'une suite (position, couleur), par morceaux lineaires."""
+    import numpy as np
+    pos = np.array([q for q, _ in points], float)
+    cou = np.array([c for _, c in points], float)
+    return np.array([np.interp(s, pos, cou[:, k]) for k in range(3)])
+
+
+# 1. Les herbes au vent : au ras du sol, a contre-jour.
+
+HERBES_COUCHES = (   # (brins, hauteur min, max, demi-largeur au pied, a la pointe, teinte, lumiere qui passe, vent, courbure,
+    #                   part d'epis, taille d'epi, teinte d'epi, lumiere de l'epi)
+    (70, 6, 16, 0.32, 0.2, (104, 62, 40), 0.62, 0.5, 0.15, 0.0, 0.0, (0, 0, 0), (0, 0, 0)),
+    (44, 13, 30, 0.42, 0.24, (48, 27, 22), 0.45, 0.75, 0.3, 0.35, 0.75, (70, 44, 30), (240, 196, 130)),
+    (18, 26, 54, 0.7, 0.22, (12, 7, 9), 0.2, 1.0, 0.55, 0.5, 1.05, (24, 14, 12), (330, 250, 150)),
+)
+
+
+def _scene_herbes(p, e, t, ecoule, dt):
+    """Au ras du sol, de hautes herbes a contre-jour qui ondulent sous les rafales ; derriere, un ciel dore et
+    flou ; des graines et des moucherons qui volent dans la lumiere."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "herbes" not in e:
+        fond = _degrade((44, 26, 52), (236, 150, 64), 0, 46)
+        d = np.hypot(X - 40, (Y - 37) * 1.2)
+        fond += (np.clip(1 - d / 38, 0, 1) ** 2)[..., None] * np.array([60, 48, 20])
+        fond += np.exp(-(d / 8.0) ** 2)[..., None] * np.array([40, 46, 34])
+        soleil = np.clip(5.5 - d, 0, 1)[..., None]
+        fond = fond * (1 - soleil) + np.array([255, 238, 190]) * soleil
+        haie = 42 + 2.5 * np.sin(X * 0.13 + 1) + 1.5 * np.sin(X * 0.37)            # des arbres au loin, flous
+        a = (np.clip((Y - haie) / 3.0 + 0.5, 0, 1) * 0.55)[..., None]
+        fond = fond * (1 - a) + np.array([96, 54, 34]) * a
+        pre = (np.clip((Y - 47) / 17, 0, 1) * 0.75)[..., None]                    # le pre, flou, plus sombre devant
+        fond = fond * (1 - pre) + np.array([30, 18, 12]) * pre
+        jour = fond.mean(-1)
+        e["herbes_fond"], e["herbes_jour"] = fond, jour / jour.max()
+        e["herbes"] = [(rng.uniform(-6, 70, c[0]), rng.uniform(c[1], c[2], c[0]), 64 + rng.uniform(0, 3, c[0]),
+                        rng.uniform(-0.15, 0.2, c[0]), rng.choice([-1, 1], c[0]) * rng.uniform(c[8] * 0.35, c[8], c[0]),
+                        rng.uniform(0, 2 * np.pi, c[0]),
+                        rng.uniform(0.7, 1.4, c[0]), rng.uniform(0, 1, c[0]) < c[9]) for c in HERBES_COUCHES]
+        e["graines"] = (rng.uniform(0, 84, 14), rng.uniform(8, 46, 14), rng.uniform(1.5, 4.5, 14), rng.uniform(0, 6, 14),
+                        rng.uniform(0.35, 1.0, 14))
+        e["bokeh"] = (rng.uniform(4, 60, 7), rng.uniform(18, 46, 7), rng.uniform(1.8, 3.6, 7), rng.uniform(0.12, 0.25, 7),
+                      rng.uniform(0, 6, 7))
+    img = e["herbes_fond"].copy()
+    jour = e["herbes_jour"]
+    bx, by, br, ba, bp = e["bokeh"]                                       # des taches de lumiere floues
+    for x0, y0, r, a, ph in zip(bx, by, br, ba, bp):
+        cx, cy = x0 + 3 * np.sin(t * 0.07 + ph), y0 + 2 * np.sin(t * 0.05 + ph * 2)
+        ya, yb, xa, xb = int(max(0, cy - r - 3)), int(min(64, cy + r + 4)), int(max(0, cx - r - 3)), int(min(64, cx + r + 4))
+        d = np.hypot(X[ya:yb, xa:xb] - cx, Y[ya:yb, xa:xb] - cy)
+        tache = np.clip(r + 0.5 - d, 0, 1) * 0.6 + np.exp(-((d - r + 0.4) / 0.8) ** 2) * 0.4
+        tache *= a * jour[ya:yb, xa:xb] * (0.7 + 0.3 * np.sin(t * 0.4 + ph))
+        img[ya:yb, xa:xb] += tache[..., None] * np.array([255, 205, 130])
+
+    def rafale(x):                                                        # le vent passe en vagues, de gauche a droite
+        u = x * 0.05 - t * 0.5
+        return (0.5 + 0.5 * np.sin(u + 0.7 * np.sin(u * 0.43 + 1.1))) ** 3 * (0.7 + 0.3 * np.sin(t * 0.09))
+
+    dore = np.array([255, 196, 110])
+    for i, (c, (x0, h, pied, incl, courbe, ph, fr, epi)) in enumerate(zip(HERBES_COUCHES, e["herbes"])):
+        vent = c[7]
+        lam = (incl + vent * (rafale(x0 + i * 6) * 0.9 - 0.1) + 0.07 * vent * np.sin(t * 1.6 * fr + ph))[:, None]
+        lam = lam + courbe[:, None]                                       # chaque brin a sa courbure, le vent la force
+        s = np.linspace(0, 1, int(c[2]) + 2)[None, :]
+        hh = h[:, None]
+        xs = x0[:, None] + lam * hh * 0.55 * s ** 2
+        ys = pied[:, None] - hh * s * (1 - 0.16 * lam ** 2)
+        pente = np.broadcast_to(1.1 * lam * s / (1 - 0.16 * lam ** 2), xs.shape)
+        demi = np.broadcast_to(c[3] + (c[4] - c[3]) * s, xs.shape)
+        couv = np.zeros(4096)
+        _paysages_brins(couv, xs.ravel(), ys.ravel(), demi.ravel(), pente.ravel())
+        a = couv.reshape(64, 64)[..., None]
+        img = img * (1 - a) + (np.asarray(c[5], float) + c[6] * jour[..., None] * dore) * a
+        if c[9] > 0:                                                      # les epis, qui s'allument a contre-jour
+            haut = (s > 0.76) & epi[:, None]
+            de = np.broadcast_to(c[10] * np.sin(np.pi * np.clip((s - 0.76) / 0.24, 0, 1)) ** 0.7, xs.shape)
+            couv = np.zeros(4096)
+            _paysages_brins(couv, xs[haut], ys[haut], de[haut] + 0.15, pente[haut])
+            a = couv.reshape(64, 64)[..., None]
+            j = jour[..., None] if i < 2 else jour[..., None] ** 2.2
+            img = img * (1 - a) + (np.asarray(c[11], float) + j * np.asarray(c[12], float)) * a
+    gx0, gy0, gv, gp, gk = e["graines"]                                   # des graines portees par le vent
+    gx = (gx0 + t * gv) % 84 - 10
+    gy = gy0 + 4 * np.sin(t * 0.23 + gp) + 1.5 * np.sin(t * 0.71 + gp * 2.3)
+    lum = jour[np.clip(gy, 0, 63).astype(int), np.clip(gx, 0, 63).astype(int)]
+    _paysages_points(img, gy, gx, ((0.25 + 0.85 * lum) * gk)[:, None] * np.array([255, 236, 190]))
+    k = np.arange(4)                                                      # des moucherons qui dansent dans la lumiere
+    mx = 44 + 6 * np.sin(t * 0.37 + k * 1.7) + 1.5 * np.sin(t * 2.9 + k * 3)
+    my = 31 + 3 * np.sin(t * 0.53 + k * 2.2) + 1.2 * np.sin(t * 3.7 + k)
+    _paysages_points(img, my, mx, np.array([230, 215, 180]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 2. La grande plaine : un terrain vu en perspective, les ombres des nuages qui glissent dessus.
+
+PLAINE_HORIZON = 30
+PLAINE_FOCALE = 40.0
+PLAINE_OEIL = 1.6        # la hauteur du regard au-dessus du sol
+PLAINE_NUAGES = 6.0      # l'altitude des nuages
+PLAINE_ECHELLE = (3.2, 5.5)     # les pixels du champ des nuages par unite de terrain : au ciel, au sol
+
+
+def _plaine_relief(w, z):
+    """La hauteur du terrain en (w lateral, z profondeur) : des ondulations douces."""
+    import numpy as np
+    return (0.42 * np.sin(0.45 * w + 0.31 * z + 0.6) * (0.6 + 0.4 * np.sin(0.17 * z + 0.2 * w))
+            + 0.22 * np.sin(0.2 * w - 0.45 * z + 2.0) + 0.1 * np.sin(1.1 * w + 0.7 * z))
+
+
+def _scene_plaine(p, e, t, ecoule, dt):
+    """Une immense plaine verte et vallonnee sous un grand ciel : les nuages derivent, leurs ombres glissent sur
+    les collines, le vent passe en vagues dans l'herbe ; un arbre seul."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    H, f = PLAINE_HORIZON, PLAINE_FOCALE
+    if "plaine" not in e:
+        champ = _brume(rng, 20) * 0.8 + _brume(rng, 5) * 0.2
+        champ = (champ - champ.min()) / (champ.max() - champ.min())
+        cols = np.arange(64) - 31.5
+        ybuf = np.full(64, 64.0)
+        Z, W, L = np.full((64, 64), 400.0), np.zeros((64, 64)), np.zeros((64, 64))
+        for z in np.geomspace(1.2, 160, 220):                             # du plus pres au plus loin, colonne par colonne
+            w = cols * z / f
+            h = _plaine_relief(w, z)
+            ys = H + (PLAINE_OEIL - h) * f / z
+            hw = (_plaine_relief(w + 0.05, z) - _plaine_relief(w - 0.05, z)) / 0.1
+            hz = (_plaine_relief(w, z + 0.05) - _plaine_relief(w, z - 0.05)) / 0.1
+            lum = np.clip((0.6 * hw + 0.6 + 0.5 * hz) / np.sqrt(1 + hw ** 2 + hz ** 2), 0, 1)   # le soleil a gauche, en face
+            m = (Y >= ys[None, :] - 0.5) & (Y < ybuf[None, :] - 0.5)
+            jj = np.nonzero(m)
+            Z[jj], W[jj], L[jj] = z, w[jj[1]], lum[jj[1]]
+            ybuf = np.minimum(ybuf, ys)
+        sol = (Y > H - 2) & (Z < 399)
+        taches = _paysages_lire(_brume(rng, 4, 64), Z * 2.0, W * 2.0)    # des pres plus jaunes, d'autres plus sombres
+        herbe = np.array([26, 64, 34]) * (1 - L[..., None]) + np.array([112, 166, 58]) * L[..., None]
+        herbe *= (0.86 + 0.28 * taches)[..., None]
+        voile = (1 - np.exp(-Z / 38.0))[..., None]
+        ciel = _degrade((28, 64, 140), (146, 180, 200), 0, H)
+        ciel += (np.clip(1 - np.hypot(X + 6, Y + 6) / 44, 0, 1) ** 2)[..., None] * np.array([70, 60, 26])   # le soleil, hors champ
+        ciel += (np.exp(-((Y - H + 6) / 4.5) ** 2) * 0.22)[..., None] * (np.array([235, 238, 240]) - ciel)   # des nuages au loin, fondus
+        zc = f * (PLAINE_NUAGES - PLAINE_OEIL) / np.maximum(H - Y, 0.5)  # le plafond des nuages, en perspective
+        zh = f * (PLAINE_NUAGES - PLAINE_OEIL) / np.maximum(H - Y - 1.5, 0.5)
+        zb = f * (PLAINE_NUAGES - PLAINE_OEIL) / np.maximum(H - Y + 1.5, 0.5)
+        S, G = PLAINE_ECHELLE                                             # un meme champ : les nuages, et leurs ombres au sol
+        vit = np.where(sol, G, S)
+        fy = np.where(sol, Z, zc) * vit
+        fx = np.where(sol, W + 0.8, (X - 31.5) * zc / f) * vit
+        e["plaine"] = dict(champ=champ, sol=sol, Z=Z, W=W, herbe=herbe, voile=voile, ciel=ciel, fy=fy, fx=fx, vit=vit,
+                           fyh=zh * S, fxh=(X - 31.5) * zh / f * S, fyb=zb * S, fxb=(X - 31.5) * zb / f * S,
+                           brume=np.array([150, 178, 190]))
+        tz, tw = 6.4, 2.2                                                 # l'arbre seul, sur une butte
+        e["arbre"] = (31.5 + tw * f / tz, H + (PLAINE_OEIL - _plaine_relief(tw, tz)) * f / tz)
+        e["feuilles"] = _brume(rng, 2, 64)
+        zl = np.array([14.0, 18, 22, 27, 33, 40, 52])                     # quelques arbres au loin
+        wl = rng.uniform(-0.35, 0.35, len(zl)) * zl
+        e["bosquets"] = (31.5 + wl * f / zl, H + (PLAINE_OEIL - _plaine_relief(wl, zl)) * f / zl, zl)
+    P = e["plaine"]
+    sol = P["sol"]
+    dx, dz = t * 0.22, -t * 0.07                                           # le vent pousse les nuages vers la droite
+    F = _paysages_lire(P["champ"], P["fy"] + dz * P["vit"], P["fx"] + dx * P["vit"])
+    dens = np.clip((F - 0.5) * 4.0, 0, 1)
+    img = P["ciel"].copy()
+    S = PLAINE_ECHELLE[0]
+    Fh = _paysages_lire(P["champ"], P["fyh"] + dz * S, P["fxh"] + dx * S)  # le dessus des nuages au soleil, le dessous gris
+    Fb = _paysages_lire(P["champ"], P["fyb"] + dz * S, P["fxb"] + dx * S)
+    relief = np.clip(0.55 + (Fb - Fh) * 7 + (F - 0.5) * 1.2, 0, 1)[..., None]
+    nuage = np.array([118, 128, 160]) * (1 - relief) + np.array([238, 238, 234]) * relief
+    haut = np.clip((H - 9 - Y) / 8, 0, 1)                                 # vers l'horizon, les nuages se fondent dans la brume
+    a = (dens * haut * ~sol)[..., None] * 0.96
+    img = img * (1 - a) + nuage * a
+    Z, W = P["Z"], P["W"]
+    ombre = dens * np.exp(-(Z / 11) ** 2)
+    vague = (0.5 + 0.5 * np.sin(3.6 * W - 2.7 * Z - t * 1.5 + 1.2 * np.sin(0.5 * W + 0.4 * Z + t * 0.05))) ** 4
+    vague *= np.exp(-(Z / 6.0) ** 2) * (0.35 + 0.65 * (0.5 + 0.5 * np.sin(0.45 * W - 0.35 * Z - t * 0.3)))   # par rafales
+    herbe = P["herbe"] * (1 - 0.55 * ombre)[..., None] + (vague * (1 - 0.6 * ombre))[..., None] * np.array([46, 54, 18])
+    herbe = herbe * (1 - P["voile"]) + P["brume"] * P["voile"]
+    img[sol] = herbe[sol]
+    bx, by, bz = e["bosquets"]
+    for x, y, z in zip(bx, by, bz):
+        h = 0.55 * f / z
+        _paysages_traits(img, [(y - h * 0.4, x, y - h * 1.2, x, h * 0.55, h * 0.4)], np.array([30, 66, 40]) * (1 - z / 70)
+                         + np.array([150, 178, 190]) * z / 70)
+    ax, ay = e["arbre"]                                                   # l'arbre : son ombre, son tronc, sa couronne
+    d = np.hypot((X - ax - 3.5) / 4.2, (Y - ay - 0.7) / 1.2)
+    img *= (1 - 0.4 * np.clip((1 - d) * 2, 0, 1))[..., None]
+    _paysages_traits(img, [(ay + 0.3, ax, ay - 5.0, ax - 0.2, 0.7, 0.45), (ay - 4, ax, ay - 6.5, ax + 1.8, 0.35, 0.25),
+                           (ay - 4.5, ax - 0.2, ay - 6.8, ax - 2.0, 0.3, 0.25)], (36, 28, 22))
+    cy = ay - 9.0
+    phi = np.arctan2(Y - cy, X - ax)
+    d = np.hypot((X - ax) * 0.88, Y - cy)
+    bord = 5.4 + 0.55 * np.sin(phi * 5 + 1 + 0.15 * np.sin(t * 0.7)) + 0.3 * np.sin(phi * 9 + 2)
+    couronne = np.clip(bord + 0.5 - d, 0, 1)[..., None]
+    fe = _fenetre(e["feuilles"], t * 0.6, 0)
+    lum = np.clip(0.5 - (X - ax) * 0.09 - (Y - cy) * 0.09 + (fe - 0.5) * 0.7, 0.08, 1)[..., None]
+    img = img * (1 - couronne) + (np.array([18, 40, 22]) + lum * np.array([76, 104, 42])) * couronne
+    k = t * 0.25                                                          # un rapace qui tourne tres haut
+    oy, ox = 10 + 3 * np.sin(k), 16 + 8 * np.cos(k)
+    aile = 0.5 + 0.5 * np.sin(t * 0.8)
+    _poser(img, [oy - aile, oy, oy - aile], [ox - 1, ox, ox + 1], [[40, 50, 70]] * 3)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 3. La montagne : l'alpenglow glisse sur ses faces au fil d'un long cycle.
+
+MONTAGNE_PERIODE = 120.0    # secondes : le jour dore, l'alpenglow qui monte, l'heure bleue, l'aube qui redescend
+MONTAGNE_LUMIERE = ((0.0, (255, 230, 194)), (0.4, (255, 190, 130)), (0.65, (252, 146, 126)), (0.85, (240, 104, 126)),
+                    (1.0, (200, 88, 140)))
+MONTAGNE_AMBIANTE = ((0.0, (80, 94, 130)), (0.6, (82, 78, 124)), (0.85, (98, 74, 128)), (1.0, (60, 66, 118)))
+MONTAGNE_CIEL_HAUT = ((0.0, (44, 84, 148)), (0.55, (42, 52, 112)), (1.0, (10, 12, 40)))
+MONTAGNE_CIEL_BAS = ((0.0, (236, 200, 162)), (0.5, (248, 158, 126)), (0.8, (150, 88, 136)), (1.0, (48, 42, 92)))
+
+
+def _scene_montagne(p, e, t, ecoule, dt):
+    """Une grande montagne, ses aretes, ses faces au soleil et a l'ombre, ses neiges : l'alpenglow rose et dore
+    glisse lentement sur elle ; un nuage accroche le sommet ; au pied, une vallee boisee dans la brume."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "montagne" not in e:
+        x = X[0]
+        crete = np.where(x < 30, 4 + (30 - x) * 1.15, np.minimum(4 + (x - 30) * 1.3, 15 + np.abs(x - 46) * 0.8))
+        crete = crete + 0.7 * np.sin(x * 1.3 + 0.5) * np.clip(np.abs(x - 30) / 5, 0, 1) * np.clip(np.abs(x - 46) / 3, 0.3, 1)
+        dedans = np.clip(Y - crete[None, :] + 0.5, 0, 1)
+        ag = 30 + (Y - 4) * 0.13 + 0.6 * np.sin(Y * 0.45)                 # l'arete : la face au soleil, la face a l'ombre
+        face = 0.3 + 0.7 * np.clip((ag - X) / 1.2 + 0.5, 0, 1)
+        face = face + 0.12 * np.clip(1 - np.abs(X - ag + 0.6) / 0.8, 0, 1)    # l'arete accroche la lumiere
+        epaule = np.clip(1 - np.abs(X - 45.5 + (Y - 15) * 0.3) / 1.0, 0, 1) * np.clip((25 - Y) / 6, 0, 1)
+        face = face + 0.35 * epaule                                       # et le fil de l'epaule aussi
+        lim = 19.5 + 1.8 * np.sin(X * 0.3 + 1) + 1.0 * np.sin(X * 0.9)      # le bas du champ de neige...
+        for x0, penche, long, large in ((8, -0.5, 6, 2.5), (14, -0.45, 9, 3.0), (20.5, -0.3, 12, 3.2), (26, -0.15, 7, 2.2),
+                                        (35, 0.2, 11, 3.0), (41, 0.3, 8, 2.6), (47, 0.4, 10, 3.0), (54, 0.5, 7, 2.6),
+                                        (60, 0.55, 5, 2.4)):
+            dx = np.abs(X - x0 - penche * (Y - 19.5)) / large            # ... et ses langues pointues dans les couloirs
+            lim = lim + long * np.clip(1 - dx, 0, 1) ** 1.6
+        neige = np.clip((lim - Y) / 1.1, 0, 1)
+        for y0, x0, y1, x1 in ((11, 25.5, 19, 20.5), (12, 35, 20, 39.5), (17, 46, 23, 50)):
+            u = np.clip(((X - x0) * (x1 - x0) + (Y - y0) * (y1 - y0)) / ((x1 - x0) ** 2 + (y1 - y0) ** 2), 0, 1)
+            d = np.hypot(X - x0 - u * (x1 - x0), Y - y0 - u * (y1 - y0))
+            neige *= 0.35 + 0.65 * np.clip(d / 0.9, 0, 1)                # des cotes de rocher trop raides pour la neige
+        neige *= np.clip(np.abs(X - ag - 0.9) / 0.6, 0, 1) * (Y > 8) + (Y <= 8)   # l'arete, rocheuse cote ombre
+        tex = _brume(rng, 2, 64)
+        gorges = _paysages_lire(tex, Y * 0.3, X * 1.2)                    # des eboulis, en long ; des strates
+        roche = np.array([0.36, 0.33, 0.33]) * (0.8 + 0.3 * gorges + 0.08 * np.sin(Y * 0.9 + X * 0.25))[..., None]
+        bas = np.clip((Y - 34) / 10, 0, 1)[..., None]                     # en bas, les alpages et les forets
+        roche = roche * (1 - bas) + np.array([0.15, 0.21, 0.17]) * bas
+        albedo = roche * (1 - neige[..., None]) + np.array([0.78, 0.81, 0.87]) * neige[..., None]
+        loin = 22 + np.abs(x - 6) * 0.8 + 0.6 * np.sin(x * 1.1)            # un sommet plus loin, a gauche
+        e["montagne"] = dict(crete=crete, dedans=dedans, face=face, albedo=albedo, loin=loin,
+                             neige_loin=np.clip((29 - Y) / 3, 0, 1))
+        base = 48 + 1.2 * np.sin(x * 0.15)
+        e["sapins"] = (_paysages_cimes(rng, 34, base, 2, 5, 0.9),
+                       _paysages_cimes(rng, 18, 59.5 + 1.5 * np.sin(x * 0.2 + 1), 4, 9, 0.65))
+        e["nuees"] = _brume(rng, 7)
+        e["vallee"] = _brume(rng, 10)
+        e["etoiles"] = (rng.uniform(0, 64, 40), rng.uniform(0, 30, 40), rng.uniform(0, 6, 40), rng.uniform(0.4, 1, 40))
+        cx = rng.uniform(4, 60, 5)
+        e["chalets"] = (cx, np.minimum(e["sapins"][1][cx.astype(int)] - 2, 53 + rng.uniform(0, 2, 5)), rng.uniform(0, 6, 5))
+    M = e["montagne"]
+    s = 0.5 - 0.5 * np.cos(2 * np.pi * (t / MONTAGNE_PERIODE))             # 0 : plein jour dore ; 1 : l'heure bleue
+    m = s ** 0.6                                                           # la lumiere s'attarde sur les hauteurs
+    lumiere = _paysages_nuancier(MONTAGNE_LUMIERE, m)
+    ambiante = _paysages_nuancier(MONTAGNE_AMBIANTE, s)
+    ciel_bas = _paysages_nuancier(MONTAGNE_CIEL_BAS, s)
+    img = _degrade(_paysages_nuancier(MONTAGNE_CIEL_HAUT, s), ciel_bas, 0, 46)
+    nuit = float(np.clip((s - 0.8) / 0.15, 0, 1))
+    if nuit > 0:
+        ex, ey, ep, el = e["etoiles"]
+        _pointer(img, ey, ex, (el * nuit * (0.6 + 0.4 * np.sin(t * 1.9 + ep)))[:, None] * np.array([210, 210, 240]))
+    ligne = 52 - m * 50 + 2.0 * np.sin(X * 0.09 + 1)                       # l'ombre de la terre qui monte, puis redescend
+    eclaire = np.clip((ligne - Y) / 3.0, 0, 1)
+    rose = (np.clip(1 - np.abs(Y - ligne) / 9, 0, 1) * min(1.0, m * 2.5))[..., None]   # tout pres de la limite, la lumiere rougit
+    lum = lumiere * (1 - 0.3 * rose) + np.array([255, 96, 120]) * 0.3 * rose
+    c = _paysages_sous(img, M["loin"], (0, 0, 0), 1.0)                     # le sommet du fond, voile par l'air
+    loin = np.array([0.5, 0.52, 0.56]) + M["neige_loin"][..., None] * 0.35
+    img += (loin * (ambiante + eclaire[..., None] * lum * 0.7) * 0.6 + ciel_bas * 0.4) * c[..., None]
+    roc = M["albedo"] * (ambiante + (eclaire * M["face"])[..., None] * lum * 0.78)
+    a = M["dedans"][..., None]
+    img = img * (1 - a) + roc * a
+    F = _fenetre(e["nuees"], t * 1.8, t * 0.15)                            # la banniere de nuage, accrochee au sommet
+    plume = np.exp(-((Y - 5.5 - (X - 30) * 0.2) / (1.0 + np.abs(X - 30) * 0.1)) ** 2) * np.clip((X - 27) / 4, 0, 1) \
+        * np.exp(-np.clip(X - 30, 0, None) / 20)
+    a = (np.clip((F * 1.4 - 0.35) * 2.4, 0, 1) * plume * 0.9)[..., None]
+    lum_nuage = ambiante * 1.3 + np.clip((ligne + 3 - Y) / 4.0, 0, 1)[..., None] * lumiere * 0.8
+    img = img * (1 - a) + lum_nuage * a
+    voile = (np.clip((Y - 38) / 10, 0, 1) * 0.55)[..., None]              # l'air de la vallee, au pied
+    img = img * (1 - voile) + (ciel_bas * 0.5 + ambiante * 0.5) * voile
+    pres, devant = e["sapins"]
+    _paysages_sous(img, pres, ambiante * 0.38 + np.array([2, 10, 8]))
+    V = _fenetre(e["vallee"], t * 0.7, 0)                                  # la brume de la vallee
+    a = (np.exp(-((Y - 52.5) / 3.0) ** 2) * (0.3 + 0.55 * V))[..., None]
+    img = img * (1 - a) + (ciel_bas * 0.6 + ambiante * 0.5) * a
+    soir = float(np.clip((s - 0.72) / 0.15, 0, 1))                         # a l'heure bleue, les chalets s'allument
+    if soir > 0:
+        cx, cy, cp = e["chalets"]
+        for xi, yi, ph in zip(cx, cy, cp):
+            v = soir * (0.85 + 0.15 * np.sin(t * 1.3 + ph))
+            img += (np.exp(-((X - xi) ** 2 + (Y - yi) ** 2) / 2.5) * v * 0.45)[..., None] * np.array([255, 160, 70])
+            _pointer(img, [yi], [xi], [np.array([255, 205, 130]) * v])
+    _paysages_sous(img, devant, ambiante * 0.16 + np.array([2, 6, 5]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 4. La savane : le grand soleil qui descend, l'acacia, les girafes.
+
+SAVANE_HORIZON = 46
+
+
+def _savane_girafe(img, x, sol, k, pas, sens, couleur):
+    """Une girafe en silhouette, qui marche (k : sa taille ; pas : la phase de sa marche ; sens : +1 vers la droite)."""
+    import numpy as np
+    if x + 9 * k < 0 or x - 9 * k > 64:
+        return
+    s = sens
+    hoche = 0.5 * k * np.sin(2 * pas)                                     # le cou se balance avec les pas
+    traits = [(sol - 8.7 * k, x - 2.4 * k * s, sol - 9.7 * k, x + 2.3 * k * s, 1.45 * k, 1.6 * k),     # le corps
+              (sol - 9.9 * k, x + 2.5 * k * s, sol - 17.6 * k, x + (4.9 * k + hoche) * s, 0.95 * k, 0.5 * k),   # le cou
+              (sol - 17.8 * k, x + (4.8 * k + hoche) * s, sol - 17.0 * k, x + (6.7 * k + hoche) * s, 0.6 * k, 0.35 * k),
+              (sol - 18.0 * k, x + (5.0 * k + hoche) * s, sol - 19.2 * k, x + (4.8 * k + hoche) * s, 0.2, 0.2),
+              (sol - 9.2 * k, x - 3.7 * k * s, sol - 5.6 * k, x - 4.2 * k * s, 0.2, 0.25)]            # la queue
+    for hx, cote in ((-2.3, 0.0), (-1.9, np.pi), (2.0, 0.0), (2.4, np.pi)):   # l'amble : les deux pattes d'un cote ensemble
+        ph = pas + cote
+        pied = x + (hx + 1.2 * np.sin(ph)) * k * s
+        leve = max(0.0, np.cos(ph)) * 0.7 * k
+        traits.append((sol - 8.2 * k, x + hx * k * s, sol - leve, pied, 0.42 * k, 0.28 * k))
+    _paysages_traits(img, traits, couleur)
+
+
+def _scene_savane(p, e, t, ecoule, dt):
+    """Un grand soleil rouge-orange descend sur la savane ; un acacia en parasol, des girafes qui passent
+    lentement en silhouette, l'air chaud qui fait trembler l'horizon, des oiseaux."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    H = SAVANE_HORIZON
+    if "savane" not in e:
+        acacia = np.zeros((64, 64))                                       # l'acacia : un masque fixe
+        for cx, cy, ra, rb in ((50, 28.6, 13.0, 2.4), (43.5, 30.0, 6.5, 2.0), (57.5, 30.2, 6.0, 1.9), (50.5, 27.2, 8.5, 1.6)):
+            bord = 1 + 0.12 * np.sin(X * 1.3 + cy) + 0.1 * np.sin(X * 2.9)
+            acacia = np.maximum(acacia, np.clip((bord - ((X - cx) / ra) ** 2 - ((Y - cy) / rb) ** 2) * rb * 1.2, 0, 1))
+        tronc = np.zeros((64, 64, 3))
+        _paysages_traits(tronc, [(H + 0.5, 49.0, 36.0, 49.4, 1.0, 0.75), (37.5, 49.4, 31.0, 44.0, 0.6, 0.4),
+                                 (37.5, 49.4, 30.5, 55.0, 0.6, 0.4), (40.0, 49.2, 31.0, 50.5, 0.45, 0.35),
+                                 (34.0, 46.0, 31.0, 40.0, 0.35, 0.3)], (1, 1, 1))
+        e["savane"] = np.maximum(acacia, tronc[..., 0])
+        e["stries"] = _brume(rng, 6)
+        e["oiseaux"] = (rng.uniform(0, 90, 5), rng.uniform(6, 22, 5), rng.uniform(0, 6, 5))
+        n = 26                                                            # des touffes d'herbe au premier plan
+        e["touffes"] = (np.concatenate([rng.uniform(-2, 16, n // 2), rng.uniform(46, 66, n // 2)]), rng.uniform(4, 11, n),
+                        rng.uniform(-0.5, 0.5, n), rng.uniform(0, 6, n))
+        buissons = np.zeros((64, 64))                                     # des buissons epars
+        for x0, y0, r0 in zip(rng.uniform(2, 62, 6), H + rng.uniform(1.5, 4, 6), rng.uniform(1.0, 2.0, 6)):
+            buissons = np.maximum(buissons, np.clip(r0 + 0.5 - np.hypot((X - x0) * 0.7, Y - y0), 0, 1) * (Y <= y0 + 0.5))
+        e["buissons"] = buissons
+        ciel = _degrade((44, 12, 40), (160, 46, 40), 0, 30)
+        e["degrades"] = (np.where((Y >= 30)[..., None], _degrade((160, 46, 40), (250, 124, 44), 30, H), ciel),
+                         _degrade((38, 13, 18), (12, 5, 8), H, 64))
+    descente = min(max(ecoule, 0.0), 120.0) / 120.0                        # il descend, puis se pose sur l'horizon
+    sy = 26 + descente * 15
+    ciel, terre = e["degrades"]
+    img = ciel.copy()
+    d = np.hypot(X - 25, Y - sy)
+    img += (np.clip(1 - d / 34, 0, 1) ** 2)[..., None] * np.array([90, 40, 6]) * (1 - descente * 0.3)
+    r = 10.5
+    disque = np.clip(r + 0.5 - d, 0, 1)[..., None]
+    k = np.clip(d / r, 0, 1)[..., None]
+    coeur = np.array([255, 214, 120]) * (1 - descente) + np.array([255, 170, 80]) * descente
+    bordc = np.array([248, 110, 46]) * (1 - descente) + np.array([226, 70, 40]) * descente
+    img = img * (1 - disque) + (coeur * (1 - k ** 2) + bordc * k ** 2) * disque
+    S = e["stries"]                                                       # de longs nuages fins devant le soleil
+    for yk, ep, v, ph in ((20.0, 1.0, 0.25, 0.0), (29.5, 0.8, 0.4, 40.0), (35.0, 1.3, 0.3, 80.0)):
+        f = _paysages_lire(S, np.full(64, ph), X[0] * 0.8 - t * v)
+        long = np.clip((f - 0.42) * 3, 0, 1)
+        a = (np.exp(-((Y - yk - 0.8 * np.sin(X * 0.07 + ph)) / ep) ** 2) * long[None, :] * 0.75)[..., None]
+        img = img * (1 - a) + np.array([70, 20, 42]) * a
+    x = X[0]
+    mesa = np.minimum(np.clip(9 - np.abs(x - 10) * 0.9, 0, 4.5), 4.5) + np.clip(5 - np.abs(x - 60) * 0.6, 0, 3)
+    _paysages_sous(img, H - mesa - 0.3 * np.sin(x * 0.7), (120, 42, 46))  # des collines plates, dans la brume chaude
+    for yy in range(H - 8, H + 1):                                        # l'air chaud fait trembler l'horizon
+        f = 0.35 * np.sin(t * 2.6 + yy * 1.7) * (yy - H + 9) / 9
+        img[yy] = img[yy] * (1 - abs(f)) + np.roll(img[yy], 1 if f > 0 else -1, axis=0) * abs(f)
+    sol = H + 0.4 * np.sin(x * 0.9) + 0.3 * np.sin(x * 2.3)
+    _paysages_sous(img, sol, (34, 12, 16))
+    img[H + 2:] = terre[H + 2:]
+    lisiere = np.clip(1 - np.abs(Y - sol[None, :] - 0.5), 0, 1)[..., None] * 0.5   # le bord de l'herbe accroche la lumiere
+    img = img * (1 - lisiere) + np.array([170, 60, 36]) * lisiere
+    silhouette = np.array([16, 6, 12])
+    a = e["buissons"][..., None]
+    img = img * (1 - a) + silhouette * 1.3 * a
+    a = e["savane"][..., None]
+    img = img * (1 - a) + silhouette * a
+    for x0, k, sens, v, ecart in ((92.0, 1.0, -1, 1.1, 0), (92.0, 0.72, -1, 1.1, 9), (92.0, 0.95, -1, 1.1, 23),
+                                  (-30.0, 0.5, 1, 0.55, 0), (-30.0, 0.42, 1, 0.55, 6)):
+        q = (t * v + (0 if sens < 0 else 37)) % 150
+        gx = x0 + sens * q - ecart * sens
+        _savane_girafe(img, gx, H + (4 if k > 0.6 else 0.5) * k + 0.5, k, q * 1.15 / k + ecart, sens, silhouette)
+    tx, th, tc, tp = e["touffes"]                                          # les touffes devant, qui bougent a peine
+    s = np.linspace(0, 1, 12)[None, :]
+    lam = (tc + 0.12 * np.sin(t * 0.9 + tp))[:, None]
+    xs = tx[:, None] + lam * th[:, None] * s ** 2
+    ys = 64.5 - th[:, None] * s
+    couv = np.zeros(4096)
+    _paysages_brins(couv, xs.ravel(), ys.ravel(), np.broadcast_to(0.45 - 0.25 * s, xs.shape).ravel(),
+                    np.broadcast_to(2 * lam * s, xs.shape).ravel())
+    a = couv.reshape(64, 64)[..., None]
+    pointe = np.clip((64 - Y) / 9, 0, 1)[..., None] ** 2                   # leurs pointes prennent un peu de lumiere
+    img = img * (1 - a) + (np.array([10, 4, 7]) + pointe * np.array([110, 40, 22])) * a
+    ox0, oy0, op = e["oiseaux"]
+    for i in range(5):                                                    # des oiseaux qui passent
+        bx = (ox0[i] + t * 3.2) % 100 - 18
+        by = oy0[i] + np.sin(t * 0.4 + op[i]) * 1.5
+        aile = 0.5 + 0.5 * np.sin(t * 5 + op[i] * 3)
+        _poser(img, [by - aile, by, by - aile], [bx - 1, bx, bx + 1], [silhouette * 2] * 3)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 5. Les eoliennes au crepuscule.
+
+EOLIENNES = (   # (x du pied, y du pied, hauteur du mat, longueur des pales, vitesse (rad/s), profondeur 0 loin .. 1 pres)
+    (8.0, 46.5, 7.5, 3.4, 0.55, 0.12),
+    (27.0, 46.0, 9.5, 4.3, 0.62, 0.22),
+    (60.0, 47.0, 9.0, 4.0, 0.5, 0.2),
+    (46.5, 50.0, 18.0, 7.6, 0.47, 0.55),
+    (18.0, 58.5, 34.0, 13.5, 0.4, 1.0),
+)
+
+
+def _scene_eoliennes(p, e, t, ecoule, dt):
+    """Des eoliennes sur les collines au crepuscule : leurs pales tournent lentement, chacune a sa vitesse ;
+    leurs feux rouges s'allument et s'eteignent doucement, ensemble."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "eoliennes" not in e:
+        ciel = _degrade((10, 12, 40), (70, 44, 96), 0, 30)
+        bas = _degrade((70, 44, 96), (226, 116, 76), 30, 47)
+        ciel = np.where((Y >= 30)[..., None], bas, ciel)
+        ciel += (np.clip(1 - np.hypot((X - 44) * 0.6, Y - 47) / 22, 0, 1) ** 2)[..., None] * np.array([70, 40, 10])
+        lune = np.clip(2.8 - np.hypot(X - 11, Y - 9), 0, 1) * (1 - np.clip(2.6 - np.hypot(X - 12.4, Y - 8.2), 0, 1))
+        ciel += (np.exp(-np.hypot(X - 11, Y - 9) / 4) * 0.25)[..., None] * np.array([120, 110, 90])
+        e["eoliennes"] = (ciel, lune)
+        e["stratus"] = _brume(rng, 9)
+        e["etoiles"] = (rng.uniform(0, 64, 45), rng.uniform(0, 34, 45), rng.uniform(0, 6, 45), rng.uniform(0.3, 1, 45))
+        e["village"] = (rng.uniform(30, 62, 7), rng.uniform(0, 6, 7))
+        e["rotors"] = rng.uniform(0, 2 * np.pi, len(EOLIENNES))
+    ciel, lune = e["eoliennes"]
+    img = ciel.copy()
+    ex, ey, ep, el = e["etoiles"]
+    scintille = el * np.clip(1 - ey / 34, 0, 1) * (0.55 + 0.45 * np.sin(t * 2.1 + ep))
+    _pointer(img, ey, ex, scintille[:, None] * np.array([200, 205, 235]))
+    img = img * (1 - lune[..., None]) + np.array([235, 225, 190]) * lune[..., None]
+    F = _paysages_lire(e["stratus"], Y * 1.6, X * 0.35 + t * 0.6)           # de longs nuages fins, roses par dessous
+    a = (np.clip((F - 0.5) * 2.5, 0, 1) * np.exp(-((Y - 35) / 4.5) ** 2) * 0.7)[..., None]
+    img = img * (1 - a) + np.array([210, 104, 108]) * a
+    x = X[0]
+    _paysages_sous(img, 45 + 1.5 * np.sin(x * 0.09 + 1) + 0.8 * np.sin(x * 0.27), (46, 32, 62))
+    vx, vp = e["village"]
+    for xi, ph in zip(vx, vp):                                            # un village au loin
+        _pointer(img, [47.2 + np.sin(xi)], [xi], [np.array([255, 190, 110]) * (0.6 + 0.15 * np.sin(t * 0.7 + ph))])
+    _paysages_sous(img, 49 + 1.2 * np.sin(x * 0.12 + 3) + 0.6 * np.sin(x * 0.4), (28, 20, 42))
+    feu = (0.5 - 0.5 * np.cos(2 * np.pi * t / 2.4)) ** 2.5                # le balisage : tous ensemble, doucement
+    lueurs = np.zeros((64, 64))
+    for i, (px, py, mat, pale, v, prof) in enumerate(EOLIENNES):
+        if prof > 0.9:
+            _paysages_sous(img, 57.5 + 0.004 * (x - 18) ** 2 + 0.6 * np.sin(x * 0.3), (12, 10, 22))   # la colline devant
+        teinte = np.array([150, 108, 124]) * (1 - prof) + np.array([136, 128, 160]) * prof
+        hy = py - mat
+        k = max(prof, 0.3)
+        _paysages_traits(img, [(py, px, hy, px, 0.75 * k + 0.1, 0.4 * k + 0.1)], teinte * 0.85)
+        a0 = t * v + e["rotors"][i]
+        pales = []
+        for j in range(3):
+            a = a0 + j * 2 * np.pi / 3
+            pales.append((hy, px, hy - np.cos(a) * pale, px + np.sin(a) * pale, 0.6 * k + 0.1, 0.1 + 0.08 * k))
+        _paysages_traits(img, pales, teinte)
+        _paysages_traits(img, [(hy, px - 0.2, hy, px + 0.2, 0.6 * k + 0.25, 0.6 * k + 0.25)], teinte * 1.1)
+        lueurs += np.exp(-((X - px) ** 2 + (Y - hy + 0.8 * k) ** 2) / (0.8 + 4 * prof)) * (0.6 + 0.4 * prof)
+        if prof > 0.9:                                                     # la grande en a un second, a mi-hauteur
+            lueurs += np.exp(-((X - px) ** 2 + (Y - py + mat * 0.5) ** 2) / 1.5) * 0.5
+    img += (np.clip(lueurs, 0, 1.2) * feu)[..., None] * np.array([255, 40, 24])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 6. Les montgolfieres au lever du soleil.
+
+MONTGOLFIERES = (   # (profondeur 0 loin .. 1 pres, depart, altitude, couleurs des fuseaux, periode du bruleur)
+    (0.2, 10.0, 15.0, ((70, 130, 215), (235, 232, 222)), 11.0),
+    (0.32, 50.0, 24.0, ((232, 70, 58), (250, 200, 70)), 13.0),
+    (0.42, 30.0, 9.0, ((128, 74, 186), (244, 156, 196)), 9.5),
+    (0.6, 0.0, 22.0, ((40, 164, 124), (246, 152, 52)), 12.0),
+    (1.0, 40.0, 29.0, ((222, 52, 72), (250, 220, 92), (60, 112, 204)), 10.5),
+)
+
+
+def _scene_montgolfieres(p, e, t, ecoule, dt):
+    """Des montgolfieres colorees flottent lentement, a plusieurs distances, au-dessus d'une vallee au lever du
+    soleil ; leurs bruleurs s'allument de temps en temps ; la brume dort dans la vallee."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "montgolfieres" not in e:
+        ciel = _degrade((54, 78, 132), (196, 152, 162), 0, 30)
+        bas = _degrade((196, 152, 162), (252, 196, 136), 30, 42)
+        ciel = np.where((Y >= 30)[..., None], bas, ciel)
+        d = np.hypot(X - 50, Y - 38.0)
+        ciel += (np.clip(1 - d / 30, 0, 1) ** 2)[..., None] * np.array([60, 40, 10])
+        sol = np.clip(4.6 - d, 0, 1)[..., None]
+        ciel = ciel * (1 - sol) + np.array([255, 238, 190]) * sol
+        x = X[0]
+        decor = ciel.copy()
+        _paysages_sous(decor, 39.5 + 2.2 * np.sin(x * 0.07 + 2) + 1.0 * np.sin(x * 0.23), (166, 136, 166))   # les monts au loin
+        gauche = 43.5 + x * 0.3 + 0.8 * np.sin(x * 0.5)
+        droite = 46 + (63 - x) * 0.26 + 0.8 * np.sin(x * 0.4 + 1)
+        e["plans"] = (_paysages_cimes(rng, 30, np.minimum(gauche, droite), 0.8, 2.0, 0, True),
+                      _paysages_cimes(rng, 22, np.minimum(51 + x * 0.25, 56 + (63 - x) * 0.28), 1.5, 3.5, 0, True),
+                      _paysages_cimes(rng, 14, np.where(x > 34, 62.5 - (x - 34) * 0.3, 66), 2.0, 4.5, 0, True))   # une butte, devant
+        e["montgolfieres"] = (ciel, decor)
+        e["brume"] = _brume(rng, 9)
+        e["fuseaux"] = rng.uniform(0, 1, len(MONTGOLFIERES))
+    ciel, decor = e["montgolfieres"]
+    img = decor.copy()
+    p1, p2, p3 = e["plans"]
+    _paysages_sous(img, p1, (112, 98, 128))                               # la pente d'en face
+    B = _fenetre(e["brume"], t * 0.5, 10)
+    a = (np.clip(np.exp(-((Y - 51) / 4.5) ** 2) * (0.45 + 0.6 * B), 0, 0.92))[..., None]
+    lueur = np.clip(1 - np.abs(X - 50) / 40, 0, 1)[..., None]             # la brume, doree du cote du soleil
+    img = img * (1 - a) + (np.array([236, 196, 200]) * (1 - lueur) + np.array([255, 218, 176]) * lueur) * a
+    _paysages_sous(img, p2, (58, 54, 80))
+    B2 = _fenetre(e["brume"], 60 - t * 0.35, 40)
+    a = (np.clip(np.exp(-((Y - 59) / 3.5) ** 2) * (0.3 + 0.5 * B2), 0, 0.8))[..., None]
+    img = img * (1 - a) + np.array([228, 190, 196]) * a
+    _paysages_sous(img, p3, (28, 28, 44))
+    for i, (prof, x0, alt, couleurs, periode) in enumerate(MONTGOLFIERES):  # du plus loin au plus pres
+        R = 2.0 + 7.2 * prof
+        m = 2.2 * R + 4
+        cx = (x0 + t * (0.12 + 0.5 * prof)) % (64 + 2 * m) - m
+        cy = alt + 1.6 * np.sin(t * 0.11 + i * 2.1)
+        brule = float(np.clip((np.sin(2 * np.pi * t / periode + i * 1.7) - 0.86) / 0.1, 0, 1))
+        brule *= 0.8 + 0.2 * np.sin(t * 17 + i) * np.sin(t * 7.3)
+        ya, yb = int(max(0, cy - R - 2)), int(min(64, cy + 2.1 * R + 2))
+        xa, xb = int(max(0, cx - R - 2)), int(min(64, cx + R + 3))
+        if ya >= yb or xa >= xb:
+            continue
+        yy, xx = Y[ya:yb, xa:xb], X[ya:yb, xa:xb]
+        u, v = (xx - cx) / R, (yy - cy) / R
+        demi = np.where(v < 0.35, np.sqrt(np.clip(1 - v ** 2, 0, 1)), 0.94 - (v - 0.35) * 0.56)
+        couv = np.clip((demi - np.abs(u)) * R + 0.5, 0, 1) * np.clip((1.45 - v) * R + 0.5, 0, 1) * np.clip((v + 1) * R + 0.5, 0, 1)
+        sn = np.clip(u / np.maximum(demi, 1e-3), -1, 1)
+        ang = np.arcsin(sn)                                               # les fuseaux se resserrent sur les bords
+        n = 6 if R < 5 else 8
+        fuseau = np.floor((ang / np.pi + 0.5) * n + e["fuseaux"][i]).astype(int) % len(couleurs)
+        teinte = np.asarray(couleurs, float)[fuseau]
+        nz = np.sqrt(np.clip(1 - sn ** 2, 0, 1))
+        lum = 0.34 + 0.8 * np.clip(sn * 0.7 - np.clip(v, -1, 0.4) * 0.35 + nz * 0.55, 0, 1)   # le soleil a droite
+        teinte = teinte * lum[..., None]
+        teinte += (brule * 0.75 * np.clip(v + 0.2, 0, 1.2))[..., None] * np.array([255, 150, 60])   # le bruleur l'eclaire du dedans
+        brume = (1 - prof) * 0.5                                          # au loin, elles se fondent dans le ciel
+        teinte = teinte * (1 - brume) + ciel[ya:yb, xa:xb] * brume
+        zone = img[ya:yb, xa:xb]
+        zone[...] = zone * (1 - couv[..., None]) + teinte * couv[..., None]
+        nacelle = np.clip((0.24 - np.abs(u)) * R + 0.5, 0, 1) * np.clip((v - 1.62) * R + 0.5, 0, 1) \
+            * np.clip((1.95 - v) * R + 0.5, 0, 1)
+        corde = np.clip(0.5 - np.abs(np.abs(u) - 0.27 + (v - 1.45) * 0.3) * R, 0, 1) * (v > 1.45) * (v < 1.65) * (R > 5)
+        nac = np.maximum(nacelle, corde * 0.8)[..., None]
+        zone[...] = zone * (1 - nac) + np.array([64, 42, 34]) * (1 - brume) * nac + ciel[ya:yb, xa:xb] * brume * nac
+        if brule > 0.02:
+            fl = np.exp(-((u / 0.12) ** 2 + ((v - 1.42) / 0.12) ** 2) * 0.5 * R / 3) * brule
+            zone += fl[..., None] * np.array([255, 210, 120]) * 1.2
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 7. Le voilier : il glisse au coucher du soleil ; on le suit, l'eau defile.
+
+VOILIER_HORIZON = 36
+
+
+def _voilier_formes(lx, ly, gonfle):
+    """Les formes du voilier dans son repere (lx vers l'etrave, ly vers le bas, 0 a la flottaison) :
+    (coque, liston, mat, grand-voile, foc), en 0/1."""
+    import numpy as np
+    pont = -1.8 - 0.07 * lx
+    coque = (ly >= pont) & (ly <= 0.7) & (lx >= -8.2 + (ly + 1.8) * 0.4) & (lx <= 8.8 - (ly - pont) * 1.1)
+    liston = coque & (ly < pont + 0.7)
+    mat = (np.abs(lx - 1.0) <= 0.45) & (ly >= -22.5) & (ly < pont)
+    q = np.clip((ly + 21.0) / 18.0, 0, 1)
+    chute = 0.5 - 8.6 * q - gonfle * 1.7 * np.sin(np.pi * q)               # la chute de la grand-voile, bombee
+    gv = (ly >= -21.0) & (ly <= -3.2) & (lx <= 0.55) & (lx >= chute)
+    bome = (np.abs(ly + 3.0) <= 0.45) & (lx <= 0.6) & (lx >= -8.4)
+    r = np.clip((ly + 19.0) / 16.2, 0, 1)
+    etai = 1.5 + 6.9 * r                                                  # l'etai, du haut du mat a l'etrave
+    arriere = 1.5 + 0.9 * r + gonfle * 1.5 * np.sin(np.pi * r)
+    foc = (ly >= -19.0) & (ly <= -2.6 - 0.05 * lx) & (lx <= etai) & (lx >= arriere)
+    return coque, liston, mat | bome, gv, foc
+
+
+def _scene_voilier(p, e, t, ecoule, dt):
+    """Un voilier glisse lentement sur la mer au coucher du soleil : ses voiles gonflees, il tangue un peu ;
+    le soleil et son reflet, des mouettes, des vagues douces."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    H = VOILIER_HORIZON
+    if "voilier" not in e:
+        ciel = _degrade((34, 22, 64), (196, 84, 96), 0, 26)
+        bas = _degrade((196, 84, 96), (252, 160, 76), 26, H)
+        ciel = np.where((Y >= 26)[..., None], bas, ciel)
+        d = np.hypot(X - 45, Y - 30)
+        ciel += (np.clip(1 - d / 30, 0, 1) ** 2)[..., None] * np.array([80, 50, 10])
+        soleil = np.clip(5.0 - d, 0, 1)[..., None]
+        ciel = ciel * (1 - soleil) + np.array([255, 228, 160]) * soleil
+        miroir = ciel[np.clip(2 * H - 1 - Y, 0, H - 1).astype(int), X.astype(int)]
+        mer = _degrade((100, 54, 96), (18, 14, 44), H, 64)
+        prof = np.clip((Y - H + 0.5) / (64 - H), 0, 1)
+        e["voilier"] = dict(ciel=ciel, miroir=miroir, mer=mer, prof=prof, lueur=np.clip(1 - d / 34, 0, 1)[..., None])
+        e["rides"] = _brume(rng, 4)
+        e["nuages"] = _brume(rng, 7)
+        e["mouettes"] = (rng.uniform(0, 6, 3), rng.uniform(0.6, 1.2, 3))
+    V = e["voilier"]
+    img = V["ciel"].copy()
+    N = _paysages_lire(e["nuages"], Y * 2.4 + 9, X * 0.45 + t * 0.5)      # de longs nuages, eclaires par dessous
+    Nb = _paysages_lire(e["nuages"], Y * 2.4 + 11.4, X * 0.45 + t * 0.5)
+    a = (np.clip((N - 0.45) * 2.2, 0, 1) * np.clip(1 - np.abs(Y - 17) / 10, 0, 1) * 0.75)[..., None]
+    dessous = np.clip((N - Nb) * 5 + V["lueur"][..., 0] * 0.9, 0, 1)[..., None]
+    img = img * (1 - a) + (np.array([96, 40, 82]) * (1 - dessous) + np.array([255, 156, 112]) * dessous) * a
+    mer = Y >= H
+    z = 30.0 / np.maximum(Y - H + 0.6, 0.6)                               # la mer en perspective : les rides defilent
+    R = _paysages_lire(e["rides"], z * 4.0, (X - 32) / np.maximum(Y - H + 0.6, 0.6) * 6 + t * 2.0)
+    calme = np.exp(-z / 8)                                               # au loin, les rides se fondent
+    ride = (R - 0.5) * calme
+    eau = V["mer"] * (1 - 0.6 * ride[..., None]) + V["miroir"] * np.clip(0.35 + ride * 1.6, 0, 1)[..., None] * 0.5
+    large = 1.5 + (Y - H) * 0.42
+    chemin = np.exp(-((X - 45) / large) ** 2) * (np.clip(R * 2 - 0.75, 0, 1) ** 2 * calme + (1 - calme) * 0.35)
+    eau += (chemin * (1 - V["prof"] * 0.4))[..., None] * np.array([255, 190, 100])
+    img[mer] = eau[mer]
+    vx = (t * 0.15 + 20) % 100 - 18                                       # une voile au loin, sur l'horizon
+    _pointer(img, [H - 1, H - 2, H - 2], [vx, vx, vx + 1], [[230, 170, 150]] * 3)
+    bx = 25 + 5 * np.sin(t * 0.031) + 2 * np.sin(t * 0.07)                 # on le suit : il derive a peine
+    by = 50.5 + 0.5 * np.sin(t * 0.9 + 0.8)
+    ang = 0.05 * np.sin(t * 0.9) + 0.02 * np.sin(t * 1.63)
+    gonfle = 0.85 + 0.15 * np.sin(t * 0.37)
+    k = np.arange(16.0)                                                   # le sillage, qui s'ouvre derriere lui
+    for sgn in (-1, 1):
+        _paysages_points(img, by + 0.9 + sgn * k * 0.24, bx - 8.5 - k * 1.4,
+                         ((1 - k / 16) ** 1.2 * (0.35 + 0.3 * np.sin(k * 0.9 + t * 2.4)))[:, None] * np.array([90, 76, 96]))
+    ya, yb, xa, xb = int(by - 25), int(min(64, by + 12)), int(max(0, bx - 13)), int(min(64, bx + 13))
+    yy, xx = Y[ya:yb, xa:xb], X[ya:yb, xa:xb]
+    ca, sa = np.cos(ang), np.sin(ang)
+    zone = img[ya:yb, xa:xb]
+    couv = [np.zeros(yy.shape) for _ in range(5)]
+    reflet = [np.zeros(yy.shape) for _ in range(5)]
+    for oy, ox in ((-0.25, -0.25), (-0.25, 0.25), (0.25, -0.25), (0.25, 0.25)):   # quatre echantillons par pixel
+        dx, dy = xx + ox - bx, yy + oy - by
+        lx, ly = dx * ca + dy * sa, -dx * sa + dy * ca
+        for c, f in zip(couv, _voilier_formes(lx, ly, gonfle)):
+            c += f * 0.25
+        tremble = 0.8 * np.sin((yy + oy) * 1.6 + t * 2.5)
+        for c, f in zip(reflet, _voilier_formes(lx + tremble, -ly + 1.4, gonfle)):
+            c += f * 0.25 * (yy + oy > by + 0.7)
+    dx, dy = xx - bx, yy - by
+    lx, ly = dx * ca + dy * sa, -dx * sa + dy * ca
+    q = np.clip((ly + 21) / 18, 0, 1)
+    voile = np.array([255, 196, 150]) * (0.62 + 0.38 * np.clip((lx + 8) / 9, 0, 1))[..., None] * (1 - 0.15 * q)[..., None]
+    foc = np.array([255, 210, 160]) * (0.7 + 0.3 * np.clip((8 - lx) / 6, 0, 1))[..., None]
+    teintes = (np.array([30, 20, 40]), np.array([210, 150, 120]), np.array([50, 34, 48]), voile, foc)
+    for c, te in zip((couv[3], couv[4], couv[2], couv[0], couv[1]), (teintes[3], teintes[4], teintes[2], teintes[0], teintes[1])):
+        c = c[..., None]
+        zone[...] = zone * (1 - c) + te * c
+    fond = (yy > by + 0.7)[..., None]
+    for c, te in zip((reflet[3], reflet[4], reflet[0]), (teintes[3], teintes[4], teintes[0])):
+        c = c[..., None] * 0.4 * np.exp(-(yy - by) / 9)[..., None] * fond
+        zone[...] = zone * (1 - c) + te * 0.55 * c
+    ph, vit = e["mouettes"]                                               # des mouettes qui tournent, et planent
+    for i in range(3):
+        mx = 14 + i * 17 + 12 * np.sin(t * 0.07 * vit[i] + ph[i])
+        my = 7 + i * 4 + 3 * np.sin(t * 0.11 * vit[i] + ph[i] * 2)
+        bat = 0.9 * np.sin(t * 5 + i) if np.sin(t * 0.3 + ph[i]) > 0.3 else 0.0   # elles battent des ailes, puis planent
+        _poser(img, [my - 1 + bat, my - 0.2 + bat * 0.4, my + 0.3, my - 0.2 + bat * 0.4, my - 1 + bat],
+               [mx - 2, mx - 1, mx, mx + 1, mx + 2], [[64, 36, 62]] * 5)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 8. Les rayons en foret, au petit matin.
+
+FORET_SOURCE = (-26.0, -10.0)    # (y, x) : le soleil, hors champ en haut a gauche
+FORET_RAYONS = ((0.64, 0.035, 0.9), (0.76, 0.055, 0.75), (0.86, 0.03, 1.0), (0.96, 0.065, 0.7), (1.07, 0.04, 0.85),
+                (1.17, 0.03, 0.6))   # (angle vu du soleil, largeur, force)
+
+
+def _scene_foret_rayons(p, e, t, ecoule, dt):
+    """L'interieur d'une foret au petit matin : des troncs en plusieurs plans dans la brume, des rayons de soleil
+    obliques qui respirent, des poussieres et des insectes qui brillent dedans, la mousse au sol."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    sy, sx = FORET_SOURCE
+    if "foret" not in e:
+        x = X[0]
+        fond = _degrade((50, 70, 66), (34, 48, 46), 0, 50)
+        fond += (np.exp(-np.hypot(X - 2, Y - 2) / 22))[..., None] * np.array([130, 122, 72])   # la lueur du soleil
+        sols = (47 + 1.0 * np.sin(x * 0.2 + 2),                            # le sol au loin, au milieu, devant
+                51 + 1.5 * np.sin(x * 0.13 + 4) + 0.6 * np.sin(x * 0.45),
+                55.5 + 2.0 * np.sin(x * 0.11 + 1) + 0.8 * np.sin(x * 0.37))
+        plans = ([], [], [])
+        occulte = np.zeros((64, 64))
+        for plan, n, l0, l1 in ((0, 13, 0.8, 1.6), (1, 5, 1.8, 3.0), (2, 3, 0, 0)):
+            if plan == 2:
+                xs = np.array([3.5, 41.0, 61.5]) + rng.uniform(-1.5, 1.5, 3)
+                ls = np.array([7.5, 4.0, 8.5]) * rng.uniform(0.9, 1.1, 3)
+            else:
+                xs = (np.arange(n) + rng.uniform(0.2, 0.8, n)) / n * 68 - 2
+                ls = rng.uniform(l0, l1, n)
+            for xc, l in zip(xs, ls):
+                pied = sols[plan][int(np.clip(xc, 0, 63))] + (0.5 if plan < 2 else 4)
+                axe = xc + rng.uniform(-0.05, 0.05) * (Y - pied)
+                demi = l / 2 * (1 + (0.5 + 0.4 * plan) * np.clip((Y - pied + 4 + plan) / (4 + plan), 0, 1) ** 2)   # les racines
+                c = np.clip(demi + 0.5 - np.abs(X - axe), 0, 1) * np.clip(pied + 0.5 - Y, 0, 1)
+                plans[plan].append((c, axe, demi))
+                if plan == 1:
+                    occulte = np.maximum(occulte, c)
+        ombre = np.zeros((64, 64))                                        # l'ombre des troncs dans la brume, vers le bas a droite
+        uy, ux = sy - Y, sx - X
+        nrm = np.hypot(uy, ux)
+        uy, ux = uy / nrm, ux / nrm
+        for j in range(2, 70, 2):
+            py, px = np.round(Y + uy * j).astype(int), np.round(X + ux * j).astype(int)
+            ok = (py >= 0) & (px >= 0) & (px < 64) & (py < 64)
+            ombre = np.maximum(ombre, np.where(ok, occulte[np.clip(py, 0, 63), np.clip(px, 0, 63)], 0))
+        feuilles = _brume(rng, 3, 64)
+        ouvert = np.clip(1 - np.hypot(X + 2, Y + 2) / 24, 0, 1)            # le feuillage s'ouvre la ou entre le soleil
+        canopee = np.clip((0.62 - feuilles - (Y - 3) * 0.06 - 0.5 * ouvert) * 5, 0, 1) * np.clip((12 - Y) / 5, 0, 1)
+        fougeres = np.zeros((64, 64, 3))                                  # des fougeres sur la mousse
+        for fx in rng.uniform(8, 58, 5):
+            fy = sols[2][int(fx)] + 1.5
+            for k in range(-2, 3):
+                a = k * 0.42 + rng.uniform(-0.1, 0.1)
+                l = rng.uniform(4, 6.5) * (1 - 0.15 * abs(k))
+                mx, my = fx + np.sin(a) * l * 0.55, fy - np.cos(a) * l * 0.7
+                _paysages_traits(fougeres, [(fy, fx, my, mx, 0.45, 0.4),
+                                            (my, mx, my + 0.6 + abs(k) * 0.5, mx + np.sin(a) * l * 0.5, 0.4, 0.2)], (1, 1, 1))
+        loin = np.ones((64, 64))                                          # les troncs du fond assombrissent la brume
+        for c, _, _ in plans[0]:
+            loin *= 1 - 0.5 * c * 0.45 * np.clip((Y + 16) / 50, 0, 1)
+        milieu = 1 - np.prod([1 - c * 0.92 for c, _, _ in plans[1]], axis=0)
+        devant, cote, ecorce = np.zeros((64, 64)), np.zeros((64, 64)), np.ones((64, 64))
+        for c, axe, demi in plans[2]:                                     # les grands troncs : leur cote au soleil, leur ecorce
+            devant = np.maximum(devant, c)
+            cote = np.where(c > 0, np.clip((axe - X) / np.maximum(demi, 0.5), -1, 1), cote)
+            ecorce = np.where(c > 0, 0.85 + 0.15 * np.sin((X - axe) * 2.3 + np.sin(Y * 0.3) * 1.5), ecorce)
+        e["foret"] = dict(fond=fond * loin[..., None], sols=sols, troncs=(milieu, devant, cote, ecorce), ombre=ombre,
+                          canopee=canopee, tapis=_brume(rng, 1, 64), fougeres=fougeres[..., 0],
+                          angle=np.arctan2(Y - sy, X - sx), profil=np.clip((Y - 1) / 12, 0, 1) * (0.75 + 0.35 * Y / 64))
+        e["brume"] = _brume(rng, 10)
+        e["poussiere"] = (rng.uniform(0, 64, 80), rng.uniform(0, 64, 80), rng.uniform(0.6, 1.4, 80), rng.uniform(0, 6, 80))
+        e["insectes"] = (rng.uniform(10, 54, 5), rng.uniform(16, 46, 5), rng.uniform(0.7, 1.3, 5), rng.uniform(0, 6, 5))
+        e["phases"] = rng.uniform(0, 2 * np.pi, len(FORET_RAYONS))
+    Fo = e["foret"]
+    loin, milieu, devant = Fo["sols"]
+    img = Fo["fond"].copy()
+    B = _fenetre(e["brume"], t * 0.4, t * 0.1)                             # la brume qui derive
+    img *= (0.85 + 0.3 * B)[..., None]
+    milieu_t, devant_t, cote, ecorce = Fo["troncs"]
+    _paysages_sous(img, loin, np.array([46, 62, 54]) * (0.9 + 0.2 * B)[..., None])
+    sombre = _degrade((60, 76, 70), (24, 34, 32), 0, 52) * (0.9 + 0.2 * B)[..., None]   # plus haut, plus de brume
+    a = milieu_t[..., None]
+    img = img * (1 - a) + sombre * a
+    _paysages_sous(img, milieu, np.array([30, 46, 32]) * (0.9 + 0.2 * B)[..., None])
+    rayons = np.zeros((64, 64))
+    for (a0, w, force), ph in zip(FORET_RAYONS, e["phases"]):
+        souffle = 0.5 + 0.5 * np.sin(2 * np.pi * t / 17 + ph)            # chaque rayon respire a son rythme
+        a = a0 + 0.012 * np.sin(t * 0.05 + ph)
+        rayons += np.exp(-((Fo["angle"] - a) / w) ** 2) * force * (0.35 + 0.65 * souffle)
+    rayons *= Fo["profil"] * (1 - 0.6 * Fo["ombre"]) * (0.5 + 0.7 * B)
+    img += (np.clip(rayons, 0, 1.4) * 0.8)[..., None] * np.array([255, 224, 156])
+    for sol, force in ((loin, 0.35), (milieu, 0.3)):                      # la brume posee sur le sol
+        a = (np.exp(-((Y - sol[None, :]) / 2.2) ** 2) * (0.3 + 0.4 * B) * force * 2)[..., None]
+        img = img * (1 - a) + np.array([110, 132, 114]) * a
+    lumiere = rayons[np.clip(devant.astype(int) - 1, 0, 63), np.arange(64)]   # les taches de soleil sur la mousse
+    m = np.array([26, 50, 20]) + (np.clip(lumiere, 0, 1.2)[None, :] * np.exp(-np.clip(Y - devant[None, :], 0, None) / 5))[..., None] \
+        * np.array([110, 140, 46])
+    m *= (0.7 + 0.6 * Fo["tapis"])[..., None]
+    _paysages_sous(img, devant, m)
+    a = (Fo["fougeres"] * 0.95)[..., None]
+    img = img * (1 - a) + (np.array([14, 34, 14]) + np.clip(rayons, 0, 1)[..., None] * np.array([40, 70, 20])) * a
+    te = np.array([16, 19, 16]) * ((0.75 + 0.35 * cote) * ecorce)[..., None]   # les grands troncs devant, eclaires du cote du soleil
+    te += (np.clip(cote - 0.6, 0, 1) * 2.5 * (0.35 + rayons))[..., None] * np.array([110, 96, 50])
+    te += (np.clip(Y - devant[None, :] + 8, 0, 8) / 8 * 0.7)[..., None] * np.array([20, 42, 12])   # de la mousse au pied
+    a = devant_t[..., None]
+    img = img * (1 - a) + te * a
+    can = Fo["canopee"][..., None]
+    img = img * (1 - can) + np.array([10, 18, 12]) * can
+    px0, py0, pv, pp = e["poussiere"]                                     # les poussieres : visibles dans les rayons seulement
+    px = (px0 + t * 0.3 + 1.5 * np.sin(t * 0.11 * pv + pp)) % 64
+    py = (py0 + t * 0.15 + 2 * np.sin(t * 0.07 * pv + pp * 2)) % 64
+    r = rayons[py.astype(int), px.astype(int)]
+    brille = np.clip(r, 0, 1.2) * (0.55 + 0.45 * np.sin(t * 0.9 * pv + pp * 3))
+    _paysages_points(img, py, px, brille[:, None] * np.array([255, 236, 190]))
+    ix, iy, iv, ip = e["insectes"]                                        # des insectes qui volent, et brillent dans la lumiere
+    qx = ix + 8 * np.sin(t * 0.21 * iv + ip) + 2 * np.sin(t * 1.3 * iv + ip * 2)
+    qy = iy + 5 * np.sin(t * 0.17 * iv + ip * 3) + 1.5 * np.sin(t * 1.7 * iv)
+    r = rayons[np.clip(qy, 0, 63).astype(int), np.clip(qx, 0, 63).astype(int)]
+    _paysages_points(img, qy, qx, (0.25 + 1.1 * np.clip(r, 0, 1))[:, None] * np.array([255, 240, 200]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 9. Le jardin zen, vu de haut.
+
+JARDIN_PIERRES = ((19.5, 22.0, 6.0), (44.5, 37.0, 4.4), (26.5, 48.5, 2.9))     # (x, y, rayon)
+JARDIN_PAS = 3.4         # l'ecart des sillons, en pixels
+JARDIN_PASSAGE = 40.0    # secondes pour un passage du rateau
+JARDIN_TERRASSE = 56.5   # le bord de la terrasse en bois, en bas
+
+
+def _scene_jardin_zen(p, e, t, ecoule, dt):
+    """Un jardin sec japonais vu de haut : le sable ratisse en sillons autour de pierres moussues, un rateau
+    invisible qui le redessine, une lumiere douce qui tourne, une feuille d'erable rouge qui tombe parfois."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "jardin" not in e:
+        tex = _brume(rng, 2, 64)
+        gmin = np.full((64, 64), 99.0)
+        grx, gry = np.zeros((64, 64)), np.zeros((64, 64))
+        pierre = np.zeros((64, 64))
+        nx, ny, nz = np.zeros((64, 64)), np.zeros((64, 64)), np.ones((64, 64))
+        ilot = np.zeros((64, 64))
+        formes = []
+        for cx, cy, r in JARDIN_PIERRES:
+            a = rng.uniform(0, 6, 4)
+            phi = np.arctan2(Y - cy, X - cx)
+            d = np.hypot(X - cx, Y - cy)
+            bord = r * (1 + 0.12 * np.sin(2 * phi + a[0]) + 0.07 * np.sin(3 * phi + a[1]) + 0.04 * np.sin(5 * phi + a[2]))
+            rho = d / bord
+            c = np.clip((bord - d) + 0.5, 0, 1)
+            hz = np.sqrt(np.clip(1 - rho ** 2, 0, 1))
+            dedans = c > pierre
+            nx = np.where(dedans, (X - cx) / bord, nx)
+            ny = np.where(dedans, (Y - cy) / bord, ny)
+            nz = np.where(dedans, hz * 1.2 + 0.1, nz)
+            pierre = np.maximum(pierre, c)
+            mb = bord + 2.0 + 0.7 * np.sin(4 * phi + a[3]) + 0.5 * tex[Y.astype(int), X.astype(int)]
+            ilot = np.maximum(ilot, np.clip(mb - d + 0.5, 0, 1))
+            g = d - (r + 2.6) - (bord - r) * np.exp(-np.clip(d - r, 0, None) / 6)   # les anneaux s'arrondissent en s'eloignant
+            plus = g < gmin
+            gmin = np.where(plus, g, gmin)
+            grx = np.where(plus, (X - cx) / np.maximum(d, 0.1), grx)
+            gry = np.where(plus, (Y - cy) / np.maximum(d, 0.1), gry)
+            formes.append((cx, cy, r, a))
+        anneaux = gmin < JARDIN_PAS * 3.0
+        motifs = []
+        for vague in (0.0, 1.0):                                           # deux dessins : des lignes droites, des vagues
+            ondule = vague * 2.2 * np.sin(X * 0.2 + 0.9)
+            g = np.where(anneaux, gmin, Y + ondule)
+            gx = np.where(anneaux, grx, vague * 2.2 * 0.2 * np.cos(X * 0.2 + 0.9))
+            gy = np.where(anneaux, gry, 1.0)
+            motifs.append((g, gx, gy))
+        n = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2)
+        taches = _brume(rng, 1, 64)
+        mousse = np.clip((taches - 0.6) * 6, 0, 1) * np.clip((nz / n - 0.55) * 4, 0, 1)   # de la mousse par plaques, sur le dessus
+        veine = _paysages_lire(_brume(rng, 2, 64), Y * 1.0, X * 0.25)    # la terrasse en bois, au bas du jardin
+        lame = (Y - JARDIN_TERRASSE) % 3
+        bois = np.array([96, 64, 40]) * (0.75 + 0.45 * veine)[..., None] * (1 - 0.45 * (lame < 0.6))[..., None]
+        bois *= (1 + 0.2 * np.sin(np.floor((Y - JARDIN_TERRASSE) / 3) * 2.7 + 1))[..., None]   # chaque lame sa teinte
+        e["jardin"] = dict(motifs=motifs, pierre=pierre, n=(nx / n, ny / n, nz / n), ilot=ilot, mousse=mousse, tex=tex,
+                           formes=formes, bois=bois)
+        loin = ilot < 0.01
+        for dy, dx in ((3, 0), (-3, 0), (0, 3), (0, -3), (2, 2), (-2, 2), (2, -2), (-2, -2)):
+            loin &= np.roll(np.roll(ilot, dy, 0), dx, 1) < 0.01
+        libre = np.argwhere(loin & (Y > 8) & (Y < 53) & (X > 14) & (X < 58))   # ou la feuille peut se poser
+        choix = libre[rng.integers(0, len(libre), 32)]
+        e["feuilles"] = (choix[:, 1] + 0.5, choix[:, 0] + 0.5, rng.uniform(0, 6, 32))
+    J = e["jardin"]
+    th = 2 * np.pi * t / 150.0 + 0.7                                      # la lumiere tourne autour du jardin
+    lx, ly = np.cos(th), np.sin(th)
+    passage = t / JARDIN_PASSAGE
+    n = int(np.floor(passage))
+    q = passage - n
+    front = -4 + q * 72                                                   # le rateau avance, ligne apres ligne
+    neuf = np.clip((front - Y) / 2.5, 0, 1)
+    vitesse = 72 / JARDIN_PASSAGE
+    age = np.where(Y < front, (front - Y) / vitesse, (front - Y) / vitesse + JARDIN_PASSAGE)
+    nettete = 0.7 + 0.3 * np.exp(-age / 30)
+
+    def relief(motif):
+        g, gx, gy = motif
+        w = 2 * np.pi * g / JARDIN_PAS
+        return np.sin(w) * (gx * lx + gy * ly) * 0.9, np.cos(w)
+
+    pa, ca = relief(J["motifs"][n % 2])
+    pb, cb = relief(J["motifs"][(n + 1) % 2])
+    pente = pa * (1 - neuf) + pb * neuf
+    creux = ca * (1 - neuf) + cb * neuf
+    clair = 0.82 + 0.22 * np.clip(((X - 32) * lx + (Y - 32) * ly) / 45, -1, 1)   # le cote eclaire du jardin
+    sable = (1 + nettete * (0.3 * pente + 0.08 * creux)) * clair
+    sable += 0.1 * np.exp(-((Y - front) / 1.0) ** 2)                      # le sable fraichement remue
+    img = (sable[..., None] * np.array([150, 140, 122]))
+    ombre = np.zeros((64, 64))
+    for cx, cy, r, a in J["formes"]:                                      # l'ombre des pierres, a l'oppose de la lumiere
+        ox, oy = X - cx + lx * r * 0.6, Y - cy + ly * r * 0.6
+        phi = np.arctan2(oy, ox)
+        bord = r * (1.25 + 0.12 * np.sin(2 * phi + a[0]) + 0.07 * np.sin(3 * phi + a[1]))
+        ombre = np.maximum(ombre, np.clip((bord - np.hypot(ox, oy)) / 1.6, 0, 1))
+    img *= (1 - 0.45 * ombre)[..., None]
+    nx, ny, nz = J["n"]
+    lam = np.clip(nx * lx * 0.8 + ny * ly * 0.8 + nz * 0.6, 0, 1)
+    il = J["ilot"][..., None]
+    tx = J["tex"]
+    vert = np.array([62, 100, 40]) * (0.7 + 0.5 * tx)[..., None] * (0.8 + 0.2 * clair)[..., None] * (1 - 0.5 * ombre)[..., None]
+    img = img * (1 - il) + vert * il
+    roche = np.array([132, 126, 118]) * (0.8 + 0.35 * tx)[..., None]
+    mousse = np.array([78, 122, 46]) * (0.8 + 0.4 * tx)[..., None]
+    m = J["mousse"][..., None]
+    pierre = (roche * (1 - m) + mousse * m) * (0.34 + 0.85 * lam)[..., None]
+    pc = J["pierre"][..., None]
+    img = img * (1 - pc) + pierre * pc
+    ombre_t = np.clip((Y - JARDIN_TERRASSE + 1.6 * max(0.0, ly) + 0.5), 0, 1) * (Y < JARDIN_TERRASSE)   # la terrasse fait de l'ombre
+    img *= (1 - 0.4 * ombre_t)[..., None]
+    a = np.clip(Y - JARDIN_TERRASSE + 0.5, 0, 1)[..., None]
+    img = img * (1 - a) + J["bois"] * (0.75 + 0.3 * clair)[..., None] * a
+    cycle = 34.0                                                          # la feuille d'erable : elle tombe, se pose, s'envole
+    k = int(np.floor(t / cycle))
+    phase = t - k * cycle
+    fx, fy, fr = (a[k % 32] for a in e["feuilles"])
+    if phase < 30:
+        chute = float(np.clip(1 - phase / 7, 0, 1))
+        hauteur = chute ** 1.5 * 12
+        x = fx - chute * 24 + 2.5 * np.sin(phase * 2.2) * chute
+        y = fy - chute * 17
+        vue = min(1.0, phase / 1.5, (30 - phase) / 1.5)                   # elle arrive d'en haut, et repart, en fondu
+        tourne = fr + phase * 2.5 * chute + 0.5 * (1 - chute)
+        if phase > 24:
+            g = phase - 24
+            x += g * g * 1.3
+            y += g * g * 0.25
+            tourne += g * 0.8
+        echelle = 2.9 * (1 + hauteur / 30)
+        for decal, couleur in (((-lx * hauteur * 0.5, -ly * hauteur * 0.5), None), ((0.0, 0.0), (214, 46, 28))):
+            cxl, cyl = x + decal[0], y + decal[1]
+            ya, yb = int(max(0, cyl - 5)), int(min(64, cyl + 6))
+            xa, xb = int(max(0, cxl - 5)), int(min(64, cxl + 6))
+            if ya >= yb or xa >= xb:
+                continue
+            yy, xx = Y[ya:yb, xa:xb], X[ya:yb, xa:xb]
+            phi = np.arctan2(yy - cyl, xx - cxl) - tourne
+            lobe = np.abs(np.cos(2.5 * (phi + np.pi / 2)))                # cinq lobes, le plus grand en haut
+            rr = echelle * (0.38 + 0.62 * lobe ** 1.5) * (1 - 0.25 * np.clip(np.sin(phi), 0, 1))
+            c = np.clip(rr - np.hypot(xx - cxl, yy - cyl) + 0.5, 0, 1)
+            cq, sq = np.cos(tourne + np.pi / 2), np.sin(tourne + np.pi / 2)
+            queue = np.clip(0.55 - np.abs((xx - cxl) * sq - (yy - cyl) * cq), 0, 1)
+            vers = (xx - cxl) * cq + (yy - cyl) * sq
+            c = np.maximum(c, queue * (vers > 0) * (vers < echelle * 1.1))[..., None] * vue   # et sa queue
+            zone = img[ya:yb, xa:xb]
+            if couleur is None:
+                zone *= (1 - 0.35 * c)
+            else:
+                vif = 0.8 + 0.25 * np.clip(-((xx - cxl) * lx + (yy - cyl) * ly) / 2, -1, 1)
+                zone[...] = zone * (1 - c) + np.array(couleur, float) * vif[..., None] * c
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# LES VILLES EN 3D. « Scenes 3D dans une ville [...] ville 3D rasterized de
+# Cyberpunk 2077 » : un vol dans une avenue-canyon de tours (un rayon par
+# colonne, de case en case), le survol d'une ville en damier, une ruelle
+# neon, un pare-brise sous la pluie, un pont suspendu, une grande roue -- et
+# deux vols en 3D hors des villes : des montagnes en « voxel space » et
+# l'ocean au clair de lune.
+
+
+# LES VILLES ET LA 3D. Des villes la nuit, et des vols en vraie perspective : une avenue de tours
+# cyberpunk (un rayon par colonne, de case en case), la ville vue d'avion, une ruelle sous la pluie, un
+# pare-brise, un pont, une grande roue, des montagnes en "voxel space", l'ocean sous la lune.
+
+
+def _v3d_hasard(a, b, c=0):
+    """Un hasard fixe (0 a 1) par couple d'entiers : la meme case donne toujours la meme valeur."""
+    import numpy as np
+    n = (np.asarray(a, np.int64) * 374761393 + np.asarray(b, np.int64) * 668265263 + int(c) * 1274126177) & 0xFFFFFFFF
+    n = ((n ^ (n >> 13)) * 1540483477) & 0xFFFFFFFF
+    n = ((n ^ (n >> 15)) * 668265261) & 0xFFFFFFFF
+    return (n ^ (n >> 16)) / 4294967296.0
+
+
+def _v3d_flou(a, r=2, n=2):
+    """Un flou doux (des boites successives), sans que la lumiere passe d'un bord a l'autre."""
+    import numpy as np
+    k = 1.0 / (2 * r + 1)
+    for _ in range(n):
+        c = np.cumsum(np.concatenate([np.repeat(a[:1], r + 1, 0), a, np.repeat(a[-1:], r, 0)], 0), axis=0)
+        a = (c[2 * r + 1:] - c[:-2 * r - 1]) * k
+        c = np.cumsum(np.concatenate([np.repeat(a[:, :1], r + 1, 1), a, np.repeat(a[:, -1:], r, 1)], 1), axis=1)
+        a = (c[:, 2 * r + 1:] - c[:, :-2 * r - 1]) * k
+    return a
+
+
+def _v3d_creneau(x, d, w):
+    """Un creneau periodique (periode 1, allume sur une largeur d au milieu), moyenne sur une largeur w autour
+    de x : des fenetres sans scintillement, nettes de pres, fondues de loin."""
+    import numpy as np
+    w = np.maximum(w, 1e-3)
+
+    def cumul(x):
+        f = np.floor(x)
+        return f * d + np.clip(x - f - (0.5 - d / 2), 0, d)
+    return (cumul(x + w / 2) - cumul(x - w / 2)) / w
+
+
+def _v3d_tache(img, y, x, rayon, couleur, force=1.0, aussi=None):
+    """Une lumiere ronde et douce (gaussienne), posee a une position pas forcement entiere (et, plus faible,
+    dans un second calque si on le donne : aussi=(calque, part))."""
+    import numpy as np
+    r = int(rayon * 2.2) + 1
+    ya, yb, xa, xb = max(0, int(y) - r), min(64, int(y) + r + 2), max(0, int(x) - r), min(64, int(x) + r + 2)
+    if ya >= yb or xa >= xb:
+        return
+    k = np.exp(-(np.arange(ya, yb) + 0.5 - y) ** 2 / (2 * rayon * rayon))[:, None] \
+        * np.exp(-(np.arange(xa, xb) + 0.5 - x) ** 2 / (2 * rayon * rayon))[None, :]
+    tache = (k * force)[..., None] * np.asarray(couleur, float)
+    img[ya:yb, xa:xb] += tache
+    if aussi is not None:
+        aussi[0][ya:yb, xa:xb] += tache * aussi[1]
+
+
+# 1. La ville cyberpunk : on vole dans une avenue-canyon. La ville est une grille de cases (une tour par
+# case, des rues en travers) ; chaque colonne lance son rayon, de case en case, et garde toutes les tours
+# qu'il traverse : la plus proche qui couvre un pixel l'emporte. Les enseignes en drapeau, les voitures
+# volantes et la pluie sont posees par-dessus, en perspective.
+
+CYBER_NEONS = ((255, 40, 170), (40, 225, 255), (255, 205, 50), (255, 40, 170), (40, 225, 255), (170, 80, 255))
+CYBER_VITRES = ((255, 175, 90), (90, 205, 255), (255, 110, 190), (230, 235, 255))
+CYBER_VITESSE = 0.75     # cases par seconde
+CYBER_F = 30.0           # la focale, en pixels
+
+
+def _cyber_hauteurs(ix, iz, g):
+    """La hauteur de la tour de chaque case ; 0 : une rue, l'avenue, une rue en travers."""
+    import numpy as np
+    r = _v3d_hasard(ix, iz, g)
+    r2 = _v3d_hasard(ix, iz, g + 1)
+    bord = (ix == -2) | (ix == 1)                                            # les murs de l'avenue
+    h = np.where(bord, 2.8 + 4.0 * r, 1.0 + 5.5 * r ** 1.3)
+    h = np.where(bord & (r2 < 0.12), 1.2 + 0.8 * r, h)                       # une tour basse : on voit derriere
+    h = np.where(r2 > 0.93, h + 4.5, h)                                      # quelques geantes
+    rue = _v3d_hasard(iz, 7, g + 2) < 0.16
+    vide = (ix % 10 == 9) | (ix % 10 == 0) | rue
+    return np.where(vide, 0.0, h)
+
+
+def _cyber_camera(e, ecoule):
+    """Ou est la camera : elle avance dans l'avenue en ondulant doucement (x, hauteur, z, cap, horizon)."""
+    import numpy as np
+    tau = ecoule + e["cy_phase"]
+    z = e["cy_z0"] + ecoule * CYBER_VITESSE
+    x = 0.2 * np.sin(tau * 0.17) + 0.07 * np.sin(tau * 0.43 + 1.3)
+    vx = 0.2 * 0.17 * np.cos(tau * 0.17) + 0.07 * 0.43 * np.cos(tau * 0.43 + 1.3)
+    y = 2.7 + 0.5 * np.sin(tau * 0.11 + 0.7) + 0.12 * np.sin(tau * 0.31)
+    cap = 1.4 * vx / CYBER_VITESSE                                           # le nez suit la trajectoire
+    hz = 27.0 + 1.5 * np.sin(tau * 0.09)
+    return x, y, z, cap, hz
+
+
+def _cyber_projeter(cam, wx, wy, wz):
+    """Un point du monde -> (colonne, ligne, profondeur) a l'ecran."""
+    import numpy as np
+    x, y, z, cap, hz = cam
+    rx, rz = wx - x, wz - z
+    prof = rx * np.sin(cap) + rz * np.cos(cap)
+    lat = rx * np.cos(cap) - rz * np.sin(cap)
+    p = np.maximum(prof, 1e-3)
+    return 32 + lat * CYBER_F / p, hz - (wy - y) * CYBER_F / p, prof
+
+
+def _scene_cyber_3d(p, e, t, ecoule, dt):
+    """Un vol lent dans une avenue de tours la nuit : fenetres, enseignes neon, brume coloree, pluie, voitures volantes."""
+    import numpy as np
+    rng = e["rng"]
+    if "cy_g" not in e:
+        e.update(cy_g=int(rng.integers(0, 2 ** 20)), cy_z0=float(rng.uniform(0, 3000)), cy_phase=float(rng.uniform(0, 100)),
+                 cy_brume=_brume(rng, 5, 64), cy_autos=[], cy_pluie=[rng.uniform(0, 64, 55), rng.uniform(0, 64, 55),
+                                                                     rng.uniform(55, 80, 55)])
+    g, F, K = e["cy_g"], CYBER_F, 32
+    cam = _cyber_camera(e, ecoule)
+    cx, cy, cz, cap, hz = cam
+    # les rayons, de case en case
+    sx = np.arange(64) - 31.5
+    dx = np.sin(cap) + np.cos(cap) * sx / F
+    dz = np.cos(cap) - np.sin(cap) * sx / F
+    pas = np.where(dx > 0, 1, -1)
+    dxs = np.where(np.abs(dx) < 1e-6, 1e-6, dx)
+    n = np.arange(K + 1)[None, :]                                             # les traversees de lignes x et z, triees
+    ev = np.concatenate([((np.floor(cx) + (pas > 0) - cx) / dxs)[:, None] + n * np.abs(1 / dxs)[:, None],
+                         ((np.floor(cz) + 1 - cz) / dz)[:, None] + n / dz[:, None]], 1)
+    o = np.argsort(ev, axis=1, kind="stable")[:, :K + 1]
+    S = np.take_along_axis(ev, o, 1).T
+    COTE = (o < K + 1).T[:K]
+    IX = (int(np.floor(cx)) + pas[None, :] * np.cumsum(COTE, 0)).astype(np.int64)
+    IZ = (int(np.floor(cz)) + np.cumsum(~COTE, 0)).astype(np.int64)
+    S_in, S_out = np.maximum(S[:K], 0.05), S[1:]
+    H = _cyber_hauteurs(IX, IZ, g)
+    haut_in = hz - (H - cy) * F / S_in
+    bas = hz + cy * F / S_in                                                 # le pied des tours, qui remonte au loin
+    # la plus proche tour qui couvre le pixel : celle ou le minimum courant des sommets passe sous lui
+    M = np.where(H > 0, np.minimum(haut_in, hz - (H - cy) * F / S_out), 1e9)   # avec le toit s'il est sous nous
+    rk = np.clip(np.ceil(np.minimum.accumulate(M, axis=0) - 0.5), 0, 64).astype(np.int64)
+    premier = np.full((65, 64), K, np.int64)
+    np.minimum.at(premier, (rk, np.broadcast_to(np.arange(64), (K, 64))), np.broadcast_to(np.arange(K)[:, None], (K, 64)))
+    k = np.minimum.accumulate(premier, axis=0)[:64]
+    col = np.arange(64)[None, :]
+    yc = np.arange(64)[:, None] + 0.5
+    kk = np.minimum(k, K - 1)
+    vu = (k < K) & (yc < bas[kk, col])
+    s, cote, bx, bz, h = S_in[kk, col], COTE[kk, col], IX[kk, col], IZ[kk, col], H[kk, col]
+    hb = _v3d_hasard(IX, IZ, g + 3)[kk, col]                                 # un tirage par tour, decline
+    toit = vu & (yc < haut_in[kk, col])
+    v = cy - (yc - hz) * s / F                                               # la hauteur dans le monde
+    u = np.where(cote, cz + dz[col] * s - bz, cx + dx[col] * s - bx)        # ou l'on est sur la facade
+    pied_v = s / F
+    lg = np.hypot(dx, dz)[col]
+    pied_u = pied_v * lg / np.maximum(np.where(cote, np.abs(dx[col]), np.abs(dz[col])) / lg, 0.06)
+    # les fenetres : allumees au hasard ; fondues en une lueur moyenne quand elles deviennent trop petites
+    nf = 3 + (hb * 4).astype(int)
+    dens = 0.1 + 0.3 * ((hb * 256) % 1)
+    etage = 0.2
+    fv, fu = v / etage, u * nf
+    fl, wc = np.floor(fv), np.floor(fu)
+    forme = _v3d_creneau(fv, 0.5, pied_v / etage) * _v3d_creneau(fu, 0.6, pied_u * nf)
+    tirage = _v3d_hasard(bx * 1009 + wc * 7 + cote * 3, bz * 4099 + fl, g + 4)
+    fen = forme * (tirage < dens) * (0.45 + 0.55 * ((tirage * 256) % 1))
+    net = np.clip(2.0 - 2.0 * np.maximum(pied_v / etage, pied_u * nf), 0, 1)
+    fen = dens * 0.3 * 0.72 + (fen - dens * 0.3 * 0.72) * net
+    vitres = np.asarray(CYBER_VITRES, float)
+    teinte = np.where((((tirage * 65536) % 1) < 0.25)[..., None], vitres[3], vitres[(((hb * 65536) % 1) * 3).astype(int)])
+    face = np.where(cote, 1.0, 1.4)[..., None]
+    surf = np.array([7.0, 5, 15]) * face + np.exp(-np.maximum(v, 0) / 1.4)[..., None] * np.array([38, 8, 44])
+    arete = np.maximum(np.clip(1 - np.minimum(u, 1 - u) / np.maximum(pied_u, 0.02), 0, 1) * 0.6,   # les coins des tours
+                       np.clip(1 - (h - v) / pied_v, 0, 1))                                         # et leur sommet
+    surf = surf + fen[..., None] * teinte * 0.8 + arete[..., None] * np.array([34.0, 18, 52])
+    surf[toit] = (14, 10, 26)
+    # les tubes de neon sur les murs de l'avenue : des traits qui filent vers le point de fuite
+    lum = np.zeros((64, 64, 3))
+    neons = np.asarray(CYBER_NEONS, float)
+    ou = np.nonzero(cote & ((bx == -2) | (bx == 1)) & ~toit)              # seulement la ou il y a des murs d'avenue
+    if len(ou[0]):
+        bxo, bzo, ho, vo, uo, pvo, puo = bx[ou], bz[ou], h[ou], v[ou], u[ou], pied_v[ou], pied_u[ou]
+        for j in range(2):
+            r = _v3d_hasard(bxo * 31 + j, bzo, g + 8 + j)
+            c = neons[(((r * 256) % 1) * 6).astype(int)]
+            hn = 0.6 + ((r * 65536) % 1) * np.maximum(ho - 1.0, 0.2)
+            couv = np.clip(np.minimum(hn + 0.035, vo + pvo / 2) - np.maximum(hn - 0.035, vo - pvo / 2), 0, None) / pvo
+            a = (r < 0.45) * np.minimum(couv * 1.4, 1)
+            u0 = 0.15 + 0.7 * ((r * 4096) % 1)                               # et des tubes verticaux
+            v0 = 0.5 + ((r * 1048576) % 1) * np.maximum(ho - 2.2, 0.1)
+            a = a + ((r > 0.62) & (vo > v0) & (vo < v0 + 1.5)) * np.clip(1 - np.abs(uo - u0) / np.maximum(puo, 0.03), 0, 1) \
+                * np.clip(0.06 / pvo, 0.35, 1)
+            lum[ou] += a[:, None] * c
+    # les ecrans geants sur les faces qui nous regardent, au bout des rues en travers
+    ou = np.nonzero(~cote & ~toit & (((hb * 4096) % 1) < 0.3) & (np.abs(u - 0.5) < 0.38) & (v > h * 0.45) & (v < h * 0.45 + 1.1))
+    if len(ou[0]):
+        defile = (0.5 + 0.5 * np.sin(v[ou] * 5 - t * 0.6 + bx[ou] * 2.1 + np.sin(u[ou] * 3 + t * 0.4) * 1.5))[:, None]
+        c1 = neons[(((hb[ou] * 1048576) % 1) * 6).astype(int)]
+        lum[ou] += (c1 * defile + neons[1] * (1 - defile)) * 0.55
+    # la brume mange le lointain : rose pres de la rue, violette en haut
+    brume = _fenetre(e["cy_brume"], t * 1.3, t * 0.4)
+    hv = np.clip(v / 7.0, 0, 1)[..., None]
+    c_brume = np.array([110.0, 30, 100]) * (1 - hv) + np.array([58, 22, 84]) * hv
+    transp = np.exp(-s / (12.0 * (0.8 + 0.4 * brume)))[..., None]
+    lum *= np.exp(-s / 18.0)[..., None]
+    img = surf * transp + c_brume * (1 - transp) + lum
+    # le ciel entre les tours ; la rue tout en bas, noyee de brume, et ses files de feux
+    kc = np.clip(yc / max(hz, 1.0), 0, 1)[..., None]
+    ciel = np.array([14.0, 7, 32]) * (1 - kc) + np.array([96, 32, 104]) * kc
+    sol = ~vu & (yc > hz + 0.5)
+    img = np.where(vu[..., None], img, ciel)
+    zbuf = np.where(vu, s, 1e9)
+    ou = np.nonzero(sol)                                                       # seulement la ou l'on voit la rue
+    if len(ou[0]):
+        sg = cy * F / np.maximum(yc[ou[0], 0] - hz, 0.5)
+        gx, gz = cx + dx[ou[1]] * sg, cz + dz[ou[1]] * sg
+        pied_g = sg / F
+        xl = np.floor((gx + 1) / 0.5) * 0.5 - 0.75                          # quatre voies
+        lat = np.clip(1 - np.abs(gx - xl) / np.maximum(pied_g * 1.2, 0.06), 0, 1) * (np.abs(gx) < 1)
+        sens = np.where(xl < 0, 1.0, -1.0)
+        ph = gz * 0.9 + sens * t * 2.2 + xl * 7.3
+        feux = (lat * (0.3 + 0.7 * np.clip(1 - np.abs((ph % 1) - 0.5) / np.maximum(0.12, pied_g * sg / cy * 0.9), 0, 1)))[:, None]
+        phares = np.where((xl < 0)[:, None], np.array([255.0, 235, 200]), np.array([255.0, 45, 55]))
+        t_sol = np.exp(-sg / 8.0)[:, None]
+        img[ou] = (np.array([18.0, 9, 26]) + feux * phares * 0.55) * t_sol + np.array([110.0, 30, 100]) * (1 - t_sol)
+        lum[ou] += feux * phares * 0.3 * t_sol
+        zbuf[ou] = sg
+    # les passerelles au-dessus de l'avenue, et les enseignes en drapeau accrochees aux murs
+    iz0 = int(np.floor(cz))
+    rangs = np.arange(iz0, iz0 + 22)
+    objets = []
+    for bxm, xm, sens in ((-2, -1.0, 1.0), (1, 1.0, -1.0)):
+        hm = _cyber_hauteurs(np.full(len(rangs), bxm), rangs, g)
+        q = _v3d_hasard(bxm * 13 + 1, rangs, g + 20)
+        q1, q2, q3, q4 = (q * 2 ** 6) % 1, (q * 2 ** 12) % 1, (q * 2 ** 18) % 1, (q * 2 ** 24) % 1
+        v0 = 0.7 + q2 * np.minimum(hm - 1.9, 3.4)
+        v1 = np.minimum(v0 + 0.7 + 1.1 * q3, hm - 0.1)
+        for i in np.nonzero((q < 0.6) & (hm > 2.0))[0]:
+            objets.append((rangs[i] + 0.2 + 0.6 * q1[i], xm, xm + sens * (0.24 + 0.16 * q4[i]), v0[i], v1[i])
+                          + CYBER_NEONS[int(q3[i] * 97) % 6] + (q1[i], rangs[i] * 2 + bxm, 0))
+    q = _v3d_hasard(rangs, 5, g + 23)
+    for i in np.nonzero(q < 0.09)[0]:
+        r1, r2 = (q[i] * 2 ** 8) % 1, (q[i] * 2 ** 16) % 1
+        v0 = 4.4 + 1.2 * r1 if r2 < 0.75 else 0.9
+        objets.append((rangs[i] + 0.5, -1.0, 1.0, v0, v0 + 0.22) + CYBER_NEONS[int(r1 * 97) % 6] + (r2, rangs[i], 1))
+    _cyber_panneaux(img, lum, zbuf, cam, objets, t, g)
+    _cyber_voitures(e, img, lum, zbuf, cam, dt, g)
+    img += _v3d_flou(lum, 3, 2) * 0.75
+    # la pluie fine, qui s'allume dans les neons
+    px, py, pv = e["cy_pluie"]
+    py += pv * dt
+    px += pv * 0.12 * dt
+    py[:] = (py + 4) % 70 - 4
+    px %= 64
+    for j in range(3):
+        yy, xx = (py - j).astype(int), (px - j * 0.12).astype(int) % 64
+        ok = (yy >= 0) & (yy < 64)
+        yy, xx = yy[ok], xx[ok]
+        eclaire = np.clip(img[yy, xx].mean(axis=1), 0, 160)[:, None]
+        img[yy, xx] += (np.array([24.0, 26, 40]) + eclaire * 0.35) * (1 - j * 0.3)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _cyber_panneaux(img, lum, zbuf, cam, P, t, g):
+    """Des panneaux verticaux vus de face, chacun entre (xa, zs) et (xb, zs), de v0 a v1 : des enseignes en
+    drapeau (leur cadre vif, leurs lignes de caracteres) et des passerelles (sombres, une rangee de lampes).
+    Tous d'un coup : une entree par colonne de panneau ; le plus proche l'emporte sur chaque pixel."""
+    import numpy as np
+    if not P:
+        return
+    F = CYBER_F
+    cx, cy, cz, cap, hz = cam
+    zs, xa, xb, v0, v1, cr, cg, cb_, q, ident, genre = (np.array(c, float) for c in zip(*P))
+    ca, _, da = _cyber_projeter(cam, xa, 0.0, zs)
+    cb, _, db = _cyber_projeter(cam, xb, 0.0, zs)
+    ret = ca > cb
+    ca, cb, da, db = np.where(ret, cb, ca), np.where(ret, ca, cb), np.where(ret, db, da), np.where(ret, da, db)
+    c0 = np.clip(np.floor(ca - 0.5), 0, 64).astype(int)
+    c1 = np.clip(np.ceil(cb - 0.5), -1, 63).astype(int)
+    w = np.where((da > 0.35) & (db > 0.35), np.maximum(c1 - c0 + 1, 0), 0)
+    if not w.sum():
+        return
+    i = np.repeat(np.arange(len(w)), w)
+    cols = c0[i] + np.arange(len(i)) - (np.cumsum(w) - w)[i]
+    lam = np.clip((cols + 0.5 - ca[i]) / np.maximum(cb - ca, 1e-6)[i], 0, 1)
+    inv = (1 - lam) / da[i] + lam / db[i]                                    # 1/profondeur : lineaire a l'ecran
+    d = 1 / inv
+    a = (lam / db[i]) / inv                                                  # en travers, juste en perspective
+    a = np.where(ret[i], 1 - a, a)
+    haut, bas = hz - (v1[i] - cy) * F / d, hz - (v0[i] - cy) * F / d
+    yy = np.arange(64)[:, None] + 0.0
+    couv = (np.clip(np.minimum(yy + 1, bas) - np.maximum(yy, haut), 0, 1)
+            * np.clip(np.minimum(cols + 1.0, cb[i]) - np.maximum(cols + 0.0, ca[i]), 0, 1) * (d < zbuf[:, cols]))
+    if not couv.any():
+        return
+    rangs = np.broadcast_to(np.arange(64)[:, None], couv.shape)
+    cle = np.where(couv > 0, np.broadcast_to(d, couv.shape), np.inf)
+    pres = np.full((64, 64), np.inf)
+    np.minimum.at(pres, (rangs, np.broadcast_to(cols, couv.shape)), cle)
+    sel = (couv > 0) & (cle <= pres[rangs, np.broadcast_to(cols, couv.shape)])   # le plus proche, sur chaque pixel
+    ry, rx = np.nonzero(sel)
+    r_, c_, k_ = ry, cols[rx], couv[ry, rx][:, None]
+    i, d, a, haut, bas = i[rx], d[rx], a[rx], haut[rx], bas[rx]
+    b = np.clip((ry + 0.5 - haut) / np.maximum(bas - haut, 1e-3), 0, 1)
+    pied = np.maximum(d / F, 0.02)
+    hs, larg = (v1 - v0)[i], np.abs(xb - xa)[i]
+    c = np.stack([cr, cg, cb_], -1)[i]
+    brouille = np.exp(-d / 18.0)[:, None]
+    bord = np.maximum(np.clip(1 - np.minimum(a, 1 - a) * larg / pied, 0, 1), np.clip(1 - np.minimum(b, 1 - b) * hs / pied, 0, 1))
+    nr = np.maximum(2, np.round(hs / 0.17))
+    j = np.floor(b * nr)
+    glyphe = (_v3d_hasard(ident[i] * 64 + j, (a * 3).astype(int), g + 22) > 0.4) \
+        * np.clip((0.4 - np.abs(b * nr - j - 0.5)) / 0.1 + 0.5, 0, 1)
+    net = np.clip(1.5 - 1.5 * np.maximum(pied * nr / hs, pied * 3 / larg), 0, 1)
+    souffle = (0.88 + 0.12 * np.sin(t * (0.6 + q) + q * 20))[i]              # certaines respirent, doucement
+    force = np.maximum(bord, (0.42 + (glyphe - 0.42) * net) * 0.85) * souffle
+    enseigne = (c * (0.15 + 0.85 * force[:, None]) + 80 * (bord ** 2 * souffle)[:, None]) * brouille
+    lampes = (np.clip(1 - np.abs(b - 0.75) * 0.22 / pied, 0, 1) * (0.7 + 0.3 * np.sin(a * 40 + t * 1.5)))[:, None]
+    passe = (genre[i] == 1)[:, None]
+    emis = np.where(passe, lampes * c * 0.9 * brouille, enseigne)
+    couleur = np.where(passe, emis + np.array([10.0, 8, 20]) * brouille + (1 - brouille) * np.array([40.0, 16, 60]), enseigne)
+    img[r_, c_] = img[r_, c_] * (1 - k_) + couleur * k_
+    lum[r_, c_] += emis * k_ * 0.9
+    zbuf[r_, c_] = np.where(k_[:, 0] > 0.5, d, zbuf[r_, c_])
+
+
+def _cyber_voitures(e, img, lum, zbuf, cam, dt, g):
+    """Les voitures volantes : deux qui traversent l'avenue par les rues en travers, deux qui la suivent."""
+    import numpy as np
+    rng = e["rng"]
+    cx, cy, cz, cap, hz = cam
+    autos = e["cy_autos"]
+    while len(autos) < 4:
+        i = len(autos)
+        autos.append({"vie": -1.0, "genre": i % 2})
+    for a in autos:
+        if a["vie"] < 0:                                                     # une nouvelle
+            if a["genre"] == 0:
+                rangs = np.arange(int(cz) + 6, int(cz) + 20)
+                rues = rangs[_v3d_hasard(rangs, 7, g + 2) < 0.16]
+                zr = float(rues[int(rng.integers(len(rues)))] + 0.5) if len(rues) else cz + 12
+                sens = float(rng.choice([-1, 1]))
+                a.update(x=-9.0 * sens, y=float(rng.uniform(1.8, 4.2)), z=zr, vx=sens * float(rng.uniform(1.6, 2.4)),
+                         vz=0.0, vie=0.0)
+            else:
+                vient = rng.random() < 0.5
+                a.update(x=float(rng.uniform(-0.6, 0.6)), y=float(cy + rng.uniform(-0.8, 0.9)), vx=0.0, vie=0.0,
+                         z=cz + (24.0 if vient else -1.5),
+                         vz=-float(rng.uniform(0.8, 1.6)) if vient else CYBER_VITESSE + float(rng.uniform(0.5, 1.0)))
+        a["vie"] += dt
+        a["x"] += a["vx"] * dt
+        a["z"] += a["vz"] * dt
+        _, _, prof = _cyber_projeter(cam, a["x"], a["y"], a["z"])
+        if abs(a["x"]) > 9.5 or prof > 26 or (prof < 0.3 and a["vie"] > 1) or a["vie"] > 40:
+            a["vie"] = -1.0
+            continue
+        if a["genre"] == 0:                                                  # vue de cote : phare devant, feu derriere
+            s = np.sign(a["vx"])
+            points = ((a["x"] + 0.16 * s, 0.0, (255, 245, 225), 1.0), (a["x"] - 0.16 * s, 0.0, (255, 40, 50), 0.8),
+                      (a["x"], -0.05, (60, 140, 255), 0.5))
+            for k in range(1, 4):                                            # sa trainee
+                points += ((a["x"] - (0.16 + 0.12 * k) * s, 0.0, (255, 40, 50), 0.35 / k),)
+        else:
+            c = (255, 245, 225) if a["vz"] < 0 else (255, 35, 45)
+            points = ((a["x"] - 0.11, 0.0, c, 1.0), (a["x"] + 0.11, 0.0, c, 1.0), (a["x"], -0.06, (60, 140, 255), 0.4))
+        for wx, dy, c, f in points:
+            sx, sy, d = _cyber_projeter(cam, wx, a["y"] + dy, a["z"])
+            if d < 0.3:
+                continue
+            iy, ix = int(np.floor(sy)), int(np.floor(sx))
+            if 0 <= iy < 64 and 0 <= ix < 64 and zbuf[iy, ix] < d:
+                continue
+            rayon = float(np.clip(0.05 * CYBER_F / d, 0.45, 1.3))
+            f = f * float(np.exp(-d / 18.0)) * min(1.0, 0.25 + 0.25 * a["vie"]) * min(1.0, d / 1.5) \
+                * min(1.0, max(0.0, (26.0 - prof) / 4))                          # elle s'efface avant de disparaitre
+            _v3d_tache(img, sy, sx, rayon, c, f, (lum, 0.6))
+
+
+# 2. Le survol : la meme idee de rayons par colonne, mais vue d'en haut. Chaque case est un pate de maisons
+# (un bloc en retrait, la rue autour) ; on voit les toits, les facades tournees vers nous, et dans les rues
+# les files de phares et de feux arriere, sous les reverberes.
+
+SURVOL_F = 30.0
+
+
+def _survol_hauteurs(ix, iz, g):
+    """La hauteur du bloc de chaque case (0 : un parc)."""
+    import numpy as np
+    r = _v3d_hasard(ix, iz, g)
+    h = 0.2 + 0.75 * r ** 1.6
+    h = np.where(((r * 4096) % 1) > 0.93, 1.3 + 0.9 * ((r * 256) % 1), h)    # quelques tours
+    return np.where(((r * 65536) % 1) < 0.07, 0.0, h)
+
+
+def _scene_survol(p, e, t, ecoule, dt):
+    """La ville la nuit vue d'avion : des blocs aux fenetres chaudes, des rues ou coulent les phares, un horizon brumeux."""
+    import numpy as np
+    rng = e["rng"]
+    if "sv_g" not in e:
+        e.update(sv_g=int(rng.integers(0, 2 ** 20)), sv_z0=float(rng.uniform(0, 3000)), sv_x0=float(rng.uniform(-500, 500)),
+                 sv_phase=float(rng.uniform(0, 100)))
+    g, F, K, marge = e["sv_g"], SURVOL_F, 44, 0.16
+    tau = ecoule + e["sv_phase"]
+    cx, cz = e["sv_x0"] + 0.3 * np.sin(tau * 0.05), e["sv_z0"] + ecoule * 0.42
+    cy = 3.4 + 0.2 * np.sin(tau * 0.07)
+    cap = 0.32 * np.sin(tau * 0.031) + 0.1 * np.sin(tau * 0.083)
+    hz = 10.0
+    sx = np.arange(64) - 31.5
+    dx = np.sin(cap) + np.cos(cap) * sx / F
+    dz = np.cos(cap) - np.sin(cap) * sx / F
+    dxs = np.where(np.abs(dx) < 1e-6, 1e-6, dx)
+    s0 = 0.85 * cy * F / (64 - hz)                                            # rien de plus pres n'est a l'ecran
+    pas = np.where(dx > 0, 1, -1)
+    x0, z0 = cx + dx * s0, cz + dz * s0
+    n = np.arange(K)[None, :]
+    ev = np.concatenate([s0 + ((np.floor(x0) + (pas > 0) - x0) / dxs)[:, None] + n * np.abs(1 / dxs)[:, None],
+                         s0 + ((np.floor(z0) + 1 - z0) / dz)[:, None] + n / dz[:, None]], 1)
+    o = np.argsort(ev, axis=1, kind="stable")[:, :K]
+    S = np.concatenate([np.full((1, 64), s0), np.take_along_axis(ev, o, 1).T], 0)      # (K+1, 64) : l'entree dans chaque case
+    estx = (o < K).T
+    IX = np.floor(x0).astype(np.int64)[None, :] + pas[None, :] * np.concatenate([np.zeros((1, 64), int), np.cumsum(estx, 0)], 0)
+    IZ = np.floor(z0).astype(np.int64)[None, :] + np.concatenate([np.zeros((1, 64), int), np.cumsum(~estx, 0)], 0)
+    H = _survol_hauteurs(IX, IZ, g)
+    # le bloc en retrait dans sa case : par ou le rayon entre, par ou il sort
+    ax = (IX + marge - cx) / dxs[None]
+    bx_ = (IX + 1 - marge - cx) / dxs[None]
+    az, bz_ = (IZ + marge - cz) / dz[None], (IZ + 1 - marge - cz) / dz[None]
+    tminx, tminz = np.minimum(ax, bx_), np.minimum(az, bz_)
+    s_a = np.maximum(tminx, tminz)
+    s_b = np.minimum(np.maximum(ax, bx_), np.maximum(az, bz_))
+    touche = (H > 0) & (s_a < s_b) & (s_a > 0.1)
+    s_a = np.maximum(s_a, 0.1)
+    haut_in = hz + (cy - H) * F / s_a
+    bas = np.where(touche, hz + cy * F / s_a, -1e9)
+    M = np.where(touche, np.minimum(haut_in, hz + (cy - H) * F / np.maximum(s_b, 0.1)), 1e9)
+    L = K + 1
+    rk = np.clip(np.ceil(np.minimum.accumulate(M, axis=0) - 0.5), 0, 64).astype(np.int64)
+    premier = np.full((65, 64), L, np.int64)
+    np.minimum.at(premier, (rk, np.broadcast_to(np.arange(64), (L, 64))), np.broadcast_to(np.arange(L)[:, None], (L, 64)))
+    k = np.minimum.accumulate(premier, axis=0)[:64]
+    col = np.arange(64)[None, :]
+    yc = np.arange(64)[:, None] + 0.5
+    kk = np.minimum(k, L - 1)
+    vu = (k < L) & (yc < bas[kk, col])
+    s, h, bx, bz = s_a[kk, col], H[kk, col], IX[kk, col], IZ[kk, col]
+    cote = (tminx > tminz)[kk, col]
+    toit = vu & (yc < haut_in[kk, col])
+    hb = _v3d_hasard(bx, bz, g + 3)
+    # les facades : des etages de fenetres chaudes, fondues en lueur quand elles sont trop petites
+    v = cy - (yc - hz) * s / F
+    u = np.where(cote, cz + dz[col] * s - bz, cx + dx[col] * s - bx)
+    pied_v = s / F
+    lg = np.hypot(dx, dz)[col]
+    pied_u = pied_v * lg / np.maximum(np.where(cote, np.abs(dx[col]), np.abs(dz[col])) / lg, 0.08)
+    etage, nf = 0.075, 5
+    fv, fu = v / etage, (u - marge) / (1 - 2 * marge) * nf
+    fl, wc = np.floor(fv), np.floor(fu)
+    forme = _v3d_creneau(fv - 0.05, 0.4, pied_v / etage) * _v3d_creneau(fu, 0.64, pied_u * nf / (1 - 2 * marge))
+    dens = 0.12 + 0.3 * ((hb * 256) % 1)
+    tirage = _v3d_hasard(bx * 977 + wc * 5 + cote * 2, bz * 3001 + fl, g + 4)
+    fen = forme * (tirage < dens) * (0.6 + 0.6 * ((tirage * 256) % 1)) * (fl >= 1)
+    net = np.clip(2.0 - 2.0 * np.maximum(pied_v / etage, pied_u * nf / (1 - 2 * marge)), 0, 1)
+    fen = dens * 0.1 + (fen - dens * 0.1) * net
+    chaud = np.where((((tirage * 65536) % 1) < 0.1)[..., None], np.array([200.0, 215, 255]), np.array([255.0, 175, 90]))
+    surf = np.where(cote, 1.0, 1.3)[..., None] * np.array([14.0, 14, 26])
+    emis = fen[..., None] * chaud * ~toit[..., None]
+    # les toits : bleu nuit, leur rebord un peu plus clair
+    sr = np.where(toit, (cy - h) * F / np.maximum(yc - hz, 0.3), s)
+    rx_, rz_ = cx + dx[col] * sr - bx, cz + dz[col] * sr - bz
+    rebord = np.clip(1 - np.minimum(np.minimum(rx_ - marge, 1 - marge - rx_), np.minimum(rz_ - marge, 1 - marge - rz_))
+                     / np.maximum(sr / F, 0.02), 0, 1)                         # le rebord du toit, un peu plus clair
+    toits = np.array([9.0, 11, 21]) * (0.8 + 0.4 * hb)[..., None] + rebord[..., None] * np.array([16.0, 16, 26])
+    surf = np.where(toit[..., None], toits, surf)
+    # le sol : les rues, leurs reverberes, et les phares qui coulent
+    sg = np.maximum(cy * F / np.maximum(yc - hz, 0.3), s0) * np.ones((1, 64))
+    gx, gz = cx + dx[col] * sg, cz + dz[col] * sg
+    fx, fz = gx - np.round(gx), gz - np.round(gz)                              # par rapport au milieu des rues
+    pied = sg / F
+    pied_z = pied * sg / cy
+    parc = _survol_hauteurs(np.floor(gx), np.floor(gz), g) == 0
+    rue_z = np.abs(fx) < marge                                                 # une rue nord-sud
+    rue_x = np.abs(fz) < marge
+    def bande(d, w, pd):                                                       # la part du pixel dans une bande de largeur w
+        return np.clip(np.minimum(w / 2, d + pd / 2) - np.maximum(-w / 2, d - pd / 2), 0, None) / pd
+    eclaire = np.maximum(bande(np.abs(fx), 2 * marge, pied), bande(np.abs(fz), 2 * marge, pied_z)) * ~parc
+    carrefour = bande(np.abs(fx), 2 * marge, pied) * bande(np.abs(fz), 2 * marge, pied_z) * ~parc
+    sol = np.where(parc[..., None], np.array([7.0, 14, 12]), np.array([10.0, 10, 17]))
+    reverb = eclaire * 0.42 + carrefour * 0.5                                  # la lumiere orangee des reverberes
+    fil = np.zeros(sg.shape + (3,))
+    for voie, axe_lat, axe_lon, rue, sens in ((0.055, fx, gz, rue_z, 1.0), (-0.055, fx, gz, rue_z, -1.0),
+                                              (0.055, fz, gx, rue_x, -1.0), (-0.055, fz, gx, rue_x, 1.0)):
+        lat = np.clip(1 - np.abs(axe_lat - voie) / np.maximum(pied * 1.1, 0.03), 0, 1) * rue
+        ident = np.round(gx if axe_lat is fx else gz)
+        ph = axe_lon * 1.6 - sens * t * (0.55 + 0.25 * _v3d_hasard(ident, sens * 3, g + 9)) + _v3d_hasard(ident, sens, g + 8) * 7
+        larg = np.maximum(0.1, (pied_z if axe_lat is fx else pied) * 1.6)
+        voit = np.clip(1 - np.abs(ph % 1 - 0.5) / larg, 0, 1) * np.minimum(1, 0.16 / larg) \
+            * (_v3d_hasard(ident * 7 + np.floor(ph), sens, g + 10) < 0.7)
+        c = np.array([255.0, 240, 215]) if sens > 0 else np.array([255.0, 45, 35])
+        fil += (lat * (0.12 + 1.1 * voit))[..., None] * c
+    img = np.where(vu[..., None], surf, sol)
+    emis = np.where(vu[..., None], emis, reverb[..., None] * np.array([200.0, 110, 40]) + fil)
+    prof = np.where(vu, s, sg)
+    # la brume de l'horizon, ambre en bas, bleu nuit en haut ; le ciel
+    voile = 1 - np.exp(-prof / 14.0)
+    pres_hz = np.clip((prof - 9.0) / 16.0, 0, 1)[..., None] ** 1.5                 # au loin, la lueur ambree de la ville
+    c_brume = np.array([16.0, 20, 42]) * (1 - pres_hz) + np.array([100.0, 68, 54]) * pres_hz
+    img = img * (1 - voile[..., None]) + c_brume * voile[..., None] + emis * np.exp(-prof / 24.0)[..., None]
+    kc = np.clip((hz - yc) / hz, 0, 1)[..., None]
+    ciel = np.array([100.0, 72, 64]) * (1 - kc) ** 3 + np.array([8.0, 12, 32]) * (1 - (1 - kc) ** 3)
+    img = np.where((yc < hz)[..., None] * np.ones((1, 64, 1), bool), ciel, img)
+    # le feu rouge au sommet des tours, qui respire
+    tours = touche & (H > 1.25)
+    if tours.any():
+        paires = np.unique(np.stack([IX[tours], IZ[tours]], 1), axis=0)
+        hx, hzz = paires[:, 0] + 0.5, paires[:, 1] + 0.5
+        ht = _survol_hauteurs(paires[:, 0], paires[:, 1], g)
+        rx_, rz_ = hx - cx, hzz - cz
+        pr = rx_ * np.sin(cap) + rz_ * np.cos(cap)
+        ok = pr > 0.5
+        colx = 32 + (rx_ * np.cos(cap) - rz_ * np.sin(cap))[ok] * F / pr[ok]
+        lig = hz - (ht[ok] + 0.03 - cy) * F / pr[ok]
+        f = (0.5 + 0.5 * np.sin(t * 1.4 + paires[ok, 0] * 1.7 + paires[ok, 1])) * np.exp(-pr[ok] / 13.0)
+        _pointer(img, lig, colx, f[:, None] * np.array([255.0, 40, 30]))
+    lumiere = np.clip(img - 90, 0, None)
+    img += _v3d_flou(lumiere, 1, 2) * 0.7
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 3. La ruelle : la camera ne bouge pas, toute la geometrie (les deux murs, le sol, le bout de la rue) est
+# calculee une fois. A chaque image : les enseignes qui gresillent, le sol mouille qui les reflete (le reflet
+# d'un mur dans le sol, c'est l'image du mur retournee autour de son pied), les ronds des gouttes, la vapeur.
+
+RUELLE_F, RUELLE_HZ, RUELLE_CX, RUELLE_CY = 32.0, 29.0, 0.15, 0.8
+RUELLE_MURS = (-1.0, 1.1)        # x du mur de gauche, du mur de droite
+RUELLE_BOUT = 9.0                # la ou la ruelle debouche ; en face, a +1.5, une facade eclairee
+# les enseignes en drapeau : (z, x du mur, saillie, y bas, y haut, couleur, defaillante)
+RUELLE_DRAPEAUX = ((3.4, -1.0, 0.45, 1.05, 2.35, (255, 45, 160), 0), (2.3, 1.1, -0.42, 1.35, 2.75, (255, 185, 50), 0),
+                   (5.4, 1.1, -0.36, 0.95, 1.9, (50, 220, 255), 1), (6.9, -1.0, 0.32, 1.45, 2.4, (170, 90, 255), 0))
+# les enseignes a plat sur les murs : (mur, z0, z1, y0, y1, couleur, defaillante)
+RUELLE_PLATES = ((0, 4.6, 6.0, 1.6, 2.0, (40, 230, 255), 0), (1, 3.1, 4.5, 2.4, 2.8, (255, 60, 150), 1),
+                 (0, 7.7, 8.6, 1.15, 1.45, (255, 120, 60), 0))
+
+
+def _ruelle_lumiere(P, N, L, couleur, force, rayon):
+    """Ce qu'une lampe (position L) donne a chaque point P de normale N : decroit avec la distance."""
+    import numpy as np
+    d = L[None, None, :] - P
+    d2 = (d ** 2).sum(-1)
+    face = np.clip((d * N).sum(-1) / np.sqrt(d2 + 1e-6), 0, 1) * 0.75 + 0.25
+    return (force * face / (1 + d2 / rayon ** 2) ** 1.3)[..., None] * np.asarray(couleur, float)
+
+
+def _ruelle_geometrie(e):
+    """Tout ce qui ne bouge pas : la geometrie, l'eclairage, les enseignes (chacune a part), leurs reflets."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    F, hz, cx, cy = RUELLE_F, RUELLE_HZ, RUELLE_CX, RUELLE_CY
+    xg, xd = RUELLE_MURS
+    sx, sy = X + 0.5 - 32, Y + 0.5 - hz
+    gauche = sx < 0
+    s_mur = np.where(gauche, (cx - xg) * F / np.maximum(-sx, 1e-6), (xd - cx) * F / np.maximum(sx, 1e-6))
+    y_mur = cy - sy * s_mur / F
+    haut_mur = np.where(gauche, np.where(s_mur < 6.0, 3.6, 3.0), np.where(s_mur < 4.2, 4.3, 3.7))
+    mur = (s_mur < RUELLE_BOUT) & (y_mur < haut_mur) & (y_mur > -0.01)
+    s_sol = np.where(sy > 0, cy * F / np.maximum(sy, 1e-6), 1e9)
+    s_face = RUELLE_BOUT + 1.5
+    y_face, x_face = cy - sy * s_face / F, cx + sx * s_face / F
+    face = ~mur & (y_face < 4.6) & (y_face >= 0) & (s_face < s_sol)
+    sol = ~mur & ~face & (sy > 0)
+    ciel = ~mur & ~face & ~sol
+    gx, gz = cx + sx * s_sol / F, s_sol
+    # chaque pixel : son point dans le monde, sa normale
+    P = np.stack([np.where(mur, np.where(gauche, xg, xd), np.where(face, x_face, gx)),
+                  np.where(mur, y_mur, np.where(face, y_face, 0.0)),
+                  np.where(mur, s_mur, np.where(face, s_face, np.minimum(gz, 60)))], -1)
+    N = np.zeros((64, 64, 3))
+    N[mur & gauche, 0], N[mur & ~gauche, 0], N[sol, 1], N[face, 2] = 1, -1, 1, -1
+    z, yv = s_mur, y_mur
+    pied = np.where(mur, s_mur, np.where(sol, s_sol, s_face)) / F
+    # les matieres : brique sombre, taches, portes en retrait ; l'asphalte ; la facade d'en face
+    tache = _brume(rng, 4, 64)
+    brique = 0.92 + 0.08 * np.clip(np.sin(yv * 2 * np.pi / 0.16) * 3, -1, 1) * np.clip(1 - pied / 0.06, 0, 1)
+    albedo = np.where(gauche[..., None], np.array([0.62, 0.45, 0.55]), np.array([0.5, 0.45, 0.62]))
+    albedo = albedo * (brique * (0.7 + 0.6 * tache))[..., None]
+    porte = mur & (((gauche & (np.abs(z - 2.5) < 0.32)) | (~gauche & (np.abs(z - 7.45) < 0.28))) & (yv < 1.15))
+    albedo[porte] *= 0.3
+    corniche = mur & (np.abs(yv - haut_mur + 0.06) < np.maximum(pied * 0.7, 0.05))
+    albedo[corniche] = (1.0, 0.9, 1.1)
+    albedo[sol] = (np.array([0.42, 0.4, 0.48]) * (0.75 + 0.5 * tache)[..., None])[sol]
+    albedo[face] = (0.55, 0.5, 0.55)
+    # l'eclairage fixe : la lueur du ciel, les lampes des portes, la lumiere qui vient du bout de la rue
+    lampes = ((np.array([-0.93, 1.35, 2.5]), (255, 165, 80), 1.6, 0.6), (np.array([1.03, 1.3, 7.45]), (255, 165, 80), 1.4, 0.6),
+              (np.array([0.05, 0.9, 10.3]), (230, 165, 110), 1.5, 2.0))
+    eclairage = np.array([44.0, 32, 66]) * (1.15 - 0.55 * np.clip(P[..., 1] / 4, 0, 1))[..., None]
+    for L, c, k, r in lampes:
+        eclairage = eclairage + _ruelle_lumiere(P, N, L, c, k, r)
+    img = albedo * eclairage
+    emis = np.zeros((64, 64, 3))
+    for zf, yf, lit, cote in ((6.3, 2.5, 1, 1), (3.0, 3.2, 0, 1), (8.1, 2.2, 1, 1), (2.6, 2.95, 1, 0), (6.0, 2.6, 1, 0),
+                              (8.3, 2.7, 0, 0), (4.1, 3.5, 1, 0)):
+        fen = mur & (gauche if cote else ~gauche) & (np.abs(z - zf) < 0.3) & (np.abs(yv - yf) < 0.28)
+        store = 0.7 + 0.3 * (np.sin(yv * 2 * np.pi / 0.1) > 0) * np.clip(1 - pied / 0.05, 0, 1)
+        img[fen] = (6, 5, 10)
+        if lit:
+            emis[fen] = (np.array([255.0, 165, 85]) * 0.55 * store[..., None])[fen]
+    for L, c, k, r in lampes[:2]:                                              # les ampoules des portes
+        col, lig = 32 + (L[0] - cx) * F / L[2], hz - (L[1] - cy) * F / L[2]
+        _v3d_tache(emis, lig, col, 0.6, (255, 200, 130), 1.0)
+    vitrine = face & (np.abs(x_face - 0.05) < 0.8) & (y_face > 0.15) & (y_face < 1.0)
+    emis[vitrine] = (220, 160, 100)
+    emis[face & (np.abs(y_face - 1.35) < 0.08) & (np.abs(x_face - 0.05) < 0.6)] = (60, 230, 200)
+    etages = face & (np.abs((y_face - 2.0) % 0.8 - 0.3) < 0.18) & (np.abs((x_face + 2) % 0.7 - 0.35) < 0.15) & (y_face > 1.8)
+    emis[etages & (np.sin(x_face * 9.1 + y_face * 3.7) > 0.2)] = (110, 85, 60)
+    # le ciel : une bande etroite entre les toits, rougie par la ville ; des fils qui la traversent
+    kc = np.clip(Y / 22.0, 0, 1)[..., None]
+    img[ciel] = (np.array([14.0, 10, 30]) * (1 - kc) + np.array([70, 34, 80]) * kc)[ciel]
+    for xa, ya, xb, yb, fl, zf in ((-1.0, 3.3, 1.1, 3.6, 0.4, 3.9), (-1.0, 2.9, 1.1, 3.1, 0.25, 7.8)):
+        k = np.linspace(0, 1, 120)
+        wx, wy = xa + (xb - xa) * k, ya + (yb - ya) * k - fl * 4 * k * (1 - k)
+        cols, rows = (32 + (wx - cx) * F / zf).astype(int), (hz - (wy - cy) * F / zf).astype(int)
+        ok = (rows >= 0) & (rows < 64) & (cols >= 0) & (cols < 64)
+        r_, c_ = rows[ok], cols[ok]
+        dessous = ciel[r_, c_] | (s_mur[r_, c_] > zf)
+        img[r_[dessous], c_[dessous]] = img[r_[dessous], c_[dessous]] * 0.45 + 4
+    # la guirlande d'ampoules, en travers de la ruelle
+    reflets = np.zeros((64, 64, 3))
+    k = np.linspace(0.06, 0.94, 9)
+    for i, kk in enumerate(k):
+        wx, wy, wz = xg + (xd - xg) * kk, 2.75 - 0.32 * 4 * kk * (1 - kk), 4.4 + 0.3 * kk
+        col, lig = 32 + (wx - cx) * F / wz, hz - (wy - cy) * F / wz
+        c = ((255, 200, 120), (255, 120, 160), (140, 220, 255))[i % 3]
+        _v3d_tache(emis, lig, col, 0.55, c, 0.9)
+        _v3d_tache(reflets, hz + (wy + cy) * F / wz, col, 0.7, c, 0.35)
+    # le sol : les flaques, la bouche d'egout
+    flaques = _brume(rng, 6, 64)
+    mare = flaques[((gz * 5) % 64).astype(int) % 64, ((gx * 9) % 64).astype(int) % 64]
+    flaque = np.clip((mare - 0.42) / 0.08, 0, 1) * sol
+    trou = ((gx - 0.35) / 0.32) ** 2 + ((gz - 3.2) / 0.22) ** 2
+    img[sol & (trou < 1)] *= 0.45
+    img[sol & (trou < 1) & (trou > 0.6)] += (14, 12, 18)
+    flaque[trou < 1.2] = 0
+    s_pied = np.where(s_mur < RUELLE_BOUT, s_mur, s_face)
+    y_reflet = np.clip(np.round(2 * (hz + cy * F / s_pied) - (Y + 0.5) - 0.5), -1, 63).astype(int)
+    # les enseignes : leur dessin, leur halo, la lumiere qu'elles jettent, leur reflet -- chacune a part
+    enseignes = []
+    for zs, xm, saillie, y0, y1, c, defaut in RUELLE_DRAPEAUX:
+        c = np.asarray(c, float)
+        xa, xb = sorted((xm, xm + saillie))
+        ca, cb = 32 + (xa - cx) * F / zs, 32 + (xb - cx) * F / zs
+        ha, ba = hz - (y1 - cy) * F / zs, hz - (y0 - cy) * F / zs
+        cx_ = np.clip(np.minimum(X + 1, cb) - np.maximum(X, ca), 0, 1)
+        couv = cx_ * np.clip(np.minimum(Y + 1, ba) - np.maximum(Y, ha), 0, 1) * (zs < np.where(mur, s_mur, 1e9))
+        a, b = np.clip((X + 0.5 - ca) / (cb - ca), 0, 1), np.clip((Y + 0.5 - ha) / (ba - ha), 0, 1)
+        bord = np.maximum(np.clip(1.5 - np.minimum(a, 1 - a) * (cb - ca), 0, 1), np.clip(1.5 - np.minimum(b, 1 - b) * (ba - ha), 0, 1))
+        nr = max(3, int(round((y1 - y0) / 0.2)))
+        j = np.floor(b * nr)
+        glyphe = (_v3d_hasard(j + zs * 100, (a * 3).astype(int), 31) > 0.35) * (np.abs(b * nr - j - 0.5) < 0.32)
+        dessin = (c * (0.12 + 0.8 * np.maximum(bord, glyphe * 0.9))[..., None] + 70 * bord[..., None] ** 2) * couv[..., None]
+        ra, rb = hz + (y0 + cy) * F / zs, hz + (y1 + cy) * F / zs                # son reflet, a l'envers sous le sol
+        reflet = c * (cx_ * np.clip(np.minimum(Y + 1, rb) - np.maximum(Y, ra), 0, 1) * sol)[..., None] * 0.75
+        L = np.array([xm + saillie / 2, (y0 + y1) / 2, zs])
+        enseignes.append([couv, dessin, reflet * 0.75, defaut, albedo * _ruelle_lumiere(P, N, L, c, 1.6, 0.95)])
+    for m_, z0, z1, y0, y1, c, defaut in RUELLE_PLATES:
+        c = np.asarray(c, float)
+        ici = mur & (gauche if m_ == 0 else ~gauche) & (z > z0) & (z < z1) & (yv > y0) & (yv < y1)
+        pz = pied * np.maximum(np.abs(sx) / 4, 1)
+        bord = (np.minimum(z - z0, z1 - z) < np.maximum(pz, 0.05)) | (np.minimum(yv - y0, y1 - yv) < np.maximum(pied, 0.04))
+        lettres = (np.sin((z - z0) * 2 * np.pi / 0.22) > 0.1) & (np.abs(yv - (y0 + y1) / 2) < (y1 - y0) * 0.28)
+        dessin = (c * (0.15 + 0.85 * np.maximum(bord, lettres * np.clip(1.5 - pz / 0.08, 0.3, 1)))[..., None] + 50 * bord[..., None]) * ici[..., None]
+        L = np.array([(xg + 0.15) if m_ == 0 else (xd - 0.15), (y0 + y1) / 2, (z0 + z1) / 2])
+        enseignes.append([ici * 1.0, dessin, np.zeros((64, 64, 3)), defaut, albedo * _ruelle_lumiere(P, N, L, c, 1.3, 0.9)])
+    for en in enseignes:
+        en.append(_v3d_flou(en[1], 2, 2) * 0.8)                                  # le halo
+    e["rl"] = dict(sol=sol, img=img, emis=emis, flaque=flaque, y_reflet=y_reflet, gx=gx, gz=gz, enseignes=enseignes,
+                   reflets=reflets, brume=_brume(rng, 4, 64), loin=(np.where(mur, s_mur, np.where(sol, s_sol, s_face)) > 9.6))
+
+
+def _scene_ruelle(p, e, t, ecoule, dt):
+    """Une ruelle etroite sous la pluie : des enseignes qui gresillent, des flaques qui les refletent, de la vapeur."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "rl" not in e:
+        _ruelle_geometrie(e)
+        e["rl_gouttes"] = np.zeros((14, 4))                                    # x, z, naissance, force
+        e["rl_pluie"] = [rng.uniform(0, 64, 50), rng.uniform(0, 64, 50), rng.uniform(50, 75, 50)]
+        e["rl_suivante"] = 0.0
+    R = e["rl"]
+    hz, F, cx, cy = RUELLE_HZ, RUELLE_F, RUELLE_CX, RUELLE_CY
+    img = R["img"].copy()
+    reflets = R["reflets"].copy()
+    for i, (couv, dessin, reflet, defaut, jet, halo) in enumerate(R["enseignes"]):
+        f = 0.9 + 0.05 * np.sin(t * 1.3 + i * 2.1) + 0.03 * np.sin(t * 7.9 + i) + 0.02 * np.sin(t * 13.1 + i * 3)
+        if defaut:                                                           # elle faiblit par moments, en douceur
+            ph = (t / (6.3 + i) + i * 0.37) % 1
+            f *= 1 - 0.5 * np.sin(np.pi * np.clip(ph / 0.07, 0, 1)) ** 2 - 0.3 * np.sin(np.pi * np.clip((ph - 0.09) / 0.05, 0, 1)) ** 2
+        img += jet * f
+        img = img * (1 - couv[..., None]) + dessin * f + halo * f
+        reflets += reflet * f
+    img += R["emis"]
+    # un passant sous son parapluie, de temps en temps, dans la rue du bout
+    cycle = (t / 34.0) % 1
+    if cycle < 0.62:
+        wx, wz = -2.2 + cycle / 0.62 * 4.6, RUELLE_BOUT + 0.9
+        col, k = 32 + (wx - cx) * F / wz, F / wz
+        pas = np.sin(t * 5.0) * 0.04
+        corps = (np.abs(X + 0.5 - col) < 0.13 * k + 0.25) & (Y + 0.5 > hz - (1.0 - cy) * k) & (Y + 0.5 < hz + cy * k - pas * k)
+        pluie_ = ((X + 0.5 - col) / (0.34 * k)) ** 2 + ((Y + 0.5 - (hz - (1.2 - cy) * k)) / (0.16 * k)) ** 2 < 1
+        ombre = (corps | (pluie_ & (Y + 0.5 > hz - (1.36 - cy) * k))) & R["loin"]
+        img[ombre] = img[ombre] * 0.12 + np.array([6.0, 5, 10])
+    # le reflet dans le sol mouille : l'image retournee autour du pied des murs, que les gouttes font onduler
+    G = e["rl_gouttes"]
+    if ecoule >= e["rl_suivante"]:
+        e["rl_suivante"] = ecoule + rng.uniform(0.08, 0.22)
+        i = int(np.argmin(G[:, 2]))
+        G[i] = (rng.uniform(-0.9, 1.0), rng.uniform(1.0, 6.5), t, rng.uniform(0.6, 1.0))
+    sol = R["sol"]
+    gx, gz = R["gx"], R["gz"]
+    onde = 0.3 * np.sin(gz * 6 + t * 1.3) * np.sin(gx * 7 - t * 0.9)
+    for x0, z0, n0, a0 in G:
+        age = t - n0
+        if 0 <= age < 1.4:
+            d = np.hypot(gx - x0, gz - z0) - age * 0.35
+            onde += a0 * np.sin(d * 40) * np.exp(-(d / 0.06) ** 2) * (1 - age / 1.4)
+    dy, dxp = np.round(onde * 1.3).astype(int), np.round(onde * 0.8).astype(int)
+    yr = R["y_reflet"] + dy
+    xr = np.clip(X.astype(int) + dxp, 0, 63)
+    source = np.where(sol[..., None], 0.0, img)
+    reflet = np.where((yr >= 0)[..., None], source[np.clip(yr, 0, 63), xr], np.array([40.0, 20, 50]))
+    reflet += reflets[np.clip(Y.astype(int) + dy, 0, 63), xr]
+    k = R["flaque"][..., None]
+    img = np.where(sol[..., None], img + reflet * 0.7 * k + _v3d_flou(reflet, 1, 2) * 0.2 * (1 - k), img)
+    # la vapeur qui monte de la bouche d'egout, eclairee par les neons
+    bx, by = 32 + (0.35 - cx) * F / 3.2, hz + cy * F / 3.2
+    hauteur = np.clip((by - Y) / 24.0, 0, 1)
+    derive = np.sin(Y * 0.15 - t * 0.6) * hauteur * 3 + hauteur * 5
+    panache = np.exp(-((X - bx - derive) / (1.8 + hauteur * 9)) ** 2) * np.clip(1 - hauteur, 0, 1) ** 1.1 * (Y < by)
+    vapeur = np.clip(panache * (0.35 + 1.0 * _fenetre(R["brume"], t * 0.6, t * 6.0)) - 0.08, 0, 0.9)[..., None]
+    img = img * (1 - vapeur * 0.55) + (np.array([84.0, 74, 100]) + _v3d_flou(img, 2, 1) * 0.8) * vapeur * 0.9
+    # la pluie, qu'on ne voit que dans la lumiere
+    px, py, pv = e["rl_pluie"]
+    py += pv * dt
+    px += pv * 0.08 * dt
+    py[:] = (py + 4) % 70 - 4
+    px %= 64
+    eclaire = np.clip(img.mean(axis=2), 0, 150)
+    for j in range(3):
+        yy, xx = (py - j).astype(int), (px - j * 0.08).astype(int) % 64
+        ok = (yy >= 0) & (yy < 64)
+        img[yy[ok], xx[ok]] += (np.array([14.0, 15, 22]) + eclaire[yy[ok], xx[ok], None] * 0.45) * (1 - j * 0.3)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 4. Le pare-brise : derriere la vitre, la ville floue (des disques de lumiere) ; sur la vitre, une carte de
+# l'eau (chaque goutte y pose son dome) : sa pente devie la lumiere, comme une petite lentille. L'essuie-glace
+# efface la carte la ou il passe ; un film d'eau s'y attarde un instant.
+
+PB_PIVOTS = ((14.0, 71.0, 50.0), (44.0, 70.0, 42.0))       # les deux essuie-glaces : pivot, longueur
+PB_CYCLE = 8.0                                              # un balayage toutes les 8 s
+
+
+def _pb_angle(ecoule):
+    """L'angle des essuie-glaces : au repos couches vers la droite ; un aller-retour lent et propre."""
+    import numpy as np
+    ph = ecoule % PB_CYCLE
+    k = np.clip(ph / 3.2, 0, 1)                                                # l'aller-retour dure 3,2 s
+    return 0.12 + (2.75 - 0.12) * np.sin(np.pi * k) ** 2 * (ph < 3.2)
+
+
+def _scene_pare_brise(p, e, t, ecoule, dt):
+    """La nuit, a l'arret au feu rouge sous la pluie : la ville floue derriere le pare-brise, les gouttes, l'essuie-glace."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "pb_eau" not in e:
+        e.update(pb_eau=np.zeros((64, 64)), pb_film=np.zeros((64, 64)), pb_hi=np.zeros((64, 64)), pb_rim=np.zeros((64, 64)),
+                 pb_angle=_pb_angle(ecoule), pb_phase=float(rng.uniform(0, 60)))
+        for _ in range(30):                                                    # la pluie a deja commence
+            _pb_goutte(e, rng)
+    dt = min(dt, 0.5)
+    tau = ecoule + e["pb_phase"]
+    # derriere la vitre : la rue de nuit, floue -- des disques de lumiere, et leur reflet qui coule sur la chaussee
+    hz = 33.0
+    fond = _degrade((8, 8, 22), (34, 20, 40), 0, hz) * (Y < hz)[..., None] + (Y >= hz)[..., None] * np.array([14.0, 11, 22])
+    if "pb_ville" not in e:                                                    # des fenetres floues, loin
+        n = 26
+        e["pb_ville"] = (rng.uniform(0, 64, n), rng.uniform(10, 31, n), rng.uniform(0.8, 1.8, n), rng.uniform(0, 6, n))
+    feu = (tau / 46.0) % 1                                                     # le feu : rouge longtemps, puis vert, orange
+    rouge = np.clip(feu / 0.02, 0, 1) * np.clip((0.62 - feu) / 0.02, 0, 1)
+    vert = np.clip((feu - 0.63) / 0.02, 0, 1) * np.clip((0.92 - feu) / 0.02, 0, 1)
+    orange = np.clip((feu - 0.93) / 0.01, 0, 1) * np.clip((1.0 - feu) / 0.02, 0, 1)
+    vx, vy, vr, vp = e["pb_ville"]
+    disques = [(x, y, r, (255, 190, 120) if ph < 4 else (150, 200, 255), 0.13 + 0.03 * np.sin(t * 0.3 + ph))
+               for x, y, r, ph in zip(vx, vy, vr, vp)]
+    disques += [(5, 5, 4.2, (255, 150, 60), 0.6), (15, 13, 3.0, (255, 150, 60), 0.55), (22, 19, 2.1, (255, 160, 70), 0.5),
+                (27, 23, 1.5, (255, 160, 70), 0.45), (60, 4, 4.5, (255, 150, 60), 0.6), (50, 12, 3.2, (255, 150, 60), 0.55),
+                (3, 27, 5.5, (255, 40, 150), 0.4), (61, 24, 5.0, (40, 200, 255), 0.4), (55, 29, 3.0, (170, 80, 255), 0.35),
+                (44, 6, 2.4, (255, 40, 40), 0.95 * rouge + 0.07), (44, 11.5, 2.4, (255, 170, 30), 0.95 * orange + 0.05),
+                (44, 17, 2.4, (40, 255, 140), 0.95 * vert + 0.05)]
+    for k in range(3):                                                         # les voitures qui croisent, pendant notre rouge
+        cyc = (tau / 9.0 + k / 3.0) % 1
+        sens = 1 if k % 2 else -1
+        x = -14 + cyc * 92 if sens > 0 else 78 - cyc * 92
+        f = rouge * np.clip(np.sin(np.pi * cyc), 0, 1) ** 0.3
+        disques += [(x, 31 + k % 2, 2.2, (255, 245, 220), 0.75 * f), (x - 5 * sens, 31 + k % 2, 1.9, (255, 245, 220), 0.65 * f),
+                    (x - 17 * sens, 31 + k % 2, 1.6, (255, 40, 40), 0.4 * f)]
+    freins = 0.5 + 0.5 * np.clip(1 - vert * 1.5, 0, 1)                         # la voiture devant : ses feux stop
+    caisse = ((np.abs(X + 0.5 - 32) < 13 - np.maximum(31 - Y, 0) * 0.8) & (Y > 26) & (Y < 42))
+    n_avant = len(disques)
+    disques += [(23, 36, 3.0, (255, 30, 30), 0.9 * freins), (41, 36, 3.0, (255, 30, 30), 0.9 * freins),
+                (32, 39, 1.4, (230, 220, 200), 0.2)]
+    for i, (x0, y0, r, c, f) in enumerate(disques):
+        if i == n_avant:
+            fond[caisse] = fond[caisse] * 0.25 + np.array([14.0, 10, 20]) \
+                + np.array([30.0, 8, 10]) * freins * np.exp(-((Y[caisse] - 36) / 4) ** 2)[:, None]
+        if f > 0.01:
+            ya, yb = max(0, int(y0 - r - 2)), min(64, int(y0 + r + 3))
+            xa, xb = max(0, int(x0 - r - 2)), min(64, int(x0 + r + 3))
+            if ya < yb and xa < xb:
+                d = np.hypot(X[ya:yb, xa:xb] + 0.5 - x0, Y[ya:yb, xa:xb] + 0.5 - y0)
+                disque = np.clip((r - d) / 0.9 + 0.5, 0, 1) * (0.75 + 0.25 * (d / r) ** 2)   # un bokeh : un disque net, au bord plus vif
+                fond[ya:yb, xa:xb] += (disque * f)[..., None] * np.asarray(c, float)
+            if f > 0.15 and r > 1.4:                                           # son reflet sur la chaussee mouillee
+                y1 = max(y0 + r + 1, hz + 1) if y0 > hz - 6 else hz + (hz - y0) * 0.35
+                long = 3 + r * 1.6
+                ya, yb = int(max(hz, y1 - 1)), int(min(54, y1 + long * 2.2))
+                if ya < yb:
+                    ys = Y[ya:yb, xa:xb] + 0.5
+                    trace = np.exp(-((X[ya:yb, xa:xb] + 0.5 - x0) / (0.55 * r)) ** 2) * np.exp(-((ys - y1) / long) ** 2) \
+                        * (0.75 + 0.25 * np.sin(ys * 1.7 + t * 2.0 + x0))
+                    fond[ya:yb, xa:xb] += (trace * f * 0.4)[..., None] * np.asarray(c, float)
+    fond += _v3d_flou(fond, 4, 1) * 0.3
+    # la pluie qui arrive sur la vitre, et l'essuie-glace qui l'efface
+    for _ in range(int(rng.poisson(7 * dt))):
+        _pb_goutte(e, rng)
+    W, film, hi, rim = e["pb_eau"], e["pb_film"], e["pb_hi"], e["pb_rim"]
+    a0, a1 = e["pb_angle"], _pb_angle(ecoule)
+    e["pb_angle"] = a1
+    film *= np.exp(-dt / 0.5)
+    for px, py, L in PB_PIVOTS:
+        ang = np.arctan2(py - (Y + 0.5), X + 0.5 - px)
+        rad = np.hypot(X + 0.5 - px, Y + 0.5 - py)
+        balaye = (ang >= min(a0, a1) - 0.03) & (ang <= max(a0, a1) + 0.03) & (rad < L + 1) & (rad > 8)
+        if abs(a1 - a0) > 1e-4:
+            W[balaye], hi[balaye], rim[balaye] = 0, 0, 0
+            film[balaye] = 1.0
+    flou = _v3d_flou(fond, 1, 2)
+    large = _v3d_flou(fond, 4, 1)                                              # une goutte voit large : elle ramasse la lumiere
+    goutte = W[..., None]
+    img = fond * (1 - goutte) + (large * 1.5 + np.array([5.0, 5, 9])) * goutte
+    img += hi[..., None] * (large * 2.4 + np.array([16.0, 17, 24]))            # son reflet vif, en haut
+    img *= 1 - rim[..., None] * 0.5                                            # son bord sombre, en bas
+    img = img * (1 - film[..., None] * 0.3) + flou * film[..., None] * 0.3 + film[..., None] * np.array([8.0, 8, 12])
+    # les balais
+    for px, py, L in PB_PIVOTS:
+        ca, sa = np.cos(a1), -np.sin(a1)
+        u = (X + 0.5 - px) * ca + (Y + 0.5 - py) * sa                          # le long du balai
+        v = -(X + 0.5 - px) * sa + (Y + 0.5 - py) * ca                         # en travers
+        balai = np.clip(1.6 - np.abs(v + 0.3), 0, 1) * (u > 9) * (u < L)
+        reflet = np.clip(1 - np.abs(v - 1.2), 0, 1) * (u > 9) * (u < L) * 0.25          # le metal accroche un peu de lumiere
+        img = img * (1 - balai[..., None] * 0.93) + balai[..., None] * np.array([8.0, 8, 12]) + reflet[..., None] * np.array([40.0, 40, 52])
+    # l'habitacle : le haut du pare-brise et le retroviseur, les montants, le tableau de bord et sa lueur
+    img += (np.exp(-((Y - 52) / 3.0) ** 2) * np.exp(-((X - 18) / 14.0) ** 2) * 0.22)[..., None] * np.array([60.0, 160, 200])
+    habitacle = (Y + 0.5 < 1.6 + ((X + 0.5 - 32) / 32) ** 2 * 2.5) | (X + 0.5 < (64 - Y) * 0.05) | (X + 0.5 > 64 - (64 - Y) * 0.05)
+    retro = ((X + 0.5 - 33) / 6.0) ** 2 + ((Y + 0.5 - 3.0) / 3.6) ** 2 < 1
+    img[habitacle | retro] = (6, 6, 9)
+    img[(((X + 0.5 - 33) / 4.8) ** 2 + ((Y + 0.5 - 3.3) / 2.5) ** 2 < 1)] = (22, 16, 28)      # ce que le retroviseur voit
+    bord = 55.5 - 2.0 * np.sin(np.clip((X + 0.5) / 64, 0, 1) * np.pi)
+    tableau = Y + 0.5 > bord
+    lueur = np.exp(-((X - 16) / 8.0) ** 2 - ((Y - 59) / 3.0) ** 2) + 0.6 * np.exp(-((X - 36) / 5.0) ** 2 - ((Y - 59) / 2.5) ** 2)
+    img[tableau] = (np.array([8.0, 8, 12]) + lueur[..., None] * np.array([30.0, 110, 140]))[tableau]
+    img[tableau & (Y + 0.5 < bord + 1)] += (14, 18, 26)                                       # le rebord, qui accroche la lumiere
+    _pointer(img, [59, 59, 60], [13, 19, 36], [[120, 230, 255], [120, 230, 255], [255, 170, 80]])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _pb_goutte(e, rng):
+    """Une goutte se pose sur la vitre : son disque, son reflet vif en haut a gauche, son bord sombre en bas."""
+    import numpy as np
+    x0, y0, r = rng.uniform(0, 64), rng.uniform(0, 56), rng.uniform(0.9, 2.1)
+    ya, yb, xa, xb = max(0, int(y0 - r - 1)), min(64, int(y0 + r + 2)), max(0, int(x0 - r - 1)), min(64, int(x0 + r + 2))
+    if ya >= yb or xa >= xb:
+        return
+    yy, xx = np.mgrid[ya:yb, xa:xb] + 0.5
+    d = np.hypot(xx - x0, yy - y0)
+    disque = np.clip(r - d + 0.5, 0, 1)
+    W = e["pb_eau"]
+    W[ya:yb, xa:xb] = np.maximum(W[ya:yb, xa:xb], disque)
+    e["pb_hi"][ya:yb, xa:xb] = np.maximum(e["pb_hi"][ya:yb, xa:xb], np.clip(1 - np.hypot(xx - x0 + r * 0.35, yy - y0 + r * 0.35) / 0.8, 0, 1))
+    e["pb_rim"][ya:yb, xa:xb] = np.maximum(e["pb_rim"][ya:yb, xa:xb], disque * np.clip((yy - y0) / r * 1.4 - 0.3, 0, 1)
+                                           * np.clip(1 - (r - d) / 1.2, 0, 1))
+
+
+# 5. Le pont : une vraie perspective (le pont s'eloigne vers la gauche), dessinee deux fois -- telle qu'on la
+# voit, et retournee sous l'eau (y -> -y) pour son reflet, que l'eau fait onduler et etire.
+
+PONT_F, PONT_HZ, PONT_CY = 34.0, 40.0, 0.6
+PONT_O, PONT_D = (2.0, 30.0), (0.95, -0.31)                 # un point de l'axe du pont (x, z), sa direction
+PONT_PYLONES, PONT_HAUT, PONT_TABLIER = (-17.0, 17.0), 20.0, 5.0
+
+
+def _pont_proj(x, y, z, miroir=False):
+    """Un point du monde -> (colonne, ligne) ; en miroir, son reflet sous l'eau."""
+    import numpy as np
+    y = -np.asarray(y, float) if miroir else np.asarray(y, float)
+    return 32 + np.asarray(x, float) * PONT_F / z, PONT_HZ - (y - PONT_CY) * PONT_F / z
+
+
+def _pont_axe(s, lat=0.0):
+    """Le point (x, z) a l'abscisse s le long du pont, decale de lat en travers."""
+    ox, oz = PONT_O
+    dx, dz = PONT_D
+    return ox + s * dx + lat * (-dz), oz + s * dz + lat * dx
+
+
+def _pont_semer(img, ys, xs, couleurs):
+    """Pose des points a des positions pas entieres, partages entre les quatre pixels voisins (des traits lisses)."""
+    import numpy as np
+    ys, xs = (np.ravel(v) for v in np.broadcast_arrays(np.asarray(ys, float) - 0.5, np.asarray(xs, float) - 0.5))
+    c = np.broadcast_to(np.asarray(couleurs, float), (len(ys), 3))
+    y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+    fy, fx = ys - y0, xs - x0
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        ok = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+        for k in range(3):
+            np.add.at(img[..., k], (yy[ok], xx[ok]), (w * c[:, k])[ok])
+
+
+def _pont_trait(img, ys, xs, couleur):
+    """Un trait le long de points serres : chaque point pese la longueur qu'il couvre a l'ecran (le trait garde
+    le meme eclat de pres comme de loin, ou les points se tassent)."""
+    import numpy as np
+    ys, xs = np.broadcast_arrays(np.asarray(ys, float), np.asarray(xs, float))
+    pas = np.hypot(np.gradient(ys, axis=-1), np.gradient(xs, axis=-1))
+    _pont_semer(img, ys, xs, np.ravel(pas)[:, None] * np.asarray(couleur, float)[None, :])
+
+
+def _pont_structure(miroir):
+    """Le pont fixe (pylones, tablier, cables, suspentes, lampadaires) : (couleur, couverture, lumieres)."""
+    import numpy as np
+    Y, X = _xy()
+    coul, couv, lum = np.zeros((64, 64, 3)), np.zeros((64, 64)), np.zeros((64, 64, 3))
+    # le tablier : une bande, de -48 a +40, avec sa ligne de diodes
+    s = np.linspace(-50, 42, 1400)
+    x, z = _pont_axe(s, -1.5)
+    c0, yh = _pont_proj(x, PONT_TABLIER + 0.4, z, miroir)
+    _, yb = _pont_proj(x, PONT_TABLIER - 0.5, z, miroir)
+    ok = (c0 >= -1) & (c0 < 65)
+    xc = np.arange(64) + 0.5                                                   # le tablier, colonne par colonne
+    haut, bas = np.interp(xc, c0, np.minimum(yh, yb)), np.interp(xc, c0, np.maximum(yh, yb))
+    couv = np.clip(np.minimum(Y + 1, bas[None, :]) - np.maximum(Y, haut[None, :]), 0, 1)
+    coul[couv > 0] = (16, 16, 26)
+    _, yd = _pont_proj(x, PONT_TABLIER - 0.15, z, miroir)
+    _pont_trait(lum, yd[ok], c0[ok], np.array([60.0, 140, 255]) * 0.35)          # la ligne de diodes du tablier
+    # les pylones : deux jambes et deux traverses, eclairees par en dessous
+    for sp in PONT_PYLONES:
+        for lat in (-1.6, 1.6):
+            px, pz = _pont_axe(sp, lat)
+            cx_, ytop = _pont_proj(px, PONT_HAUT, pz, miroir)
+            _, ybas = _pont_proj(px, 0.0, pz, miroir)
+            w = 0.9 * PONT_F / pz
+            haut, bas = min(ytop, ybas), max(ytop, ybas)
+            kx = np.clip(np.minimum(X + 1, cx_ + w / 2) - np.maximum(X, cx_ - w / 2), 0, 1)
+            ky = np.clip(np.minimum(Y + 1, bas) - np.maximum(Y, haut), 0, 1)
+            k = kx * ky * (1.0 if lat < 0 else 0.999)
+            hauteur = np.clip(np.abs(PONT_HZ + PONT_CY * PONT_F / pz - (Y + 0.5)) * pz / PONT_F / PONT_HAUT, 0, 1)
+            eclat = 0.95 - 0.6 * hauteur + 0.25 * np.clip(1 - np.abs(X + 0.5 - cx_ + w * 0.25) / max(w * 0.3, 0.4), 0, 1)
+            teinte = np.array([255.0, 195, 120]) * eclat[..., None] * (0.85 if lat > 0 else 1.0)
+            coul = coul * (1 - k[..., None]) + teinte * k[..., None]
+            couv = np.maximum(couv, k)
+        for yt in (PONT_HAUT - 2.0, PONT_TABLIER + 6.0):                        # les traverses
+            xa, za = _pont_axe(sp, -1.6)
+            xb, zb = _pont_axe(sp, 1.6)
+            ca, ya = _pont_proj(xa, yt, za, miroir)
+            cb, yb_ = _pont_proj(xb, yt, zb, miroir)
+            k = np.linspace(0, 1, 30)
+            _pont_semer(lum, ya + (yb_ - ya) * k, ca + (cb - ca) * k, np.array([[255.0, 190, 110]]) * 0.12)
+    # les cables porteurs, leurs lumieres, et les suspentes
+    pts = []
+    for lat in (-1.6, 1.6):
+        s = np.linspace(-50, 42, 900)
+        sp = PONT_PYLONES[1]
+        y = np.where(np.abs(s) <= sp, PONT_TABLIER + 1.2 + (PONT_HAUT - PONT_TABLIER - 1.2) * (s / sp) ** 2,
+                     PONT_TABLIER + 0.5 + (PONT_HAUT - PONT_TABLIER - 0.5) * np.clip((48 - np.abs(s)) / (48 - sp), 0, 1) ** 1.7)
+        x, z = _pont_axe(s, lat)
+        c0, y0 = _pont_proj(x, y, z, miroir)
+        f = 0.3 if lat < 0 else 0.15
+        _pont_trait(coul, y0, c0, np.array([150.0, 160, 190]) * f)
+        sl = np.arange(-46.0, 41.0, 1.6)                                        # les suspentes : de fins traits
+        yl = np.interp(sl, s, y)
+        sl, yl = sl[yl > PONT_TABLIER + 0.8], yl[yl > PONT_TABLIER + 0.8]
+        k = np.linspace(0, 1, 14)[None, :]
+        xs_, zs_ = _pont_axe(sl, lat)
+        cc, yy = _pont_proj(xs_[:, None], PONT_TABLIER + 0.4 + (yl[:, None] - PONT_TABLIER - 0.4) * k, zs_[:, None], miroir)
+        _pont_trait(coul, yy, cc, np.array([110.0, 120, 150]) * 0.12 * (1 if lat < 0 else 0.6))
+        sk = np.arange(-46.0, 41.0, 3.0)
+        pts.append((sk, np.interp(sk, s, y), lat))
+    return coul, np.clip(couv, 0, 1), lum, pts
+
+
+def _scene_pont(p, e, t, ecoule, dt):
+    """Un pont suspendu la nuit : pylones eclaires, cables pointilles de lumiere, voitures, l'eau qui reflete tout, la ville au loin."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    hz = PONT_HZ
+    if "pt" not in e:
+        ciel = _degrade((4, 6, 20), (34, 30, 66), 0, hz)
+        ciel += (np.exp(-np.maximum(hz - Y, 0) / 6.0) * (Y < hz))[..., None] * np.array([60.0, 34, 40])   # la lueur de la ville
+        ville, ville_r = np.zeros((64, 64, 3)), np.zeros((64, 64, 3))
+        x = -150.0
+        while x < 150:                                                         # la ville sur l'autre rive, loin
+            w, h = rng.uniform(2.5, 7), rng.uniform(3, 16) * (1.3 if abs(x) < 50 else 0.8)
+            eclat = 0.5 + 0.5 * rng.random()
+            for miroir, buf in ((False, ville), (True, ville_r)):
+                ca, yt = _pont_proj(x, h, 70.0, miroir)
+                cb, yb = _pont_proj(x + w, 0, 70.0, miroir)
+                c0, c1 = max(0, int(np.floor(ca))), min(64, int(np.ceil(cb)))
+                if c1 <= c0:
+                    continue
+                Xs, Ys = X[:, c0:c1], Y[:, c0:c1]
+                kx = np.clip(np.minimum(Xs + 1, cb) - np.maximum(Xs, ca), 0, 1)
+                ky = np.clip(np.minimum(Ys + 1, max(yt, yb)) - np.maximum(Ys, min(yt, yb)), 0, 1)
+                k = (kx * ky)[..., None]
+                fen = (_v3d_hasard(Xs.astype(int) + int(x * 10), Ys.astype(int), 41) > 0.88)[..., None]
+                buf[:, c0:c1] = buf[:, c0:c1] * (1 - k) + k * (np.array([14.0, 14, 28]) + fen * np.array([150.0, 120, 80]) * eclat)
+            x += w + rng.uniform(0, 2)
+        couv_v = (ville.sum(-1) > 0)[..., None]
+        fond = np.where(couv_v, ville, ciel)
+        coul, couv, lum, cables = _pont_structure(False)
+        coul_r, couv_r, lum_r, _ = _pont_structure(True)
+        base = fond * (1 - couv[..., None]) + coul + lum
+        reflet = np.where((ville_r.sum(-1) > 0)[..., None], ville_r, 0) * (1 - couv_r[..., None]) + coul_r + lum_r
+        libre = (couv < 0.05) & ~couv_v[..., 0] & (Y < hz - 2)
+        ey, ex = np.nonzero(libre)
+        choix = rng.choice(len(ey), min(40, len(ey)), replace=False)
+        voies = [(lat, sens, rng.uniform(-50, 42, 7)) for lat, sens in ((-0.9, 1.0), (-0.35, 1.0), (0.35, -1.0), (0.9, -1.0))]
+        e["pt"] = dict(base=base, reflet=reflet, cables=cables, etoiles=(ey[choix], ex[choix], rng.uniform(0, 6, len(choix))),
+                       voies=voies, vitesses=[rng.uniform(3.0, 4.5) for _ in range(4)])
+    P = e["pt"]
+    img = P["base"].copy()
+    refl = P["reflet"].copy()
+    ey, ex, ep = P["etoiles"]
+    img[ey, ex] += ((0.5 + 0.5 * np.sin(t * 1.9 + ep)) * 70)[:, None] * np.array([0.9, 0.9, 1.0])
+    # les lumieres des cables : une onde lente qui les parcourt ; les feux rouges en haut des pylones
+    for sk, yk, lat in P["cables"]:
+        x, z = _pont_axe(sk, lat)
+        f = (0.45 + 0.55 * np.sin(sk * 0.22 - t * 0.7)) * (1.0 if lat < 0 else 0.3) * np.clip((44 - np.abs(sk)) / 16, 0.2, 1)
+        c = f[:, None] * np.array([210.0, 230, 255])
+        for miroir, buf in ((False, img), (True, refl)):
+            cc, yy = _pont_proj(x, yk + 0.1, z, miroir)
+            _pont_semer(buf, yy, cc, c)
+    for sp in PONT_PYLONES:
+        x, z = _pont_axe(sp, -1.6)
+        f = 0.5 + 0.5 * np.sin(t * 1.5 + sp)
+        for miroir, buf in ((False, img), (True, refl)):
+            cc, yy = _pont_proj(x, PONT_HAUT + 0.6, z, miroir)
+            _v3d_tache(buf, float(yy), float(cc), 0.7, (255, 40, 30), f)
+    # les voitures : des phares blancs vers la droite, des feux rouges vers la gauche
+    for (lat, sens, s), v in zip(P["voies"], P["vitesses"]):
+        s += sens * v * min(dt, 0.5)
+        s[:] = np.where(s > 42, s - 92, np.where(s < -50, s + 92, s))
+        x, z = _pont_axe(s, lat)
+        c = (np.array([255.0, 240, 210]) if sens > 0 else np.array([255.0, 40, 40])) * np.clip(30.0 / z, 0.4, 1.0)[:, None]
+        for miroir, buf in ((False, img), (True, refl)):
+            cc, yy = _pont_proj(x, PONT_TABLIER + 0.75, z, miroir)
+            _pont_semer(buf, yy, cc, c * (0.8 if miroir else 0.9))
+    # l'eau : le reflet, etire vers le bas, qui ondule de plus en plus fort pres de nous
+    eau = Y >= hz
+    prof = np.clip((Y + 0.5 - hz) / (64 - hz), 0, 1)
+    ampl = 0.3 + 2.2 * prof
+    dx = ampl * np.sin(Y * 1.9 + t * 1.4 + np.sin(X * 0.21 + t * 0.6) * 1.5) + 0.6 * np.sin(Y * 0.7 - t * 0.9)
+    sx = np.clip((X + dx).astype(int), 0, 63)
+    sy = np.clip((Y + np.sin(X * 0.4 + Y * 1.3 + t * 2.1) * prof * 1.2).astype(int), 0, 63)
+    r = refl[sy, sx]
+    c = np.cumsum(np.concatenate([np.zeros((1, 64, 3)), r], 0), 0)        # etire vers le bas : chaque ligne reprend les 3 d'avant
+    n = np.arange(64)
+    r = r * 0.45 + (c[1:] - c[np.maximum(n - 3, 0)]) / np.minimum(n + 1, 4)[:, None, None] * 0.55
+    fond_eau = np.array([6.0, 10, 26]) * (1 - prof[..., None]) + np.array([3.0, 5, 14]) * prof[..., None]
+    scintille = (0.5 + 0.5 * np.sin(X * 0.9 + Y * 2.3 - t * 2.0 + np.sin(Y * 0.5 + t) * 2)) ** 6 * 12
+    img = np.where(eau[..., None], fond_eau + r * (0.75 - 0.35 * prof[..., None]) + scintille[..., None] * np.array([0.6, 0.7, 1.0]), img)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 6. La grande roue : tout en coordonnees polaires autour du moyeu. Les rayons et la jante portent des
+# ampoules ; quatre motifs de lumiere se relaient en fondu ; les nacelles pendent, toujours a l'aplomb.
+
+ROUE_C, ROUE_R, ROUE_N, ROUE_SOL = (32.0, 24.0), 19.5, 16, 53
+
+
+def _scene_grande_roue(p, e, t, ecoule, dt):
+    """Une grande roue illuminee qui tourne lentement la nuit, ses motifs de lumiere, ses nacelles, son reflet sur le sol mouille."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    cx, cy = ROUE_C
+    R, N, sol = ROUE_R, ROUE_N, ROUE_SOL
+    if "gr_fond" not in e:
+        fond = _degrade((6, 6, 24), (40, 20, 58), 0, sol)
+        fond += (np.exp(-np.maximum(sol - Y, 0) / 7.0) * (Y < sol))[..., None] * np.array([40.0, 18, 30])
+        ciel = np.zeros((64, 64, 3))
+        ey, ex = rng.integers(0, 40, 40), rng.integers(0, 64, 40)
+        loin = np.hypot(ex - cx, ey - cy) > R + 3
+        e["gr_etoiles"] = (ey[loin], ex[loin], rng.uniform(0, 6, int(loin.sum())))
+        # la charpente : deux jambes du moyeu au sol, et des baraques
+        for pied in (cx - 12, cx + 12):
+            d = np.abs((X + 0.5 - cx) * (sol - cy) - (pied - cx) * (Y + 0.5 - cy)) / np.hypot(sol - cy, pied - cx)
+            jambe = (np.clip(1.2 - d, 0, 1) * (Y + 0.5 > cy) * (Y < sol))[..., None]
+            fond = fond * (1 - jambe) + jambe * np.array([20.0, 16, 30])
+        for x0, x1, h, c in ((3, 13, 47, (255, 160, 80)), (51, 61, 48, (255, 120, 170))):
+            baraque = (X >= x0) & (X < x1) & (Y >= h) & (Y < sol)
+            fond[baraque] = (10, 8, 18)
+            toit = (X >= x0 - 1) & (X < x1 + 1) & (Y >= h - 2) & (Y < h) & ~((Y == h - 2) & ((X == x0 - 1) | (X == x1)))
+            fond[toit] = np.where((((X[toit] - x0) // 2) % 2 == 0)[:, None], np.array([170.0, 40, 60]), np.array([190.0, 180, 170])) * 0.5
+            comptoir = (X >= x0 + 1) & (X < x1 - 1) & (Y >= h + 1) & (Y < h + 3)
+            fond[comptoir] = np.array(c, float) * 0.55
+            fond += (np.exp(-((X + 0.5 - (x0 + x1) / 2) / 6.0) ** 2 - ((Y + 0.5 - h - 3) / 3.0) ** 2) * (Y >= h + 3))[..., None] * np.array(c, float) * 0.12
+        e["gr_fond"] = fond
+        e["gr_r"] = np.hypot(X + 0.5 - cx, Y + 0.5 - cy)
+        e["gr_a"] = np.arctan2(Y + 0.5 - cy, X + 0.5 - cx)
+    img = e["gr_fond"].copy()
+    ey, ex, ep = e["gr_etoiles"]
+    img[ey, ex] += ((0.5 + 0.5 * np.sin(t * 1.7 + ep)) * 80)[:, None] * np.array([0.85, 0.85, 1.0])
+    r, a = e["gr_r"], e["gr_a"]
+    th = ecoule * 2 * np.pi / 110.0 + e.setdefault("gr_phase", float(rng.uniform(0, 6.3)))   # un tour en 110 s
+    pas = 2 * np.pi / N
+    da = (a - th + pas / 2) % pas - pas / 2                                      # l'ecart au rayon le plus proche
+    k_rayon = np.round((a - th - da) / pas).astype(int) % N
+    rayon = np.clip(1.25 - np.abs(r * np.sin(da)) / 0.6, 0, 1) * (r > 2.5) * (r < R)
+    jante = np.clip(1 - np.abs(r - R) / 0.7, 0, 1) + 0.55 * np.clip(1 - np.abs(r - R + 2.2) / 0.6, 0, 1)
+    # les ampoules : des points le long des rayons et de la jante
+    ampoule_r = 0.55 + 0.45 * np.cos(2 * np.pi * r / 2.6)
+    ampoule_j = 0.5 + 0.5 * np.cos((a - th) * 48)
+    # quatre motifs, en fondu enchaine : arc-en-ciel qui tourne, vagues vers le dehors, rayons alternes, spirale
+    m = (ecoule / 16.0 + e["gr_phase"]) % 4
+    poids = [np.clip(1 - min(abs(m - i), 4 - abs(m - i)) / 1.0, 0, 1) for i in range(4)]
+    hue = (a - th) / (2 * np.pi) + t * 0.04
+    c1 = _teintes(hue, 0.75, 1.0).astype(float)
+    v1 = np.ones_like(r)
+    c2 = np.zeros((64, 64, 3)) + np.array([255.0, 200, 120])
+    v2 = 0.4 + 0.9 * np.clip(np.cos(2 * np.pi * (r / 7.0 - t * 0.35)), 0, 1) ** 2
+    alt = (0.5 + 0.5 * np.cos(np.pi * k_rayon + t * 0.7))[..., None]           # un rayon sur deux, qui s'echangent en fondu
+    c3 = np.array([255.0, 50, 170]) * alt + np.array([50.0, 210, 255]) * (1 - alt)
+    v3 = 0.6 + 0.4 * np.sin(t * 1.2 + k_rayon * 0.4)
+    c4 = _teintes(0.55 + 0.25 * np.sin(r / R * 3 - t * 0.3), 0.6, 1.0).astype(float)
+    v4 = 0.2 + 0.8 * np.clip(np.cos(2 * np.pi * (r / R * 0.9 + (a - th) / (2 * np.pi) - t * 0.12)), 0, 1) ** 3
+    couleur = c1 * poids[0] + c2 * poids[1] + c3 * poids[2] + c4 * poids[3]
+    valeur = v1 * poids[0] + v2 * poids[1] + v3 * poids[2] + v4 * poids[3]
+    lum = (rayon * ampoule_r * valeur * 1.25)[..., None] * couleur
+    lum += (jante * (0.45 + 0.55 * ampoule_j) * (0.6 + 0.4 * valeur))[..., None] * np.array([255.0, 215, 150])
+    moyeu = np.clip(2.2 - r, 0, 1)
+    lum += moyeu[..., None] * np.array([255.0, 220, 170]) * 0.8
+    img = img * (1 - np.clip(rayon + jante, 0, 1)[..., None] * 0.7) + lum
+    # les nacelles : accrochees a la jante, elles pendent droit
+    for k in range(N):
+        ak = th + k * pas
+        px, py = cx + R * np.cos(ak), cy + R * np.sin(ak)
+        x0, y0 = px - 1.5, py + 1.0
+        xa, xb, ya, yb = int(np.floor(x0)), int(np.floor(x0)) + 4, int(np.floor(y0)), int(np.floor(y0)) + 4
+        fx, fy = x0 - np.floor(x0), y0 - np.floor(y0)
+        if xa < 0 or ya < 0 or xb > 64 or yb > 64:
+            continue
+        wx = np.array([1 - fx, 1, 1, fx])                                          # un petit carre, glisse au sous-pixel
+        wy = np.array([1 - fy, 1, 1, fy])
+        k2 = wy[:, None] * wx[None, :]
+        teinte = np.array(((255, 70, 90), (255, 190, 60), (70, 200, 255), (190, 100, 255))[k % 4], float)
+        cabine = np.array([[0.0, 1.0, 1.0, 0.0], [0.5, 2.0, 2.0, 0.5], [0.5, 2.0, 2.0, 0.5], [0.0, 0.6, 0.6, 0.0]])
+        coul = np.where((cabine > 1.5)[..., None], np.array([255.0, 205, 130]) * 0.7, teinte * cabine[..., None] * 0.6)
+        k2 = k2 * (cabine > 0)
+        zone = img[ya:yb, xa:xb]
+        img[ya:yb, xa:xb] = zone * (1 - k2[..., None]) + coul * k2[..., None]
+    # des guirlandes entre des mats, et les comptoirs des baraques qui brillent
+    for x0, x1, y0 in ((0.0, 20.0, 42.0), (44.0, 64.0, 43.0)):
+        s = np.linspace(0, 1, 9)
+        gx = x0 + (x1 - x0) * s
+        gy = y0 + 3.0 * 4 * s * (1 - s) + 0.3 * np.sin(t * 0.9 + gx * 0.2)
+        ph = np.arange(9) + t * 1.2                                              # les couleurs passent d'ampoule en ampoule, en fondu
+        tons = np.array([(255, 70, 60), (255, 210, 70), (80, 255, 140), (80, 160, 255)], float)
+        f = (ph % 1)[:, None]
+        f = f * f * (3 - 2 * f)
+        cs = tons[np.floor(ph).astype(int) % 4] * (1 - f) + tons[(np.floor(ph).astype(int) + 1) % 4] * f
+        _pointer(img, gy, gx, cs * 0.9)
+        _pointer(img, gy, gx + 1, cs * 0.25)
+    halo = _v3d_flou(np.clip(img - 60, 0, None), 2, 2)
+    img += halo * 0.6
+    # le sol mouille : le reflet de tout cela, retourne, sombre, qui ondule
+    eau = Y >= sol
+    yy = np.clip(2 * sol - 1 - Y + np.round(np.sin(X * 0.5 + Y * 1.3 + t * 1.6) * 0.6).astype(int), 0, sol - 1)
+    xx = np.clip(X + np.round(np.sin(Y * 1.7 - t * 1.2 + X * 0.15) * (Y - sol) * 0.12).astype(int), 0, 63).astype(int)
+    reflet = img[yy.astype(int), xx]
+    img = np.where(eau[..., None], np.array([8.0, 6, 16]) + reflet * (0.5 - (Y - sol) * 0.025)[..., None], img)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 7. Les montagnes en "voxel space" : une carte des hauteurs et une carte des couleurs (eclairees une fois
+# par le soleil couchant, ombres portees comprises), qui se raccordent sur leurs bords. Pour chaque colonne,
+# on lit le terrain de pres vers le loin ; un pixel montre le premier relief qui monte jusqu'a lui. Au loin,
+# on lit des cartes adoucies (sinon le relief grouille), et la brume prend la couleur du ciel.
+
+VOXEL_N, VOXEL_F, VOXEL_NIVEAUX = 256, 40.0, 5
+VOXEL_SOLEIL = 2.6                       # l'azimut du soleil couchant (radians)
+
+
+def _voxel_cartes(rng):
+    """Le terrain (periodique, par FFT) et ses cartes adoucies : (niveaux, N, N, 4) = hauteur + couleur."""
+    import numpy as np
+    n = VOXEL_N
+    kx, ky = np.fft.fftfreq(n)[:, None], np.fft.rfftfreq(n)[None, :]
+    k = np.hypot(kx, ky)
+    k[0, 0] = 1.0
+    spectre = (rng.normal(size=k.shape) + 1j * rng.normal(size=k.shape)) / k ** 2.0 * (1 - np.exp(-(k / 0.016) ** 2))
+    spectre[0, 0] = 0
+    h = np.fft.irfft2(spectre, s=(n, n))
+    h = (h - h.min()) / (h.max() - h.min())
+    h = h ** 1.6 * 50.0                                                         # des sommets, des vallees
+    eau = 4.0
+    lac = h < eau
+    h = np.maximum(h, eau)
+    # l'eclairage : le soleil bas, a l'azimut VOXEL_SOLEIL ; une ombre portee le long de ses rayons
+    sx, sy = np.cos(VOXEL_SOLEIL), np.sin(VOXEL_SOLEIL)
+    gx = (np.roll(h, -1, 1) - np.roll(h, 1, 1)) / 2
+    gy = (np.roll(h, -1, 0) - np.roll(h, 1, 0)) / 2
+    nz = 1 / np.sqrt(gx ** 2 + gy ** 2 + 1)
+    elev = 0.16
+    lambert = np.clip((-gx * sx - gy * sy) * nz * np.cos(elev) + nz * np.sin(elev), 0, 1)
+    ombre = np.zeros((n, n))
+    for d in range(1, 40, 2):
+        decale = np.roll(np.roll(h, -int(round(d * sy)), 0), -int(round(d * sx)), 1)
+        ombre = np.maximum(ombre, np.clip((decale - h - d * np.tan(elev)) / 3.0, 0, 1))
+    soleil = lambert * (1 - ombre)
+    hn = h / 50.0
+    pente = np.clip(np.hypot(gx, gy) / 2.5, 0, 1)
+    albedo = np.array([0.42, 0.46, 0.34]) * (1 - pente[..., None]) + np.array([0.62, 0.52, 0.46]) * pente[..., None]
+    neige = np.clip((hn - 0.58) / 0.12, 0, 1)[..., None] * (1 - pente[..., None] * 0.5)
+    albedo = albedo * (1 - neige) + np.array([1.0, 0.95, 0.98]) * neige
+    couleur = albedo * (soleil[..., None] * np.array([255.0, 160, 80]) * 1.5 + np.array([48.0, 48, 104]) * (0.55 + 0.45 * hn[..., None]))
+    couleur[lac] = (150.0, 80, 95)                                             # les lacs : le ciel rose dedans
+    cartes = np.concatenate([h[..., None], couleur], -1).astype(np.float32)
+    F = np.fft.rfft2(cartes, axes=(0, 1))
+    k = k.astype(np.float32)
+    niveaux = []
+    for l in range(VOXEL_NIVEAUX):                                             # des cartes de plus en plus douces
+        s = 0.5 * 2 ** l if l else 0.0
+        k[0, 0] = 0.0
+        niveaux.append(np.fft.irfft2(F * np.exp(-2 * (np.pi * s * k) ** 2)[..., None], s=(n, n), axes=(0, 1)).astype(np.float32))
+    return np.stack(niveaux)
+
+
+def _voxel_lire(cartes, lev, x, y):
+    """Lit les cartes (hauteur + couleur) au niveau de douceur lev (fractionnaire), en (x, y) : bilineaire, raccorde."""
+    import numpy as np
+    n = VOXEL_N
+    l0 = np.minimum(np.floor(lev).astype(int), VOXEL_NIVEAUX - 2)
+    fl = (lev - l0)[..., None]
+    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
+    fx, fy = (x - x0)[..., None], (y - y0)[..., None]
+    x0, y0, x1, y1 = x0 % n, y0 % n, (x0 + 1) % n, (y0 + 1) % n
+    out = 0
+    for l, wl in ((l0, 1 - fl), (l0 + 1, fl)):
+        a = cartes[l, y0, x0] * (1 - fx) + cartes[l, y0, x1] * fx
+        b = cartes[l, y1, x0] * (1 - fx) + cartes[l, y1, x1] * fx
+        out = out + (a * (1 - fy) + b * fy) * wl
+    return out
+
+
+def _scene_voxel(p, e, t, ecoule, dt):
+    """Un vol au ras des montagnes au coucher du soleil (voxel space) : sommets dores, vallees dans l'ombre, brume au loin."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "vx_cartes" not in e:
+        e["vx_cartes"] = _voxel_cartes(rng)
+        e["vx_depart"] = (float(rng.uniform(0, VOXEL_N)), float(rng.uniform(0, VOXEL_N)), float(rng.uniform(0, 100)))
+        z = 1.2 * 1.042 ** np.arange(120)
+        e["vx_z"] = z[z < 260]
+    cartes, Z = e["vx_cartes"], e["vx_z"]
+    F, K = VOXEL_F, len(Z)
+    x0, y0, ph = e["vx_depart"]
+    tau = ecoule + ph
+    cap0 = VOXEL_SOLEIL - 0.95                                                  # le soleil sur le cote : il dore les pentes
+    u, w = np.array([np.cos(cap0), np.sin(cap0)]), np.array([-np.sin(cap0), np.cos(cap0)])
+    v = 7.0
+    lat, dlat = 40 * np.sin(tau * 0.045) + 7 * np.sin(tau * 0.12), 40 * 0.045 * np.cos(tau * 0.045) + 7 * 0.12 * np.cos(tau * 0.12)
+    cx, cy = np.array([x0, y0]) + u * v * tau + w * lat
+    cap = cap0 + np.arctan2(dlat, v)
+    fx, fy = np.cos(cap), np.sin(cap)
+    dd = np.array([0.0, 10, 20, 32, 45])
+    sol = _voxel_lire(cartes, np.full(5, 3.5), cx + fx * dd, cy + fy * dd)[:, 0]
+    haut = float(np.max(sol - dd * 0.1)) + 12.0                                # on suit le relief, en voyant venir les cretes
+    hz = 21.0 + 1.5 * np.sin(tau * 0.07)
+    sx = (np.arange(64) - 31.5) / F
+    wx = cx + Z[:, None] * (fx - fy * sx[None, :])
+    wy = cy + Z[:, None] * (fy + fx * sx[None, :])
+    lev = np.clip(np.log2(np.maximum(Z * 0.055, 1.0)), 0, VOXEL_NIVEAUX - 1.001)[:, None] * np.ones((1, 64))
+    lu = _voxel_lire(cartes, lev, wx, wy)                                       # (K, 64, 4)
+    sommet = hz + (haut - lu[..., 0]) * F / Z[:, None]
+    # le premier relief qui monte jusqu'a chaque demi-ligne (deux par pixel, pour adoucir les cretes)
+    rk = np.clip(np.ceil(np.minimum.accumulate(sommet, axis=0) * 2 - 0.5), 0, 128).astype(np.int64)
+    premier = np.full((129, 64), K, np.int64)
+    np.minimum.at(premier, (rk, np.broadcast_to(np.arange(64), (K, 64))), np.broadcast_to(np.arange(K)[:, None], (K, 64)))
+    k = np.minimum.accumulate(premier, axis=0)[:128]
+    vu = k < K
+    kk = np.minimum(k, K - 1)
+    col = np.arange(64)[None, :]
+    couleur = lu[kk, col, 1:]
+    z = Z[kk]
+    # le ciel : du violet au rose, orange vers le soleil ; et la brume qui en prend la couleur
+    ys = (np.arange(128)[:, None] + 0.5) / 2
+    az = cap + np.arctan(sx)[None, :]
+    vers_soleil = np.clip(np.cos(az - VOXEL_SOLEIL), 0, 1) ** 3
+    el = (hz - ys) / F
+    kc = np.clip(el / 0.55, 0, 1)
+    ciel = (np.array([255.0, 140, 70]) * (1 - kc[..., None]) ** 3 * (0.55 + 0.45 * vers_soleil[..., None])
+            + np.array([150.0, 70, 110]) * ((1 - kc[..., None]) ** 1.2 - (1 - kc[..., None]) ** 3).clip(0) * 1.3
+            + np.array([22.0, 22, 62]) * kc[..., None])
+    soleil_x, soleil_y = 31.5 + np.tan(VOXEL_SOLEIL - cap) * -F * -1, hz - 0.07 * F
+    d = np.hypot(np.arange(64)[None, :] + 0.5 - soleil_x, ys - soleil_y)
+    if abs(VOXEL_SOLEIL - cap) < 1.2:
+        ciel += (np.clip(3.2 - d, 0, 1)[..., None] * np.array([255.0, 230, 170]) + np.exp(-d / 7.0)[..., None] * np.array([120.0, 60, 25]))
+    nuages = 0.5 + 0.5 * np.sin(az * 9 + np.sin(az * 3) * 2 + el * 4)[..., None] * np.sin(el * 60 + az * 4)[..., None]
+    ciel += (np.clip(nuages - 0.55, 0, 1) * 1.6 * np.exp(-((el - 0.12) / 0.06) ** 2)[..., None]) * np.array([255.0, 120, 110]) * 0.5
+    brume_c = np.array([200.0, 120, 100]) * (0.45 + 0.55 * vers_soleil[..., None]) + np.array([20.0, 10, 30])
+    voile = (1 - np.exp(-z / 190.0))[..., None] ** 1.3
+    terrain = couleur * (1 - voile) + brume_c * voile
+    img2 = np.where(vu[..., None], terrain, ciel)
+    img = (img2[0::2] + img2[1::2]) / 2
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 8. L'ocean : chaque pixel sous l'horizon voit un point de la mer ; la mer est une somme de vagues (leur
+# pente donne la normale). On renvoie le ciel dans la direction du reflet, et la lune quand le reflet la
+# vise : de pres, des eclats sur les vagues ; au loin, les vagues trop petites pour un pixel sont retirees, et
+# leur pente passe dans le flou du reflet -- le chemin de lune s'elargit et s'adoucit, sans grouiller.
+
+OCEAN_F = 40.0
+OCEAN_LUNE = (0.13, 0.24)                # la lune : azimut (a droite), hauteur (radians)
+
+
+def _scene_ocean(p, e, t, ecoule, dt):
+    """La surface de l'ocean la nuit, en perspective : la houle, la lune et son chemin de lumiere qui scintille, l'horizon."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    F = OCEAN_F
+    if "oc_vagues" not in e:
+        n = 10
+        lam = 14.0 * 0.62 ** np.arange(n)                                         # de la houle aux vaguelettes
+        ang = 1.75 + rng.normal(0, 0.45, n)                                       # elles viennent vers nous, un peu de biais
+        k = 2 * np.pi / lam
+        e["oc_vagues"] = (k * np.cos(ang), k * np.sin(ang), lam * rng.uniform(0.011, 0.02, n), np.sqrt(3.2 * k),
+                          rng.uniform(0, 2 * np.pi, n))
+        ey, ex = rng.integers(0, 22, 50), rng.integers(0, 64, 50)
+        e["oc_etoiles"] = (ey, ex, rng.uniform(0, 6, 50), rng.uniform(0.3, 1, 50))
+    kx, kz, amp, om, ph = e["oc_vagues"]
+    cy = 3.0 + 0.12 * np.sin(t * 0.37)
+    hz = 25.0 + 0.5 * np.sin(t * 0.29)
+    sx = X + 0.5 - 32
+    sy = Y + 0.5 - hz
+    # le ciel : bleu nuit, plus clair vers l'horizon ; la lune et son halo
+    ma, mh = OCEAN_LUNE
+    def ciel(dx, dy, dz):
+        el = np.arcsin(np.clip(dy / np.sqrt(dx * dx + dy * dy + dz * dz), -1, 1))
+        k = np.clip(el / 0.5, 0, 1)
+        c = np.array([30.0, 40, 72]) * (1 - k[..., None]) ** 2 + np.array([5.0, 7, 20]) * (1 - (1 - k[..., None]) ** 2)
+        az = np.arctan2(dx, dz)
+        d = np.hypot(az - ma, el - mh)
+        return c + np.exp(-d / 0.12)[..., None] * np.array([40.0, 46, 60]) + np.exp(-d / 0.035)[..., None] * np.array([40.0, 40, 40])
+    img = ciel(sx / F, -sy / F, np.ones_like(sx))
+    ey, ex, ep, el_ = e["oc_etoiles"]
+    _pointer(img, ey, ex, (el_ * (0.5 + 0.5 * np.sin(t * 1.8 + ep)) * 160)[:, None] * np.array([0.9, 0.92, 1.0]))
+    lx, ly = 32 + np.tan(ma) * F, hz - np.tan(mh) * F
+    dl = np.hypot(X + 0.5 - lx, Y + 0.5 - ly)
+    disque = np.clip(3.3 - dl, 0, 1)
+    mers = 0.82 + 0.18 * np.sin((X - lx) * 1.7 + 1) * np.sin((Y - ly) * 2.1)       # ses mers, a peine
+    img = img * (1 - disque[..., None]) + disque[..., None] * np.array([235.0, 232, 215]) * mers[..., None]
+    # la mer
+    mer = sy > 0.0
+    s = cy * F / np.maximum(sy, 0.05)
+    gx, gz = sx * s / F, s
+    pied_x, pied_z = s / F, s * s / (F * cy)
+    dhx, dhz, var_x, var_z = np.zeros_like(s), np.zeros_like(s), np.zeros_like(s), np.zeros_like(s)
+    for i in range(len(kx)):
+        alias = np.abs(kx[i]) * pied_x + np.abs(kz[i]) * pied_z                   # combien de la vague tient dans un pixel
+        garde = np.exp(-(alias / 2.2) ** 2)
+        phase = kx[i] * gx + kz[i] * gz - om[i] * t + ph[i]
+        c = np.cos(phase) * amp[i] * garde
+        dhx += c * kx[i]
+        dhz += c * kz[i]
+        perdu = (amp[i] ** 2) * 0.5 * (1 - garde ** 2)                            # la pente qu'on ne voit plus : du flou
+        var_x += perdu * kx[i] ** 2
+        var_z += perdu * kz[i] ** 2
+    nrm = np.sqrt(dhx ** 2 + 1 + dhz ** 2)
+    nx, ny, nz = -dhx / nrm, 1 / nrm, -dhz / nrm
+    dl_ = np.sqrt(sx ** 2 + sy ** 2 + F ** 2)
+    vx, vy, vz = sx / dl_, -sy / dl_, F / dl_                                       # le rayon qui part de l'oeil
+    dn = vx * nx + vy * ny + vz * nz
+    rx, ry, rz = vx - 2 * dn * nx, vy - 2 * dn * ny, vz - 2 * dn * nz
+    ry = np.abs(ry)
+    fresnel = (0.02 + 0.98 * np.clip(1 + dn, 0, 1) ** 5)[..., None]
+    reflet = ciel(rx, ry, rz)
+    sa, se = 0.0011 + 4 * var_x, 0.0045 + 4 * var_z                                # l'etalement du reflet, en travers et en hauteur
+    d_az = np.arctan2(rx, rz) - ma
+    d_el = np.arcsin(np.clip(ry / np.sqrt(rx ** 2 + ry ** 2 + rz ** 2), -1, 1)) - mh
+    eclat = np.exp(-(d_az ** 2 / (2 * sa) + d_el ** 2 / (2 * se))) * (0.0011 * 0.0045 / (sa * se)) ** 0.22
+    garde = np.exp(-(4.5 * pied_z / 2.2) ** 2)                                  # des eclats qui courent en travers du chemin
+    eclat *= 1 + 0.9 * garde * np.sin(gz * 4.5 - t * 1.7 + 2 * np.sin(gx * 1.3 + t * 0.6))
+    eau = np.array([3.0, 7, 18]) * (1 - fresnel) + reflet * fresnel * 0.7
+    eau += eclat[..., None] * np.array([255.0, 240, 205]) * 1.6
+    eau += (np.clip(-dhz * 3, 0, 1) * 6)[..., None] * np.array([0.4, 0.7, 1.0])        # les dos des vagues, un rien plus clairs
+    couv = np.clip(sy + 0.5, 0, 1)[..., None]                                      # l'horizon, net mais lisse
+    img = np.where((sy > -0.5)[..., None], img * (1 - couv) + eau * couv, img)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
 # Les ambiances d'abord (la page les montre dans cet ordre), puis les jeux de lumiere.
 ECRANS = {
     "aurore": ("Aurore boreale", _ecran_aurore),
@@ -19149,13 +22522,17 @@ ECRANS_AMBIANCES = ("aurore", "aurore_lac", "coucher", "lucioles", "nebuleuse", 
 
 
 DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur ou None, titre), ...)), ...))
-    ("sous_l_eau", "Sous l'eau : recif, abysses, banc de poissons, kelp, baleine", (
+    ("sous_l_eau", "Sous l'eau : recif, abysses, banc de poissons, kelp, baleine, grande meduse, raie manta, tortue", (
         ("recif", _scene_recif, (("tropical", "Recif de corail"), ("nuit", "Recif la nuit"))),
         ("abysses", _scene_abysses, (("bleu", "Abysses"), ("violet", "Abysses violettes"))),
         ("banc", _scene_banc, (("lagune", "Banc de poissons"), ("ocean", "Banc au large"))),
         ("kelp", _scene_kelp, (("emeraude", "Foret de kelp"), ("dore", "Kelp au soleil"))),
-        ("baleine", _scene_baleine, (("bleu", "Baleine"), ("plancton", "Baleine et plancton"))))),
-    ("ciel_et_eau", "Le ciel et l'eau : nuages, orage, pluie sur la vitre, surface, etang, plage, cascade", (
+        ("baleine", _scene_baleine, (("bleu", "Baleine"), ("plancton", "Baleine et plancton"))),
+        ("grande_meduse", _scene_grande_meduse, ((None, "Grande meduse"),)),
+        ("manta", _scene_manta, ((None, "Raie manta"),)),
+        ("tortue", _scene_tortue, ((None, "Tortue de mer"),)))),
+    ("ciel_et_eau", "Le ciel et l'eau : nuages, orage, pluie sur la vitre, surface, etang, plage, cascade, mer de "
+                    "nuages, hublot, arc-en-ciel, lever de lune, ocean", (
         ("nuages", _scene_nuages, (("ete", "Nuages d'ete"), ("coucher", "Nuages au couchant"),
                                    ("orage", "Nuages d'orage"), ("neon", "Nuages neon"))),
         ("orage", _scene_orage, (("campagne", "Orage sur la campagne"), ("ville", "Orage sur la ville"))),
@@ -19164,15 +22541,28 @@ DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur ou 
         ("surface", _scene_surface, (("piscine", "Fond de piscine"), ("lagon", "Lagon"), ("lune", "Eau sous la lune"))),
         ("etang", _scene_etang, (("jour", "Etang aux carpes"), ("nuit", "Etang la nuit"))),
         ("plage", _scene_plage, (("jour", "Plage"),)),
-        ("cascade", _scene_cascade, (("jungle", "Cascade dans la jungle"), ("lune", "Cascade sous la lune"))))),
-    ("villes", "Les villes : rues et voitures, autoroute, grille neon, train de nuit", (
+        ("cascade", _scene_cascade, (("jungle", "Cascade dans la jungle"), ("lune", "Cascade sous la lune"))),
+        ("mer_de_nuages", _scene_mer_de_nuages, ((None, "Mer de nuages"),)),
+        ("hublot", _scene_hublot, ((None, "Hublot de nuit"),)),
+        ("arc_en_ciel", _scene_arc_en_ciel, ((None, "Arc-en-ciel"),)),
+        ("lever_de_lune", _scene_lever_de_lune, ((None, "Lever de lune"),)),
+        ("ocean", _scene_ocean, ((None, "Ocean au clair de lune"),)))),
+    ("villes", "Les villes : rues et voitures, autoroute, grille neon, train de nuit, la ville cyberpunk en 3D, le "
+               "survol, la ruelle neon, le pare-brise sous la pluie, le pont, la grande roue", (
         ("ville", _scene_ville, (("nuit", "Ville la nuit"), ("neon", "Ville neon sous la pluie"),
                                  ("aube", "Ville a l'aube"), ("brume", "Ville dans la brume"))),
         ("autoroute", _scene_autoroute, (("nuit", "Autoroute de nuit"), ("neon", "Autoroute neon"))),
         ("synthwave", _scene_synthwave, (("magenta", "Grille neon"), ("cyan", "Grille neon cyan"))),
-        ("train", _scene_train, (("nuit", "Train de nuit"), ("neige", "Train dans la neige"))))),
+        ("train", _scene_train, (("nuit", "Train de nuit"), ("neige", "Train dans la neige"))),
+        ("cyber_3d", _scene_cyber_3d, ((None, "Ville cyberpunk 3D"),)),
+        ("survol", _scene_survol, ((None, "Survol de la ville"),)),
+        ("ruelle", _scene_ruelle, ((None, "Ruelle neon sous la pluie"),)),
+        ("pare_brise", _scene_pare_brise, ((None, "Pare-brise sous la pluie"),)),
+        ("pont", _scene_pont, ((None, "Pont suspendu la nuit"),)),
+        ("grande_roue", _scene_grande_roue, ((None, "Grande roue illuminee"),)))),
     ("paysages", "Les paysages : collines, grand nord, feu de camp, ble, dunes, cerisiers, champignons, cristaux, "
-                 "volcan, phare, etourneaux", (
+                 "volcan, phare, etourneaux, village sous la neige, herbes, plaine, montagne, savane, eoliennes, "
+                 "montgolfieres, voilier, foret, jardin zen, vol sur les montagnes", (
         ("couches", _scene_couches, (("automne", "Collines d'automne"), ("lavande", "Collines lavande"),
                                      ("nuit", "Collines la nuit"), ("nordique", "Collines du nord"))),
         ("nordique", _scene_nordique, (("aube", "Tour du nord a l'aube"), ("tempete", "Tour du nord dans la tempete"),
@@ -19188,7 +22578,17 @@ DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur ou 
         ("lave", _scene_lave, (("rouge", "Volcan"), ("bleu", "Volcan au feu bleu"))),
         ("phare", _scene_phare, (("tempete", "Phare dans la tempete"), ("calme", "Phare la nuit"))),
         ("murmuration", _scene_murmuration, (("coucher", "Etourneaux au couchant"), ("ville", "Etourneaux sur la ville"))),
-        ("village_neige", _scene_village_neige, ((None, "Village sous la neige"),)))),
+        ("village_neige", _scene_village_neige, ((None, "Village sous la neige"),)),
+        ("herbes", _scene_herbes, ((None, "Herbes au vent"),)),
+        ("plaine", _scene_plaine, ((None, "Grande plaine"),)),
+        ("montagne", _scene_montagne, ((None, "Montagne et alpenglow"),)),
+        ("savane", _scene_savane, ((None, "Savane au couchant"),)),
+        ("eoliennes", _scene_eoliennes, ((None, "Eoliennes au crepuscule"),)),
+        ("montgolfieres", _scene_montgolfieres, ((None, "Montgolfieres a l'aube"),)),
+        ("voilier", _scene_voilier, ((None, "Voilier au couchant"),)),
+        ("foret_rayons", _scene_foret_rayons, ((None, "Rayons en foret"),)),
+        ("jardin_zen", _scene_jardin_zen, ((None, "Jardin zen"),)),
+        ("voxel", _scene_voxel, ((None, "Vol sur les montagnes"),)))),
     ("cocon", "Le cocon : bougies, feu de cheminee, the sous la pluie, rayon de soleil, lampe a fibres, boule plasma, "
               "vinyle", (
         ("bougies", _scene_bougies, ((None, "Bougies dans le noir"),)),
