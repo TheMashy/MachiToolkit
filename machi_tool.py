@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.122.0"
+VERSION = "1.123.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -11718,7 +11718,7 @@ PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la 
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
-PANNEAU_CROQUIS = 8                    # carte/machi_panneau/machi_panneau.ino
+PANNEAU_CROQUIS = 9                    # carte/machi_panneau/machi_panneau.ino
 PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
@@ -14213,30 +14213,56 @@ def _ecran_artifice(e, t, ecoule, dt):
     return np.clip(e["lueur"], 0, 255).astype(np.uint8)
 
 
+NEIGE_TALUS = 1.1          # la pente la plus raide que la neige tient : pixels de haut d'une colonne a l'autre
+NEIGE_TASSEMENT = 0.005    # elle se tasse (par seconde, en proportion) : des tas, jamais un mur
+NEIGE_MAX = 24.0
+
+
+def _neige_ebouler(sol, talus=NEIGE_TALUS, passes=4):
+    """« Qu'elle fasse des tas plutot que de grosses colonnes rigides. » Le tas
+    de sable : partout ou une colonne depasse sa voisine de plus que le talus,
+    l'exces glisse vers elle -- la neige s'eboule en pentes douces. Rien ne se
+    perd ; le panneau se raccorde sur ses bords, comme les flocons."""
+    import numpy as np
+    for _ in range(passes):
+        ecart = sol - np.roll(sol, -1)                   # chaque colonne, moins sa voisine de droite
+        glisse = np.sign(ecart) * np.clip(np.abs(ecart) - talus, 0, None) / 4
+        sol = sol - glisse + np.roll(glisse, 1)
+    return sol
+
+
 def _ecran_neige(e, t, ecoule, dt):
-    """Il neige, la nuit, sous la lune ; la neige s'amasse au sol."""
+    """Il neige, la nuit, sous la lune ; la neige s'amasse au sol, en tas qui
+    s'eboulent, plus hauts la ou le vent la pousse."""
     import numpy as np
     rng = e["rng"]
     Y, X = _xy()
     if "fx" not in e:
         n = 120
         e.update(fx=rng.uniform(0, 64, n), fy=rng.uniform(-64, 64, n), fv=rng.uniform(5, 16, n),
-                 fp=rng.uniform(0, 2 * np.pi, n), sol=np.zeros(64))
+                 fp=rng.uniform(0, 2 * np.pi, n), sol=np.zeros(64), vent=rng.uniform(0, 2 * np.pi))
     e["fy"] += e["fv"] * dt
     e["fx"] = (e["fx"] + np.sin(t * 1.3 + e["fp"]) * 6 * dt) % 64
     cols = e["fx"].astype(int) % 64
     pose = e["fy"] >= 63 - e["sol"][cols]
-    for c in cols[pose]:
-        e["sol"][c] = min(14.0, e["sol"][c] + 0.35)
     if pose.any():
+        # le vent la pose plus volontiers a deux endroits : c'est la que les tas montent
+        prise = 0.3 + 0.7 * (0.5 + 0.5 * np.sin(np.arange(64) * (4 * np.pi / 64) + e["vent"])) ** 2
+        for c in cols[pose]:
+            if rng.random() < prise[c] and e["sol"][c] < NEIGE_MAX:
+                e["sol"][c] += 0.35
         k = int(pose.sum())
         e["fy"][pose], e["fx"][pose] = rng.uniform(-8, 0, k), rng.uniform(0, 64, k)
+    e["sol"] = _neige_ebouler(e["sol"]) * np.exp(-NEIGE_TASSEMENT * dt)
     img = np.stack([4 + Y * 0.15, 6 + Y * 0.2, 26 + Y * 0.45], -1)
     lune = np.hypot(X - 50, Y - 11)
     img += np.clip(1 - (lune - 4) / 6, 0, 1)[..., None] * np.array([40, 40, 30])
     img[lune <= 4] = (230, 230, 200)
-    sol = e["sol"] + np.sin(np.arange(64) * 0.7) * 0.6
-    img[Y >= 64 - sol[None, :]] = (215, 225, 245)
+    surface = 64 - (e["sol"] + np.sin(np.arange(64) * 0.7) * 0.4)
+    sous = Y - surface[None, :]                          # la profondeur sous la surface de la neige
+    tas = sous >= 0
+    ombre = 1 - np.clip(sous / 14.0, 0, 1) * 0.3         # la crete claire, le pied du tas plus bleu
+    img[tas] = (np.array([215, 225, 245]) * ombre[..., None])[tas]
     img = np.clip(img, 0, 255).astype(np.uint8)
     lum = (0.5 + 0.5 * (e["fv"] - 5) / 11)[:, None]
     _pointer(img, e["fy"], e["fx"], lum * np.array([255, 255, 255]))
@@ -14673,6 +14699,405 @@ def _sillages_poser(e, t, pole_x, pole_y, vitesse):
     _pointer(e["trace"], y, x, e["lum"][:, None] * teintes[e["teinte"]] * 0.9)
 
 
+# LES CENT AURORES. « Tu peux generer 100 screensavers differents dans un
+# mood des aurores boreales ? J'aime bcp le tunnel aussi. » Pas cent
+# fonctions : un moteur, et cent jeux de reglages. Un ciel, ses etoiles, une
+# aurore (des rideaux, un voile, un ruban, une couronne, une spirale), une
+# lune, un paysage (montagnes, lac, fjord, mer, banquise, foret, cabane,
+# phare, village, volcan...) et un detail (des etoiles filantes, de la neige,
+# une brume) : quatre-vingts paysages boreaux, chacun dans ses couleurs -- et
+# vingt tunnels aux couleurs d'aurore. Chaque ecran est un jeu de reglages
+# FIXE (son nom ne change pas d'une version a l'autre) ; le hasard (les
+# etoiles, les sapins, les maisons) vient de sa graine.
+
+AURORE_COULEURS = (                 # (nom, les couleurs des rideaux, du bas vers le haut)
+    ("emeraude", ((60, 255, 140), (40, 205, 110), (110, 255, 180))),
+    ("emeraude et violet", ((60, 255, 140), (150, 70, 255))),
+    ("rose", ((255, 90, 170), (190, 80, 255))),
+    ("turquoise", ((40, 220, 255), (60, 255, 190))),
+    ("pourpre", ((170, 60, 255), (255, 70, 150))),
+    ("rouge et vert", ((60, 255, 140), (255, 60, 70))),
+    ("multicolore", ((60, 255, 140), (40, 190, 255), (150, 70, 255), (255, 90, 170))),
+    ("glacier", ((110, 190, 255), (190, 235, 255))),
+    ("vert tendre", ((190, 255, 80), (60, 255, 140))),
+    ("magenta et cyan", ((255, 60, 200), (40, 220, 255))),
+)
+AURORE_CIELS = (                    # (le haut, l'horizon)
+    ((2, 4, 16), (12, 24, 52)),
+    ((0, 1, 6), (6, 10, 28)),
+    ((8, 6, 28), (52, 30, 70)),
+    ((1, 7, 18), (16, 44, 64)),
+    ((6, 2, 18), (32, 14, 56)),
+)
+AURORE_PAYSAGES = (                 # (cle, nom, ligne d'horizon)
+    ("montagnes", "Montagnes", 44), ("lac", "Lac", 40), ("fjord", "Fjord", 42), ("mer", "Mer", 46),
+    ("banquise", "Banquise", 48), ("plaine", "Plaine", 50), ("foret", "Foret", 50), ("cabane", "Cabane", 50),
+    ("tente", "Bivouac", 52), ("phare", "Phare", 47), ("village", "Village", 50), ("igloo", "Igloo", 50),
+    ("volcan", "Volcan", 48), ("sommet", "Sommet", 64), ("foret_lac", "Foret et lac", 42), ("ciel", "Ciel", 64),
+)
+AURORE_STYLES = ("rideaux", "rideaux_fins", "voile", "ruban", "couronne")
+TUNNEL_FORMES = (("rond", "rond"), ("carre", "carre"), ("spirale", "en spirale"), ("anneaux", "d'anneaux"),
+                 ("ver", "vermoulu"))
+
+
+def _presets_boreaux():
+    """Les cent jeux de reglages, dans un ordre fixe : (cle, titre, reglages)."""
+    out = []
+    for L, (paysage, nom, horizon) in enumerate(AURORE_PAYSAGES):
+        for k in range(5):
+            palette = (L * 3 + k * 2) % len(AURORE_COULEURS)
+            style = AURORE_STYLES[(k + L) % 5]
+            if paysage == "ciel":
+                style = ("couronne", "spirale", "rideaux_fins", "voile", "ruban")[k]
+            elif paysage == "sommet" and style == "couronne":
+                style = "spirale"
+            out.append(("boreale_%02d" % (len(out) + 1),
+                        "%s %s" % (nom, AURORE_COULEURS[palette][0]),
+                        {"paysage": paysage, "horizon": horizon, "palette": palette, "style": style,
+                         "ciel": (L + k) % len(AURORE_CIELS),
+                         "lune": (None, "croissant", None, "pleine", None)[(k + 2 * L) % 5],
+                         "detail": ("filantes", None, "neige", "brume", None)[(3 * k + L) % 5],
+                         "vitesse": (0.8, 1.0, 1.25, 0.9, 1.1)[(k + 2 * L) % 5],
+                         "variante": L * 5 + k}))
+    for j, (forme, nom) in enumerate(TUNNEL_FORMES):
+        for k in range(4):
+            palette = (j * 2 + k * 3) % len(AURORE_COULEURS)
+            out.append(("tunnel_%02d" % (j * 4 + k + 1),
+                        "Tunnel %s %s" % (nom, AURORE_COULEURS[palette][0]),
+                        {"forme": forme, "palette": palette, "sens": (1, -1, 1, 1)[k],
+                         "vitesse": (1.0, 0.8, 1.3, 1.1)[k], "variante": j * 4 + k}))
+    return out
+
+
+def _rideaux_boreaux(Y, X, t, base_y, couleurs, fins=False, ruban=False, v=1.0):
+    """Des rideaux d'aurore -- ceux de _rideaux, en plus libres : `fins` (plus de
+    plis, des rayons serres), `ruban` (un seul pli qui serpente, sa crete vive)."""
+    import numpy as np
+    lumiere = np.zeros(Y.shape + (3,))
+    n = len(couleurs)
+    for i, c in enumerate(couleurs):
+        decal = 1.7 * i + 0.4
+        haut = -7.0 * i if not ruban else -3.0 * i
+        if ruban:
+            base = base_y + haut + 9 * np.sin(X * 0.06 + t * 0.35 * v + decal) + 4 * np.sin(X * 0.17 - t * 0.6 * v)
+            rideau = 0.65 + 0.35 * np.sin(X * 0.25 + t * 0.9 * v + decal)
+            profil = np.where(Y <= base, np.exp(-(base - Y) / 5.0), np.exp(-((Y - base) / 1.6) ** 2))
+            crete = np.exp(-((Y - base) / 0.9) ** 2) * 0.6
+            lumiere += ((profil + crete) * rideau)[..., None] * np.asarray(c, float) * (0.95 - 0.12 * i)
+            continue
+        amp, w = (4, 0.13) if fins else (6, 0.08)
+        base = base_y + haut + amp * np.sin(X * w + t * 0.5 * v + decal) + 3 * np.sin(X * 0.23 - t * 0.7 * v + decal)
+        plis = X * (1.1 if fins else 0.5) + t * (2.2 if fins else 1.5) * v + np.sin(X * 0.1 + t * 0.8 * v + decal) * 3
+        rideau = 0.5 + 0.5 * np.sin(plis)
+        if fins:
+            rideau = rideau ** 2 * (0.7 + 0.3 * np.sin(X * 2.3 + t * 4 * v + decal))
+        profil = np.where(Y <= base, np.exp(-(base - Y) / (6.0 if fins else 9.0)), np.exp(-((Y - base) / 2.2) ** 2))
+        lumiere += (profil * rideau)[..., None] * np.asarray(c, float) * (1.0 if n == 1 else 0.95 - 0.1 * i)
+    return lumiere
+
+
+def _voile_boreal(e, Y, X, t, base_y, couleurs, v=1.0):
+    """Un voile d'aurore, diffus : un champ doux qui derive, en bande au-dessus de l'horizon."""
+    import numpy as np
+    if "voile" not in e:
+        e["voile"] = (_brume(e["rng"], 12), _brume(e["rng"], 24))
+    a, b = e["voile"]
+    champ = _fenetre(a, t * 2.2 * v, 6 + t * 0.3) ** 2 * 0.7 + _fenetre(b, 40 - t * 1.4 * v, 20) ** 1.5 * 0.5
+    bande = np.exp(-((Y - base_y + 6) / 11.0) ** 2)
+    lumiere = np.zeros(Y.shape + (3,))
+    k = np.clip((base_y - Y) / 22.0, 0, 1)[..., None]           # la couleur du bas vers celle du haut
+    bas, haut = np.asarray(couleurs[0], float), np.asarray(couleurs[-1], float)
+    stries = 0.7 + 0.3 * np.sin(X * 1.3 + np.sin(X * 0.21 + t * 0.6 * v) * 3 + t * 1.1 * v)
+    lumiere += (champ * bande * stries)[..., None] * (bas * (1 - k) + haut * k) * 1.3
+    return lumiere
+
+
+def _couronne_boreale(Y, X, t, couleurs, spirale=False, v=1.0, cy=14.0):
+    """La couronne : l'aurore juste au-dessus de soi, ses rayons qui partent
+    d'un point ; ou une spirale qui tourne."""
+    import numpy as np
+    dx, dy = X - 32 - 4 * np.sin(t * 0.2), Y - cy
+    r = np.hypot(dx, dy) + 0.5
+    a = np.arctan2(dy, dx)
+    if spirale:
+        motif = (0.5 + 0.5 * np.sin(3 * a + r * 0.28 - t * 0.9 * v)) ** 3
+    else:
+        a = a + 0.25 * np.sin(r * 0.07 + t * 0.35 * v)            # les rayons se plient, comme des rideaux vus d'en dessous
+        rayons = (0.5 + 0.5 * np.sin(a * 11 + t * 0.4 * v)) * (0.5 + 0.5 * np.sin(a * 7 - t * 0.3 * v + 1.3))
+        motif = rayons ** 1.3 * (0.7 + 0.3 * np.sin(a * 3 + t * 0.5 * v))
+    fond = np.exp(-r / 26.0) * (r > 2.5)
+    k = np.clip(r / 34.0, 0, 1)[..., None]
+    interieur, exterieur = np.asarray(couleurs[0], float), np.asarray(couleurs[-1], float)
+    lum = (motif * fond * (0.85 + 0.15 * np.sin(t * 0.7)))[..., None]
+    return lum * (interieur * (1 - k) + exterieur * k) * (1.25 if spirale else 1.7) \
+        + np.exp(-r / 5.0)[..., None] * interieur * 0.3
+
+
+def _faites(Y, X, bas, crete):
+    """Le masque d'une silhouette : de la crete (par colonne) jusqu'a `bas`."""
+    return (Y >= crete[None, :]) & (Y < bas)
+
+
+def _paysage_boreal(e, img, lumiere, p, Y, X, t):
+    """Le paysage, par-dessus le ciel et l'aurore ; ses lumieres a lui (fenetres, phare, lave)."""
+    import numpy as np
+    rng = e["rng"]
+    x = X[0]
+    hz = p["horizon"]
+    sombre = np.array([4, 6, 12], float)
+    pays = p["paysage"]
+    # ce que l'aurore jette sur la neige : la lumiere moyenne au-dessus de l'horizon
+    reflet_aurore = lumiere[max(0, hz - 14):hz].mean(axis=(0, 1)) if hz < 64 else np.zeros(3)
+
+    def neige(depuis, force=0.35):
+        ou = Y >= depuis
+        k = np.clip((Y - depuis) / max(1.0, 64 - depuis), 0, 1)[..., None]
+        sol = np.array([18, 24, 38], float) + reflet_aurore * force * (1 - 0.5 * k)
+        img[ou] = np.broadcast_to(sol, img.shape)[ou] * (0.9 + 0.1 * np.sin(X * 1.3 + Y * 2.1))[ou][:, None]
+
+    def reflet(force=0.45, frisson=1.0):
+        for y in range(hz, 64):
+            src = img[max(0, 2 * hz - 1 - y)] * force
+            d = int(round(np.sin(y * 0.9 + t * 2.0) * (0.4 + (y - hz) * 0.06) * frisson))
+            img[y] = np.roll(src, d, axis=0) * (0.85 + 0.15 * np.sin(x * 0.5 + y * 1.3 + t * 3))[:, None]
+
+    def sapins(base, n, hmin, hmax, couleur=(2, 6, 6)):
+        if "sapins" not in e:
+            e["sapins"] = [(rng.uniform(0, 64), rng.uniform(hmin, hmax), rng.uniform(0.32, 0.45)) for _ in range(n)]
+        for sx, h, w in e["sapins"]:
+            sommet = base - h
+            img[(Y >= sommet) & (Y <= base + 1) & (np.abs(X - sx) <= (Y - sommet) * w + 0.5)] = couleur
+
+    def cretes(h0, amp, f, pointu=True, graine=0.0):
+        s = np.sin(x * f + 1.3 + graine)
+        return h0 - amp * (np.abs(s) if pointu else 0.5 + 0.5 * s) - amp * 0.35 * np.sin(x * f * 2.7 + graine)
+
+    if pays == "montagnes":
+        img[_faites(Y, X, 64, cretes(hz, 14, 0.09))] = (6, 8, 16)
+        img[_faites(Y, X, 64, cretes(hz + 6, 8, 0.15, graine=2.0))] = sombre
+    elif pays == "lac":
+        img[_faites(Y, X, hz, cretes(hz, 10, 0.12))] = (4, 6, 12)
+        reflet()
+    elif pays == "fjord":
+        bords = np.minimum(hz - 2 - 26 * np.clip(1 - x / 20, 0, 1) ** 1.3, hz - 2 - 30 * np.clip((x - 44) / 20, 0, 1) ** 1.3)
+        img[_faites(Y, X, hz, bords + 1.5 * np.sin(x * 0.7))] = sombre
+        reflet(0.5)
+    elif pays == "mer":
+        reflet(0.4, 1.6)
+        vagues = (0.5 + 0.5 * np.sin(X * 0.5 + Y * 2.2 - t * 1.5)) * (Y >= hz)
+        img += vagues[..., None] * np.array([8, 14, 24])
+    elif pays == "banquise":
+        neige(hz, 0.45)
+        if "blocs" not in e:
+            e["blocs"] = [(rng.uniform(4, 60), rng.uniform(4, 9), rng.uniform(0.9, 1.8)) for _ in range(4)]
+        for bx, h, pente in e["blocs"]:
+            crete = hz - h + np.abs(X - bx) * pente + 0.8 * np.abs(np.sin(X * 1.7 + bx))
+            bloc = (Y >= crete) & (Y <= hz)
+            cote = np.where(X < bx, 1.0, 0.6)[..., None]          # le cote qui regarde l'aurore, plus clair
+            glace = (np.array([80, 120, 160]) + reflet_aurore * 0.35) * cote
+            img[bloc] = np.broadcast_to(glace, img.shape)[bloc]
+    elif pays == "plaine":
+        neige(hz)
+        img[_faites(Y, X, hz + 1, cretes(hz - 1, 3, 0.07, pointu=False))] = (10, 14, 26)
+    elif pays in ("foret", "foret_lac"):
+        if pays == "foret_lac":
+            sapins(hz, 16, 6, 16)
+            reflet(0.4)
+        else:
+            neige(hz)
+            sapins(hz, 18, 8, 22)
+    elif pays == "cabane":
+        colline = hz + 3 - 5 * np.exp(-((x - 40) / 16) ** 2)
+        neige(hz)
+        img[(Y >= colline[None, :]) & (Y < hz + 2)] = np.array([22, 28, 44]) + reflet_aurore * 0.3
+        img[hz - 6:hz - 1, 34:43] = (6, 8, 12)
+        for i in range(4):
+            img[hz - 7 - i, 33 + i:44 - i] = (6, 8, 12)
+        f = 0.85 + 0.15 * np.sin(t * 3.1)
+        img[hz - 4:hz - 2, 36:38] = np.array([255, 185, 90]) * f
+        img[hz - 4:hz - 2, 40:42] = np.array([255, 185, 90]) * f
+        if "fumee" not in e:
+            e["fumee"] = rng.uniform(0, 6, 8)
+        for k, phase in enumerate(e["fumee"]):                # la fumee de la cheminee
+            age = (t * 0.5 + phase) % 6
+            _pointer(img, [hz - 12 - age * 3], [41 + np.sin(age * 1.3 + k) * 1.5 + age * 0.8],
+                     [np.array([60, 60, 70]) * (1 - age / 6)])
+        img[hz - 12:hz - 8, 40:42] = (6, 8, 12)
+    elif pays == "tente":
+        neige(hz)
+        for i in range(7):
+            img[hz - 7 + i, 30 - i:32 + i] = np.array([255, 160, 70]) * (0.35 + 0.05 * np.sin(t * 2.5)) * (0.6 + i * 0.07)
+        img[hz - 3:hz, 30:32] = (40, 22, 12)
+    elif pays == "phare":
+        reflet(0.4, 1.4)
+        rocher = (Y >= hz - 4 + 3 * np.abs((X - 12) / 12)) & (X < 26) & (Y < 64)
+        img[rocher] = sombre
+        img[hz - 22:hz - 4, 10:14] = (14, 14, 22)
+        img[hz - 22:hz - 19, 9:15] = (20, 20, 30)
+        lampe = 0.6 + 0.4 * np.cos(t * 1.4)
+        img[hz - 21:hz - 19, 11:13] = np.array([255, 235, 160]) * (0.5 + 0.5 * lampe)
+        a = (t * 1.4) % (2 * np.pi)                          # le faisceau qui tourne
+        if np.cos(a) > 0:
+            pente = np.sin(a) * 0.35
+            fx = np.clip(X - 12, 0, None)
+            faisceau = np.exp(-((Y - (hz - 20) - fx * pente) / (1.2 + fx * 0.06)) ** 2) * (X > 13) * np.cos(a)
+            img += (faisceau * np.exp(-fx / 40))[..., None] * np.array([90, 85, 60])
+    elif pays == "village":
+        neige(hz)
+        if "maisons" not in e:
+            e["maisons"], x0 = [], 2.0
+            while x0 < 60:
+                larg = int(rng.integers(6, 10))
+                e["maisons"].append((int(x0), larg, int(rng.integers(4, 8)), rng.uniform(0, 6)))
+                x0 += larg + rng.uniform(1, 5)
+        for mx, larg, h, ph in e["maisons"]:
+            img[hz - h:hz + 1, mx:mx + larg] = (8, 9, 16)
+            for i in range(larg // 2 + 1):
+                img[hz - h - 1 - i, mx + i:mx + larg - i] = (8, 9, 16)
+            if np.sin(t * 0.13 + ph) > -0.6:
+                img[hz - h + 2, mx + larg // 2 - 1:mx + larg // 2 + 1] = np.array([255, 190, 100]) * 0.9
+    elif pays == "igloo":
+        neige(hz)
+        d = ((X - 32) / 11.0) ** 2 + ((Y - hz) / 8.0) ** 2
+        img[(d <= 1) & (Y <= hz)] = np.array([60, 80, 110]) + reflet_aurore * 0.45
+        img[(np.abs(X - 32) <= 2) & (Y >= hz - 3) & (Y <= hz)] = np.array([255, 170, 80]) * (0.8 + 0.2 * np.sin(t * 2))
+        for k in range(3):
+            img[(np.abs(d - (0.35 + k * 0.25)) < 0.04) & (Y <= hz)] = np.array([40, 56, 80]) + reflet_aurore * 0.3
+    elif pays == "volcan":
+        cone = hz - np.clip(24 - np.abs(x - 32) * 1.2, 0, 22)
+        img[_faites(Y, X, 64, cone)] = (8, 6, 10)
+        img[(Y >= hz + 4)] = (6, 6, 10)
+        lave = np.exp(-((X - 32) ** 2) / 6.0 - ((Y - (hz - 21)) ** 2) / 4.0) * (0.75 + 0.25 * np.sin(t * 2.3))
+        coulee = np.exp(-((X - 32 - np.sin(Y * 0.4) * 2) ** 2) / 1.5) * (Y > hz - 20) * (Y < hz + 4) * 0.5
+        img += ((lave + coulee) * (Y >= hz - 23))[..., None] * np.array([255, 90, 30])
+    elif pays == "sommet":
+        pic = 64 - np.clip(30 - np.abs(x - 14) * 1.6, 0, 30)
+        img[_faites(Y, X, 64, pic)] = (8, 10, 18)
+        calotte = _faites(Y, X, 64, pic) & (Y < pic[None, :] + 2 + np.clip(52 - pic, 0, None)[None, :] * 0.25)
+        img[calotte] = np.array([46, 56, 78]) + reflet_aurore * 0.3
+    return img
+
+
+def _detail_boreal(e, img, p, Y, X, t, dt, ecoule):
+    """Le detail : des etoiles filantes, de la neige qui tombe, une brume au ras du sol."""
+    import numpy as np
+    rng = e["rng"]
+    detail = p.get("detail")
+    if detail == "filantes":
+        if "filantes" not in e:
+            e.update(filantes=[], suivante=1.0)
+        if ecoule >= e["suivante"]:
+            e["suivante"] = ecoule + rng.uniform(2.0, 5.0)
+            e["filantes"].append([rng.uniform(20, 70), rng.uniform(0, 16), -rng.uniform(50, 80), rng.uniform(18, 30),
+                                  0.0, rng.uniform(0.5, 0.8)])
+        restantes = []
+        for f in e["filantes"]:
+            f[0] += f[2] * dt
+            f[1] += f[3] * dt
+            f[4] += dt
+            if f[4] < f[5]:
+                restantes.append(f)
+                k = np.arange(10)
+                _pointer(img, f[1] - f[3] * k * 0.008, f[0] - f[2] * k * 0.008,
+                         ((1 - k / 10) ** 1.6 * (1 - f[4] / f[5]))[:, None] * np.array([255, 245, 225]))
+        e["filantes"] = restantes
+    elif detail == "neige":
+        if "flocons" not in e:
+            e["flocons"] = (rng.uniform(0, 64, 45), rng.uniform(0, 64, 45), rng.uniform(4, 10, 45), rng.uniform(0, 6, 45))
+        fx, fy, fv, fp = e["flocons"]
+        fy += fv * dt
+        fy %= 64
+        lum = (0.4 + 0.6 * (fv - 4) / 6)[:, None]
+        _pointer(img, fy, (fx + np.sin(t * 1.1 + fp) * 2) % 64, lum * np.array([210, 220, 240]))
+    elif detail == "brume":
+        if "brume" not in e:
+            e["brume"] = _brume(rng, 10)
+        hz = min(p.get("horizon", 64), 60)
+        b = _fenetre(e["brume"], t * 1.5, 30) * np.exp(-((Y - hz + 2) / 5.0) ** 2)
+        img += (b * 0.6)[..., None] * np.array([70, 80, 100])
+
+
+def _ecran_boreal(p, e, t, ecoule, dt):
+    """Un des cent : son ciel, ses etoiles, son aurore, sa lune, son paysage."""
+    import numpy as np
+    if "forme" in p:
+        return _tunnel_boreal(p, e, t, ecoule, dt)
+    Y, X = _xy()
+    v = p["vitesse"]
+    couleurs = AURORE_COULEURS[p["palette"]][1]
+    hz = p["horizon"]
+    haut, bas = (np.asarray(c, float) for c in AURORE_CIELS[p["ciel"]])
+    k = np.clip(Y / max(20.0, min(hz, 60)), 0, 1)[..., None]
+    img = haut * (1 - k) + bas * k
+    _etoiles_du_ciel(e, img, t, 50 if p["style"] != "couronne" else 70, max(8, min(hz - 4, 64)))
+    if p["lune"]:
+        lx, ly = (50, 9) if p["variante"] % 2 else (13, 10)
+        d = np.hypot(X - lx, Y - ly)
+        img += np.clip(1 - (d - 3) / 7, 0, 1)[..., None] * np.array([26, 26, 22])
+        disque = d <= 3.2
+        if p["lune"] == "croissant":
+            disque &= np.hypot(X - lx - 1.6, Y - ly + 0.8) > 2.9
+        img[disque] = (225, 225, 200)
+    style = p["style"]
+    base = min(hz, 52) - 14 if hz < 64 else 34
+    if style in ("rideaux", "rideaux_fins", "ruban"):
+        lumiere = _rideaux_boreaux(Y, X, t, base, couleurs, fins=style == "rideaux_fins", ruban=style == "ruban", v=v)
+    elif style == "voile":
+        lumiere = _voile_boreal(e, Y, X, t, base + 4, couleurs, v=v)
+    else:
+        lumiere = _couronne_boreale(Y, X, t, couleurs, spirale=style == "spirale", v=v,
+                                    cy=14.0 if hz < 64 else 26.0)
+    if hz < 64:
+        lumiere *= (Y < hz)[..., None]                            # derriere l'horizon : rien
+    img = img + lumiere * 0.85
+    img = _paysage_boreal(e, img, lumiere, p, Y, X, t)
+    _detail_boreal(e, img, p, Y, X, t, dt, ecoule)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _tunnel_boreal(p, e, t, ecoule, dt):
+    """Un tunnel tapisse d'aurores : on s'y enfonce ; des anneaux qui viennent
+    a soi, des rideaux qui filent le long des parois, le fond dans le noir."""
+    import numpy as np
+    Y, X = _xy()
+    forme, v, sens = p["forme"], p["vitesse"], p["sens"]
+    couleurs = np.array([np.asarray(c, float) for c in AURORE_COULEURS[p["palette"]][1]])
+    errance = 8 if forme == "ver" else 4
+    cx, cy = 32 - errance * np.sin(t * 0.6 * v), 32 - errance * np.cos(t * 0.45 * v)
+    dx, dy = X - cx, Y - cy
+    d = (np.maximum(np.abs(dx), np.abs(dy)) if forme == "carre" else np.hypot(dx, dy)) + 0.6
+    a = np.arctan2(dy, dx)
+    z = (40.0 if forme == "anneaux" else 26.0) / d + sens * t * 1.4 * v   # la profondeur, qui defile
+    tour = a / (2 * np.pi) + t * 0.03 * sens                      # le tour de la paroi, de 0 a 1
+    if forme == "spirale":
+        tour = tour + z * 0.18
+    if forme == "ver":
+        tour = tour + np.sin(z * 0.6 + t * 0.7) * 0.08
+    n = len(couleurs)
+    teinte = (z * 0.35) % n                                       # la couleur change en profondeur
+    i0 = np.floor(teinte).astype(int) % n
+    f = (teinte - np.floor(teinte))[..., None]
+    couleur = couleurs[i0] * (1 - f) + couleurs[(i0 + 1) % n] * f
+    rideaux = (0.5 + 0.5 * np.sin(tour * 2 * np.pi * (6 if forme != "carre" else 4)
+                                 + np.sin(z * 0.9 + tour * 6) * 1.6)) ** 2
+    anneaux = (0.5 + 0.5 * np.cos(z * 2 * np.pi)) ** (5 if forme == "anneaux" else 3)
+    if forme == "anneaux":
+        motif = anneaux * (0.5 + 0.5 * rideaux)
+    else:                                                       # les anneaux font la profondeur, les rideaux la paroi
+        motif = (0.2 + 0.8 * anneaux) * (0.3 + 0.7 * rideaux)
+    profondeur = np.clip((d - 1.5) / (16.0 if forme == "anneaux" else 24.0), 0, 1) ** 1.3   # le fond se perd dans le noir
+    img = (motif * profondeur)[..., None] * couleur
+    if forme == "ver":
+        img += np.exp(-d / 3.0)[..., None] * couleurs[0] * 0.8    # une lumiere tout au bout
+    if "poussiere" not in e:
+        e["poussiere"] = (e["rng"].uniform(0, 2 * np.pi, 40), e["rng"].uniform(0, 1, 40))
+    pa, pz = e["poussiere"]
+    q = (pz + t * 0.22 * v * sens) % 1.0                         # des poussieres qui filent vers soi
+    r = 2 + q ** 2 * 44
+    _pointer(img, cy + r * np.sin(pa), cx + r * np.cos(pa), (q ** 1.5)[:, None] * np.array([200, 220, 255]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
 # Les ambiances d'abord (la page les montre dans cet ordre), puis les jeux de lumiere.
 ECRANS = {
     "aurore": ("Aurore boreale", _ecran_aurore),
@@ -14699,6 +15124,22 @@ ECRANS = {
 }
 ECRANS_AMBIANCES = ("aurore", "aurore_lac", "coucher", "lucioles", "nebuleuse", "filantes", "meduses", "lanternes",
                     "sillages", "neige")
+
+
+def _ecran_selon(reglages):
+    return lambda e, t, ecoule, dt: _ecran_boreal(reglages, e, t, ecoule, dt)
+
+
+for _cle, _titre, _reglages in _presets_boreaux():
+    ECRANS[_cle] = (_titre, _ecran_selon(_reglages))
+ECRANS_AURORES = tuple(cle for cle, _, _ in _presets_boreaux())
+# Sur la page, par familles : cent cases seraient illisibles.
+FAMILLES_ECRANS = (
+    ("boreales", "Les 80 aurores boreales : montagnes, lacs, fjords, mer, banquise, forets, cabane, phare, village, "
+                 "igloo, volcan, sommet, ciel", tuple(c for c in ECRANS_AURORES if c.startswith("boreale_"))),
+    ("tunnels", "Les 20 tunnels boreaux : ronds, carres, en spirale, d'anneaux, vermoulus",
+     tuple(c for c in ECRANS_AURORES if c.startswith("tunnel_"))),
+)
 
 
 def reglages_ecrans(cfg):
@@ -15740,13 +16181,17 @@ def etat_veille_lisible(cfg):
         return "Les reglages partiront a la carte des qu'elle sera branchee."
     croquis = PANNEAU.get("croquis") or 1
     if croquis < 7:
-        return ("La carte a le croquis v%d : televerse la v8 (carte/machi_panneau/machi_panneau.ino) pour "
-                "qu'elle dessine les ambiances elle-meme." % croquis)
+        return ("La carte a le croquis v%d : televerse la v%d (carte/machi_panneau/machi_panneau.ino) pour "
+                "qu'elle dessine les ambiances elle-meme." % (croquis, PANNEAU_CROQUIS))
     if croquis < 8 and (entier(cfg.get("panneau_rotation", 0), 0) // 90) % 4:
-        return ("La carte a le croquis v7 : ses ambiances ne suivent pas le sens du panneau. Televerse la v8 "
-                "(carte/machi_panneau/machi_panneau.ino).")
+        return ("La carte a le croquis v7 : ses ambiances ne suivent pas le sens du panneau. Televerse la v%d "
+                "(carte/machi_panneau/machi_panneau.ino)." % PANNEAU_CROQUIS)
     if PANNEAU.get("carte_veille"):
-        return "La carte a ses reglages : %d ambiance%s quand le PC s'eteindra." % (n, "s" if n > 1 else "")
+        texte = "La carte a ses reglages : %d ambiance%s quand le PC s'eteindra." % (n, "s" if n > 1 else "")
+        if croquis < 9 and "neige" not in sans:
+            texte += " (Croquis v%d : sa neige fait encore des colonnes ; la v%d la met en tas.)" % (croquis,
+                                                                                                  PANNEAU_CROQUIS)
+        return texte
     return "Les reglages partent a la carte..."
 
 
@@ -19621,15 +20066,25 @@ class Panneau:
         grille.pack(fill="x")
         sans = set(self.cfg.get("panneau_ecrans_sans") or [])
         self.vars_ecrans = {}
-        for k, (nom, (titre, _)) in enumerate(ECRANS.items()):
+        for k, (nom, (titre, _)) in enumerate((n, c) for n, c in ECRANS.items() if n not in ECRANS_AURORES):
             v = tk.IntVar(value=0 if nom in sans else 1)
             self.vars_ecrans[nom] = v
             self.case(grille, titre, v, self.choisir_ecrans).grid(row=k // 3, column=k % 3, sticky="w",
                                                                   padx=(0, self.px(10)))
+        # « tu peux generer 100 screensavers differents dans un mood des aurores boreales ? j'aime bcp le
+        # tunnel aussi » : par familles -- cent cases seraient illisibles
+        self.vars_familles = {}
+        for cle, texte, noms in FAMILLES_ECRANS:
+            v = tk.IntVar(value=0 if all(n in sans for n in noms) else 1)
+            self.vars_familles[cle] = (v, noms)
+            c = self.case(ecrans, texte, v, self.choisir_ecrans)
+            c.configure(wraplength=self.px(360))
+            c.pack(fill="x", pady=(4, 0))
         ligne = tk.Frame(ecrans, bg=NUIT)
         ligne.pack(anchor="w", pady=(4, 0))
         self.bouton(ligne, "Tous", lambda: self.choisir_ecrans(list(ECRANS)), compact=True).pack(side="left")
-        self.bouton(ligne, "Les ambiances seulement", lambda: self.choisir_ecrans(list(ECRANS_AMBIANCES)),
+        self.bouton(ligne, "Les ambiances et les aurores",
+                    lambda: self.choisir_ecrans(list(ECRANS_AMBIANCES) + list(ECRANS_AURORES)),
                     compact=True).pack(side="left", padx=(8, 0))
         # « c'est possible que tu laisses les screen savers meme a l'arret du PC ? » -- « keep only
         # atmospheric effects » : la carte (croquis v7) dessine elle-meme les ambiances
@@ -19903,12 +20358,19 @@ class Panneau:
         self._peindre_panneau()
 
     def choisir_ecrans(self, noms=None):
-        """Les cases des ecrans (ou « Tous », « Les ambiances seulement ») : la config
-        retient ceux qu'on a decoches ; le prochain ecran les respecte deja."""
+        """Les cases des ecrans et des familles (ou « Tous », « Les ambiances et les
+        aurores ») : la config retient ceux qu'on a decoches -- une famille decochee,
+        tous les siens ; le prochain ecran les respecte deja."""
         if noms is not None:
             for nom, v in self.vars_ecrans.items():
                 v.set(1 if nom in noms else 0)
-        self.cfg["panneau_ecrans_sans"] = [nom for nom, v in self.vars_ecrans.items() if not v.get()]
+            for v, membres in self.vars_familles.values():
+                v.set(1 if any(n in noms for n in membres) else 0)
+        sans = [nom for nom, v in self.vars_ecrans.items() if not v.get()]
+        for v, membres in self.vars_familles.values():
+            if not v.get():
+                sans += list(membres)
+        self.cfg["panneau_ecrans_sans"] = sans
         PANNEAU["ecrans_sac"] = None
         sauver_config(self.cfg)
 

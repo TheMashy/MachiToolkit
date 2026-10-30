@@ -1,10 +1,10 @@
-// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 8.
+// Le croquis du panneau LED de Machi Tool (Machi LED Wall), version 9.
 // Un panneau 64x64 sur une Adafruit MatrixPortal S3, nourri par USB :
 //   "MG" + 8 192 octets (RGB565, poids fort d'abord) + 2 octets de controle
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 8" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 9" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees),
 //   "MA" + 12 octets + 2 de controle = les reglages des ecrans de veille
 //                    (gardes dans la carte : ils survivent a une coupure),
@@ -67,6 +67,15 @@
 // ne tournaient pas. Le sens du panneau arrive maintenant avec les reglages
 // ("MA", deux bits de l'octet « actif » : une v7 les ignore), et la carte
 // tourne ses ambiances exactement comme Machi Tool tourne ses images.
+//
+// v9 : « pour la neige, tu peux faire en sorte qu'elle fasse des tas
+// lorsqu'elle s'accumule trop vers le haut (plutot que de grosses colonnes
+// rigides) ». Chaque flocon montait sa colonne, jusqu'a 14 pixels : des
+// barres. Maintenant la neige s'eboule (le tas de sable : une colonne qui
+// depasse sa voisine de plus que le talus lui cede l'exces), le vent la pose
+// plus volontiers a deux endroits, et elle se tasse avec le temps -- des
+// tas aux pentes douces, la crete claire, le pied plus bleu. La meme que
+// celle de Machi Tool (_ecran_neige).
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Preferences.h>
 #include <esp_system.h>
@@ -630,30 +639,55 @@ void ecran_sillages(bool debut, float t, float dt) {
     for (int x = 12; x < 14; x++) peindre(y, x, 40, 22, 12);
 }
 
-// --- la neige, la nuit, sous la lune ---
-struct { float x[120], y[120], v[120], p[120], sol[64]; } nei;
+// --- la neige, la nuit, sous la lune : elle s'amasse en tas qui s'eboulent ---
+const float NEIGE_TALUS = 1.1f, NEIGE_TASSEMENT = 0.005f, NEIGE_MAX = 24.0f;
+struct { float x[120], y[120], v[120], p[120], sol[64], vent; } nei;
+void neige_ebouler() {         // le tas de sable : l'exces au-dela du talus glisse vers la voisine
+  for (int k = 0; k < 4; k++) {
+    float glisse[64];
+    for (int i = 0; i < 64; i++) {
+      const float ecart = nei.sol[i] - nei.sol[(i + 1) & 63];
+      const float exces = fmaxf(0.0f, fabsf(ecart) - NEIGE_TALUS) / 4;
+      glisse[i] = ecart > 0 ? exces : -exces;
+    }
+    for (int i = 0; i < 64; i++) {
+      nei.sol[i] -= glisse[i];
+      nei.sol[(i + 1) & 63] += glisse[i];
+    }
+  }
+}
 void ecran_neige(bool debut, float t, float dt) {
   if (debut) {
     for (int i = 0; i < 120; i++) { nei.x[i] = hasard(0, 64); nei.y[i] = hasard(-64, 64); nei.v[i] = hasard(5, 16); nei.p[i] = hasard(0, PI2); }
     for (int x = 0; x < 64; x++) nei.sol[x] = 0;
+    nei.vent = hasard(0, PI2);
   }
   for (int i = 0; i < 120; i++) {
     nei.y[i] += nei.v[i] * dt;
     nei.x[i] = fmodf(fmodf(nei.x[i] + sinf(t * 1.3f + nei.p[i]) * 6 * dt, 64) + 64, 64);
     const int c = (int)nei.x[i] % 64;
     if (nei.y[i] >= 63 - nei.sol[c]) {                    // elle se pose, et la suivante tombe
-      nei.sol[c] = fminf(14.0f, nei.sol[c] + 0.35f);
+      // le vent la pose plus volontiers a deux endroits : c'est la que les tas montent
+      const float s = 0.5f + 0.5f * sinf(c * (4 * 3.14159265f / 64) + nei.vent);
+      if (hasard(0, 1) < 0.3f + 0.7f * s * s && nei.sol[c] < NEIGE_MAX) nei.sol[c] += 0.35f;
       nei.y[i] = hasard(-8, 0);
       nei.x[i] = hasard(0, 64);
     }
   }
+  neige_ebouler();
+  const float tasse = expf(-NEIGE_TASSEMENT * dt);
+  for (int x = 0; x < 64; x++) nei.sol[x] *= tasse;
   for (int y = 0; y < H; y++)
     for (int x = 0; x < W; x++) {
       const float lune = hypotf(x - 50.0f, y - 11.0f);
       const float halo = borne(1 - (lune - 4) / 6, 0, 1);
       if (lune <= 4) peindre(y, x, 230, 230, 200);
       else peindre(y, x, 4 + y * 0.15f + halo * 40, 6 + y * 0.2f + halo * 40, 26 + y * 0.45f + halo * 30);
-      if (y >= 64 - (nei.sol[x] + sinf(x * 0.7f) * 0.6f)) peindre(y, x, 215, 225, 245);
+      const float sous = y - (64 - (nei.sol[x] + sinf(x * 0.7f) * 0.4f));   // la profondeur sous la surface
+      if (sous >= 0) {
+        const float ombre = 1 - borne(sous / 14.0f, 0, 1) * 0.3f;          // la crete claire, le pied plus bleu
+        peindre(y, x, 215 * ombre, 225 * ombre, 245 * ombre);
+      }
     }
   for (int i = 0; i < 120; i++) {
     const float l = (0.5f + 0.5f * (nei.v[i] - 5) / 11) * 255;
@@ -804,7 +838,7 @@ void loop() {
       if (etat != VEILLE) panneau->setBrightness8(min(b, PLAFOND));
     }
   } else if (genre == 'V') {
-    Serial.println("MACHI 8");
+    Serial.println("MACHI 9");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'A') {
