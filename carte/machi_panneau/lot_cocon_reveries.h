@@ -66,7 +66,7 @@ __attribute__((always_inline)) inline void cr_tamponner(float y, float x, float 
   if (!(y > -1 && y < 64 && x > -1 && x < 64)) return;
   const int y0 = (int)(y + 1.0f) - 1, x0 = (int)(x + 1.0f) - 1;   // floor, pour y > -1
   const float fy = y - y0, fx = x - x0;
-  if (y0 >= 0 && y0 < 63 && x0 >= 0 && x0 < 63) {        // les quatre voisins dans le panneau
+  if ((unsigned)y0 < 63u && (unsigned)x0 < 63u) {        // les quatre voisins dans le panneau
     float *p = scene[y0][x0], *q = scene[y0 + 1][x0];
     const float a = (1 - fy) * (1 - fx), c = (1 - fy) * fx, d = fy * (1 - fx), g = fy * fx;
     p[0] += a * r; p[1] += a * v; p[2] += a * b; p[3] += c * r; p[4] += c * v; p[5] += c * b;
@@ -189,7 +189,9 @@ void cr_flou_rev(float *a, int c, int n, int taille = 64, int y0 = 0, int y1 = -
 // _reveries_halo : un grand halo pas cher -- a demi-taille (32 x 32 x 3), flou n fois, remis a la taille du
 // panneau et flou une fois (ce qui revient a l'agrandir en melangeant 1/4 - 3/4) ; ajoute k * halo a la scene
 // (multiplie, s'il est donne, par mult[pixel])
-void cr_agrandir(const float *petit, float k, const float *mult = nullptr);
+// (avec loin : ajoute aussi un fond, f0 + loin[pixel] * f1)
+void cr_agrandir(const float *petit, float k, const float *mult = nullptr, const float *loin = nullptr,
+                 const float *f0 = nullptr, const float *f1 = nullptr);
 void cr_halo_rev(const float *src, float *petit, int n, float k) {
   for (int y = 0; y < 32; y++)
     for (int x = 0; x < 32; x++)
@@ -200,7 +202,7 @@ void cr_halo_rev(const float *src, float *petit, int n, float k) {
   cr_flou_rev(petit, 3, n, 32);
   cr_agrandir(petit, k);
 }
-void cr_agrandir(const float *petit, float k, const float *mult) {
+void cr_agrandir(const float *petit, float k, const float *mult, const float *loin, const float *f0, const float *f1) {
   float ligne[34 * 3];                                   // une ligne a demi-taille, ses bouts recopies
   for (int y = 0; y < 64; y++) {
     const int ya = y & 1 ? y >> 1 : max(0, (y >> 1) - 1), yb = y & 1 ? min(31, (y >> 1) + 1) : y >> 1;
@@ -210,12 +212,28 @@ void cr_agrandir(const float *petit, float k, const float *mult) {
     for (int c = 0; c < 3; c++) { ligne[c] = ligne[3 + c]; ligne[99 + c] = ligne[96 + c]; }
     float *o = scene[y][0];
     const float *m = mult ? mult + y * 64 : nullptr;
-    for (int i = 0; i < 32; i++, o += 6) {               // puis entre les deux colonnes : 1/4 - 3/4, 3/4 - 1/4
-      const float *g = ligne + 3 * i, *c = g + 3, *d = g + 6;
-      const float ma = m ? m[2 * i] : 1.0f, mb = m ? m[2 * i + 1] : 1.0f;
-      o[0] += ma * (0.25f * g[0] + 0.75f * c[0]); o[1] += ma * (0.25f * g[1] + 0.75f * c[1]); o[2] += ma * (0.25f * g[2] + 0.75f * c[2]);
-      o[3] += mb * (0.75f * c[0] + 0.25f * d[0]); o[4] += mb * (0.75f * c[1] + 0.25f * d[1]); o[5] += mb * (0.75f * c[2] + 0.25f * d[2]);
-    }
+    if (loin) {
+      const float *lo = loin + y * 64;
+      for (int i = 0; i < 32; i++, o += 6) {
+        const float *g = ligne + 3 * i, *c = g + 3, *d = g + 6, la = lo[2 * i], lb = lo[2 * i + 1];
+        o[0] += 0.25f * g[0] + 0.75f * c[0] + f0[0] + la * f1[0]; o[1] += 0.25f * g[1] + 0.75f * c[1] + f0[1] + la * f1[1];
+        o[2] += 0.25f * g[2] + 0.75f * c[2] + f0[2] + la * f1[2];
+        o[3] += 0.75f * c[0] + 0.25f * d[0] + f0[0] + lb * f1[0]; o[4] += 0.75f * c[1] + 0.25f * d[1] + f0[1] + lb * f1[1];
+        o[5] += 0.75f * c[2] + 0.25f * d[2] + f0[2] + lb * f1[2];
+      }
+    } else if (!m)
+      for (int i = 0; i < 32; i++, o += 6) {             // puis entre les deux colonnes : 1/4 - 3/4, 3/4 - 1/4
+        const float *g = ligne + 3 * i, *c = g + 3, *d = g + 6;
+        o[0] += 0.25f * g[0] + 0.75f * c[0]; o[1] += 0.25f * g[1] + 0.75f * c[1]; o[2] += 0.25f * g[2] + 0.75f * c[2];
+        o[3] += 0.75f * c[0] + 0.25f * d[0]; o[4] += 0.75f * c[1] + 0.25f * d[1]; o[5] += 0.75f * c[2] + 0.25f * d[2];
+      }
+    else
+      for (int i = 0; i < 32; i++, o += 6) {
+        const float *g = ligne + 3 * i, *c = g + 3, *d = g + 6;
+        const float ma = m[2 * i], mb = m[2 * i + 1];
+        o[0] += ma * (0.25f * g[0] + 0.75f * c[0]); o[1] += ma * (0.25f * g[1] + 0.75f * c[1]); o[2] += ma * (0.25f * g[2] + 0.75f * c[2]);
+        o[3] += mb * (0.75f * c[0] + 0.25f * d[0]); o[4] += mb * (0.75f * c[1] + 0.25f * d[1]); o[5] += mb * (0.75f * c[2] + 0.25f * d[2]);
+      }
   }
 }
 
@@ -2530,6 +2548,8 @@ struct E_vortex {
   float poids[12];                         // l'eclat le long de la trainee
   float petit[32 * 32 * 3];
   float loin[4096];                        // exp(-d / 26) autour de la lueur, pour le fond
+  float t78[200];                          // exp(-d / 78), d de 0 a 99.5 par demi-pixel
+  float tg[330];                           // exp(-u^2), u^2 de 0 a 20.5 par seizieme
 };
 void s_vortex(int humeur, bool debut, float t, float ecoule, float dt) {
   E_vortex &e = etat_ecran<E_vortex>(debut);
@@ -2551,6 +2571,8 @@ void s_vortex(int humeur, bool debut, float t, float ecoule, float dt) {
       e.iro[i] = expf(-lrho); e.sig[i] = expf(-1.3f * lrho); e.iro11[i] = expf(-11 * lrho);
     }
     for (int j = 0; j < 12; j++) { const float k = 1 - j / 12.0f; e.poids[j] = k * sqrtf(k); }
+    for (int k = 0; k < 200; k++) e.t78[k] = expf(-k * 0.5f / 78.0f);
+    for (int k = 0; k < 330; k++) e.tg[k] = expf(-k / 16.0f);
   }
   const float bx = 9 * sinf(t * 0.071f), by = 7 * sinf(t * 0.053f + 1.0f);   // le tunnel se courbe
   const float avance = fmodf(t * CR_VORTEX_VITESSE, 1.0f);
@@ -2578,12 +2600,23 @@ void s_vortex(int humeur, bool debut, float t, float ecoule, float dt) {
     // la courbure du tunnel, (1 - PRES / z)^1.5 : exacte aux deux bouts de la trainee, lineaire entre
     const float ta = 1 - CR_VORTEX_PRES * iz, tb = 1 - CR_VORTEX_PRES * iz * e.iro11[i];
     const float ka = ta * sqrtf(ta), dk = (tb * sqrtf(tb) - ka) * (1.0f / 11);
-    const float k7 = 0.7f * base, cd = e.cd[i], sd = e.sd[i], iro = e.iro[i], sig = e.sig[i], rr = e.rr[i];
+    const float cd = e.cd[i], sd = e.sd[i], iro = e.iro[i], sig = e.sig[i], rr = e.rr[i];
+    const float c0 = coul[0] * 0.7f * base, c1 = coul[1] * 0.7f * base, c2 = coul[2] * 0.7f * base;
     for (int j = 0; j < 12; j++) {
       const float k = ka + dk * j, rayon = rr * iz;
       const float y = 31.5f + by * k + rayon * sn, x = 31.5f + bx * k + rayon * cs;
-      const float l = k7 * cr_min(g, 2.5f) * e.poids[j];   // de pres plus vives
-      cr_tamponner(y, x, coul[0] * l, coul[1] * l, coul[2] * l);
+      const int yi = (int)(y + 64.0f) - 64, xi = (int)(x + 64.0f) - 64;   // floor (|y|, |x| < 64 + 52)
+      if ((unsigned)yi < 63u && (unsigned)xi < 63u) {     // le cas courant : les quatre voisins dans le panneau
+        const float l = cr_min(g, 2.5f) * e.poids[j];   // de pres plus vives
+        const float fy = y - yi, fx = x - xi, ly = l * fy, lh = l - ly;
+        const float a = lh - lh * fx, c = lh * fx, d = ly - ly * fx, w = ly * fx;
+        float *p = scene[yi][xi], *u = p + 192;
+        p[0] += a * c0; p[1] += a * c1; p[2] += a * c2; p[3] += c * c0; p[4] += c * c1; p[5] += c * c2;
+        u[0] += d * c0; u[1] += d * c1; u[2] += d * c2; u[3] += w * c0; u[4] += w * c1; u[5] += w * c2;
+      } else if (yi >= -1 && yi <= 63 && xi >= -1 && xi <= 63) {
+        const float l = cr_min(g, 2.5f) * e.poids[j];
+        cr_tamponner(y, x, c0 * l, c1 * l, c2 * l);
+      }
       const float c2 = cs * cd - sn * sd;
       sn = sn * cd + cs * sd; cs = c2;
       iz *= iro; g *= sig;
@@ -2608,8 +2641,10 @@ void s_vortex(int humeur, bool debut, float t, float ecoule, float dt) {
       for (int x = max(0, (int)(cx - xo)); x <= min(63, (int)(cx + xo) + 1); x++) {
         const float dx = x - cx;
         if (fabsf(dx) < xi) continue;                    // le trou de l'anneau
-        const float u = (sqrtf(dx * dx + dy2) - rayon) * il;
-        const float a = cr_exp(-u * u) * f;
+        const float u = (sqrtf(dx * dx + dy2) - rayon) * il, q = u * u * 16;
+        if (q >= 328) continue;                          // exp(-20.5) : rien
+        const int qi = (int)q;
+        const float a = (e.tg[qi] + (e.tg[qi + 1] - e.tg[qi]) * (q - qi)) * f;
         float *o = scene[y][x];
         o[0] += a * teinte[0]; o[1] += a * teinte[1]; o[2] += a * teinte[2];
       }
@@ -2623,7 +2658,9 @@ void s_vortex(int humeur, bool debut, float t, float ecoule, float dt) {
     for (int x = 0; x < 64; x++) {
       const float d = cr_hypot(x - fx, y - fy);
       float *o = scene[y][x];
-      const float e1 = cr_exp(-d * (1 / 78.0f)), e3 = e1 * e1 * e1, e4 = e3 * e1, e8 = e4 * e4;   // exp(-d/78)^n
+      const float dq = d * 2;                            // (d < 91 : dans la table)
+      const int di = (int)dq;
+      const float e1 = e.t78[di] + (e.t78[di + 1] - e.t78[di]) * (dq - di), e3 = e1 * e1 * e1, e4 = e3 * e1, e8 = e4 * e4;   // exp(-d/78)^n
       e.loin[y * 64 + x] = e3;                           // exp(-d / 26), pour le fond
       const float a = e8 * e4 * e1 * 0.35f * souffle;     // exp(-d / 6)
       o[0] += a * fondc[0]; o[1] += a * fondc[1]; o[2] += a * fondc[2];
@@ -2638,10 +2675,6 @@ void s_vortex(int humeur, bool debut, float t, float ecoule, float dt) {
         e.petit[(y * 32 + x) * 3 + c] = (p[0] + p[3] + p[192] + p[195]) * 0.25f;
       }
   cr_flou_rev(e.petit, 3, 2, 32);
-  for (int i = 0; i < 4096; i++) {
-    const float a = e.loin[i];
-    float *o = &scene[0][0][0] + 3 * i;
-    o[0] += 3 + a * 12; o[1] += 2 + a * 6; o[2] += 10 + a * 26;
-  }
-  cr_agrandir(e.petit, 0.3f);
+  static const float f0[3] = {3, 2, 10}, f1[3] = {12, 6, 26};   // et le fond : une lueur violette au bout du tunnel
+  cr_agrandir(e.petit, 0.3f, nullptr, e.loin, f0, f1);
 }

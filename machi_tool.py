@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.128.0"
+VERSION = "1.129.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -23728,7 +23728,12 @@ def etat_veille_lisible(cfg):
                 "(carte/machi_panneau/machi_panneau.ino)." % PANNEAU_CROQUIS)
     if croquis >= 10 and PANNEAU.get("carte_ecrans") is not None:
         k = PANNEAU["carte_ecrans"]
-        return "La carte a ses reglages : %d ecran%s quand le PC s'eteindra." % (k, "s" if k > 1 else "")
+        texte = "La carte a ses reglages : %d ecran%s quand le PC s'eteindra." % (k, "s" if k > 1 else "")
+        if k < tous:
+            texte += (" %d autre%s ne tien%s pas dans sa memoire : active la PSRAM (IDE Arduino, Outils > PSRAM) "
+                      "et televerse le croquis a nouveau." % (tous - k, "s" if tous - k > 1 else "",
+                                                                "nent" if tous - k > 1 else "t"))
+        return texte
     if PANNEAU.get("carte_veille"):
         texte = "La carte a ses reglages : %d ambiance%s quand le PC s'eteindra." % (n, "s" if n > 1 else "")
         if croquis < 10 and tous > n:
