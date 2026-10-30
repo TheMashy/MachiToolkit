@@ -5199,9 +5199,9 @@ SPOTIFY_PORT = 8765
 SPOTIFY_RETOUR = "http://127.0.0.1:%d/callback" % SPOTIFY_PORT
 SPOTIFY_PORTEES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
                    "user-library-modify user-library-read playlist-read-private user-read-private")
-# Le contexte SSL des requetes : Machi Tool y met le sien (_contexte_ssl), qui
-# tombe sur certifi quand le magasin de Windows ressort vide -- ce qui arrive
-# dans l'exe. Sans lui, TOUT Spotify echouait (« certificate verify failed »),
+# Le contexte SSL des requetes : Machi Tool y met le sien (_contexte_ssl), le
+# magasin de Windows complete par celui de certifi -- celui de Windows ressort
+# vide dans l'exe, ou incomplet. Sans lui, TOUT Spotify echouait (« certificate verify failed »),
 # jusqu'a l'echange du code a la connexion.
 CONTEXTE_SSL = None
 

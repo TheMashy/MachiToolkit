@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.124.0"
+VERSION = "1.125.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -24257,25 +24257,35 @@ def _contexte_ssl():
 
 
 def _nouveau_contexte_ssl():
-    """Le magasin de Windows passe en premier : c'est lui qui contient les
-    autorites ajoutees par un antivirus ou un proxy d'entreprise, sans
-    lesquelles la connexion echouerait. certifi ne sert que si ce magasin
-    ressort vide, ce qui arrive sur certaines compilations."""
+    """Le magasin de Windows ET celui de certifi (les autorites de Mozilla).
+    Windows d'abord : c'est lui qui contient les autorites ajoutees par un
+    antivirus ou un proxy d'entreprise, sans lesquelles la connexion
+    echouerait. Mais Windows ne telecharge une autorite racine qu'au moment
+    ou il en a besoin lui-meme -- et Chrome ne le lui demande plus, il a son
+    propre magasin. Son magasin peut donc avoir l'intermediaire d'un
+    certificat sans sa racine : Python refusait alors GitHub (« unable to get
+    issuer certificate » : plus de mise a jour, en 1.122). certifi comble le
+    trou, et un intermediaire du magasin suffit a conclure (ce que Python
+    fait de lui-meme a partir de 3.13)."""
     try:
         import ssl
     except Exception:
         return None
     try:
         contexte = ssl.create_default_context()
-        if contexte.cert_store_stats().get("x509_ca", 0) > 0:
-            return contexte
     except Exception:
         contexte = None
     try:
         import certifi
-        return ssl.create_default_context(cafile=certifi.where())
+        if contexte is None:
+            contexte = ssl.create_default_context(cafile=certifi.where())
+        else:
+            contexte.load_verify_locations(cafile=certifi.where())
     except Exception:
-        return contexte
+        pass
+    if contexte is not None and hasattr(ssl, "VERIFY_X509_PARTIAL_CHAIN"):
+        contexte.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    return contexte
 
 
 _jv.CONTEXTE_SSL = _contexte_ssl          # Spotify (http_json) : le meme magasin de certificats
@@ -24366,6 +24376,11 @@ def verifier_maj(cfg):
     except Exception as e:
         MAJ["etat"] = "erreur"
         MAJ["message"] = "Verification impossible : %s" % e
+        if isinstance(getattr(e, "reason", e), _ssl_erreurs()):
+            _oublier_contexte_ssl()          # le magasin de Windows a pu se completer : relu au prochain essai
+            MAJ["message"] = ("Verification impossible : le certificat HTTPS de GitHub est refuse (%s). Nouvel "
+                              "essai plus tard ; la derniere version se telecharge aussi a la main : %s"
+                              % (getattr(e, "reason", e), PAGE_PUBLICATIONS))
         return None
 
     MAJ["verifie_le"] = time.time()

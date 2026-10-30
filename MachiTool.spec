@@ -44,8 +44,10 @@ hiddenimports += ['win32clipboard']
 # Le panneau LED : pyserial, importe dans des fonctions (trouver_panneau).
 hiddenimports += ['serial', 'serial.tools.list_ports',
                   'serial.tools.list_ports_windows']
+# certifi : son cacert.pem est une DONNEE ; sans lui, l'import passe et le
+# magasin de secours est vide (voir _nouveau_contexte_ssl).
 for paquet in ('bleak', 'winrt', 'mss', 'soundcard', 'cffi', 'numpy',
-               'onnxruntime', 'onnx_asr', 'pycaw', 'comtypes'):
+               'onnxruntime', 'onnx_asr', 'pycaw', 'comtypes', 'certifi'):
     try:
         d, b, h = collect_all(paquet)
     except Exception as e:
