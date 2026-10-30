@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.128.0"
+VERSION = "1.129.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -389,6 +389,8 @@ CONFIG_DEFAUT = {
     # atmospheric effects » : la carte (croquis v7) dessine elle-meme les ambiances, PC eteint
     "panneau_veille": True,
     "panneau_veille_sans": [],        # les ambiances decochees
+    # « tu peux faire un sketch avec tous ces ecrans ? » : la carte (croquis v10) les dessine tous
+    "panneau_veille_tous": True,      # PC eteint, aussi les autres ecrans coches (« Lesquels »)
     "panneau_veille_luminosite": 32,  # basse : l'USB d'un PC eteint donne peu
     "panneau_veille_arret_h": 0,      # s'eteindre au bout de (heures) ; 0 : jamais
     "panneau_eq_sensibilite": 1.0,    # l'egaliseur : 0,2 (calme) a 3 (tout monte)
@@ -11718,7 +11720,7 @@ PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la 
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
-PANNEAU_CROQUIS = 9                    # carte/machi_panneau/machi_panneau.ino
+PANNEAU_CROQUIS = 10                   # carte/machi_panneau/machi_panneau.ino
 PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
@@ -16666,7 +16668,7 @@ def _scene_village_neige(p, e, t, ecoule, dt):
         sommet = base - sh
         corps = (Y >= sommet) & (Y <= base) & (np.abs(X - sx) <= (Y - sommet) * 0.4 + 0.5)
         img[corps] = (14, 30, 32)
-        etages = corps & (((Y - sommet) % 3) == 0)
+        etages = corps & (((Y - np.ceil(sommet)) % 3) == 0)        # une rangee sur trois, des la cime
         img[etages] = (150, 165, 200)
     allumees = []
     for mx, larg, haut, ph in e["maisons"]:
@@ -23200,6 +23202,26 @@ def trame_veille(cfg):
     return b"MA" + d + fletcher16(d).to_bytes(2, "big")
 
 
+def ecrans_de_la_carte(cfg):
+    """Ce que la carte montre PC eteint : les ambiances cochees pour elle, et --
+    « tu peux faire un sketch avec tous ces ecrans ? » (croquis v10) -- les
+    autres ecrans coches plus haut, si « tous les autres » l'est."""
+    sans = set(cfg.get("panneau_veille_sans") or [])
+    noms = [n for n in ECRANS_AMBIANCES if n not in sans]
+    if cfg.get("panneau_veille_tous", True):
+        noms += [n for n in ecrans_permis(cfg) if n not in ECRANS_AMBIANCES]
+    return noms
+
+
+def trame_ecrans(cfg):
+    """« ME » (croquis v10) : les ecrans permis a la carte par leurs noms --
+    separes de virgules, leur longueur (2 octets) devant, leur Fletcher-16
+    derriere. Par leurs noms : une carte qui ne connait pas un ecran (plus
+    ancienne, ou plus recente) l'ignore, sans decaler les autres."""
+    d = ",".join(ecrans_de_la_carte(cfg)).encode("ascii")
+    return b"ME" + len(d).to_bytes(2, "big") + d + fletcher16(d).to_bytes(2, "big")
+
+
 def trame_image(donnees, croquis):
     """Une image pour la carte : controlee (« MG » + somme) pour le croquis v3,
     « MF » nue sinon -- la v3 accepte les deux, une version mal lue ne fige rien."""
@@ -23224,6 +23246,9 @@ def lire_bilan_carte(lien):
         v = re.search(rb"VEILLE (\d+) (\d+)", ligne)
         if v:
             PANNEAU["carte_veille"] = (int(v.group(1)), int(v.group(2)))   # elle a ses reglages (v7)
+        v = re.search(rb"ECRANS (\d+)", ligne)
+        if v:
+            PANNEAU["carte_ecrans"] = int(v.group(1))   # les ecrans qu'elle montrera (v10)
 
 
 def version_croquis(lien, attente=0.5, calme=0.3):
@@ -23558,6 +23583,8 @@ def piloter_panneau(cfg=None, tours=None):
                     lum = voulue
                 if (PANNEAU.get("croquis") or 1) >= 7:
                     veille = trame_veille(cfg)      # ses ambiances, PC eteint : a la connexion, et a chaque reglage
+                    if (PANNEAU.get("croquis") or 1) >= 10:
+                        veille += trame_ecrans(cfg)   # et tous les autres ecrans (v10)
                     if veille != veille_envoyee:
                         with PANNEAU_VERROU:
                             lien.write(veille)
@@ -23672,7 +23699,7 @@ def confier_panneau_a_la_carte(cfg=None):
     PANNEAU.update(fini=True, confie=True)
     try:
         with PANNEAU_VERROU:
-            lien.write(trame_veille(cfg) + b"MW")
+            lien.write(trame_veille(cfg) + (trame_ecrans(cfg) if (PANNEAU.get("croquis") or 1) >= 10 else b"") + b"MW")
             lien.flush()
         print("Panneau LED : la carte prend le relais avec ses ambiances.")
         return True
@@ -23687,22 +23714,31 @@ def etat_veille_lisible(cfg):
         return "PC eteint, le panneau s'eteint aussi."
     sans = set(cfg.get("panneau_veille_sans") or [])
     n = sum(1 for nom in ECRANS_AMBIANCES if nom not in sans)
-    if not n:
-        return "Aucune ambiance cochee : PC eteint, le panneau s'eteint aussi."
+    croquis = PANNEAU.get("croquis") or 1
+    tous = len(ecrans_de_la_carte(cfg))
+    if not (tous if croquis >= 10 or PANNEAU.get("etat") != "connecte" else n):
+        return "Aucun ecran coche : PC eteint, le panneau s'eteint aussi."
     if PANNEAU.get("etat") != "connecte":
         return "Les reglages partiront a la carte des qu'elle sera branchee."
-    croquis = PANNEAU.get("croquis") or 1
     if croquis < 7:
         return ("La carte a le croquis v%d : televerse la v%d (carte/machi_panneau/machi_panneau.ino) pour "
                 "qu'elle dessine les ambiances elle-meme." % (croquis, PANNEAU_CROQUIS))
     if croquis < 8 and (entier(cfg.get("panneau_rotation", 0), 0) // 90) % 4:
         return ("La carte a le croquis v7 : ses ambiances ne suivent pas le sens du panneau. Televerse la v%d "
                 "(carte/machi_panneau/machi_panneau.ino)." % PANNEAU_CROQUIS)
+    if croquis >= 10 and PANNEAU.get("carte_ecrans") is not None:
+        k = PANNEAU["carte_ecrans"]
+        texte = "La carte a ses reglages : %d ecran%s quand le PC s'eteindra." % (k, "s" if k > 1 else "")
+        if k < tous:
+            texte += (" %d autre%s ne tien%s pas dans sa memoire : active la PSRAM (IDE Arduino, Outils > PSRAM) "
+                      "et televerse le croquis a nouveau." % (tous - k, "s" if tous - k > 1 else "",
+                                                                "nent" if tous - k > 1 else "t"))
+        return texte
     if PANNEAU.get("carte_veille"):
         texte = "La carte a ses reglages : %d ambiance%s quand le PC s'eteindra." % (n, "s" if n > 1 else "")
-        if croquis < 9 and "neige" not in sans:
-            texte += " (Croquis v%d : sa neige fait encore des colonnes ; la v%d la met en tas.)" % (croquis,
-                                                                                                  PANNEAU_CROQUIS)
+        if croquis < 10 and tous > n:
+            texte += (" Televerse le croquis v%d (carte/machi_panneau, tout le dossier) pour qu'elle dessine aussi "
+                      "les %d autres ecrans." % (PANNEAU_CROQUIS, tous - n))
         return texte
     return "Les reglages partent a la carte..."
 
@@ -27468,7 +27504,7 @@ class Panneau:
                     "panneau_cycle_bonhomme", "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid",
                     "panneau_cycle_notes", "panneau_ecrans", "panneau_ecrans_intervalle", "panneau_ecrans_duree",
                     "panneau_ecrans_sans", "panneau_veille", "panneau_veille_sans", "panneau_veille_luminosite",
-                    "panneau_veille_arret_h",
+                    "panneau_veille_arret_h", "panneau_veille_tous",
                     "panneau_eq_sensibilite"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
@@ -27607,6 +27643,12 @@ class Panneau:
         self.var_panneau_veille = tk.IntVar(value=1 if self.cfg.get("panneau_veille", True) else 0)
         self.case(ecrans, "Les ambiances quand le PC est eteint ou en veille", self.var_panneau_veille,
                   lambda: self.regler_panneau("panneau_veille")).pack(fill="x", pady=(4, 0))
+        # « tu peux faire un sketch avec tous ces ecrans ? » : la carte (croquis v10) les dessine tous
+        self.var_panneau_veille_tous = tk.IntVar(value=1 if self.cfg.get("panneau_veille_tous", True) else 0)
+        c = self.case(ecrans, "Et tous les autres ecrans coches plus haut (croquis v10)", self.var_panneau_veille_tous,
+                      lambda: self.regler_panneau("panneau_veille_tous"))
+        c.configure(wraplength=self.px(360))
+        c.pack(fill="x", pady=(2, 0))
         grille = tk.Frame(ecrans, bg=NUIT)
         grille.pack(fill="x", pady=(2, 4))
         sans = set(self.cfg.get("panneau_veille_sans") or [])
@@ -27811,8 +27853,8 @@ class Panneau:
                 PANNEAU["miroir"] = None                # coupe : il s'efface tout de suite
         elif cle == "panneau_miroir_filtre":
             self.cfg[cle] = bool(self.var_panneau_miroir_filtre.get())
-        elif cle == "panneau_veille":
-            self.cfg[cle] = bool(self.var_panneau_veille.get())
+        elif cle in ("panneau_veille", "panneau_veille_tous"):
+            self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "panneau_veille_arret_h":
             self.cfg[cle] = int(self.var_panneau_veille_arret_h.get())
         sauver_config(self.cfg)

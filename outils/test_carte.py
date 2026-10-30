@@ -16,12 +16,15 @@ Tenu ici :
   - deux lignes redessinees d'office par image : tout le panneau en 32 images ;
   - « MF » (Machi Tool d'avant) reste accepte ;
   - v7 : PC eteint, la carte dessine elle-meme les ambiances (« MA », gardes
-    dans sa memoire ; « MW », « MO »), et reste noire apres une baisse de tension.
+    dans sa memoire ; « MW », « MO »), et reste noire apres une baisse de tension ;
+  - v10 : elle connait tous les ecrans de Machi Tool, permis par leurs noms
+    (« ME »), et chacun se dessine, bouge et reste leger.
 
     python outils/test_carte.py        (sans g++ ou sans numpy, il se saute)
 """
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -48,6 +51,7 @@ ENTETE = r'''
 #include <vector>
 #include <algorithm>
 using std::min;
+using std::max;
 
 struct HUB75_I2S_CFG {
   struct i2s_pins { int8_t r1, g1, b1, r2, g2, b2, a, b, c, d, e, lat, oe, clk; };
@@ -217,6 +221,55 @@ int main(int argc, char **argv) {
 '''
 
 
+# Le banc des ecrans (v10) : chacun 20 s a 30 images/s, comme la carte les dessine.
+BANC = r'''
+#include "ESP32-HUB75-MatrixPanel-I2S-DMA.h"
+#include <chrono>
+#include <cmath>
+FauxSerial Serial;
+#include "machi_panneau.ino"
+
+int main(int argc, char **argv) {
+  preparer_arene();
+  preparer_lut();
+  static float avant[64][64][3];
+  for (int a = 1; a < argc; a++) {
+    int i = -1;
+    for (int k = 0; k < NB_ECRANS; k++) if (!strcmp(ECRANS[k].nom, argv[a])) i = k;
+    if (i < 0) continue;
+    graine = 0x2545F491u;
+    std::vector<double> couts;
+    int nan = 0, bouge = 0;
+    long allumes = 0;
+    for (int n = 0; n <= 600; n++) {
+      auto t0 = std::chrono::steady_clock::now();
+      ECRANS[i].dessin(ECRANS[i].humeur, n == 0, 137.0f + n / 30.0f, n / 30.0f, n ? 1.0f / 30 : 0.0f);
+      if (n) couts.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) for (int c = 0; c < 3; c++)
+        if (!std::isfinite(scene[y][x][c])) nan++;
+      if (n % 30 == 0) {
+        if (n) {
+          bool change = false;
+          allumes = 0;
+          for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+            float m = 0;
+            for (int c = 0; c < 3; c++) { change |= scene[y][x][c] != avant[y][x][c]; m = fmaxf(m, scene[y][x][c]); }
+            allumes += m > 60;
+          }
+          bouge += change;
+        }
+        memcpy(avant, scene, sizeof avant);
+      }
+    }
+    std::sort(couts.begin(), couts.end());
+    printf("ECRAN %s MEDIANE %.3f NAN %d BOUGE %d ALLUMES %ld TAILLE %u\n", argv[a], couts[couts.size() / 2], nan, bouge,
+           allumes, (unsigned)ECRANS[i].taille);
+  }
+  return 0;
+}
+'''
+
+
 def charger_module(dossier):
     os.environ["LOCALAPPDATA"] = dossier
     spec = importlib.util.spec_from_file_location("mt_carte", os.path.join(RACINE, "machi_tool.py"))
@@ -298,7 +351,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 9", reponses)
+        self.assertIn("MACHI 10", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
@@ -542,7 +595,7 @@ class LaCarte(unittest.TestCase):
         self.assertLessEqual(int(np.abs(np.diff(hauteurs)).max()), 3, "des pentes douces, plus de colonnes")
 
     def test_chaque_ambiance_se_dessine_et_bouge(self):
-        # « keep only atmospheric effects » : les dix ambiances de Machi Tool, et elles seules
+        # « keep only atmospheric effects » : les dix ambiances de Machi Tool, les bits de « MA »
         self.assertEqual(len(self.M.ECRANS_AMBIANCES), 10)
         for i, nom in enumerate(self.M.ECRANS_AMBIANCES):
             with self.subTest(ambiance=nom):
@@ -553,10 +606,71 @@ class LaCarte(unittest.TestCase):
                 b, _, _ = self.envoyer(flux, ["+4500"])
                 self.assertGreater(int((a != 0).sum()), 1500, "elle se voit")
                 self.assertFalse((a == b).all(), "elle bouge")
-        with open(os.path.join(CROQUIS, "machi_panneau.ino"), encoding="utf-8") as f:
-            croquis = f.read()
-        for absent in ("matrice", "feu", "plasma", "tunnel"):
-            self.assertNotIn("ecran_" + absent, croquis, "pas de jeux de lumiere a l'arret")
+
+    # ---------------- v10 : tous les ecrans de Machi Tool ----------------
+
+    def ecrans(self, noms):
+        d = ",".join(noms).encode("ascii")
+        return b"ME" + len(d).to_bytes(2, "big") + d + self.M.fletcher16(d).to_bytes(2, "big")
+
+    def test_la_carte_connait_tous_les_ecrans_de_machi_tool(self):
+        # « tu peux faire un sketch avec tous ces ecrans ? »
+        with open(os.path.join(CROQUIS, "registre.h"), encoding="utf-8") as f:
+            noms = re.findall(r'^  \{"([a-z0-9_]+)", ', f.read(), re.M)
+        self.assertEqual(noms, list(self.M.ECRANS), "les memes, dans le meme ordre")
+        self.assertEqual(noms[:10], list(self.M.ECRANS_AMBIANCES), "les dix premiers : les bits de « MA »")
+        for lot in os.listdir(CROQUIS):
+            if lot.startswith("lot_"):
+                with open(os.path.join(CROQUIS, lot), encoding="utf-8") as f:
+                    self.assertNotIn("A PORTER", f.read(), lot)
+
+    def test_me_choisit_les_ecrans_par_leurs_noms(self):
+        flux = self.veille() + self.ecrans(["grande_roue", "pas_un_ecran", "aurore"])
+        _, reponses, _ = self.envoyer(flux)
+        self.assertIn("ECRANS 2", reponses, "un nom qu'elle ne connait pas : ignore, sans decaler les autres")
+        self.assertEqual(self.M.trame_ecrans({"panneau_veille_tous": False, "panneau_veille_sans": list(
+            self.M.ECRANS_AMBIANCES)}), self.ecrans([]), "Machi Tool la fabrique pareil")
+        noir, reponses, _ = self.envoyer(self.veille() + self.ecrans([]) + b"MW", ["+2000"])
+        self.assertIn("ECRANS 0", reponses)
+        self.assertFalse(noir.any(), "aucun ecran : noir")
+        seul, _, _ = self.envoyer(self.veille() + self.ecrans(["synthwave_magenta"]) + b"MW", ["+2000"])
+        self.assertGreater(int((seul != 0).sum()), 1500, "le seul permis, PC eteint")
+        abimee = bytearray(self.ecrans(["synthwave_magenta"]))
+        abimee[6] ^= 1
+        _, reponses, _ = self.envoyer(self.veille() + bytes(abimee))
+        self.assertNotIn("ECRANS", reponses, "abimee : ignoree")
+
+    def test_les_ecrans_permis_survivent_a_une_coupure(self):
+        nvs = os.path.join(tempfile.mkdtemp(), "nvs")
+        flux = self.veille() + self.ecrans(["synthwave_magenta"])
+        _, reponses, _ = self.envoyer(flux * 2, nvs=nvs)
+        self.assertEqual(self.chiffre(reponses, "ECRITURES"), 2, "les reglages, puis les ecrans : une fois chacun")
+        a, _, _ = self.envoyer(b"", ["+9000"], nvs=nvs, reset=1)
+        self.assertTrue(a.any(), "rebranchee : son ecran, sans le PC")
+        b, _, _ = self.envoyer(flux, ["+9000"])
+        self.assertGreater(float((a == b).mean()), 0.8, "le meme ecran que si Machi Tool venait de le lui dire")
+
+    def test_chaque_ecran_se_dessine_bouge_et_tient_dans_son_temps(self):
+        # les 160 : chacun 20 s a 30 images/s ; pas de NaN, il se voit, il bouge, et il reste leger
+        binaire = os.path.join(self.dossier, "banc")
+        source = os.path.join(self.dossier, "banc.cpp")
+        with open(source, "w") as f:
+            f.write(BANC)
+        r = subprocess.run([COMPILATEUR, "-std=c++17", "-O2", "-Wall", "-I", self.dossier, "-I", CROQUIS, source,
+                            "-o", binaire], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        r = subprocess.run([binaire] + list(self.M.ECRANS), capture_output=True, text=True, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stderr[-3000:])
+        lignes = {l.split()[1]: l.split() for l in r.stdout.splitlines() if l.startswith("ECRAN ")}
+        self.assertEqual(sorted(lignes), sorted(self.M.ECRANS))
+        for nom, l in lignes.items():
+            with self.subTest(ecran=nom):
+                v = dict(zip(l[2::2], l[3::2]))
+                self.assertEqual(int(v["NAN"]), 0, "pas de NaN")
+                self.assertGreater(int(v["ALLUMES"]), 40, "il se voit")
+                self.assertGreaterEqual(int(v["BOUGE"]), 15, "il bouge (secondes sur 20)")
+                self.assertLessEqual(int(v["TAILLE"]), 192 * 1024, "son etat tient dans l'arene")
+                self.assertLess(float(v["MEDIANE"]), 2.0, "leger (ms par image, ici)")
 
 
 if __name__ == "__main__":

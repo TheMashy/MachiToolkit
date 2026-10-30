@@ -3093,7 +3093,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_luminosite=0))[4], 4)
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_arret_h="n'importe"))[9:11], b"\x00\x00")
         self.assertTrue(m.CONFIG_DEFAUT["panneau_veille"])
-        self.assertEqual(m.PANNEAU_CROQUIS, 9)
+        self.assertEqual(m.PANNEAU_CROQUIS, 10)
         # « le sketch display les screen savers avec un angle de 90 degres » : le sens du panneau, bits 1-2
         for degres, octet in ((0, 1), (90, 3), (180, 5), (270, 7), (450, 3)):
             self.assertEqual(m.trame_veille(dict(cfg, panneau_rotation=degres))[3], octet, degres)
@@ -3170,14 +3170,106 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(carte.ecrit, [b"MO"])
         # ce que la page en dit
         m.PANNEAU.update(etat="connecte", croquis=6, carte_veille=None)
-        self.assertIn("televerse la v9", m.etat_veille_lisible({}))
+        self.assertIn("televerse la v10", m.etat_veille_lisible({}))
         m.PANNEAU["croquis"] = 7
         self.assertIn("ne suivent pas le sens", m.etat_veille_lisible({"panneau_rotation": 90}))
         self.assertNotIn("v7", m.etat_veille_lisible({"panneau_rotation": 0}), "droit, la v7 suffit")
         self.assertIn("s'eteint aussi", m.etat_veille_lisible({"panneau_veille": False}))
-        self.assertIn("Aucune ambiance", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}))
+        self.assertIn("Aucun ecran", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}))
         m.PANNEAU["etat"] = "absent"
         self.assertIn("des qu'elle sera branchee", m.etat_veille_lisible({}))
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_la_carte_v10_recoit_tous_ses_ecrans_par_leurs_noms(self):
+        # « tu peux faire un sketch avec tous ces ecrans ? » : la carte (croquis v10) les dessine tous ;
+        # Machi Tool lui dit lesquels par leurs noms (« ME »)
+        m = self.m
+        cles = ("fini", "lien", "confie", "croquis", "etat", "carte_veille", "carte_ecrans", "port", "envoyees")
+        sauve = {k: m.PANNEAU.get(k) for k in cles}
+        vrais = {n: getattr(m, n) for n in ("trouver_panneau", "ouvrir_panneau", "version_croquis")}
+        def remettre():
+            for n, f in vrais.items():
+                setattr(m, n, f)
+            m.PANNEAU.update(sauve)
+        self.addCleanup(remettre)
+        noms = m.ecrans_de_la_carte({})
+        self.assertEqual(noms[:10], list(m.ECRANS_AMBIANCES), "les ambiances d'abord")
+        self.assertEqual(sorted(noms), sorted(m.ECRANS), "par defaut : tous")
+        t = m.trame_ecrans({})
+        n = int.from_bytes(t[2:4], "big")
+        self.assertEqual((t[:2], len(t)), (b"ME", 4 + n + 2))
+        self.assertEqual(t[4:4 + n].decode("ascii").split(","), noms)
+        self.assertEqual(int.from_bytes(t[-2:], "big"), m.fletcher16(t[4:4 + n]))
+        self.assertLessEqual(n, 4096, "la carte en lit 4 096 au plus")
+        # ses cases a elle pour les ambiances ; « Lesquels » pour les autres ; « tous les autres » decoche
+        cfg = {"panneau_veille_sans": ["neige"], "panneau_ecrans_sans": ["matrice", "aurore", "galaxie_bleu"]}
+        noms = m.ecrans_de_la_carte(cfg)
+        self.assertNotIn("neige", noms)
+        self.assertIn("aurore", noms, "une ambiance : ce sont ses cases a elle qui comptent")
+        self.assertNotIn("matrice", noms)
+        self.assertNotIn("galaxie_bleu", noms)
+        self.assertIn("galaxie_or", noms)
+        self.assertEqual(m.ecrans_de_la_carte(dict(cfg, panneau_veille_tous=False)),
+                         [x for x in m.ECRANS_AMBIANCES if x != "neige"])
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_veille_tous"])
+
+        class Carte:
+            def __init__(self):
+                self.ecrit = []
+
+            def write(self, octets):
+                self.ecrit.append(bytes(octets))
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+        # une v10 branchee : « MA » et « ME » ensemble, une fois, puis a chaque changement
+        carte = Carte()
+        m.trouver_panneau = lambda: "COM7"
+        m.ouvrir_panneau = lambda p: carte
+        m.version_croquis = lambda lien: 10
+        m.PANNEAU.update(etat="absent", port=None, envoyees=0, fini=False, lien=None, confie=False)
+        pilote = {"panneau_actif": True, "panneau_contenu": "horloge", "panneau_luminosite": 64}
+        m.piloter_panneau(pilote, tours=2)
+        self.assertEqual([o[:2] for o in carte.ecrit], [b"MB", b"MA", b"MG", b"MG"])
+        self.assertEqual(carte.ecrit[1], m.trame_veille(pilote) + m.trame_ecrans(pilote))
+        del carte.ecrit[:]
+        pilote["panneau_ecrans_sans"] = ["plasma"]
+        m.piloter_panneau(pilote, tours=1)
+        self.assertIn(m.trame_ecrans(pilote), carte.ecrit[1], "un ecran decoche plus haut : la carte le sait")
+        # une v9 : « MA » seul
+        carte = Carte()
+        m.ouvrir_panneau = lambda p: carte
+        m.version_croquis = lambda lien: 9
+        m.PANNEAU.update(etat="absent", port=None, lien=None)
+        m.piloter_panneau(pilote, tours=1)
+        self.assertEqual(carte.ecrit[1], m.trame_veille(pilote))
+        # Windows s'arrete : une v10 recoit ses ecrans juste avant « MW »
+        carte = Carte()
+        m.PANNEAU.update(lien=carte, croquis=10, fini=False, confie=False)
+        self.assertTrue(m.confier_panneau_a_la_carte({}))
+        self.assertEqual(carte.ecrit, [m.trame_veille({}) + m.trame_ecrans({}) + b"MW"])
+        # ce qu'elle repond, ce que la page en dit
+        class Bavarde(Carte):
+            in_waiting = 11
+
+            def read(self, n):
+                return b"ECRANS 154\n"
+        m.lire_bilan_carte(Bavarde())
+        self.assertEqual(m.PANNEAU["carte_ecrans"], 154)
+        m.PANNEAU.update(etat="connecte", croquis=10)
+        self.assertIn("154 ecrans", m.etat_veille_lisible({}))
+        self.assertIn("active la PSRAM", m.etat_veille_lisible({}), "il en manque : sa memoire")
+        m.PANNEAU["carte_ecrans"] = len(m.ecrans_de_la_carte({}))
+        self.assertNotIn("PSRAM", m.etat_veille_lisible({}), "tous : rien a dire")
+        m.PANNEAU.update(croquis=9, carte_veille=(1, 1023))
+        self.assertIn("televerse le croquis v10", m.etat_veille_lisible({}).lower())
+        self.assertIn("Aucun ecran", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}))
+        m.PANNEAU["croquis"] = 10
+        self.assertNotIn("Aucun ecran", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}),
+                         "une v10 a encore tous les autres")
 
     def test_le_panneau_dit_qui_ralentit_et_reconnait_son_croquis(self):
         # « ca tombe a 5 fps parfois, tu pourrais fixer ca ? »
