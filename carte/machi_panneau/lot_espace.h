@@ -1451,7 +1451,7 @@ void spa_orbite_preparer(E_orbite &e) {
       dest[i] = (uint8_t)(255 * sqrtf(V / 3) + 0.5f);
     }
   }
-  uint16_t *b64 = (uint16_t *)e.nb;                                              // la lueur de loin, a demi-resolution
+  uint16_t *b64 = b;                                                             // la lueur de loin, a demi-resolution
   for (int T = 0; T < 2; T++) {
     memset(b64, 0, 4096 * sizeof(uint16_t));
     spa_villes_semer(depart, b64, 64, T, 0.25f);
@@ -1568,13 +1568,18 @@ void s_orbite(int humeur, bool debut, float t, float ecoule, float dt) {
         p[1] += li * 63 + ve * 48 + co * hv[3] + hb * 100;
         p[2] += li * 153 + ve * 24 + co * hv[4] + hb * 210;
       }
-      if (leve > 0) {
-        const float ddx = x - sx, ddy = y - sy, d = sqrtf(ddx * ddx + ddy * ddy);
-        const float disque = borne(2.6f - d, 0, 1) * cie;
-        if (disque > 0) { p[0] += (255 - p[0]) * disque; p[1] += (245 - p[1]) * disque; p[2] += (215 - p[2]) * disque; }
-        const float halo = (spa_exp(-d / 2.2f) * 0.8f + spa_exp(-d / 9.0f) * 0.3f) * leve * cie;
-        const float trait = spa_exp(-fabsf(ddy - ddx * pente) * 1.2f - fabsf(ddx) / 14) * leve;
-        const float k = halo + trait * 0.45f;
+      if (leve > 0) {                                                            // le soleil, son halo, son trait
+        const float ddx = x - sx, ddy = y - sy;
+        float k = 0;
+        if (cie > 0) {
+          const float d = sqrtf(ddx * ddx + ddy * ddy);
+          const float disque = borne(2.6f - d, 0, 1) * cie;
+          if (disque > 0) { p[0] += (255 - p[0]) * disque; p[1] += (245 - p[1]) * disque; p[2] += (215 - p[2]) * disque; }
+          k = (d < 26 ? spa_exp(-d / 2.2f) * 0.8f : 0.0f) + spa_exp(-d / 9.0f) * 0.3f;
+          k *= leve * cie;
+        }
+        const float arg = -fabsf(ddy - ddx * pente) * 1.2f - fabsf(ddx) / 14;
+        if (arg > -12) k += spa_exp(arg) * leve * 0.45f;
         p[0] += k * 255; p[1] += k * 225; p[2] += k * 170;
       }
     }

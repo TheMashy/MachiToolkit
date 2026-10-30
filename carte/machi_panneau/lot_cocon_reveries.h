@@ -130,12 +130,24 @@ void cr_flou_cocon(float *a, int c, int n, int y0 = 0, int y1 = 64, int x0 = 0, 
   }
 }
 // _reveries_flou : le meme, les bords recopies (la lumiere ne fuit pas), sur un tampon de taille x taille
-void cr_flou_rev(float *a, int c, int n, int taille = 64) {
+void cr_flou_rev(float *a, int c, int n, int taille = 64, int y0 = 0, int y1 = -1) {
+  // (y0, y1) : seules ces lignes sont traitees -- les autres sont nulles et doivent le rester (marge >= n)
+  if (y1 < 0) y1 = taille;
   float avant[64 * 3];
   const int m1 = taille - 1;
   for (int pas = 0; pas < n; pas++) {
-    for (int y = 0; y < taille; y++) {
+    for (int y = y0; y < y1; y++) {
       float *l = a + (y * taille) * c;
+      if (c == 3) {                                      // les trois couleurs ensemble
+        float g0 = l[0], g1 = l[1], g2 = l[2], m0 = g0, m1c = g1, m2 = g2;
+        for (int x = 0; x < taille; x++) {
+          const float *n = l + (x < m1 ? x + 1 : m1) * 3;
+          const float d0 = n[0], d1 = n[1], d2 = n[2];
+          l[3 * x] = (g0 + 2 * m0 + d0) * 0.25f; l[3 * x + 1] = (g1 + 2 * m1c + d1) * 0.25f; l[3 * x + 2] = (g2 + 2 * m2 + d2) * 0.25f;
+          g0 = m0; g1 = m1c; g2 = m2; m0 = d0; m1c = d1; m2 = d2;
+        }
+        continue;
+      }
       for (int k = 0; k < c; k++) {
         float g = l[k], m = l[k];
         for (int x = 0; x < taille; x++) {
@@ -145,8 +157,8 @@ void cr_flou_rev(float *a, int c, int n, int taille = 64) {
         }
       }
     }
-    for (int i = 0; i < taille * c; i++) avant[i] = a[i];
-    for (int y = 0; y < taille; y++) {
+    for (int i = 0; i < taille * c; i++) avant[i] = a[(y0 > 0 ? y0 - 1 : 0) * taille * c + i];
+    for (int y = y0; y < y1; y++) {
       float *l = a + (y * taille) * c;
       const float *s = a + ((y < m1 ? y + 1 : m1) * taille) * c;
       for (int i = 0; i < taille * c; i++) {
@@ -1667,8 +1679,12 @@ struct E_encre {
   int16_t vit[4096][2];                    // le deplacement d'un pas, en x et en y (x 4000)
   float psi[3][64];                        // trois lignes de la fonction de courant
   uint16_t a[4096], b[4096];               // les deux champs qui font le courant de fond
-  float file[CR_ENCRE_K][64][3];           // les lignes calculees, pas encore ecrites (on lit encore l'ancienne)
+  uint16_t file[CR_ENCRE_K][64][3];        // les lignes calculees, pas encore ecrites (on lit encore l'ancienne)
   float ex[64], sx[64], cx[64];
+  uint8_t plein[64];                       // les lignes ou il y a de l'encre
+  uint8_t vit_ok[64];                      // les lignes dont le deplacement est a jour
+  int vit_pas;
+  float vit_h;
   CR_Goutte g[8];
   int ng, teinte, avance;
   float horloge, prochaine, force;
@@ -1688,22 +1704,28 @@ inline void cr_encre_lire(const uint16_t (*m)[3], float sx, float sy, float *v) 
     v[c] = (ab + (dg - ab) * fy) * eau;
   }
 }
+// un point de lecture : ses quatre voisins (i, i + 1, i + 64, i + 65), ses poids, l'eau claire hors du panneau
+struct CR_Lecture { int i; float fx, fy, eau; };
+inline void cr_encre_point(CR_Lecture &l, float sx, float sy) {
+  if (sx >= 0 && sx <= 62.99999f && sy >= 0 && sy <= 62.99999f) l.eau = 1;
+  else {
+    l.eau = cr_clip01(1 - cr_max(cr_max(-sx, sx - 63), cr_max(-sy, sy - 63)));
+    sx = cr_max(0.0f, cr_min(62.99999f, sx)); sy = cr_max(0.0f, cr_min(62.99999f, sy));
+  }
+  const int x0 = (int)sx, y0 = (int)sy;
+  l.i = y0 * 64 + x0; l.fx = sx - x0; l.fy = sy - y0;
+}
+inline float cr_encre_melange(const CR_Lecture &l, float a, float b, float d, float g) {
+  const float ab = a + (b - a) * l.fx, dg = d + (g - d) * l.fx;
+  return (ab + (dg - ab) * l.fy) * l.eau;
+}
 inline void cr_encre_lire(const uint16_t (*m)[3], float sx, float sy, uint16_t *v) {
   float f[3];
   cr_encre_lire(m, sx, sy, f);
   for (int c = 0; c < 3; c++) v[c] = (uint16_t)(f[c] + 0.5f);   // un melange : jamais au-dela de 65535
 }
 
-#ifdef CR_PROFIL
-double cr_p[4];
-#define CR_T(k) auto _t##k = std::chrono::steady_clock::now();
-#define CR_A(i, a, b) cr_p[i] += std::chrono::duration<double, std::milli>(_t##b - _t##a).count();
-#else
-#define CR_T(k)
-#define CR_A(i, a, b)
-#endif
 void cr_encre_pas(E_encre &e, float h) {
-  CR_T(0)
   e.horloge += h;
   const float c = e.horloge;
   if (c >= e.prochaine && e.ng < 8) {                    // une goutte d'une autre couleur
@@ -1714,20 +1736,60 @@ void cr_encre_pas(E_encre &e, float h) {
     g.x = hasard(18, 46); g.y = -1.5f; g.age = 0; g.ph = hasard(0, 6.3f); g.vi = g.v;
     for (int j = 0; j < 3; j++) g.c[j] = CR_ENCRE[e.teinte][j] / 255.0f;
   }
-  // le courant : deux champs doux qui glissent, un tournoiement, et chaque goutte, un anneau de tourbillons
-  const cr_Fen fa = cr_fen(e.a, 64, 30 + c * 0.55f, 10 + c * 0.3f), fb = cr_fen(e.b, 64, 70 - c * 0.4f, 50 + c * 0.5f);
-  const float tourne = 0.04f * sinf(c * 0.05f);
-  float gs[8], gk[8];
-  for (int n = 0; n < e.ng; n++) {
+  float gs[8], gk[8], gx[8], gy[8];
+  const int ng = e.ng;                                   // le courant voit les gouttes d'avant ce pas
+  for (int n = 0; n < ng; n++) {
     CR_Goutte &g = e.g[n];
     gs[n] = 3.4f + 2.8f * (1 - g.v / g.v0);              // il s'elargit en ralentissant
     g.vi = g.v + 2.8f * expf(-g.age / 6.0f);             // il tourne encore un peu quand il a freine
     gk[n] = gs[n] * g.vi;
+    gx[n] = g.x; gy[n] = g.y;
   }
+  for (int n = 0; n < ng; n++) {
+    CR_Goutte &g = e.g[n];
+    if (g.age < 0.55f) {                                 // elle lache son encre en entrant
+      const float q = 1 - g.age / 0.55f, k = 46.0f * h * q * q * CR_ENCRE_ECH;
+      for (int y = max(0, (int)floorf(g.y) - 8); y <= min(63, (int)floorf(g.y) + 9); y++)
+        for (int x = max(0, (int)g.x - 8); x <= min(63, (int)g.x + 9); x++) {
+          const float r2 = (x - g.x) * (x - g.x) + (y - g.y) * (y - g.y);
+          if (r2 > 60) continue;
+          const float a = cr_exp(-r2 / 6.0f) * k;
+          uint16_t *p = e.m[y * 64 + x];
+          for (int j = 0; j < 3; j++) p[j] = (uint16_t)cr_min(65535.0f, p[j] + a * g.c[j] + 0.5f);
+          e.plein[y] = 1;
+        }
+    }
+    g.y += g.vi * h;
+    g.x += sinf(g.age * 2.2f + g.ph) * 2.5f * h;         // elle ne tombe pas tout a fait droit
+    g.v *= expf(-h / 2.6f);
+    g.age += h;
+  }
+  int garde = 0;
+  for (int n = 0; n < e.ng; n++) if (e.g[n].age < 14) e.g[garde++] = e.g[n];
+  e.ng = garde;
+  // ou il y a de l'encre : une ligne dont aucune voisine (a un pas pres) n'en a ne recoit rien, et n'a pas
+  // besoin du courant
+  // Le courant est refait tous les 1/15 s (le pas de numpy) : entre deux, le deplacement d'un pas est reutilise, et
+  // seules les lignes que l'encre vient d'atteindre sont calculees
+  uint8_t proche[64], besoin[64], calcul[64];
+  const bool neuf = e.vit_pas % 2 == 0 || h != e.vit_h;
+  e.vit_pas++;
+  e.vit_h = h;
+  for (int y = 0; y < 64; y++) {
+    proche[y] = 0;
+    for (int r = max(0, y - CR_ENCRE_D - 1); r <= min(63, y + CR_ENCRE_D + 1); r++) proche[y] |= e.plein[r];
+    besoin[y] = proche[y] && (neuf || !e.vit_ok[y]);
+    if (neuf) e.vit_ok[y] = 0;
+  }
+  for (int y = 0; y < 64; y++) calcul[y] = besoin[y] | (y > 0 && besoin[y - 1]) | (y < 63 && besoin[y + 1]);
+  // le courant : deux champs doux qui glissent, un tournoiement, et chaque goutte, un anneau de tourbillons
+  const cr_Fen fa = cr_fen(e.a, 64, 30 + c * 0.55f, 10 + c * 0.3f), fb = cr_fen(e.b, 64, 70 - c * 0.4f, 50 + c * 0.5f);
+  const float tourne = 0.04f * sinf(c * 0.05f);
   auto ligne = [&](int y, float *psi) {                  // une ligne de la fonction de courant
+    if (!calcul[y]) return;
     const float dy = y - 32.0f, ty = tourne * e.ex[y];
-    float gy2[8], gx[8];
-    for (int n = 0; n < e.ng; n++) { gy2[n] = (y - e.g[n].y) * (y - e.g[n].y) + 3.0f; gx[n] = e.g[n].x; }
+    float gy2[8];
+    for (int n = 0; n < ng; n++) gy2[n] = (y - gy[n]) * (y - gy[n]) + 3.0f;
     const uint16_t *a0 = e.a + (((y + fa.y0) & 63) << 6), *a1 = e.a + (((y + fa.y0 + 1) & 63) << 6);
     const uint16_t *b0 = e.b + (((y + fb.y0) & 63) << 6), *b1 = e.b + (((y + fb.y0 + 1) & 63) << 6);
     const float kf = e.force * (1.0f / 65535.0f);
@@ -1737,7 +1799,7 @@ void cr_encre_pas(E_encre &e, float h) {
       const float hb = b0[xb] + (b0[xb1] - (float)b0[xb]) * fb.fx, lb = b1[xb] + (b1[xb1] - (float)b1[xb]) * fb.fx;
       const float dx = x - 32.0f;
       float p = kf * ((ha + (la - ha) * fa.fy) - (hb + (lb - hb) * fb.fy)) + ty * e.ex[x] * (dx * dx + dy * dy);
-      for (int n = 0; n < e.ng; n++) {
+      for (int n = 0; n < ng; n++) {
         const float u = x - gx[n], a = u - gs[n], b = u + gs[n];
         p += gk[n] * cr_log((a * a + gy2[n]) / (b * b + gy2[n]));
       }
@@ -1750,6 +1812,8 @@ void cr_encre_pas(E_encre &e, float h) {
   ligne(1, e.psi[1]);
   for (int y = 0; y < 64; y++) {
     if (y >= 1 && y + 1 < 64) ligne(y + 1, e.psi[(y + 1) % 3]);
+    if (!besoin[y]) continue;
+    e.vit_ok[y] = 1;
     const float *av = e.psi[(y + 2) % 3], *ic = e.psi[y % 3], *ap = e.psi[(y + 1) % 3];
     for (int x = 0; x < 64; x++) {
       float vx = y == 0 ? ap[x] - ic[x] : y == 63 ? ic[x] - av[x] : (ap[x] - av[x]) * 0.5f;
@@ -1758,62 +1822,60 @@ void cr_encre_pas(E_encre &e, float h) {
       e.vit[y * 64 + x][0] = (int16_t)(vx * kv); e.vit[y * 64 + x][1] = (int16_t)(vy * kv);
     }
   }
-  CR_T(1) CR_A(0, 0, 1)
-  for (int n = 0; n < e.ng; n++) {
-    CR_Goutte &g = e.g[n];
-    if (g.age < 0.55f) {                                 // elle lache son encre en entrant
-      const float q = 1 - g.age / 0.55f, k = 46.0f * h * q * q * CR_ENCRE_ECH;
-      for (int y = max(0, (int)floorf(g.y) - 8); y <= min(63, (int)floorf(g.y) + 9); y++)
-        for (int x = max(0, (int)g.x - 8); x <= min(63, (int)g.x + 9); x++) {
-          const float r2 = (x - g.x) * (x - g.x) + (y - g.y) * (y - g.y);
-          if (r2 > 60) continue;
-          const float a = cr_exp(-r2 / 6.0f) * k;
-          uint16_t *p = e.m[y * 64 + x];
-          for (int j = 0; j < 3; j++) p[j] = (uint16_t)cr_min(65535.0f, p[j] + a * g.c[j] + 0.5f);
-        }
-    }
-    g.y += g.vi * h;
-    g.x += sinf(g.age * 2.2f + g.ph) * 2.5f * h;         // elle ne tombe pas tout a fait droit
-    g.v *= expf(-h / 2.6f);
-    g.age += h;
-  }
-  int garde = 0;
-  for (int n = 0; n < e.ng; n++) if (e.g[n].age < 14) e.g[garde++] = e.g[n];
-  e.ng = garde;
   // l'encre suit le courant : on remonte le courant, puis on corrige l'aller-retour (MacCormack)
-  CR_T(2) CR_A(1, 1, 2)
   const float iv = 1.0f / kv;
-  for (int y = 0; y < 64; y++)
+  for (int y = 0; y < 64; y++) {
+    if (!proche[y]) { memset(e.av[y * 64], 0, 64 * 3 * sizeof(uint16_t)); continue; }
     for (int x = 0; x < 64; x++) {
       const int i = y * 64 + x;
-      cr_encre_lire(e.m, x - e.vit[i][0] * iv, y - e.vit[i][1] * iv, e.av[i]);
+      CR_Lecture l;
+      cr_encre_point(l, x - e.vit[i][0] * iv, y - e.vit[i][1] * iv);
+      const uint16_t *q0 = e.m[l.i], *q1 = e.m[l.i + 64];
+      if (!(q0[0] | q0[1] | q0[2] | q0[3] | q0[4] | q0[5] | q1[0] | q1[1] | q1[2] | q1[3] | q1[4] | q1[5])) {
+        e.av[i][0] = e.av[i][1] = e.av[i][2] = 0;
+        continue;
+      }
+      for (int j = 0; j < 3; j++) e.av[i][j] = (uint16_t)(cr_encre_melange(l, q0[j], q0[j + 3], q1[j], q1[j + 3]) + 0.5f);
     }
-  CR_T(3) CR_A(2, 2, 3)
-  const float dilue = expf(-h / 17.0f), perd = 0.01f * h * CR_ENCRE_ECH;
+  }
+  const float dilue = expf(-h / 17.0f), perd = 0.01f * h * CR_ENCRE_ECH - 0.5f;   // (+ 0.5 : l'arrondi)
   for (int y = 0; y < 64 + CR_ENCRE_K - 1; y++) {
-    if (y < 64)
+    if (y < 64 && !proche[y]) memset(e.file[y % CR_ENCRE_K], 0, sizeof(e.file[0]));
+    else if (y < 64)
       for (int x = 0; x < 64; x++) {
         const int i = y * 64 + x;
         const float vx = e.vit[i][0] * iv, vy = e.vit[i][1] * iv;
-        const float sx = x - vx, sy = y - vy;            // les bornes : les quatre voisins de l'aller
-        const float dehors = cr_max(cr_max(-sx, sx - 63), cr_max(-sy, sy - 63));
-        const float eau = cr_clip01(1 - dehors);
-        const float bx = cr_max(0.0f, cr_min(62.99999f, sx)), by = cr_max(0.0f, cr_min(62.99999f, sy));
-        const int i0 = (int)by * 64 + (int)bx;
-        float retour[3];
-        cr_encre_lire(e.av, x + vx, y + vy, retour);
-        float *o = e.file[y % CR_ENCRE_K][x];
+        CR_Lecture l;                                    // les bornes : les quatre voisins de l'aller
+        cr_encre_point(l, x - vx, y - vy);
+        uint16_t *o = e.file[y % CR_ENCRE_K][x];
+        const uint16_t *q0 = e.m[l.i], *q1 = e.m[l.i + 64];
+        int bas[3], haut[3];
         for (int j = 0; j < 3; j++) {
-          const float a = e.m[i0][j], b = e.m[i0 + 1][j], d = e.m[i0 + 64][j], g = e.m[i0 + 65][j];
-          const float bas = cr_min(cr_min(a, b), cr_min(d, g)) * eau, haut = cr_max(cr_max(a, b), cr_max(d, g));
-          const float m = cr_max(bas, cr_min(haut, e.av[i][j] + (e.m[i][j] - retour[j]) * 0.5f));
-          o[j] = cr_max(0.0f, m * dilue - perd);         // tres diluee, elle disparait : pas de voile
+          const int a = q0[j], b = q0[j + 3], d = q1[j], g = q1[j + 3];
+          const int ab = a < b ? a : b, dg = d < g ? d : g, AB = a > b ? a : b, DG = d > g ? d : g;
+          bas[j] = ab < dg ? ab : dg; haut[j] = AB > DG ? AB : DG;
+        }
+        if (!(haut[0] | haut[1] | haut[2])) {           // les quatre voisins sont vides : borne a zero
+          o[0] = o[1] = o[2] = 0;
+          continue;
+        }
+        CR_Lecture r;
+        cr_encre_point(r, x + vx, y + vy);
+        const uint16_t *r0 = e.av[r.i], *r1 = e.av[r.i + 64];
+        for (int j = 0; j < 3; j++) {
+          const float retour = cr_encre_melange(r, r0[j], r0[j + 3], r1[j], r1[j + 3]);
+          const float m = cr_max(bas[j] * l.eau, cr_min((float)haut[j], e.av[i][j] + (e.m[i][j] - retour) * 0.5f));
+          o[j] = (uint16_t)cr_max(0.0f, m * dilue - perd);   // tres diluee, elle disparait : pas de voile
         }
       }
     const int pret = y - (CR_ENCRE_K - 1);               // plus personne ne lira cette ligne de l'ancienne encre
-    if (pret >= 0)
-      for (int x = 0; x < 64; x++)
-        for (int j = 0; j < 3; j++) e.m[pret * 64 + x][j] = (uint16_t)cr_min(65535.0f, e.file[pret % CR_ENCRE_K][x][j] + 0.5f);
+    if (pret >= 0) {
+      memcpy(e.m[pret * 64], e.file[pret % CR_ENCRE_K], sizeof(e.file[0]));
+      uint32_t tout = 0;
+      const uint16_t *v = e.m[pret * 64];
+      for (int k = 0; k < 64 * 3; k++) tout |= v[k];
+      e.plein[pret] = tout != 0;
+    }
   }
 }
 
@@ -1849,15 +1911,25 @@ void s_encre(int humeur, bool debut, float t, float ecoule, float dt) {
   for (int k = 0; k < n; k++) cr_encre_pas(e, reste / n);
   // la lumiere de l'encre, et ses deux halos : 0.7 L + 0.35 flou(L) + 0.2 flou3(L) = 0.7 L + flou(0.35 L + 0.2 flou2(L))
   float *sc = &scene[0][0][0];
+  int ya = 64, yb = -1;
   for (int i = 0; i < 4096; i++) {
+    if (!(e.m[i][0] | e.m[i][1] | e.m[i][2])) {
+      sc[3 * i] = sc[3 * i + 1] = sc[3 * i + 2] = 0;
+      e.av[i][0] = e.av[i][1] = e.av[i][2] = 0;
+      continue;
+    }
     float l[3] = {e.m[i][0] * (255 / CR_ENCRE_ECH), e.m[i][1] * (255 / CR_ENCRE_ECH), e.m[i][2] * (255 / CR_ENCRE_ECH)};
     cr_lumiere(l, 120);
     for (int j = 0; j < 3; j++) { sc[3 * i + j] = l[j]; e.av[i][j] = (uint16_t)(l[j] * 256 + 0.5f); }
+    ya = min(ya, i >> 6); yb = max(yb, i >> 6);
   }
-  cr_flou_rev(sc, 3, 2);
-  for (int i = 0; i < 4096; i++)
-    for (int j = 0; j < 3; j++) sc[3 * i + j] = 0.2f * sc[3 * i + j] + 0.35f / 256 * e.av[i][j];
-  cr_flou_rev(sc, 3, 1);
+  const int y0 = max(0, ya - 3), y1 = min(64, yb + 4);   // les halos ne debordent pas de trois lignes
+  if (yb >= 0) {
+    cr_flou_rev(sc, 3, 2, 64, y0, y1);
+    for (int i = y0 * 64; i < y1 * 64; i++)
+      for (int j = 0; j < 3; j++) sc[3 * i + j] = 0.2f * sc[3 * i + j] + 0.35f / 256 * e.av[i][j];
+    cr_flou_rev(sc, 3, 1, 64, y0, y1);
+  }
   const float ph = t * 0.2f, sp = sinf(ph), cp = cosf(ph);
   for (int y = 0; y < 64; y++) {
     const float k = y / 64.0f, jour = expf(-y / 14.0f);

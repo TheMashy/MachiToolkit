@@ -1434,11 +1434,266 @@ void s_grande_roue(int humeur, bool debut, float t, float ecoule, float dt) {
   }
 }
 
-struct E_voxel { char rien; };
+// --- 7. les montagnes en « voxel space » ------------------------------------------------------
+// Une carte des hauteurs et une carte de l'eclairage (le soleil couchant, ombres portees comprises),
+// faites a la premiere image : 128 x 128 cases de 2 unites (la periode de 256 du numpy), le relief tire
+// comme en numpy (un spectre en 1/k^2 sans les plus grandes ondes, ici une transformee de Fourier
+// creuse), puis deux cartes adoucies pour le lointain. Pour chaque colonne on lit le terrain de pres
+// vers le loin ; une demi-ligne montre le premier relief qui monte jusqu'a elle ; la brume prend la
+// couleur du ciel.
+
+const int V3_VX_K = 120;                // les distances lues par colonne : 1,2 x 1,042^k
+const float V3_VX_F = 40, V3_VX_SOLEIL = 2.6f, V3_VX_EAU = 4.0f;
+const int V3_VX_NF = 1700;              // les frequences gardees (|i, j| <= 32)
+
+struct E_voxel {
+  union {
+    float hf[128 * 128];                // a la premiere image : le relief en flottants
+    struct { uint16_t h[128 * 128]; uint8_t s[128 * 128], p[128 * 128]; } n;   // hauteur (0-50), soleil, pente
+  } c0;
+  union {
+    struct {
+      uint16_t h1[64 * 64]; uint8_t s1[64 * 64], p1[64 * 64], l1[64 * 64];      // adoucie une fois (cases de 4)
+      uint16_t h2[32 * 32]; uint8_t s2[32 * 32], p2[32 * 32], l2[32 * 32];      // deux fois (cases de 8)
+    } m;
+    struct { float cr[V3_VX_NF], ci[V3_VX_NF]; int8_t i[V3_VX_NF], j[V3_VX_NF]; } dft;
+  } c1;
+  float Z[V3_VX_K], voile[V3_VX_K], lev[V3_VX_K];
+  float x0, y0, ph, hmax;
+  uint16_t h_eau;
+};
+
+struct V3Terrain { float h, s, p, lac; };
+// lit le terrain en (u, v) (en cases du niveau 0) au niveau de douceur lev (0-2) : bilineaire, raccorde
+inline void v3_vx_lire_niveau(const E_voxel &e, int niv, float u, float v, V3Terrain &o, bool tout) {
+  const int n = 128 >> niv, m = n - 1;
+  if (niv) { const float sc = 1.0f / (1 << niv), dec = (niv == 1 ? 0.5f : 1.5f); u = (u - dec) * sc; v = (v - dec) * sc; }
+  const int iu = (int)u, iv = (int)v;   // u, v > 0 (decales de 256 cases) : la troncature est le plancher
+  const float fu = u - iu, fv = v - iv;
+  const int x0 = iu & m, y0 = iv & m, x1 = (x0 + 1) & m, y1 = (y0 + 1) & m;
+  const int i00 = y0 * n + x0, i01 = y0 * n + x1, i10 = y1 * n + x0, i11 = y1 * n + x1;
+  const float w00 = (1 - fu) * (1 - fv), w01 = fu * (1 - fv), w10 = (1 - fu) * fv, w11 = fu * fv;
+  const uint16_t *H = niv == 0 ? e.c0.n.h : niv == 1 ? e.c1.m.h1 : e.c1.m.h2;
+  o.h = (H[i00] * w00 + H[i01] * w01 + H[i10] * w10 + H[i11] * w11) * (50.0f / 65535);
+  if (!tout) return;
+  const uint8_t *S = niv == 0 ? e.c0.n.s : niv == 1 ? e.c1.m.s1 : e.c1.m.s2;
+  const uint8_t *P = niv == 0 ? e.c0.n.p : niv == 1 ? e.c1.m.p1 : e.c1.m.p2;
+  o.s = (S[i00] * w00 + S[i01] * w01 + S[i10] * w10 + S[i11] * w11) * (1.0f / 255);
+  o.p = (P[i00] * w00 + P[i01] * w01 + P[i10] * w10 + P[i11] * w11) * (1.0f / 255);
+  if (niv == 0) {
+    const uint16_t q = e.h_eau;
+    o.lac = (H[i00] <= q ? w00 : 0) + (H[i01] <= q ? w01 : 0) + (H[i10] <= q ? w10 : 0) + (H[i11] <= q ? w11 : 0);
+  } else {
+    const uint8_t *L = niv == 1 ? e.c1.m.l1 : e.c1.m.l2;
+    o.lac = (L[i00] * w00 + L[i01] * w01 + L[i10] * w10 + L[i11] * w11) * (1.0f / 255);
+  }
+}
+inline void v3_vx_lire(const E_voxel &e, float lev, float u, float v, V3Terrain &o, bool tout) {
+  const int l0 = min(1, (int)lev);
+  const float fl = lev - l0;
+  v3_vx_lire_niveau(e, l0, u, v, o, tout);
+  if (fl <= 0.001f) return;
+  V3Terrain b;
+  v3_vx_lire_niveau(e, l0 + 1, u, v, b, tout);
+  o.h += (b.h - o.h) * fl;
+  if (tout) { o.s += (b.s - o.s) * fl; o.p += (b.p - o.p) * fl; o.lac += (b.lac - o.lac) * fl; }
+}
+// la couleur du terrain : l'albedo (herbe, roche dans les pentes, neige en haut) sous le soleil et le ciel
+inline void v3_vx_couleur(const V3Terrain &t, float *c) {
+  const float hn = t.h * (1.0f / 50), p = t.p;
+  const float neige = v3_01((hn - 0.58f) / 0.12f) * (1 - p * 0.5f);
+  const float amb = 0.55f + 0.45f * hn;
+  const float a0 = (0.42f + 0.2f * p) * (1 - neige) + neige, a1 = (0.46f + 0.06f * p) * (1 - neige) + 0.95f * neige;
+  const float a2 = (0.34f + 0.12f * p) * (1 - neige) + 0.98f * neige;
+  c[0] = a0 * (t.s * 382.5f + 48 * amb); c[1] = a1 * (t.s * 240 + 48 * amb); c[2] = a2 * (t.s * 120 + 104 * amb);
+  if (t.lac > 0) {   // les lacs : le ciel rose dedans
+    c[0] += (150 - c[0]) * t.lac; c[1] += (80 - c[1]) * t.lac; c[2] += (95 - c[2]) * t.lac;
+  }
+}
+
+void v3_vx_cartes(E_voxel &e) {
+  // le relief : des ondes de frequence (i, j) (en tours par 256 unites), d'amplitude 1/k^2 sans les plus grandes
+  int nf = 0;
+  for (int i = 0; i <= 32; i++)
+    for (int j = -32; j <= 32; j++) {
+      if ((i == 0 && j <= 0) || i * i + j * j > 32 * 32 || nf >= V3_VX_NF) continue;
+      const float k = sqrtf((float)(i * i + j * j)) / 256, q = k / 0.016f;
+      const float a = sqrtf(-2 * logf(hasard(1e-7f, 1))) / (k * k) * (1 - expf(-q * q)), ph = hasard(0, 2 * V3_PI);
+      e.c1.dft.cr[nf] = a * cosf(ph); e.c1.dft.ci[nf] = a * sinf(ph); e.c1.dft.i[nf] = i; e.c1.dft.j[nf] = j;
+      nf++;
+    }
+  float cs[128], sn[128];
+  for (int n = 0; n < 128; n++) { cs[n] = cosf(2 * V3_PI * n / 128); sn[n] = sinf(2 * V3_PI * n / 128); }
+  float mn = 1e30f, mx = -1e30f;
+  for (int y = 0; y < 128; y++) {
+    float Cr[33], Ci[33];   // ligne par ligne : la somme sur j, puis sur i le long de la ligne
+    for (int i = 0; i < 33; i++) Cr[i] = Ci[i] = 0;
+    for (int f = 0; f < nf; f++) {
+      const int a = (e.c1.dft.j[f] * y) & 127, i = e.c1.dft.i[f];
+      Cr[i] += e.c1.dft.cr[f] * cs[a] - e.c1.dft.ci[f] * sn[a];
+      Ci[i] += e.c1.dft.cr[f] * sn[a] + e.c1.dft.ci[f] * cs[a];
+    }
+    for (int x = 0; x < 128; x++) {
+      float h = 0;
+      for (int i = 0, a = 0; i < 33; i++, a = (a + x) & 127) h += Cr[i] * cs[a] - Ci[i] * sn[a];
+      e.c0.hf[y * 128 + x] = h;
+      mn = fminf(mn, h); mx = fmaxf(mx, h);
+    }
+  }
+  // des sommets, des vallees ; les lacs au fond (en uint16, sur 50)
+  const float ech = 1.0f / fmaxf(mx - mn, 1e-9f);
+  for (int i = 0; i < 128 * 128; i++) {
+    const float n = (e.c0.hf[i] - mn) * ech, h = fmaxf(n > 0 ? expf(1.6f * logf(n)) * 50 : 0, V3_VX_EAU);
+    e.c0.n.h[i] = (uint16_t)(h * (65535 / 50.0f) + 0.5f);
+  }
+  e.h_eau = (uint16_t)(V3_VX_EAU * (65535 / 50.0f) + 0.5f);
+  uint16_t hm = 0;
+  for (int i = 0; i < 128 * 128; i++) hm = max(hm, e.c0.n.h[i]);
+  e.hmax = hm * (50.0f / 65535);
+  // l'eclairage : le soleil bas, a l'azimut 2,6 ; une ombre portee le long de ses rayons
+  const float sxs = cosf(V3_VX_SOLEIL), sys = sinf(V3_VX_SOLEIL), elev = 0.16f, ce = cosf(elev), se = sinf(elev), te = tanf(elev);
+  const uint16_t *H = e.c0.n.h;
+  const float u = 50.0f / 65535;
+  int8_t ox[20], oy[20];
+  for (int k = 0; k < 20; k++) { const float d = 1 + 2 * k; ox[k] = (int8_t)rintf(d * sxs / 2); oy[k] = (int8_t)rintf(d * sys / 2); }
+  for (int y = 0; y < 128; y++)
+    for (int x = 0; x < 128; x++) {
+      const float h = H[y * 128 + x] * u;
+      const float gx = (H[y * 128 + ((x + 1) & 127)] - H[y * 128 + ((x + 127) & 127)]) * u / 4;
+      const float gy = (H[((y + 1) & 127) * 128 + x] - H[((y + 127) & 127) * 128 + x]) * u / 4;
+      const float nz = 1 / sqrtf(gx * gx + gy * gy + 1);
+      const float lambert = v3_01((-gx * sxs - gy * sys) * nz * ce + nz * se);
+      float ombre = 0;
+      for (int k = 0; k < 20 && ombre < 1; k++) {
+        const float dec = H[((y + oy[k]) & 127) * 128 + ((x + ox[k]) & 127)] * u;
+        ombre = fmaxf(ombre, v3_01((dec - h - (1 + 2 * k) * te) / 3));
+      }
+      e.c0.n.s[y * 128 + x] = (uint8_t)(lambert * (1 - ombre) * 255 + 0.5f);
+      e.c0.n.p[y * 128 + x] = (uint8_t)(v3_01(sqrtf(gx * gx + gy * gy) / 2.5f) * 255 + 0.5f);
+    }
+  // les cartes adoucies : chaque case, la moyenne des quatre du dessous
+  for (int y = 0; y < 64; y++)
+    for (int x = 0; x < 64; x++) {
+      const int a = (2 * y) * 128 + 2 * x, b = a + 1, c = a + 128, d = a + 129, i = y * 64 + x;
+      e.c1.m.h1[i] = (uint16_t)((H[a] + H[b] + H[c] + H[d] + 2) >> 2);
+      e.c1.m.s1[i] = (uint8_t)((e.c0.n.s[a] + e.c0.n.s[b] + e.c0.n.s[c] + e.c0.n.s[d] + 2) >> 2);
+      e.c1.m.p1[i] = (uint8_t)((e.c0.n.p[a] + e.c0.n.p[b] + e.c0.n.p[c] + e.c0.n.p[d] + 2) >> 2);
+      e.c1.m.l1[i] = (uint8_t)(((H[a] <= e.h_eau) + (H[b] <= e.h_eau) + (H[c] <= e.h_eau) + (H[d] <= e.h_eau)) * 255 / 4);
+    }
+  for (int y = 0; y < 32; y++)
+    for (int x = 0; x < 32; x++) {
+      const int a = (2 * y) * 64 + 2 * x, b = a + 1, c = a + 64, d = a + 65, i = y * 32 + x;
+      e.c1.m.h2[i] = (uint16_t)((e.c1.m.h1[a] + e.c1.m.h1[b] + e.c1.m.h1[c] + e.c1.m.h1[d] + 2) >> 2);
+      e.c1.m.s2[i] = (uint8_t)((e.c1.m.s1[a] + e.c1.m.s1[b] + e.c1.m.s1[c] + e.c1.m.s1[d] + 2) >> 2);
+      e.c1.m.p2[i] = (uint8_t)((e.c1.m.p1[a] + e.c1.m.p1[b] + e.c1.m.p1[c] + e.c1.m.p1[d] + 2) >> 2);
+      e.c1.m.l2[i] = (uint8_t)((e.c1.m.l1[a] + e.c1.m.l1[b] + e.c1.m.l1[c] + e.c1.m.l1[d] + 2) >> 2);
+    }
+}
+
 void s_voxel(int humeur, bool debut, float t, float ecoule, float dt) {
   E_voxel &e = etat_ecran<E_voxel>(debut);
-  (void)e; (void)humeur; (void)t; (void)ecoule; (void)dt;
-  degrade2(20, 20, 30, 40, 40, 60);   // A PORTER
+  (void)humeur; (void)t; (void)dt;
+  const float F = V3_VX_F;
+  if (debut) {
+    v3_vx_cartes(e);
+    e.x0 = hasard(0, 256); e.y0 = hasard(0, 256); e.ph = hasard(0, 100);
+    float z = 1.2f;
+    for (int k = 0; k < V3_VX_K; k++, z *= 1.042f) {
+      e.Z[k] = z;
+      e.voile[k] = expf(1.3f * logf(1 - expf(-z / 190.0f)));
+      e.lev[k] = z * 0.055f > 1 ? fminf(1.999f, fmaxf(0.0f, log2f(z * 0.055f) - 2)) : 0;   // la douceur, selon la distance
+    }
+  }
+  const float tau = ecoule + e.ph, cap0 = V3_VX_SOLEIL - 0.95f;   // le soleil sur le cote : il dore les pentes
+  const float ux = cosf(cap0), uy = sinf(cap0), wx = -uy, wy = ux, v = 7.0f;
+  const float lat = 40 * sinf(tau * 0.045f) + 7 * sinf(tau * 0.12f), dlat = 40 * 0.045f * cosf(tau * 0.045f) + 7 * 0.12f * cosf(tau * 0.12f);
+  // (ramenee dans la carte, qui se raccorde tous les 256 : les flottants restent precis)
+  const float cx = v3_fmod(e.x0 + ux * v * tau + wx * lat, 256), cy = v3_fmod(e.y0 + uy * v * tau + wy * lat, 256);
+  const float cap = cap0 + atan2f(dlat, v), fx = cosf(cap), fy = sinf(cap);
+  float haut = -1e9f;   // on suit le relief, en voyant venir les cretes
+  static const float dd[5] = {0, 10, 20, 32, 45};
+  for (int i = 0; i < 5; i++) {
+    V3Terrain o;
+    v3_vx_lire(e, 1.5f, (cx + fx * dd[i]) * 0.5f + 256, (cy + fy * dd[i]) * 0.5f + 256, o, false);
+    haut = fmaxf(haut, o.h - dd[i] * 0.1f);
+  }
+  haut += 12.0f;
+  const float hz = 21.0f + 1.5f * sinf(tau * 0.07f);
+  // le ciel : du violet au rose, orange vers le soleil ; il ne depend que de la demi-ligne et de la colonne
+  float kc3[128], kcm[128], kc[128], nuage_el[128];
+  for (int r = 0; r < 128; r++) {
+    const float el = (hz - (r + 0.5f) * 0.5f) / F, k = v3_01(el / 0.55f), q = 1 - k;
+    kc[r] = k; kc3[r] = q * q * q;
+    kcm[r] = fmaxf(0.0f, (q > 0 ? expf(1.2f * logf(q)) : 0) - kc3[r]) * 1.3f;
+    const float b = (el - 0.12f) / 0.06f;
+    nuage_el[r] = b * b < 16 ? expf(-b * b) * 1.6f * 0.5f : 0;
+  }
+  const bool soleil_vu = fabsf(V3_VX_SOLEIL - cap) < 1.2f;
+  const float soleil_x = 31.5f + tanf(V3_VX_SOLEIL - cap) * F, soleil_y = hz - 0.07f * F;
+  float nb_s[128], nb_c[128], nc_s[128], nc_c[128];   // les nuages : sin(a + b) = sin a cos b + cos a sin b
+  for (int r = 0; r < 128; r++) {
+    if (nuage_el[r] <= 0) continue;
+    const float el = (hz - (r + 0.5f) * 0.5f) / F;
+    nb_s[r] = v3_sin(el * 4); nb_c[r] = v3_cos(el * 4); nc_s[r] = v3_sin(el * 60); nc_c[r] = v3_cos(el * 60);
+  }
+  for (int col = 0; col < 64; col++) {
+    const float sx = (col - 31.5f) / F, az = cap + atanf(sx);
+    const float na = az * 9 + v3_sin(az * 3) * 2, na_s = v3_sin(na), na_c = v3_cos(na), nd_s = v3_sin(az * 4), nd_c = v3_cos(az * 4);
+    const float vs0 = v3_01(cosf(az - V3_VX_SOLEIL)), vs = vs0 * vs0 * vs0;
+    const float brume[3] = {200 * (0.45f + 0.55f * vs) + 20, 120 * (0.45f + 0.55f * vs) + 10, 100 * (0.45f + 0.55f * vs) + 30};
+    // les rayons, de pres vers le loin : la premiere demi-ligne que chaque relief atteint
+    const float dx = fx - fy * sx, dy = fy + fx * sx;
+    uint8_t quelle[128];
+    int cur = 128;
+    float m = 1e30f;
+    const float u0 = cx * 0.5f + 256, v0 = cy * 0.5f + 256, du = dx * 0.5f, dv = dy * 0.5f;
+    for (int k = 0; k < V3_VX_K && cur > 0; k++) {
+      const float Z = e.Z[k];
+      if (hz + (haut - e.hmax) * F / Z >= m) continue;   // meme le plus haut sommet ne monterait pas plus haut
+      V3Terrain o;
+      v3_vx_lire(e, e.lev[k], u0 + Z * du, v0 + Z * dv, o, false);
+      m = v3_mn(m, hz + (haut - o.h) * F / Z);
+      const float q = m * 2 - 0.5f;
+      const int r = q <= 0 ? 0 : q >= 128 ? 128 : (int)q + ((float)(int)q < q ? 1 : 0);   // ceil, borne a 0-128
+      while (cur > r) quelle[--cur] = (uint8_t)k;
+    }
+    float img2[2][3];
+    int dernier = -1;
+    float terrain[3] = {0, 0, 0};
+    for (int r = 127; r >= 0; r--) {
+      float *c = img2[r & 1];
+      if (r >= cur) {
+        const int k = quelle[r];
+        if (k != dernier) {
+          dernier = k;
+          const float Z = e.Z[k];
+          V3Terrain o;
+          v3_vx_lire(e, e.lev[k], u0 + Z * du, v0 + Z * dv, o, true);
+          float coul[3];
+          v3_vx_couleur(o, coul);
+          const float w = e.voile[k];
+          for (int q = 0; q < 3; q++) terrain[q] = coul[q] * (1 - w) + brume[q] * w;
+        }
+        c[0] = terrain[0]; c[1] = terrain[1]; c[2] = terrain[2];
+      } else {
+        const float a = kc3[r] * (0.55f + 0.45f * vs), b = kcm[r], k = kc[r];
+        c[0] = 255 * a + 150 * b + 22 * k; c[1] = 140 * a + 70 * b + 22 * k; c[2] = 70 * a + 110 * b + 62 * k;
+        if (soleil_vu) {
+          const float ddx = col + 0.5f - soleil_x, ddy = (r + 0.5f) * 0.5f - soleil_y, d = sqrtf(ddx * ddx + ddy * ddy);
+          const float disque = v3_01(3.2f - d), g = v3_exp(-d / 7.0f);
+          c[0] += disque * 255 + g * 120; c[1] += disque * 230 + g * 60; c[2] += disque * 170 + g * 25;
+        }
+        if (nuage_el[r] > 0) {
+          const float n = 0.5f + 0.5f * (na_s * nb_c[r] + na_c * nb_s[r]) * (nc_s[r] * nd_c + nc_c[r] * nd_s);
+          if (n > 0.55f) {
+            const float k2 = (n - 0.55f) * nuage_el[r];
+            c[0] += k2 * 255; c[1] += k2 * 120; c[2] += k2 * 110;
+          }
+        }
+      }
+      if (!(r & 1)) for (int q = 0; q < 3; q++) scene[r >> 1][col][q] = (img2[0][q] + img2[1][q]) * 0.5f;
+    }
+  }
 }
 
 // --- 8. l'ocean au clair de lune -----------------------------------------------------------

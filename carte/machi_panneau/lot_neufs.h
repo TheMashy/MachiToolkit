@@ -701,7 +701,7 @@ struct E_mer_de_nuages {
   uint8_t som[64 * 64][3];           // l'image des deux sommets
   uint8_t op[2][64 * 64];            // leurs opacites, du plus loin au plus pres
   int oy[2][2];                      // les lignes ou elles ne sont pas nulles
-  float ciel[25 * 64][3];            // le ciel au-dessus de l'horizon
+  float azur[25 * 64][3];            // le ciel au-dessus de l'horizon
   float lut06[66];                   // x^0.6
   NF_MdnTravail w;
   float z[NF_MDN_N];
@@ -790,7 +790,7 @@ void nf_mdn_preparer(E_mer_de_nuages &e) {
       const float d = sqrtf((x - NF_MDN_SX) * (x - NF_MDN_SX) + (y - NF_MDN_SY) * 1.7f * (y - NF_MDN_SY) * 1.7f);
       const float a = expf(-d / 9.0f), bb = expf(-d / 26.0f);
       const float disque = borne(3.4f - sqrtf((x - NF_MDN_SX) * (x - NF_MDN_SX) + (y - NF_MDN_SY) * (y - NF_MDN_SY)), 0, 1);
-      float *p = e.ciel[y * 64 + x];
+      float *p = e.azur[y * 64 + x];
       p[0] = r + a * 110 + bb * 40 + disque * 255;
       p[1] = g + a * 75 + bb * 18 + disque * 240;
       p[2] = b + a * 25 + disque * 190;
@@ -913,7 +913,7 @@ void s_mer_de_nuages(int humeur, bool debut, float t, float ecoule, float dt) {
       const float cv = e.couv[y], rc = e.roc[y];
       float r = 0, g = 0, b = 0;
       if (y < 25 && cv < 1) {
-        const float *c = e.ciel[y * 64 + x];
+        const float *c = e.azur[y * 64 + x];
         float cr = c[0], cg = c[1], cb = c[2];
         if (y == 5 && x == 9) { cr = fmaxf(cr, 230 * etoile); cg = fmaxf(cg, 225 * etoile); cb = fmaxf(cb, 240 * etoile); }   // l'etoile du berger
         r = cr * (1 - cv); g = cg * (1 - cv); b = cb * (1 - cv);
@@ -947,7 +947,7 @@ struct E_hublot {
   uint8_t base[64 * 64][3];          // ce qui ne bouge pas : la cabine, l'aile, le reflet (deja vus par la vitre)
   uint8_t poids[64 * 64];            // la part de la vue, x255 : la vitre, moins l'aile
   uint16_t g1[64 * 64], g2[64 * 64]; // les lueurs du feu, x16384 (deja vues par la vitre)
-  uint8_t ciel[31 * 64][3];          // la vue du ciel, la lune comprise
+  uint8_t azur[31 * 64][3];          // la vue du ciel, la lune comprise
   float ex[16], ey[16], ep[16], el[16];
   float ka[9], kb[9], ph[9], amp[9], lk[9], somme;
 };
@@ -1001,7 +1001,7 @@ void nf_hublot_preparer(E_hublot &e) {
         const float a = expf(-dl / 3.5f), b = expf(-dl / 14.0f), m = borne(3.0f - dl, 0, 1);
         const float v[3] = {4 + 22 * k + a * 45 + b * 14, 7 + 29 * k + a * 50 + b * 18, 20 + 50 * k + a * 66 + b * 32};
         const float l[3] = {235, 235, 215};
-        for (int c = 0; c < 3; c++) e.ciel[y * 64 + x][c] = (uint8_t)borne(roundf(v[c] + m * (l[c] - v[c])), 0, 255);
+        for (int c = 0; c < 3; c++) e.azur[y * 64 + x][c] = (uint8_t)borne(roundf(v[c] + m * (l[c] - v[c])), 0, 255);
       }
     }
   for (int i = 0; i < 16; i++) { e.ex[i] = hasard(17, 50); e.ey[i] = hasard(14, hz - 2); e.ep[i] = hasard(0, PI2); e.el[i] = hasard(0.3f, 1); }
@@ -1025,14 +1025,14 @@ void s_hublot(int humeur, bool debut, float t, float ecoule, float dt) {
   for (int y = 13; y < 57; y++) {
     if (y < 30) {
       for (int x = 0; x < 64; x++) {
-        const uint8_t *c = e.ciel[y * 64 + x];
+        const uint8_t *c = e.azur[y * 64 + x];
         peindre(y, x, c[0], c[1], c[2]);
       }
       continue;
     }
     if (y == 30) {                               // a moitie ciel, a moitie mer de nuages, au loin
       for (int x = 0; x < 64; x++) {
-        const uint8_t *c = e.ciel[y * 64 + x];
+        const uint8_t *c = e.azur[y * 64 + x];
         peindre(y, x, c[0] * 0.5f + 18, c[1] * 0.5f + 23, c[2] * 0.5f + 40);
       }
       continue;
@@ -1117,8 +1117,8 @@ void s_arc_en_ciel(int humeur, bool debut, float t, float ecoule, float dt) {
       for (int x = 0; x < 64; x++) {
         const float r = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy));
         const float d1 = R - r, d2 = r - R2;
-        e.env[0][y * 64 + x] = d1 > 0 && d1 < 6 ? (uint8_t)roundf(powf(sinf(NF_PI * d1 / 6), 0.7f) * 255) : 0;
-        e.env[1][y * 64 + x] = d2 > 0 && d2 < 7 ? (uint8_t)roundf(powf(sinf(NF_PI * d2 / 7), 0.7f) * 255) : 0;
+        e.env[0][y * 64 + x] = d1 > 0 && d1 < 6 ? (uint8_t)roundf(powf(fmaxf(sinf(NF_PI * d1 / 6), 0.0f), 0.7f) * 255) : 0;
+        e.env[1][y * 64 + x] = d2 > 0 && d2 < 7 ? (uint8_t)roundf(powf(fmaxf(sinf(NF_PI * d2 / 7), 0.0f), 0.7f) * 255) : 0;
       }
     for (int i = 0; i < 640; i++) { const float u = (i - 250) / 5.0f / 10.0f; e.gauss[i] = expf(-u * u); }
     for (int x = 0; x < 64; x++) e.loin[x] = 45.0f + 2.2f * sinf(x * 0.08f + 0.7f) + 1.2f * sinf(x * 0.23f + 2);
@@ -1490,7 +1490,7 @@ void s_herbes(int humeur, bool debut, float t, float ecoule, float dt) {
         for (int k = 0; k < np; k++) {
           const float s = k / (float)(np - 1);
           if (s <= 0.76f) continue;
-          const float de = C[12] * powf(sinf(NF_PI * borne((s - 0.76f) / 0.24f, 0, 1)), 0.7f);
+          const float de = C[12] * powf(fmaxf(sinf(NF_PI * borne((s - 0.76f) / 0.24f, 0, 1)), 0.0f), 0.7f);
           nf_brin(e.couv, e.x0[i] + lam[b] * e.h[i] * 0.55f * s * s, e.pied[i] - e.h[i] * s * k16, de + 0.15f, 1.1f * lam[b] * s / k16);
         }
       }
@@ -1532,7 +1532,7 @@ static inline float nf_pl_relief(float w, float z, float *dw = nullptr, float *d
   return 0.42f * s1 * (0.6f + 0.4f * s2) + 0.22f * s3 + 0.1f * s4;
 }
 struct NF_PlaineFin {
-  uint16_t Z[64 * 64], W[64 * 64];   // la profondeur (x163.8 ; 65535 : le ciel), le cote ((w + 128) x 256)
+  uint16_t Z[64 * 64], cote[64 * 64];   // la profondeur (x163.8 ; 65535 : le ciel), le cote ((w + 128) x 256)
   uint8_t herbe[64 * 64][3];
   uint8_t voile[64 * 64];
 };
@@ -1543,7 +1543,7 @@ union NF_PlaineTravail {
 struct E_plaine {
   uint16_t champ[128 * 128];         // les nuages, et leurs ombres au sol
   NF_PlaineTravail w;
-  uint8_t ciel[32 * 64][3];
+  uint8_t azur[32 * 64][3];
   uint16_t feuilles[64 * 64];
   float ax, ay, bx[7], by[7], bz[7];
 };
@@ -1557,7 +1557,7 @@ void nf_plaine_preparer(E_plaine &e) {
   NF_PlaineFin &P = e.w.f;
   uint16_t *taches = e.feuilles;      // des pres plus jaunes, d'autres plus sombres (un moment)
   brume_n(taches, 64, 4);
-  for (int i = 0; i < 4096; i++) { P.Z[i] = 65535; P.W[i] = 32768; P.voile[i] = 0; P.herbe[i][0] = P.herbe[i][1] = P.herbe[i][2] = 0; }
+  for (int i = 0; i < 4096; i++) { P.Z[i] = 65535; P.cote[i] = 32768; P.voile[i] = 0; P.herbe[i][0] = P.herbe[i][1] = P.herbe[i][2] = 0; }
   float ybuf[64];
   for (int x = 0; x < 64; x++) ybuf[x] = 64.0f;
   for (int k = 0; k < 220; k++) {     // du plus pres au plus loin, colonne par colonne
@@ -1572,7 +1572,7 @@ void nf_plaine_preparer(E_plaine &e) {
       for (int y = y0; y < 64 && y < ybuf[x] - 0.5f; y++) {
         const int i = y * 64 + x;
         P.Z[i] = (uint16_t)roundf(z * 163.8375f);
-        P.W[i] = (uint16_t)roundf(borne((w + 128) * 256, 0, 65535));
+        P.cote[i] = (uint16_t)roundf(borne((w + 128) * 256, 0, 65535));
         const float tq = nf_lire(taches, 64, z * 2.0f, w * 2.0f);
         const float kt = 0.86f + 0.28f * tq;
         P.herbe[i][0] = (uint8_t)borne(roundf((26 + 86 * lum) * kt), 0, 255);
@@ -1592,7 +1592,7 @@ void nf_plaine_preparer(E_plaine &e) {
       g *= g;
       c[0] += g * 70; c[1] += g * 60; c[2] += g * 26;
       c[0] += hz * (235 - c[0]); c[1] += hz * (238 - c[1]); c[2] += hz * (240 - c[2]);     // des nuages au loin, fondus
-      for (int i = 0; i < 3; i++) e.ciel[y * 64 + x][i] = (uint8_t)borne(roundf(c[i]), 0, 255);
+      for (int i = 0; i < 3; i++) e.azur[y * 64 + x][i] = (uint8_t)borne(roundf(c[i]), 0, 255);
     }
   }
   const float tz = 6.4f, tw = 2.2f;                                 // l'arbre seul, sur une butte
@@ -1621,7 +1621,7 @@ void s_plaine(int humeur, bool debut, float t, float ecoule, float dt) {
       const int i = y * 64 + x;
       const bool sol = y > NF_PL_H - 2 && P.Z[i] != 65535;
       if (!sol) {
-        const uint8_t *c = e.ciel[min(y, 31) * 64 + x];
+        const uint8_t *c = e.azur[min(y, 31) * 64 + x];
         float r = c[0], g = c[1], b = c[2];
         if (haut > 0) {                                              // le dessus des nuages au soleil, le dessous gris
           const float u = (x - 31.5f) / NF_PL_F * S;
@@ -1637,7 +1637,7 @@ void s_plaine(int humeur, bool debut, float t, float ecoule, float dt) {
         peindre(y, x, r, g, b);
         continue;
       }
-      const float Z = P.Z[i] * (1.0f / 163.8375f), Wv = P.W[i] * (1.0f / 256) - 128;
+      const float Z = P.Z[i] * (1.0f / 163.8375f), Wv = P.cote[i] * (1.0f / 256) - 128;
       const float F = nf_lire(e.champ, 128, (Z + dz) * G, (Wv + 0.8f + dx) * G);
       const float dens = borne((F - 0.5f) * 4.0f, 0, 1);
       const float ombre = dens > 0 && Z < 40 ? dens * nf_exp(-(Z / 11) * (Z / 11)) : 0.0f;
@@ -1874,16 +1874,16 @@ struct E_savane {
 void s_savane(int humeur, bool debut, float t, float ecoule, float dt) {
   E_savane &e = etat_ecran<E_savane>(debut);
   (void)humeur; (void)dt;
-  const float H = NF_SAV_H;
+  const float hor = NF_SAV_H;
   if (debut) {
     static const float HOUPPES[4][4] = {{50, 28.6f, 13.0f, 2.4f}, {43.5f, 30.0f, 6.5f, 2.0f}, {57.5f, 30.2f, 6.0f, 1.9f}, {50.5f, 27.2f, 8.5f, 1.6f}};
     memset(e.couv, 0, sizeof e.couv);
-    const float tronc[5][6] = {{H + 0.5f, 49.0f, 36.0f, 49.4f, 1.0f, 0.75f}, {37.5f, 49.4f, 31.0f, 44.0f, 0.6f, 0.4f},
+    const float tronc[5][6] = {{hor + 0.5f, 49.0f, 36.0f, 49.4f, 1.0f, 0.75f}, {37.5f, 49.4f, 31.0f, 44.0f, 0.6f, 0.4f},
                                {37.5f, 49.4f, 30.5f, 55.0f, 0.6f, 0.4f}, {40.0f, 49.2f, 31.0f, 50.5f, 0.45f, 0.35f},
                                {34.0f, 46.0f, 31.0f, 40.0f, 0.35f, 0.3f}};
     nf_traits(tronc, 5, 1, 1, 1, 1.0f, e.couv);
     float bx[6], by[6], br[6];
-    for (int i = 0; i < 6; i++) { bx[i] = hasard(2, 62); by[i] = H + hasard(1.5f, 4); br[i] = hasard(1.0f, 2.0f); }
+    for (int i = 0; i < 6; i++) { bx[i] = hasard(2, 62); by[i] = hor + hasard(1.5f, 4); br[i] = hasard(1.0f, 2.0f); }
     for (int y = 0; y < 64; y++)
       for (int x = 0; x < 64; x++) {
         float a = e.couv[y * 64 + x];                                // l'acacia : un masque fixe
@@ -1942,11 +1942,11 @@ void s_savane(int humeur, bool debut, float t, float ecoule, float dt) {
   float crete[64];
   for (int x = 0; x < 64; x++) {                                      // des collines plates, dans la brume chaude
     const float mesa = fminf(borne(9 - fabsf(x - 10.0f) * 0.9f, 0, 4.5f), 4.5f) + borne(5 - fabsf(x - 60.0f) * 0.6f, 0, 3);
-    crete[x] = H - mesa - 0.3f * sinf(x * 0.7f);
+    crete[x] = hor - mesa - 0.3f * sinf(x * 0.7f);
   }
   nf_sous(crete, 120, 42, 46);
-  for (int yy = (int)H - 8; yy <= (int)H; yy++) {                     // l'air chaud fait trembler l'horizon
-    const float f = 0.35f * sinf(t * 2.6f + yy * 1.7f) * (yy - H + 9) / 9;
+  for (int yy = (int)hor - 8; yy <= (int)hor; yy++) {                     // l'air chaud fait trembler l'horizon
+    const float f = 0.35f * sinf(t * 2.6f + yy * 1.7f) * (yy - hor + 9) / 9;
     const float af = fabsf(f);
     float ligne[64][3];
     memcpy(ligne, scene[yy], sizeof ligne);
@@ -1956,10 +1956,10 @@ void s_savane(int humeur, bool debut, float t, float ecoule, float dt) {
     }
   }
   float sol[64];
-  for (int x = 0; x < 64; x++) sol[x] = H + 0.4f * sinf(x * 0.9f) + 0.3f * sinf(x * 2.3f);
+  for (int x = 0; x < 64; x++) sol[x] = hor + 0.4f * sinf(x * 0.9f) + 0.3f * sinf(x * 2.3f);
   nf_sous(sol, 34, 12, 16);
-  for (int y = (int)H + 2; y < 64; y++) {
-    const float k = (y - H) / 18.0f;
+  for (int y = (int)hor + 2; y < 64; y++) {
+    const float k = (y - hor) / 18.0f;
     for (int x = 0; x < 64; x++) peindre(y, x, 38 - 26 * k, 13 - 8 * k, 18 - 10 * k);
   }
   for (int x = 0; x < 64; x++)                                        // le bord de l'herbe accroche la lumiere
@@ -1977,7 +1977,7 @@ void s_savane(int humeur, bool debut, float t, float ecoule, float dt) {
   for (int g = 0; g < 5; g++) {
     const float x0 = GIRAFES[g][0], k = GIRAFES[g][1], sens = GIRAFES[g][2], v = GIRAFES[g][3], ecart = GIRAFES[g][4];
     const float q = fmodf(t * v + (sens < 0 ? 0 : 37), 150.0f);
-    nf_girafe(x0 + sens * q - ecart * sens, H + (k > 0.6f ? 4.0f : 0.5f) * k + 0.5f, k, q * 1.15f / k + ecart, sens, SIL);
+    nf_girafe(x0 + sens * q - ecart * sens, hor + (k > 0.6f ? 4.0f : 0.5f) * k + 0.5f, k, q * 1.15f / k + ecart, sens, SIL);
   }
   memset(e.couv + 48 * 64, 0, 16 * 64 * sizeof(float));             // les touffes devant, qui bougent a peine
   for (int i = 0; i < 26; i++) {
@@ -2012,7 +2012,7 @@ static const float NF_EOL[5][6] = {{8.0f, 46.5f, 7.5f, 3.4f, 0.55f, 0.12f}, {27.
                                    {18.0f, 58.5f, 34.0f, 13.5f, 0.4f, 1.0f}};
 struct E_eoliennes {
   uint16_t stratus[128 * 128];
-  uint16_t ciel[64 * 64][3];         // x64
+  uint16_t azur[64 * 64][3];         // x64
   uint8_t lune[64 * 64];
   float lueurs[64 * 64];
   float ex[45], ey[45], ep[45], el[45];
@@ -2032,7 +2032,7 @@ void s_eoliennes(int humeur, bool debut, float t, float ecoule, float dt) {
         const float dl = sqrtf((x - 11.0f) * (x - 11.0f) + (y - 9.0f) * (y - 9.0f));
         const float h = expf(-dl / 4) * 0.25f;
         c[0] += g * 70 + h * 120; c[1] += g * 40 + h * 110; c[2] += g * 10 + h * 90;
-        for (int i = 0; i < 3; i++) e.ciel[y * 64 + x][i] = (uint16_t)roundf(borne(c[i], 0, 1023) * 64);
+        for (int i = 0; i < 3; i++) e.azur[y * 64 + x][i] = (uint16_t)roundf(borne(c[i], 0, 1023) * 64);
         const float l = borne(2.8f - dl, 0, 1) * (1 - borne(2.6f - sqrtf((x - 12.4f) * (x - 12.4f) + (y - 8.2f) * (y - 8.2f)), 0, 1));
         e.lune[y * 64 + x] = (uint8_t)roundf(l * 255);
       }
@@ -2042,7 +2042,7 @@ void s_eoliennes(int humeur, bool debut, float t, float ecoule, float dt) {
     for (int i = 0; i < 5; i++) e.rotors[i] = hasard(0, PI2);
   }
   for (int i = 0; i < 4096; i++) {
-    const uint16_t *c = e.ciel[i];
+    const uint16_t *c = e.azur[i];
     peindre(i >> 6, i & 63, c[0] * (1.0f / 64), c[1] * (1.0f / 64), c[2] * (1.0f / 64));
   }
   for (int i = 0; i < 45; i++) {
@@ -2196,8 +2196,8 @@ void s_montgolfieres(int humeur, bool debut, float t, float ecoule, float dt) {
         const float u = (x - cx) / R, v = (y - cy) / R;
         const float demi = v < 0.35f ? sqrtf(borne(1 - v * v, 0, 1)) : 0.94f - (v - 0.35f) * 0.56f;
         const float couv = borne((demi - fabsf(u)) * R + 0.5f, 0, 1) * borne((1.45f - v) * R + 0.5f, 0, 1) * borne((v + 1) * R + 0.5f, 0, 1);
-        float ciel[3] = {0, 0, 0};
-        if (br > 0) nf_mg_ciel(x, y, ciel);
+        float az[3] = {0, 0, 0};
+        if (br > 0) nf_mg_ciel(x, y, az);
         if (couv > 0) {
           const float sn = borne(u / fmaxf(demi, 1e-3f), -1, 1);
           const int f = ((int)floorf((asinf(sn) / NF_PI + 0.5f) * n + e.fuseaux[i])) % nc;   // les fuseaux se resserrent sur les bords
@@ -2205,13 +2205,13 @@ void s_montgolfieres(int humeur, bool debut, float t, float ecoule, float dt) {
           const float lum = 0.34f + 0.8f * borne(sn * 0.7f - borne(v, -1, 0.4f) * 0.35f + nz * 0.55f, 0, 1);   // le soleil a droite
           const float bv = brule * 0.75f * borne(v + 0.2f, 0, 1.2f);    // le bruleur l'eclaire du dedans
           float c[3] = {NF_MG_C[i][f][0] * lum + bv * 255, NF_MG_C[i][f][1] * lum + bv * 150, NF_MG_C[i][f][2] * lum + bv * 60};
-          for (int k = 0; k < 3; k++) c[k] = c[k] * (1 - br) + ciel[k] * br;
+          for (int k = 0; k < 3; k++) c[k] = c[k] * (1 - br) + az[k] * br;
           nf_melanger(y, x, couv, c[0], c[1], c[2]);
         }
         const float nacelle = borne((0.24f - fabsf(u)) * R + 0.5f, 0, 1) * borne((v - 1.62f) * R + 0.5f, 0, 1) * borne((1.95f - v) * R + 0.5f, 0, 1);
         const float corde = R > 5 && v > 1.45f && v < 1.65f ? borne(0.5f - fabsf(fabsf(u) - 0.27f + (v - 1.45f) * 0.3f) * R, 0, 1) : 0.0f;
         const float nac = fmaxf(nacelle, corde * 0.8f);
-        if (nac > 0) nf_melanger(y, x, nac, 64 * (1 - br) + ciel[0] * br, 42 * (1 - br) + ciel[1] * br, 34 * (1 - br) + ciel[2] * br);
+        if (nac > 0) nf_melanger(y, x, nac, 64 * (1 - br) + az[0] * br, 42 * (1 - br) + az[1] * br, 34 * (1 - br) + az[2] * br);
         if (brule > 0.02f) {
           const float fu = u / 0.12f, fv = (v - 1.42f) / 0.12f;
           const float fl = nf_exp(-(fu * fu + fv * fv) * 0.5f * R / 3) * brule * 1.2f;
@@ -2246,13 +2246,13 @@ static inline int nf_voilier_formes(float lx, float ly, float gonfle) {
 }
 struct E_voilier {
   uint16_t rides[128 * 128], nuages[128 * 128];
-  uint16_t ciel[36 * 64][3];         // x64
+  uint16_t azur[36 * 64][3];         // x64
   float mph[3], mvit[3];
 };
 void s_voilier(int humeur, bool debut, float t, float ecoule, float dt) {
   E_voilier &e = etat_ecran<E_voilier>(debut);
   (void)humeur; (void)ecoule; (void)dt;
-  const float H = NF_VOIL_H;
+  const float hor = NF_VOIL_H;
   if (debut) {
     for (int y = 0; y < 36; y++)
       for (int x = 0; x < 64; x++) {
@@ -2265,7 +2265,7 @@ void s_voilier(int humeur, bool debut, float t, float ecoule, float dt) {
         c[0] += g * 80; c[1] += g * 50; c[2] += g * 10;
         const float so = borne(5.0f - d, 0, 1);
         c[0] += (255 - c[0]) * so; c[1] += (228 - c[1]) * so; c[2] += (160 - c[2]) * so;
-        for (int i = 0; i < 3; i++) e.ciel[y * 64 + x][i] = (uint16_t)roundf(borne(c[i], 0, 1023) * 64);
+        for (int i = 0; i < 3; i++) e.azur[y * 64 + x][i] = (uint16_t)roundf(borne(c[i], 0, 1023) * 64);
       }
     brume_n(e.rides, 128, 4);
     brume_n(e.nuages, 128, 7);
@@ -2275,16 +2275,16 @@ void s_voilier(int humeur, bool debut, float t, float ecoule, float dt) {
   for (int y = 0; y < 36; y++) {
     const float hn = borne(1 - fabsf(y - 17.0f) / 10, 0, 1) * 0.75f;
     for (int x = 0; x < 64; x++) {
-      const uint16_t *c = e.ciel[y * 64 + x];
+      const uint16_t *c = e.azur[y * 64 + x];
       float p[3] = {c[0] * k64, c[1] * k64, c[2] * k64};
       if (hn > 0) {                                                  // de longs nuages, eclaires par dessous
         const float fx = x * 0.45f + t * 0.5f;
-        const float N = nf_lire(e.nuages, 128, y * 2.4f + 9, fx);
-        const float a = borne((N - 0.45f) * 2.2f, 0, 1) * hn;
+        const float nn = nf_lire(e.nuages, 128, y * 2.4f + 9, fx);
+        const float a = borne((nn - 0.45f) * 2.2f, 0, 1) * hn;
         if (a > 0) {
           const float Nb = nf_lire(e.nuages, 128, y * 2.4f + 11.4f, fx);
           const float lu = borne(1 - sqrtf((x - 45.0f) * (x - 45.0f) + (y - 30.0f) * (y - 30.0f)) / 34, 0, 1);
-          const float de = borne((N - Nb) * 5 + lu * 0.9f, 0, 1);
+          const float de = borne((nn - Nb) * 5 + lu * 0.9f, 0, 1);
           p[0] += (96 + 159 * de - p[0]) * a; p[1] += (40 + 116 * de - p[1]) * a; p[2] += (82 + 30 * de - p[2]) * a;
         }
       }
@@ -2292,18 +2292,18 @@ void s_voilier(int humeur, bool debut, float t, float ecoule, float dt) {
     }
   }
   for (int y = 36; y < 64; y++) {                                   // la mer en perspective : les rides defilent
-    const float dy = y - H + 0.6f, z = 30.0f / dy;
-    const float km = (y - H) / 28.0f;
+    const float dy = y - hor + 0.6f, z = 30.0f / dy;
+    const float km = (y - hor) / 28.0f;
     const float mr = 100 - 82 * km, mg = 54 - 40 * km, mb = 96 - 52 * km;
-    const float prof = borne((y - H + 0.5f) / 28.0f, 0, 1);
+    const float prof = borne((y - hor + 0.5f) / 28.0f, 0, 1);
     const float calme = expf(-z / 8);                               // au loin, les rides se fondent
-    const int ym = (int)borne(2 * H - 1 - y, 0, H - 1);
-    const float large = 1.5f + (y - H) * 0.42f, kc = 1 - prof * 0.4f;
+    const int ym = (int)borne(2 * hor - 1 - y, 0, hor - 1);
+    const float large = 1.5f + (y - hor) * 0.42f, kc = 1 - prof * 0.4f;
     for (int x = 0; x < 64; x++) {
       const float R = nf_lire(e.rides, 128, z * 4.0f, (x - 32) / dy * 6 + t * 2.0f);
       const float ride = (R - 0.5f) * calme;
       const float km2 = borne(0.35f + ride * 1.6f, 0, 1) * 0.5f;
-      const uint16_t *m = e.ciel[ym * 64 + x];
+      const uint16_t *m = e.azur[ym * 64 + x];
       float r = mr * (1 - 0.6f * ride) + m[0] * k64 * km2, g = mg * (1 - 0.6f * ride) + m[1] * k64 * km2, b = mb * (1 - 0.6f * ride) + m[2] * k64 * km2;
       const float q = (x - 45) / large;
       if (q * q < 20) {
@@ -2315,7 +2315,7 @@ void s_voilier(int humeur, bool debut, float t, float ecoule, float dt) {
     }
   }
   const float vx = fmodf(t * 0.15f + 20, 100.0f) - 18;               // une voile au loin, sur l'horizon
-  pointer(H - 1, vx, 230, 170, 150); pointer(H - 2, vx, 230, 170, 150); pointer(H - 2, vx + 1, 230, 170, 150);
+  pointer(hor - 1, vx, 230, 170, 150); pointer(hor - 2, vx, 230, 170, 150); pointer(hor - 2, vx + 1, 230, 170, 150);
   const float bx = 25 + 5 * sinf(t * 0.031f) + 2 * sinf(t * 0.07f);   // on le suit : il derive a peine
   const float by = 50.5f + 0.5f * sinf(t * 0.9f + 0.8f);
   const float ang = 0.05f * sinf(t * 0.9f) + 0.02f * sinf(t * 1.63f);
@@ -2599,11 +2599,7 @@ struct E_jardin_zen {
 void nf_jardin_preparer(E_jardin_zen &e) {
   brume_n(e.tmp, 64, 2);
   for (int i = 0; i < 4096; i++) e.tex[i] = (uint8_t)(e.tmp[i] >> 8);
-  float *gmin = nullptr;
-  (void)gmin;
   for (int i = 0; i < 4096; i++) { e.gmin[i] = 32767; e.grx[i] = 0; e.gry[i] = 0; e.nx[i] = 0; e.ny[i] = 0; e.nz[i] = 127; e.pierre[i] = 0; e.ilot[i] = 0; }
-  static float gm[64 * 64];
-  (void)gm;
   for (int s = 0; s < 3; s++) {
     const float cx = NF_JARDIN_PIERRES[s][0], cy = NF_JARDIN_PIERRES[s][1], r = NF_JARDIN_PIERRES[s][2];
     float a[4];
@@ -2648,27 +2644,24 @@ void nf_jardin_preparer(E_jardin_zen &e) {
       e.bois[(y - 56) * 64 + x][1] = (uint8_t)borne(roundf(64 * k), 0, 255);
       e.bois[(y - 56) * 64 + x][2] = (uint8_t)borne(roundf(40 * k), 0, 255);
     }
-  // ou la feuille peut se poser : loin des ilots
+  // ou la feuille peut se poser : loin des ilots (marque dans le brouillon)
+  uint8_t *libre = (uint8_t *)e.tmp;
+  memset(libre, 0, 4096);
   int n = 0;
-  for (int pass = 0; pass < 2; pass++) {
-    int pris[32];
-    for (int k = 0; k < 32 && pass == 1; k++) pris[k] = n ? (int)(aleatoire() % n) : 0;
-    int j = 0;
-    for (int y = 9; y < 53; y++)
-      for (int x = 15; x < 58; x++) {
-        static const int8_t V[9][2] = {{0, 0}, {3, 0}, {-3, 0}, {0, 3}, {0, -3}, {2, 2}, {-2, 2}, {2, -2}, {-2, -2}};
-        bool loin = true;
-        for (int k = 0; k < 9 && loin; k++) loin = e.ilot[((y - V[k][0]) & 63) * 64 + ((x - V[k][1]) & 63)] < 3;
-        if (!loin) continue;
-        if (pass == 1)
-          for (int k = 0; k < 32; k++)
-            if (pris[k] == j) { e.fx[k] = x + 0.5f; e.fy[k] = y + 0.5f; }
-        j++;
-      }
-    if (pass == 0) n = j;
+  for (int y = 9; y < 53; y++)
+    for (int x = 15; x < 58; x++) {
+      static const int8_t V[9][2] = {{0, 0}, {3, 0}, {-3, 0}, {0, 3}, {0, -3}, {2, 2}, {-2, 2}, {2, -2}, {-2, -2}};
+      bool loin = true;
+      for (int k = 0; k < 9 && loin; k++) loin = e.ilot[((y - V[k][0]) & 63) * 64 + ((x - V[k][1]) & 63)] < 3;
+      if (loin) { libre[y * 64 + x] = 1; n++; }
+    }
+  for (int k = 0; k < 32; k++) {
+    e.fx[k] = 40.5f; e.fy[k] = 20.5f;
+    if (!n) continue;
+    int j = (int)(aleatoire() % n);
+    for (int i = 0; i < 4096; i++)
+      if (libre[i] && j-- == 0) { e.fx[k] = (i & 63) + 0.5f; e.fy[k] = (i >> 6) + 0.5f; break; }
   }
-  if (!n)
-    for (int k = 0; k < 32; k++) { e.fx[k] = 40.5f; e.fy[k] = 20.5f; }
   for (int k = 0; k < 32; k++) e.fr[k] = hasard(0, 6);
 }
 // le relief d'un sillon : (la pente vers la lumiere, le creux)
