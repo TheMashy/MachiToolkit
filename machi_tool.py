@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.126.0"
+VERSION = "1.127.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -18270,6 +18270,856 @@ def _scene_vortex(p, e, t, ecoule, dt):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+# L'ESPACE, EN GRAND. « Galaxies [...] trous noirs avec gravitations de
+# particules » : un trou noir et des centaines de particules en vraie
+# gravitation, deux galaxies qui se croisent, la Voie lactee, une eclipse,
+# le soleil de pres, une comete, la Terre vue d'orbite, des constellations.
+
+
+# L'ESPACE. Huit scenes : un trou noir et ses particules, deux galaxies qui se
+# croisent, la Voie lactee sur un arbre seul, une eclipse, le soleil de pres,
+# une comete, la Terre vue d'orbite, des constellations qui se dessinent.
+
+
+def _espace_tacher(buf, ys, xs, couleurs, net=1.0):
+    """Ajoute des points a une position pas forcement entiere, repartis sur les quatre pixels voisins : ils
+    glissent sans sauter d'un pixel a l'autre. net > 1 : le point reste plus net (presque tout sur le pixel le
+    plus proche, le passage au suivant se fait vite)."""
+    import numpy as np
+    ys, xs = np.asarray(ys, float).ravel(), np.asarray(xs, float).ravel()
+    x0, y0 = np.floor(xs), np.floor(ys)
+    fx, fy = xs - x0, ys - y0
+    if net != 1.0:
+        fx = fx ** net / (fx ** net + (1 - fx) ** net)
+        fy = fy ** net / (fy ** net + (1 - fy) ** net)
+    xi, yi = x0.astype(int), y0.astype(int)
+    yy = np.concatenate([yi, yi, yi + 1, yi + 1])
+    xx = np.concatenate([xi, xi + 1, xi, xi + 1])
+    w = np.concatenate([(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy])
+    ok = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+    idx = (yy * 64 + xx)[ok]
+    c = np.broadcast_to(np.asarray(couleurs, float), (len(ys), 3))
+    c4 = np.concatenate([c, c, c, c])[ok] * w[ok][:, None]
+    for k in range(3):
+        buf[..., k] += np.bincount(idx, c4[:, k], 4096).reshape(64, 64)
+
+
+def _espace_flou(a, n=1):
+    """Adoucit un champ (64 x 64, ou 64 x 64 x 3) sans le raccorder par les bords."""
+    for _ in range(n):
+        b = a * 0.4
+        b[1:] += a[:-1] * 0.15
+        b[:-1] += a[1:] * 0.15
+        b[:, 1:] += a[:, :-1] * 0.15
+        b[:, :-1] += a[:, 1:] * 0.15
+        a = b
+    return a
+
+
+def _espace_lire(champ, u, v):
+    """Lit un champ qui se raccorde a des positions (u en colonnes, v en lignes) quelconques, en melangeant les
+    quatre voisines."""
+    import numpy as np
+    h, w = champ.shape[:2]
+    u0, v0 = np.floor(u), np.floor(v)
+    fu, fv = u - u0, v - v0
+    i0, j0 = u0.astype(int) % w, v0.astype(int) % h
+    i1, j1 = (i0 + 1) % w, (j0 + 1) % h
+    if champ.ndim == 3:
+        fu, fv = fu[..., None], fv[..., None]
+    haut = champ[j0, i0] * (1 - fu) + champ[j0, i1] * fu
+    return haut * (1 - fv) + (champ[j1, i0] * (1 - fu) + champ[j1, i1] * fu) * fv
+
+
+def _espace_etoiles(e, img, t, n=60, cle="etoiles", haut=0, bas=64, eclat=1.0, scint=0.3):
+    """Un fond d'etoiles de tailles et de couleurs variees, qui scintillent doucement."""
+    import numpy as np
+    if cle not in e:
+        r = e["rng"]
+        teintes = np.array([[200, 215, 255], [235, 235, 245], [255, 235, 200], [255, 205, 160]], float)
+        e[cle] = (r.integers(haut, bas, n), r.integers(0, 64, n), 0.22 + 0.78 * r.random(n) ** 2.5,
+                  teintes[r.choice(4, n, p=[0.35, 0.35, 0.18, 0.12])], r.uniform(0, 2 * np.pi, n),
+                  r.uniform(0.6, 2.0, n))
+    ey, ex, el, ec, ep, ew = e[cle]
+    lum = el * eclat * (1 - scint + scint * np.sin(t * ew + ep))
+    _pointer(img, ey, ex, lum[:, None] * ec)
+    return ey, ex, lum
+
+
+# 1. Le trou noir et ses particules : de la vraie gravitation (une masse au centre, des centaines de grains qui
+# n'en ont pas), un leger freinage qui les fait spiraler vers l'horizon, et des trainees qui s'effacent.
+
+GRAVITE_GM = 900.0                  # la masse du trou noir (en pixels^3 / s^2) : 30 s pour un tour a 28 px
+GRAVITE_N = 260
+GRAVITE_HORIZON = 6.2               # en deca, la particule est avalee (elle s'eteint en s'approchant)
+GRAVITE_OMBRE = 4.8                 # l'ombre noire, et son anneau de photons juste autour
+GRAVITE_PALETTE = ((0.0, (200, 60, 25)), (0.25, (255, 125, 40)), (0.48, (255, 195, 110)), (0.66, (255, 245, 225)),
+                   (0.82, (175, 210, 255)), (1.0, (75, 135, 255)))
+
+
+def _gravite_nees(rng, n, pres=False):
+    """De nouvelles particules : loin (elles arrivent de l'exterieur), ou deja reparties (au depart)."""
+    import numpy as np
+    r = rng.uniform(6.5, 50.0, n) if pres else rng.uniform(44, 54, n)      # au depart : deja l'equilibre
+    a = rng.uniform(0, 2 * np.pi, n)
+    vc = np.sqrt(GRAVITE_GM / r)
+    tang = vc * rng.uniform(0.88, 1.02, n)
+    rad = -vc * rng.uniform(0.0, 0.1, n)
+    pos = np.stack([r * np.cos(a), r * np.sin(a)], 1)
+    vel = np.stack([-np.sin(a) * tang + np.cos(a) * rad, np.cos(a) * tang + np.sin(a) * rad], 1)
+    return pos, vel
+
+
+def _gravite_avancer(e, duree, cadence=60):
+    """Fait avancer les particules de `duree` secondes, par petits pas (`cadence` par seconde), en deposant leur
+    lumiere a chaque pas."""
+    import numpy as np
+    rng = e["rng"]
+    pos, vel, trace = e["gpos"], e["gvel"], e["gtrace"]
+    n_pas = int(np.ceil(duree * cadence - 1e-9))
+    if n_pas <= 0:
+        return
+    h = duree / n_pas
+    oubli = np.exp(-h / 1.4)
+    stops = np.array([s for s, _ in GRAVITE_PALETTE])
+    palette = np.array([c for _, c in GRAVITE_PALETTE], float)
+    for _ in range(n_pas):
+        r2 = (pos ** 2).sum(1)
+        vel -= pos * (GRAVITE_GM * h / (r2 + 1.0) ** 1.5)[:, None]        # la gravite (adoucie au tout pres)
+        r = np.sqrt(r2)
+        vel *= np.exp(-h * e["gfrein"] / np.maximum(r, 4.0))[:, None]     # le freinage : ~1 px/s vers le centre
+        pos += vel * h
+        e["gage"] += h
+        r = np.sqrt((pos ** 2).sum(1))
+        v = np.sqrt((vel ** 2).sum(1))
+        chaud = np.clip((v - 4.3) / 9.0, 0, 1)                            # vite (pres) : bleu-blanc ; lent : rouge
+        couleur = np.stack([np.interp(chaud, stops, palette[:, k]) for k in range(3)], 1)
+        eclat = e["glum"] * np.clip((r - GRAVITE_HORIZON) / 2.2, 0, 1) * np.clip(e["gage"] - e["gne"], 0, 2) * 0.5
+        trace *= oubli
+        _espace_tacher(trace, 31.5 + pos[:, 1], 31.5 + pos[:, 0], couleur * (eclat * v * h * 0.6)[:, None])
+        e["gcouleur"], e["geclat"] = couleur, eclat
+        avalees = (r < GRAVITE_HORIZON) | (r > 70)
+        k = int(avalees.sum())
+        if k:
+            pos[avalees], vel[avalees] = _gravite_nees(rng, k)
+            e["gne"][avalees] = e["gage"]
+            e["glum"][avalees] = 0.25 + 0.75 * rng.random(k) ** 1.5
+            e["gfrein"][avalees] = rng.uniform(0.3, 0.9, k)
+
+
+def _scene_gravite(p, e, t, ecoule, dt):
+    """Un trou noir et des centaines de particules en vraie gravitation : elles tournent, spiralent lentement vers
+    l'horizon en laissant des arcs de lumiere (bleu-blanc pres, ambre loin), et d'autres arrivent de loin."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    cx, cy = 31.5, 31.5
+    if "gpos" not in e:
+        pos, vel = _gravite_nees(rng, GRAVITE_N, pres=True)
+        e.update(gpos=pos, gvel=vel, gtrace=np.zeros((64, 64, 3)), gage=10.0, gne=np.zeros(GRAVITE_N),
+                 glum=0.25 + 0.75 * rng.random(GRAVITE_N) ** 1.5, gfrein=rng.uniform(0.3, 0.9, GRAVITE_N))
+        _gravite_avancer(e, 2.5, 30)                                       # la pose a deja commence : les arcs sont la
+    _gravite_avancer(e, min(dt, 0.5))
+    dx, dy = X - cx, Y - cy
+    r = np.hypot(dx, dy)
+    img = np.zeros((64, 64, 3)) + np.array([2, 2, 7])
+    if "ciel" not in e:
+        e["ciel"] = (rng.uniform(0, 64, 40), rng.uniform(0, 64, 40), rng.uniform(0, 2 * np.pi, 40),
+                     0.2 + 0.8 * rng.random(40) ** 3)
+    sx, sy, sp, sl = e["ciel"]
+    vx, vy = sx - cx, sy - cy                                              # les etoiles du fond, deviees pres du trou
+    rr = np.hypot(vx, vy) + 1e-6
+    pousse = 1 + 30 / (rr ** 2 + 4)
+    lum = sl * (0.6 + 0.4 * np.sin(t * 1.3 + sp))
+    _pointer(img, cy + vy * pousse, cx + vx * pousse, lum[:, None] * np.array([130, 140, 180]))
+    img += np.exp(-np.maximum(r - 6, 0) / 6.0)[..., None] * np.array([10, 8, 22])           # une lueur diffuse
+    img += 255 * (1 - np.exp(-(e["gtrace"] / 170.0) ** 1.5))             # les trainees, sans brulure
+    _espace_tacher(img, cy + e["gpos"][:, 1], cx + e["gpos"][:, 0], e["gcouleur"] * (e["geclat"] * 1.0)[:, None])
+    ombre = np.clip((r - GRAVITE_OMBRE + 0.3) / 1.0, 0, 1)
+    img *= ombre[..., None]                                                # l'ombre
+    anneau = np.exp(-((r - GRAVITE_OMBRE - 0.6) / 0.6) ** 2) * (0.85 + 0.15 * np.sin(np.arctan2(dy, dx) * 2 - t * 0.9))
+    img += anneau[..., None] * np.array([255, 225, 180]) * 0.85            # l'anneau de photons
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 2. Deux galaxies en collision : deux noyaux massifs qui s'attirent, des etoiles sans masse qui tournent autour ;
+# au passage, la maree les arrache en deux longues queues. Puis les noyaux fusionnent, et une autre rencontre
+# arrive en fondu.
+
+COLLISION_DUREE = 42.0              # secondes par rencontre
+COLLISION_FONDU = 9.0               # la suivante arrive pendant que celle-ci s'efface
+COLLISION_N = 600                   # etoiles par galaxie
+COLLISION_VITESSE = 0.8
+COLLISION_RP = (11.0, 13.5)
+COLLISION_FROT = 0.1
+COLLISION_EX = (0.9, 1.0)
+COLLISION_R0 = 34.0
+COLLISION_APRES = 8.0
+
+
+def _collision_disque(rng, n, masse, rayon, incl, noeud, sens):
+    """Les etoiles d'une galaxie : un disque en rotation autour de son noyau, incline dans l'espace."""
+    import numpy as np
+    r = 1.2 + (rayon - 1.2) * rng.random(n) ** 1.1                        # etendu : ses bords feront les queues
+    a = rng.uniform(0, 2 * np.pi, n)
+    v = np.sqrt(masse * r ** 2 / (r ** 2 + 1.0) ** 1.5)
+    pos = np.stack([r * np.cos(a), r * np.sin(a), rng.normal(0, 0.25, n)], 1)
+    vel = np.stack([-np.sin(a) * v * sens, np.cos(a) * v * sens, np.zeros(n)], 1)
+    ci, si, cn, sn = np.cos(incl), np.sin(incl), np.cos(noeud), np.sin(noeud)
+    rot = np.array([[1, 0, 0], [0, ci, -si], [0, si, ci]]) @ np.array([[cn, -sn, 0], [sn, cn, 0], [0, 0, 1]])
+    rot = np.array([[cn, sn, 0], [-sn, cn, 0], [0, 0, 1]]) @ rot
+    return pos @ rot.T, vel @ rot.T
+
+
+def _collision_neuve(rng, premiere=False):
+    """Une rencontre : deux galaxies sur une orbite qui les fait se croiser de pres, chacune son disque et ses couleurs."""
+    import numpy as np
+    m1 = rng.uniform(150, 190)
+    m2 = m1 * rng.uniform(0.65, 1.0)
+    rp = rng.uniform(COLLISION_RP[0], COLLISION_RP[1])                   # le passage au plus pres
+    ex = rng.uniform(COLLISION_EX[0], COLLISION_EX[1])                   # l'excentricite
+    p_orb = rp * (1 + ex)
+    r0 = COLLISION_R0
+    f = -np.arccos(np.clip((p_orb / r0 - 1) / ex, -1, 1))               # elles arrivent l'une vers l'autre
+    k = np.sqrt((m1 + m2) / p_orb)
+    rel = np.array([np.cos(f), np.sin(f), 0.0]) * r0
+    vrel = (np.array([np.cos(f), np.sin(f), 0.0]) * k * ex * np.sin(f)
+            + np.array([-np.sin(f), np.cos(f), 0.0]) * k * (1 + ex * np.cos(f)))
+    noyaux = np.stack([-rel * m2 / (m1 + m2), rel * m1 / (m1 + m2)])
+    vnoyaux = np.stack([-vrel * m2 / (m1 + m2), vrel * m1 / (m1 + m2)])
+    etoiles, vitesses, bords = [], [], []
+    for g, (m, rayon) in enumerate(((m1, rng.uniform(8, 10)), (m2, rng.uniform(6.5, 8.5)))):
+        sens = 1 if (g == 0 or rng.random() < 0.8) else -1               # surtout dans le sens de l'orbite : les queues
+        pos, vel = _collision_disque(rng, COLLISION_N, m, rayon, rng.uniform(0.3, 0.9 if g == 0 else 1.2),
+                                     rng.uniform(0, 2 * np.pi), sens)
+        etoiles.append(pos + noyaux[g])
+        bords.append(0.55 + 0.9 * np.sqrt((pos ** 2).sum(1)) / rayon)    # les bords (les queues) un peu plus vifs
+        vitesses.append(vel + vnoyaux[g])
+    froides = (((140, 180, 255), (255, 120, 190)), ((185, 160, 255), (110, 225, 255)))
+    chaudes = (((255, 200, 120), (255, 130, 80)), ((255, 175, 140), (255, 110, 160)))
+    paire = [froides[int(rng.integers(2))], chaudes[int(rng.integers(2))]]
+    if rng.random() < 0.5:
+        paire.reverse()
+    couleurs = []
+    for base, eclat in paire:
+        base, eclat = np.array(base, float), np.array(eclat, float)
+        rose = rng.random(COLLISION_N) < 0.12                            # quelques amas de jeunes etoiles
+        c = np.where(rose[:, None], eclat, base * rng.uniform(0.75, 1.1, (COLLISION_N, 1)))
+        couleurs.append(c * (0.35 + 0.65 * rng.random((COLLISION_N, 1)) ** 1.5) * bords[len(couleurs)][:, None])
+    vue = rng.uniform(0.35, 0.8)                                         # on voit le plan de l'orbite de biais
+    tourne = rng.uniform(0, 2 * np.pi)
+    return {"age": 0.0, "passe": False, "premiere": premiere, "m": np.array([m1, m2]), "noyaux": noyaux, "vnoyaux": vnoyaux,
+            "pos": np.concatenate(etoiles), "vel": np.concatenate(vitesses), "couleurs": np.concatenate(couleurs),
+            "vue": vue, "tourne": tourne, "coeurs": np.array([[255, 236, 205], [255, 222, 180]], float)}
+
+
+def _collision_avancer(s, duree):
+    """Avance une rencontre de `duree` secondes (de simulation), par petits pas."""
+    import numpy as np
+    n_pas = int(np.ceil(duree * 40 - 1e-9))
+    if n_pas <= 0:
+        return
+    h = duree / n_pas
+    pos, vel, c, vc, m = s["pos"], s["vel"], s["noyaux"], s["vnoyaux"], s["m"]
+    for _ in range(n_pas):
+        d = c[1] - c[0]
+        r2 = float(d @ d)
+        a = d * (h / (r2 + 2.0) ** 1.5)
+        vc[0] += a * m[1]
+        vc[1] -= a * m[0]
+        rel = vc[1] - vc[0]
+        if not s["passe"] and float(d @ rel) > 0:                        # le premier passage au plus pres
+            s["passe"] = True
+        if s["passe"] and r2 < 900:                                      # puis le frottement : elles fusionnent
+            perte = rel * (1 - np.exp(-h * COLLISION_FROT * (1 - r2 / 900)))
+            vc[0] += perte * m[1] / m.sum()
+            vc[1] -= perte * m[0] / m.sum()
+        c += vc * h
+        acc = np.zeros_like(pos)
+        for g in (0, 1):
+            dd = pos - c[g]
+            acc -= dd * (m[g] / ((dd ** 2).sum(1) + 1.0) ** 1.5)[:, None]
+        vel += acc * h
+        pos += vel * h
+
+
+def _collision_dessiner(s, buf, coeurs, force):
+    """Projette une rencontre sur le panneau (de biais), ajoute ses etoiles dans buf et ses noyaux dans coeurs."""
+    import numpy as np
+    Y, X = _xy()
+    cv, sv, ct, st = np.cos(s["vue"]), np.sin(s["vue"]), np.cos(s["tourne"]), np.sin(s["tourne"])
+
+    def ecran(q):
+        x, y = q[..., 0], q[..., 1] * cv - q[..., 2] * sv
+        return 32 + x * ct - y * st, 32 + x * st + y * ct
+    xs, ys = ecran(s["pos"])
+    loin = np.sqrt(np.min(((s["pos"][:, None, :2] - s["noyaux"][None, :, :2]) ** 2).sum(2), 1))
+    _espace_tacher(buf, ys, xs, s["couleurs"] * (force * np.exp(-loin / 40.0))[:, None])   # ce qui s'eparpille palit
+    nx, ny = ecran(s["noyaux"])
+    for g in (0, 1):
+        d2 = (X - nx[g]) ** 2 + (Y - ny[g]) ** 2
+        noyau = np.exp(-d2 / 2.5) * 0.6 + np.exp(-d2 / 12.0) * 0.15
+        coeurs += noyau[..., None] * s["coeurs"][g] * (force * s["m"][g] / 170)
+
+
+def _scene_collision(p, e, t, ecoule, dt):
+    """Deux galaxies de particules qui se croisent : la maree deroule leurs queues, leurs noyaux tournent l'un
+    autour de l'autre et fusionnent ; puis une nouvelle rencontre arrive en fondu."""
+    import numpy as np
+    rng = e["rng"]
+    if "rencontres" not in e:
+        e["rencontres"] = [_collision_neuve(rng, premiere=True)]
+    pas = min(dt, 0.5)
+    for s in e["rencontres"]:
+        _collision_avancer(s, pas * COLLISION_VITESSE)
+        s["age"] += pas
+    if e["rencontres"][-1]["age"] >= COLLISION_DUREE - COLLISION_FONDU:
+        e["rencontres"].append(_collision_neuve(rng))
+    e["rencontres"] = [s for s in e["rencontres"] if s["age"] < COLLISION_DUREE]
+    img = np.zeros((64, 64, 3)) + np.array([3, 2, 8])
+    _espace_etoiles(e, img, t, 45, "fond", eclat=0.55, scint=0.25)
+    buf, coeurs = np.zeros((64, 64, 3)), np.zeros((64, 64, 3))
+    for s in e["rencontres"]:
+        a = s["age"]
+        entree = 1.0 if s["premiere"] else np.clip(a / COLLISION_FONDU, 0, 1)
+        sortie = np.clip((COLLISION_DUREE - a) / COLLISION_FONDU, 0, 1)
+        force = (entree * sortie) ** 1.2
+        if force > 0.002:
+            _collision_dessiner(s, buf, coeurs, force)
+    lumiere = (buf * 0.6 + _espace_flou(buf, 2) * 1.0) * 0.25
+    fort = lumiere.max(2, keepdims=True) + 1e-6                          # adoucir sans blanchir : la teinte reste
+    img += lumiere * (255 * (1 - np.exp(-(fort / 300.0) ** 0.7)) / fort) + coeurs
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 3. La Voie lactee au-dessus d'un arbre seul : la bande (ses nuages d'etoiles, ses poussieres sombres, son
+# bulbe dore) tourne tres lentement avec tout le ciel ; de loin en loin, une etoile filante.
+
+VOIE_PIVOT = (30.0, 27.0)           # le ciel tourne autour d'ici (le bulbe y reste)
+VOIE_TOUR = 900.0                   # secondes pour un tour complet
+
+
+def _voie_arbre(rng):
+    """La silhouette : une colline, et un arbre seul (un tronc, des branches, un houppier en touffes, troue)."""
+    import numpy as np
+    Y, X = _xy()
+    x = X[0]
+    crete = 53 + 2.2 * np.sin(x * 0.055 + 0.8) + 1.3 * np.sin(x * 0.16 + 2.0) - 2.2 * np.exp(-((x - 46) / 11) ** 2)
+    masque = Y >= crete[None, :]
+    pied = float(crete[46])
+    tronc = (np.abs(X - 46 - (pied - Y) * 0.06) <= 1.2 - (pied - Y) * 0.05) & (Y <= pied + 1) & (Y >= pied - 12)
+    masque |= tronc
+    for x0, y0, x1, y1 in ((46, pied - 7, 39, pied - 14), (46.5, pied - 9, 53, pied - 15), (46, pied - 11, 46, pied - 18),
+                           (41, pied - 12, 36, pied - 14), (51, pied - 13, 56, pied - 14)):
+        k = np.linspace(0, 1, 30)
+        yy, xx = np.round(y0 + (y1 - y0) * k).astype(int), np.round(x0 + (x1 - x0) * k).astype(int)
+        masque[np.clip(yy, 0, 63), np.clip(xx, 0, 63)] = True
+    feuilles = _brume(rng, 2, 64)
+    touffes = np.full((64, 64), -1.0)
+    for tx, ty, tr in ((39, -16, 4.2), (46, -20, 4.8), (53, -17, 4.4), (42, -21, 3.5), (50, -22, 3.6), (35, -15, 2.8),
+                       (57, -15, 2.8), (46, -15, 3.5)):
+        touffes = np.maximum(touffes, 1 - np.hypot(X - tx, (Y - pied - ty) * 1.15) / tr)
+    masque |= touffes + (feuilles - 0.5) * 0.5 > 0.1                     # des bords feuillus, quelques trous
+    return masque, crete
+
+
+def _scene_voie_lactee(p, e, t, ecoule, dt):
+    """La Voie lactee au-dessus d'un arbre seul sur sa colline : ses nuages clairs, ses poussieres sombres, son
+    bulbe dore ; le ciel tourne tres lentement, une etoile filante passe de loin en loin."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "voie" not in e:
+        n = 300
+        dans = rng.random(n) < 0.55                                      # plus d'etoiles dans la bande
+        u = np.where(dans, rng.uniform(-48, 48, n), rng.uniform(-48, 48, n))
+        v = np.where(dans, rng.normal(0, 5.5, n), rng.uniform(-48, 48, n))
+        teintes = np.array([[200, 215, 255], [240, 238, 245], [255, 230, 190], [255, 200, 150]], float)
+        lum = 0.18 + 0.82 * rng.random(n) ** 3.2
+        e.update(voie=(_brume(rng, 3), _brume(rng, 9), _brume(rng, 2)), arbre=_voie_arbre(rng),
+                 astres=(u, v, lum, teintes[rng.choice(4, n, p=[0.3, 0.4, 0.2, 0.1])], rng.uniform(0, 2 * np.pi, n),
+                         rng.uniform(0.5, 1.6, n)),
+                 filante=None, prochaine=ecoule + rng.uniform(6, 14))
+    fin, large, grain = e["voie"]
+    masque, crete = e["arbre"]
+    img = _degrade((3, 4, 14), (13, 15, 30), 0, 54)
+    img += np.exp(-np.maximum(crete[None, :] - Y, 0) / 5.0)[..., None] * np.array([16, 12, 18])   # la lueur de l'horizon
+    th = 2 * np.pi * ((t / VOIE_TOUR) % 1.0) + 0.6
+    c, s = np.cos(th), np.sin(th)
+    px, py = VOIE_PIVOT
+    dx, dy = X - px, Y - py
+    u, v = dx * c + dy * s, -dx * s + dy * c                             # dans le repere de la bande
+    nf = _espace_lire(fin, u * 0.9 + 64, v * 0.9 + 64)
+    nl = _espace_lire(large, u * 0.7 + 30, v * 0.7 + 90)
+    ng = _espace_lire(grain, u * 1.3 + 10, v * 1.3 + 40)
+    bulbe = np.exp(-(u ** 2 + (v * 1.5) ** 2) / (2 * 7.5 ** 2))
+    largeur = 6.5 + 4 * np.exp(-(u / 16) ** 2)
+    bande = np.exp(-(v / largeur) ** 2) * (0.55 + 0.45 * np.exp(-(u / 40) ** 2))
+    nuages = bande * (0.3 + 1.1 * nf ** 1.6 * (0.6 + 0.8 * nl)) + bulbe * 0.8
+    rift = np.exp(-((v - 1.2 - 2.0 * np.sin(u * 0.11) - 4 * (nl - 0.5)) / (1.6 + 0.8 * nl)) ** 2)
+    poussiere = np.clip(rift * (0.65 + 0.9 * ng) + np.clip(nl - 0.6, 0, 1) * 2.4 * bande, 0, 0.92)
+    nuages *= 1 - poussiere                                              # les poussieres sombres
+    chaud = np.clip(bulbe * 1.6, 0, 1)[..., None]
+    teinte = np.array([120, 130, 175]) * (1 - chaud) + np.array([255, 205, 150]) * chaud
+    img += nuages[..., None] * teinte * 0.62
+    rose = np.clip(nf - 0.78, 0, 1) * 5 * bande * (1 - poussiere)         # quelques nebuleuses roses
+    img += rose[..., None] * np.array([150, 40, 80])
+    su, sv, sl, sc, sp, sw = e["astres"]
+    ex, ey = px + su * c - sv * s, py + su * s + sv * c                  # les etoiles tournent avec le ciel
+    lum = sl * (0.72 + 0.28 * np.sin(t * sw * 2.0 + sp))
+    ok = (ex > -1) & (ex < 65) & (ey > -1) & (ey < 65)
+    _espace_tacher(img, ey[ok], ex[ok], sc[ok] * lum[ok, None], net=4.0)
+    vives = ok & (sl > 0.8)
+    for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):                  # les plus vives, une petite croix
+        _espace_tacher(img, ey[vives] + ddy, ex[vives] + ddx, sc[vives] * lum[vives, None] * 0.22, net=4.0)
+    if e["filante"] is None and ecoule >= e["prochaine"]:
+        a = rng.uniform(0.35, 0.75) * rng.choice([-1, 1])
+        e["filante"] = [rng.uniform(10, 54), rng.uniform(4, 22), np.cos(a) * np.sign(a), abs(np.sin(a)),
+                        rng.uniform(26, 36), rng.uniform(1.0, 1.5), 0.0]
+    f = e["filante"]
+    if f is not None:                                                    # une etoile filante, douce
+        f[6] += min(dt, 0.5)
+        k = f[6] / f[5]
+        if k >= 1:
+            e["filante"], e["prochaine"] = None, ecoule + rng.uniform(14, 34)
+        else:
+            tete = f[4] * k
+            j = np.arange(0, 10, 0.5)
+            dist = np.maximum(tete - j, 0)
+            force = np.sin(np.pi * k) ** 1.5 * (1 - j / 10) ** 1.5
+            _espace_tacher(img, f[1] + f[3] * dist, f[0] + f[2] * dist, force[:, None] * np.array([172, 176, 191]))
+    img[masque] = np.array([3, 4, 8])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 4. Une eclipse totale : le disque noir de la lune, la couronne en jets nacres qui ondulent, les protuberances
+# roses au bord ; et sur un long cycle, l'anneau de diamant qui s'allume et s'eteint.
+
+ECLIPSE_CYCLE = 48.0                # secondes entre deux anneaux de diamant
+ECLIPSE_JETS = ((0.35, 1.0, 0.22, 0.10), (1.25, 0.8, 0.18, -0.08), (2.05, 0.65, 0.26, 0.12), (2.75, 0.95, 0.2, -0.1),
+                (3.6, 0.75, 0.24, 0.07), (4.35, 1.0, 0.2, -0.12), (5.15, 0.7, 0.28, 0.09), (5.8, 0.55, 0.16, -0.05))
+
+
+def _eclipse_preparer(e, rng):
+    """Tout ce qui ne bouge pas : les distances et les angles autour de la lune, l'emplacement de chaque jet, le
+    ciel, l'anneau ou vivent les protuberances, la forme de l'anneau de diamant."""
+    import numpy as np
+    Y, X = _xy()
+    cx, cy, R = 31.5, 31.5, 10.5
+    dx, dy = X - cx, Y - cy
+    r, th = np.hypot(dx, dy), np.arctan2(dy, dx)
+    hauteur = np.maximum(r - R, 0)
+    dehors = (r > R).astype(float)
+    jets = []
+    for a0, force, largeur, courbe in ECLIPSE_JETS:
+        d = (th - a0 - courbe * hauteur * 0.08 + np.pi) % (2 * np.pi) - np.pi      # ils se courbent en montant
+        jets.append((d, 1.0 / (largeur * (1.3 - 0.6 * np.clip(hauteur / 22, 0, 1))), force, a0))
+    fond = _degrade((6, 9, 30), (14, 16, 40))                            # le ciel en plein jour eteint
+    fond += (np.exp(-hauteur / 4.0) * dehors * 0.25)[..., None] * np.array([120, 150, 255])   # un voile bleute
+    anneau = np.nonzero(((r > R - 1) & (r < R + 8)).ravel())[0]          # la ou vivent les protuberances
+    ta, ha = th.ravel()[anneau], hauteur.ravel()[anneau]
+    angles = rng.permutation(np.linspace(0, 2 * np.pi, 6, endpoint=False) + rng.uniform(-0.3, 0.3, 6))[:5]
+    protus = [((ta - a + np.pi) % (2 * np.pi) - np.pi, rng.uniform(2.0, 3.8), rng.uniform(0.1, 0.22), rng.uniform(0, 6),
+               rng.uniform(0.1, 0.2)) for a in angles]
+    chromo = (np.exp(-(ha / 0.8) ** 2), np.exp(-((ta + 0.8 + np.pi) % (2 * np.pi) - np.pi) ** 2 / 0.4),
+              (r.ravel()[anneau] > R - 0.2))
+    lune = np.clip(R + 0.5 - r, 0, 1)[..., None]
+    bx, by = cx + np.cos(-0.8) * (R + 0.3), cy + np.sin(-0.8) * (R + 0.3)
+    d = np.hypot(X - bx, Y - by)
+    ey, ex = np.abs(Y - by), np.abs(X - bx)
+    croix = np.exp(-ey * 1.5 - ex / 9) + np.exp(-ex * 1.5 - ey / 9)
+    diamant = (np.exp(-d / 1.3) + 0.35 * np.exp(-d / 5.0) + croix * 0.5) * (1 - 0.92 * lune[..., 0])
+    e["eclipse"] = {"th": th, "dehors": dehors, "interne": np.exp(-hauteur / 2.0) * 0.6 * dehors,
+                    "externe": np.exp(-hauteur / 8.0) * 0.75 * dehors, "jets": jets, "fond": fond, "anneau": anneau,
+                    "ha": ha, "protus": protus, "chromo": chromo, "lune": lune, "diamant": diamant[..., None],
+                    "planete": (int(rng.integers(6, 14)), int(rng.integers(44, 58)))}
+
+
+def _scene_eclipse(p, e, t, ecoule, dt):
+    """Une eclipse totale : le disque noir de la lune, la couronne en jets nacres qui ondulent lentement, les
+    protuberances roses au bord, des etoiles ; l'anneau de diamant s'allume et s'eteint sur un long cycle."""
+    import numpy as np
+    rng = e["rng"]
+    if "eclipse" not in e:
+        _eclipse_preparer(e, rng)
+    c = e["eclipse"]
+    img = c["fond"].copy()
+    _espace_etoiles(e, img, t, 30, "etoiles", eclat=0.75, scint=0.25)
+    vy, vx = c["planete"]                                                # une planete, tres vive
+    img[vy, vx] = (255, 250, 225)
+    img[vy, vx - 1:vx + 2:2] = np.maximum(img[vy, vx - 1:vx + 2:2], (90, 88, 80))
+    img[vy - 1:vy + 2:2, vx] = np.maximum(img[vy - 1:vy + 2:2, vx], (90, 88, 80))
+    k = (ecoule / ECLIPSE_CYCLE) % 1.0
+    diamant = (0.5 - 0.5 * np.cos(2 * np.pi * k)) ** 6                  # rare, et tres doux
+    rayons = np.full((64, 64), 0.22)
+    for d, inv, force, a0 in c["jets"]:                                  # les jets de la couronne, qui ondulent
+        balance = 0.14 * np.sin(t * 0.17 + a0 * 3) + 0.06 * np.sin(t * 0.37 + a0)
+        rayons += np.exp(-((d - balance) * inv) ** 2) * (force * (0.85 + 0.15 * np.sin(t * 0.4 + a0 * 5)))
+    th = c["th"]
+    fibres = 0.8 + 0.2 * np.sin(th * 23 + np.sin(th * 3 + t * 0.11) * 2) * np.sin(th * 9 - t * 0.09)
+    couronne = (c["interne"] + c["externe"] * rayons * fibres) * (1 - 0.25 * diamant)   # la couronne interne, vive et ronde
+    img += couronne[..., None] * np.array([235, 238, 255])
+    ha = c["ha"]
+    protu = np.zeros(len(ha))
+    for d, h0, w0, ph, vit in c["protus"]:                               # les protuberances, qui montent et retombent
+        h = h0 * (0.7 + 0.3 * np.sin(t * vit + ph))
+        protu += np.exp(-(d / (w0 * (1 + 0.4 * np.sin(ha * 1.2 + t * 0.45 + ph)))) ** 2 - (ha / h) ** 2)
+    bas, cote, hors = c["chromo"]
+    rose = (np.clip(protu * 1.1 + bas * (0.3 + 0.7 * diamant * cote), 0, 1) * hors)[:, None]
+    plat = img.reshape(-1, 3)
+    plat[c["anneau"]] = plat[c["anneau"]] * (1 - rose * 0.8) + rose * np.array([255, 60, 115])
+    img = img * (1 - c["lune"]) + c["lune"] * np.array([3, 3, 6])
+    if diamant > 0.003:                                                  # l'anneau de diamant
+        img += c["diamant"] * (diamant * 1.5) * np.array([255, 250, 235])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 5. Le soleil de pres : un morceau de son disque (le bord en arc), sa surface en granules qui bouillonnent
+# lentement, plus sombre et plus rouge vers le bord ; au-dessus, des boucles de plasma qui montent et retombent.
+
+SOLEIL_CENTRE = (10.0, 88.0)
+SOLEIL_R = 58.0
+SOLEIL_BOUCLES = ((-1.44, -1.1, 21.0, 0.0, 0.07, 0.25), (-1.0, -0.84, 12.0, 2.0, 0.09, -0.15),
+                  (-0.72, -0.62, 8.0, 4.1, 0.11, 0.2), (-1.66, -1.56, 7.0, 1.0, 0.1, -0.3),
+                  (-0.56, -0.47, 6.0, 5.3, 0.12, 0.0))   # (pied, pied, hauteur, phase, vitesse, penche)
+
+
+def _soleil_preparer(e, rng):
+    """Ce qui ne bouge pas : la surface vue en sphere (ou lire les granules, l'assombrissement du bord), les
+    masques du disque et de l'espace autour."""
+    import numpy as np
+    Y, X = _xy()
+    cx, cy = SOLEIL_CENTRE
+    R = SOLEIL_R
+    dx, dy = X - cx, Y - cy
+    rho = np.hypot(dx, dy)
+    mu = np.sqrt(np.clip(1 - (rho / R) ** 2, 0, 1))                      # 1 face a nous, 0 au bord
+    su, sv = R * np.arctan2(dy, dx), R * np.arcsin(np.clip(rho / R, 0, 1))
+    haut = np.maximum(rho - R, 0)
+    e["soleil"] = {"su": su, "sv": sv, "su55": su * 0.55, "sv55": sv * 0.55, "su4": su * 0.4, "sv4": sv * 0.4,
+                   "mu06": 0.32 + 0.72 * mu ** 0.7, "mu08": mu ** 0.8, "facule": 2.5 * 0.22 * (1 - mu) ** 1.5,
+                   "haut": haut, "couronne": np.exp(-haut / 14.0) * (rho > R), "chromo": rho > R - 0.5,
+                   "bord": np.clip(R - rho + 0.5, 0, 1)[..., None], "dehors": (rho > R - 0.3)[..., None],
+                   "granules": (_brume(rng, 3), _brume(rng, 4), _brume(rng, 14)), "frange": rng.uniform(0, 2 * np.pi, 2),
+                   "visible": (su[rho <= R].min() - 8, su[rho <= R].max() + 8)}
+
+
+def _scene_soleil(p, e, t, ecoule, dt):
+    """Le soleil de pres : le bord de son disque en arc, sa surface granuleuse qui bouillonne lentement, plus sombre
+    vers le bord ; au-dessus, des boucles de plasma qui montent et retombent, une frange de flammeches."""
+    import numpy as np
+    rng = e["rng"]
+    cx, cy = SOLEIL_CENTRE
+    R = SOLEIL_R
+    if "soleil" not in e:
+        _soleil_preparer(e, rng)
+    c = e["soleil"]
+    g1, g2, g3 = c["granules"]
+    tour = t * 0.16 % 128.0                                              # le soleil tourne, lentement
+    a = _espace_lire(g1, c["su55"] + tour, c["sv55"] + (t * 0.13) % 128)
+    b = _espace_lire(g2, c["su55"] + (tour * 1.1 + 40), c["sv55"] + (70 - (t * 0.11) % 128))
+    grand = _espace_lire(g3, c["su4"] + tour * 0.4, c["sv4"])
+    cellule = np.clip((a * 0.55 + b * 0.45 - 0.5) * 3.0, -1, 1)          # deux couches qui glissent : ca bouillonne
+    lum = c["mu06"] * (0.78 + 0.22 * cellule) * (0.92 + 0.16 * grand) + np.clip(grand - 0.58, 0, 1) * c["facule"]
+    periode = 128 / 0.55
+    su, sv = c["su"], c["sv"]
+    for u0, v0, taille in ((-20.0, 38.0, 1.0), (-14.0, 41.0, 0.7)):      # deux taches, emportees par la rotation
+        centre = (u0 - tour / 0.55 + periode / 2) % periode - periode / 2
+        if c["visible"][0] < centre < c["visible"][1]:
+            d = np.hypot(su - centre, sv - v0) / taille
+            lum = lum * (1 - 0.72 * np.clip(2.2 - d, 0, 1) - 0.3 * np.clip(3.6 - d, 0, 1) * np.clip(d - 1.4, 0, 1))
+    chaud = np.clip(c["mu08"] * (0.85 + 0.25 * cellule), 0, 1)[..., None]
+    surf = (np.array([210, 50, 2]) + np.array([45, 125, 46]) * chaud) * lum[..., None]
+    voile = 0.75 + 0.25 * np.sin(su * 0.35 + 1.0 + np.sin(t * 0.05) * 0.5) * np.sin(su * 0.13 - 0.7)
+    fr = c["frange"]
+    flamme = 0.5 + 0.5 * np.sin(su * 1.3 + fr[0] + t * 0.25) * np.sin(su * 0.47 + fr[1] - t * 0.15)
+    chromo = np.exp(-c["haut"] / (0.6 + 1.2 * flamme)) * c["chromo"]      # la frange de flammeches au bord
+    img = (c["couronne"] * voile)[..., None] * np.array([46, 11, 7]) + chromo[..., None] * np.array([191, 52, 19])
+    img += np.array([3, 1, 2])
+    img = img * (1 - c["bord"]) + surf * c["bord"]
+    s = np.linspace(0, 1, 140)
+    arche = np.sin(np.pi * s)
+    ys, xs, poids = [], [], []
+    for p1, p2, h0, ph, vit, penche in SOLEIL_BOUCLES:                   # les boucles de plasma
+        h = h0 * (0.6 + 0.4 * np.sin(t * vit + ph))
+        ang = p1 + (p2 - p1) * s + penche * arche ** 2 * h / R
+        for brin, decal, force in ((0.0, 0.0, 1.0), (0.9, 1.7, 0.55)):
+            rr = R + 0.2 + (h + brin) * arche ** 0.8
+            y, x = cy + rr * np.sin(ang), cx + rr * np.cos(ang)
+            pas = np.hypot(np.diff(y, append=2 * y[-1] - y[-2]), np.diff(x, append=2 * x[-1] - x[-2]))   # par longueur
+            flux = 0.5 + 0.5 * np.sin(np.abs(s - 0.5) * 20 - t * 1.3 + ph + decal)   # le plasma qui redescend
+            ys.append(y)
+            xs.append(x)
+            poids.append(flux * pas * force)
+    boucles = np.zeros((64, 64, 3))
+    poids = np.concatenate(poids)[:, None] * np.array([255, 160, 80])
+    _espace_tacher(boucles, np.concatenate(ys), np.concatenate(xs), poids)
+    halo = _espace_flou(boucles, 2)
+    img += np.where(c["dehors"], boucles * 0.9 + halo * np.array([1.6, 0.9, 0.7]), halo * 0.4)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 6. Une comete : sa tete et sa chevelure verdatre, sa queue de poussieres courbe et doree, sa queue d'ions droite
+# et bleue ; elle traverse lentement le champ d'etoiles, s'eloigne, puis revient par l'autre bord.
+
+COMETE_PERIODE = 64.0               # secondes pour une traversee
+
+
+def _comete_dessiner(img, Y, X, s, v, t):
+    """Une comete a l'etape s de sa traversee (0 : elle entre a gauche ; 1 : elle sort a droite), sur le chemin v."""
+    import numpy as np
+    y0, pente, bombe, axe, courbe = v
+    hx = -1 + 79 * s
+    hy = y0 - pente * s - bombe * np.sin(np.pi * np.clip(s, 0, 1))
+    k = np.sin(np.pi * np.clip(s, 0, 1))
+    force = 0.72 + 0.28 * k                                              # au plus pres du soleil au milieu
+    if hx < -40 or hx > 110:
+        return
+    th = axe + 0.25 * (s - 0.5)                                          # la queue fuit le soleil (en bas a droite)
+    ax, ay = np.cos(th), np.sin(th)
+    rx, ry = X - hx, Y - hy
+    le_long = rx * ax + ry * ay
+    travers = -rx * ay + ry * ax
+    devant = np.clip(le_long + 1.5, 0, 3) / 3
+    lq = 30 + 12 * k
+    ion_axe = travers - 0.5 * np.sin(le_long * 0.22 - t * 1.1) * np.clip(le_long / 25, 0, 1)
+    arriere = np.maximum(le_long, 0)                                    # derriere la tete, la ou vont les queues
+    ion = np.exp(-arriere / lq) * np.exp(-(ion_axe / (0.45 + 0.03 * arriere)) ** 2) * devant
+    ion *= 0.8 + 0.2 * np.sin(le_long * 0.35 - t * 2.0)                  # des noeuds qui filent
+    ecart = travers - courbe * arriere ** 2 / 30                         # la poussiere traine, en courbe
+    large = 1.0 + 0.24 * arriere
+    poussiere = np.exp(-arriere / (lq * 0.8)) * np.exp(-(ecart / large) ** 2) * devant
+    poussiere *= 0.85 + 0.15 * np.sin(ecart / large * 3 + le_long * 0.08)  # des stries
+    loin = np.clip(le_long / 30, 0, 1)[..., None]
+    dore = np.array([255, 242, 205]) * (1 - loin) + np.array([240, 175, 95]) * loin
+    d2 = rx ** 2 + ry ** 2
+    chevelure = np.exp(-d2 / 7.0) * 0.7 + np.exp(-np.sqrt(d2) / 4.5) * 0.25
+    img += (ion[..., None] * np.array([70, 140, 255]) * 0.8 + poussiere[..., None] * dore * 1.0
+            + chevelure[..., None] * np.array([130, 255, 205]) * 0.8) * force
+    _espace_tacher(img, [hy], [hx], np.array([[255, 255, 240]]) * force)
+
+
+def _scene_comete(p, e, t, ecoule, dt):
+    """Une comete qui traverse lentement le champ d'etoiles : sa chevelure, sa queue de poussieres courbe et
+    doree, sa queue d'ions droite et bleue ; elle s'eloigne, puis revient par l'autre bord."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "chemins" not in e:
+        e["chemins"] = [(rng.uniform(40, 52), rng.uniform(6, 16), rng.uniform(3, 8), rng.uniform(-2.75, -2.5),
+                         -rng.uniform(0.6, 1.2)) for _ in range(8)]   # la poussiere s'incurve vers le bas
+    img = _degrade((3, 4, 14), (8, 8, 22))
+    img += np.exp(-np.hypot(X - 76, Y - 78) / 22.0)[..., None] * np.array([46, 26, 12])   # le soleil, hors champ
+    _espace_etoiles(e, img, t, 90, "etoiles", eclat=1.0, scint=0.3)
+    q = t / COMETE_PERIODE
+    n = int(np.floor(q))
+    s = q - n
+    for k, ss in ((n, s), (n - 1, s + 1.0)):                            # celle qui passe, et la queue de la precedente
+        _comete_dessiner(img, Y, X, ss, e["chemins"][k % 8], t)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 7. La Terre vue d'orbite : sa courbure en bas, cote nuit (les villes, des nuages sombres), la fine ligne bleue
+# de l'atmosphere ; la Terre defile, le soleil se leve tres lentement sur le limbe, puis se recouche.
+
+ORBITE_CENTRE = (30.0, 122.0)
+ORBITE_R = 82.0
+ORBITE_CYCLE = 96.0                 # secondes pour une aube et son retour a la nuit
+ORBITE_AUBE = -1.38                 # l'angle du point du limbe ou le soleil se leve
+ORBITE_COUCHES = ((0.0, (255, 80, 25)), (1.2, (255, 150, 50)), (2.4, (255, 215, 140)), (3.6, (150, 185, 255)),
+                  (5.5, (55, 100, 255)), (9.0, (20, 40, 140)))   # l'aube en couches, selon la hauteur
+
+
+def _orbite_villes(rng):
+    """Les lumieres des villes, vues de nuit : des amas de points (une grande ville, ses banlieues), raccordes."""
+    import numpy as np
+    villes = np.zeros((128, 128, 3))
+    for _ in range(72):
+        cx, cy = rng.uniform(0, 128, 2)
+        n = int(rng.integers(5, 32))
+        etale = rng.uniform(0.7, 2.6)
+        xs, ys = (cx + rng.normal(0, etale, n)) % 128, (cy + rng.normal(0, etale * 0.8, n)) % 128
+        teinte = np.array([255, 190, 100]) if rng.random() < 0.75 else np.array([235, 235, 210])
+        np.add.at(villes, (ys.astype(int), xs.astype(int)), teinte * rng.uniform(0.25, 0.8, (n, 1)))
+    flou = villes
+    for _ in range(2):
+        flou = (flou * 2 + np.roll(flou, 1, 0) + np.roll(flou, -1, 0) + np.roll(flou, 1, 1) + np.roll(flou, -1, 1)) / 6
+    loin = flou
+    for _ in range(4):
+        loin = (loin * 2 + np.roll(loin, 1, 0) + np.roll(loin, -1, 0) + np.roll(loin, 1, 1) + np.roll(loin, -1, 1)) / 6
+    return np.minimum(villes * 0.6 + flou * 1.2, 255), loin * 1.6
+
+
+def _orbite_preparer(e, rng):
+    """Ce qui ne bouge pas : ou chaque pixel tombe sur le sol (ecrase pres du limbe), l'atmosphere en couches."""
+    import numpy as np
+    Y, X = _xy()
+    cx, cy = ORBITE_CENTRE
+    R = ORBITE_R
+    dx, dy = X - cx, Y - cy
+    rho = np.hypot(dx, dy)
+    su = R * np.arctan2(dy, dx)
+    cos_t = np.sqrt(np.clip(1 - (rho / R) ** 2, 0, 1))                  # 0 au limbe : la, tout est ecrase
+    recul = R * (np.pi / 2 - np.arcsin(np.clip(rho / R, 0, 1)))          # la distance au limbe, sur le sol
+    h = np.maximum(rho - R, 0)
+    ciel = np.clip(rho - R + 0.5, 0, 1)                                  # le ciel, en douceur au ras du limbe
+    hauteurs, teintes = np.array([a for a, _ in ORBITE_COUCHES]), np.array([c for _, c in ORBITE_COUCHES], float)
+    couches = np.stack([np.interp(h, hauteurs, teintes[:, c]) for c in range(3)], -1)
+    e["terre"] = {"u": su * 0.9, "recul": recul * 0.9, "net": np.clip(cos_t / 0.55, 0, 1)[..., None],
+                  "voile": (np.clip(cos_t * 2.2, 0, 1) ** 1.5)[..., None], "da": (su - R * ORBITE_AUBE) / R,
+                  "aube_sol": np.exp(-recul / 14)[..., None], "brume": np.exp(-recul / 1.6)[..., None],
+                  "limbe": np.clip(R - rho + 0.5, 0, 1)[..., None], "ciel": ciel,
+                  "ligne": (np.exp(-h / 1.1) * 0.8 * ciel)[..., None] * np.array([27, 63, 153]),
+                  "verte": (np.exp(-((h - 3.0) / 0.9) ** 2) * ciel)[..., None] * np.array([18, 48, 24]),
+                  "couches": couches * np.exp(-h / 5.0)[..., None], "haut": np.exp(-h / 10) * ciel}
+    e["villes"] = _orbite_villes(rng)
+    e["nuages"] = (_brume(rng, 6), _brume(rng, 3))
+
+
+def _scene_orbite(p, e, t, ecoule, dt):
+    """La Terre vue d'orbite, cote nuit : sa courbure, les lumieres des villes sous des nuages sombres, la fine ligne
+    bleue de l'atmosphere ; elle defile doucement, et le soleil se leve tres lentement sur le limbe."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    cx, cy = ORBITE_CENTRE
+    R = ORBITE_R
+    if "terre" not in e:
+        _orbite_preparer(e, rng)
+    c = e["terre"]
+    villes, loin = e["villes"]
+    nuage_a, nuage_b = e["nuages"]
+    k = (t / ORBITE_CYCLE) % 1.0
+    aube = (0.5 - 0.5 * np.cos(2 * np.pi * k)) ** 1.6                    # 0 : la nuit ; 1 : le soleil est la
+    img = np.zeros((64, 64, 3)) + np.array([2, 2, 6])
+    _espace_etoiles(e, img, t, 50, "etoiles", haut=0, bas=35, eclat=1.0 - 0.6 * aube, scint=0.25)
+    u, v = c["u"], c["recul"] - (t * 1.6) % 128                          # le sol vient du limbe vers nous
+    flou = _espace_lire(loin, u, v)
+    lum = _espace_lire(villes, u, v) * c["net"] + flou * (1 - c["net"])
+    na = _espace_lire(nuage_a, u * 0.8 + (t * 0.2) % 128, v * 0.8)
+    nb = _espace_lire(nuage_b, u * 1.3, v * 1.3 + 50)
+    nuage = np.clip((na * 0.75 + nb * 0.25 - 0.47) * 3.2, 0, 1)[..., None]
+    da = c["da"]                                                         # l'ecart (en angle) au point de l'aube
+    pres_aube = (np.exp(-(da / (0.12 + 0.2 * aube)) ** 2) * aube)[..., None]
+    terre = np.array([3, 5, 11]) + (lum * (1 - 0.88 * nuage) + flou * nuage * 0.45) * c["voile"]   # sous les nuages
+    terre += nuage * (np.array([14, 17, 26]) * (1 - pres_aube) + np.array([150, 90, 70]) * pres_aube * c["aube_sol"])
+    terre += c["brume"] * (np.array([12, 27, 66]) + np.array([120, 120, 160]) * pres_aube)
+    img = img * (1 - c["limbe"]) + terre * c["limbe"]
+    bande = np.exp(-(da / (0.1 + 0.32 * aube)) ** 2) * aube * c["ciel"]  # l'aube, couchee sur le limbe
+    img += c["ligne"] * (1 - 0.7 * bande)[..., None] + c["verte"] * (1 - aube)
+    img += (bande * (0.6 + 0.4 * np.exp(-(da / 0.07) ** 2)))[..., None] * c["couches"]
+    img += (np.exp(-(da / (0.25 + 0.4 * aube)) ** 2) * aube * c["haut"] * 0.35)[..., None] * np.array([60, 100, 210])
+    leve = np.clip((aube - 0.62) / 0.38, 0, 1)                           # le soleil sort du limbe
+    if leve > 0:
+        sx, sy = cx + np.cos(ORBITE_AUBE) * (R - 2.6 + 3.8 * leve), cy + np.sin(ORBITE_AUBE) * (R - 2.6 + 3.8 * leve)
+        d = np.hypot(X - sx, Y - sy)
+        disque = (np.clip(2.6 - d, 0, 1) * c["ciel"])[..., None]
+        img = img * (1 - disque) + disque * np.array([255, 245, 215])
+        halo = (np.exp(-d / 2.2) * 0.8 + np.exp(-d / 9) * 0.3) * leve * c["ciel"]
+        trait = np.exp(-np.abs(Y - sy - (X - sx) * np.tan(ORBITE_AUBE + np.pi / 2)) * 1.2 - np.abs(X - sx) / 14) * leve
+        img += (halo + trait * 0.45)[..., None] * np.array([255, 225, 170])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# 8. Des constellations : un ciel profond qui scintille ; des traits fins se dessinent d'une etoile a l'autre,
+# la figure reste un moment, puis s'efface ; la suivante se dessine ailleurs.
+
+CONSTELLATION_FIGURES = (   # (etoiles (x, y) dans un carre de cote 1, traits dans l'ordre du dessin, largeur en pixels)
+    (((0.0, 0.18), (0.19, 0.06), (0.35, 0.1), (0.5, 0.22), (0.55, 0.5), (0.88, 0.56), (0.93, 0.25)),
+     ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 3)), 34),                                  # la Grande Ourse
+    (((0.0, 0.25), (0.24, 0.68), (0.5, 0.4), (0.74, 0.78), (1.0, 0.3)), ((0, 1), (1, 2), (2, 3), (3, 4)), 30),   # Cassiopee
+    (((0.22, 0.12), (0.47, 0.0), (0.76, 0.16), (0.38, 0.52), (0.5, 0.49), (0.62, 0.46), (0.28, 0.95), (0.82, 0.9)),
+     ((0, 1), (1, 2), (2, 5), (5, 4), (4, 3), (3, 0), (3, 6), (5, 7)), 26),                          # Orion
+    (((0.5, 0.0), (0.5, 0.33), (0.5, 0.62), (0.52, 1.0), (0.1, 0.22), (0.27, 0.27), (0.75, 0.42), (0.95, 0.5)),
+     ((0, 1), (1, 2), (2, 3), (4, 5), (5, 1), (1, 6), (6, 7)), 26),                                  # le Cygne
+    (((0.5, 0.0), (0.32, 0.3), (0.62, 0.32), (0.25, 0.85), (0.58, 0.92)),
+     ((0, 1), (0, 2), (1, 2), (1, 3), (3, 4), (4, 2)), 18),                                          # la Lyre
+    (((0.0, 0.55), (0.12, 0.2), (0.3, 0.02), (0.5, 0.0), (0.7, 0.05), (0.86, 0.22), (1.0, 0.5)),
+     ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)), 22),                                          # la Couronne boreale
+    (((0.0, 0.0), (0.08, 0.22), (0.2, 0.4), (0.32, 0.55), (0.42, 0.72), (0.58, 0.85), (0.76, 0.88), (0.9, 0.78),
+      (0.95, 0.62), (0.86, 0.55)),
+     ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9)), 30),                  # le Scorpion
+    (((0.05, 0.1), (0.7, 0.0), (0.75, 0.62), (0.1, 0.68), (0.95, 0.95), (0.0, 0.98)),
+     ((0, 1), (1, 2), (2, 3), (3, 0), (2, 4), (3, 5)), 30),                                          # Pegase
+    (((0.0, 0.6), (0.2, 0.35), (0.42, 0.42), (0.55, 0.2), (0.8, 0.0), (1.0, 0.25), (0.88, 0.62), (0.62, 0.7)),
+     ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (2, 7), (7, 6), (6, 5)), 32),                          # le Lion
+)
+CONSTELLATION_PLUME = 6.0           # pixels par seconde, la vitesse du trait
+CONSTELLATION_TENUE = 10.0          # secondes ou la figure reste entiere
+CONSTELLATION_FONDU = 4.0
+
+
+def _constellation_neuve(e, rng, ailleurs):
+    """Place la constellation suivante (dans l'ordre melange), loin de la precedente."""
+    import numpy as np
+    if not e["ordre"]:
+        e["ordre"] = [int(i) for i in rng.permutation(len(CONSTELLATION_FIGURES))]
+    etoiles, traits, largeur = CONSTELLATION_FIGURES[e["ordre"].pop()]
+    pts = np.array(etoiles, float) - 0.5
+    a = rng.uniform(-0.35, 0.35)
+    pts = pts @ np.array([[np.cos(a), np.sin(a)], [-np.sin(a), np.cos(a)]]) * largeur
+    lo, hi = pts.min(0), pts.max(0)
+    for _ in range(12):                                                  # loin de la precedente, dans le cadre
+        centre = np.array([rng.uniform(5 - lo[0], 59 - hi[0]), rng.uniform(5 - lo[1], 56 - hi[1])])
+        if ailleurs is None or np.hypot(*(centre - ailleurs)) > 18:
+            break
+    pts = pts + centre
+    longueurs = np.array([np.hypot(*(pts[j] - pts[i])) for i, j in traits])
+    fin = 2.0 + longueurs.sum() / CONSTELLATION_PLUME + CONSTELLATION_TENUE   # dessinee, puis tenue : alors elle s'efface
+    return {"pts": pts, "traits": traits, "longueurs": longueurs, "age": 0.0, "centre": centre, "fin": fin,
+            "eclats": 0.6 + 0.4 * rng.random(len(pts)), "phases": rng.uniform(0, 2 * np.pi, len(pts))}
+
+
+def _scene_constellations(p, e, t, ecoule, dt):
+    """Un ciel de nuit profond ou les etoiles scintillent ; des traits fins se dessinent d'une etoile a l'autre et
+    forment une constellation, qui reste un moment puis s'efface ; la suivante se dessine ailleurs."""
+    import numpy as np
+    rng = e["rng"]
+    if "figures" not in e:
+        e.update(ordre=[], voile=_brume(rng, 10))
+        e["figures"] = [_constellation_neuve(e, rng, None)]
+        e["figures"][0]["age"] = 5.0                                     # elle a deja commence
+    pas = min(dt, 0.5)
+    for f in e["figures"]:
+        f["age"] += pas
+    derniere = e["figures"][-1]
+    if derniere["age"] >= derniere["fin"] - 1.0:                         # la suivante commence quand celle-ci s'efface
+        e["figures"].append(_constellation_neuve(e, rng, derniere["centre"]))
+    e["figures"] = [f for f in e["figures"] if f["age"] < f["fin"] + CONSTELLATION_FONDU]
+    img = _degrade((3, 4, 16), (10, 11, 32))
+    img += (_fenetre(e["voile"], t * 0.05, 0) ** 2 * 14)[..., None] * np.array([0.6, 0.6, 1.0])   # un voile a peine
+    _espace_etoiles(e, img, t, 140, "etoiles", eclat=0.95, scint=0.3)
+    trait_c = np.array([140, 170, 245])
+    traits = np.zeros((64, 64, 3))
+    for f in e["figures"]:
+        a = f["age"]
+        sortie = np.clip((f["fin"] + CONSTELLATION_FONDU - a) / CONSTELLATION_FONDU, 0, 1)
+        force = np.clip(a / 2.0, 0, 1) * sortie
+        fait = max(0.0, a - 2.0) * CONSTELLATION_PLUME                   # la longueur deja tracee
+        pts = f["pts"]
+        figure = np.zeros((64, 64, 3))
+        for (i, j), L in zip(f["traits"], f["longueurs"]):
+            if fait <= 0:
+                break
+            k = min(1.0, fait / L)
+            q = np.linspace(0.12, 0.88, max(2, int(L * 3)))             # le trait s'arrete un peu avant les etoiles
+            q = q[q <= 0.12 + 0.76 * k + 1e-9]
+            if len(q):
+                ys, xs = pts[i, 1] + (pts[j, 1] - pts[i, 1]) * q, pts[i, 0] + (pts[j, 0] - pts[i, 0]) * q
+                _espace_tacher(figure, ys, xs, trait_c * 0.4, net=2.5)
+                if k < 1:                                                # la pointe du trait, qui brille
+                    _espace_tacher(traits, [ys[-1]], [xs[-1]], np.array([200, 220, 255]) * force)
+            fait -= L
+        traits += np.minimum(figure, trait_c * 0.46) * force
+        lum = (0.55 + 0.45 * force) * f["eclats"] * (0.85 + 0.15 * np.sin(t * 1.7 + f["phases"]))
+        coul = np.array([235, 238, 255]) * (lum * np.clip(a / 1.5, 0, 1) * sortie ** 0.5)[:, None]
+        _pointer(img, pts[:, 1] + 0.5, pts[:, 0] + 0.5, coul)                 # ses etoiles, un peu plus vives
+        for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            _pointer(img, pts[:, 1] + 0.5 + ddy, pts[:, 0] + 0.5 + ddx, coul * 0.3)
+    img += traits
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
 # Les ambiances d'abord (la page les montre dans cet ordre), puis les jeux de lumiere.
 ECRANS = {
     "aurore": ("Aurore boreale", _ecran_aurore),
@@ -18356,10 +19206,19 @@ DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur ou 
         ("kaleidoscope", _scene_kaleidoscope, ((None, "Kaleidoscope"),)),
         ("pendule", _scene_pendule, ((None, "Pendule de sable"),)),
         ("flocon", _scene_flocon, ((None, "Flocon qui pousse"),)))),
-    ("espace", "L'espace : planete a anneaux, trou noir, galaxie", (
+    ("espace", "L'espace : planetes, trous noirs, galaxies, Voie lactee, eclipse, soleil, comete, la Terre vue "
+               "d'orbite, constellations", (
         ("planete", _scene_planete, (("saturne", "Planete a anneaux"), ("glace", "Planete de glace"))),
         ("trou_noir", _scene_trou_noir, (("or", "Trou noir"), ("bleu", "Trou noir bleu"))),
-        ("galaxie", _scene_galaxie, (("bleu", "Galaxie"), ("or", "Galaxie doree"))))),
+        ("galaxie", _scene_galaxie, (("bleu", "Galaxie"), ("or", "Galaxie doree"))),
+        ("gravite", _scene_gravite, ((None, "Trou noir et ses particules"),)),
+        ("collision", _scene_collision, ((None, "Galaxies en collision"),)),
+        ("voie_lactee", _scene_voie_lactee, ((None, "Voie lactee"),)),
+        ("eclipse", _scene_eclipse, ((None, "Eclipse"),)),
+        ("soleil", _scene_soleil, ((None, "Le soleil de pres"),)),
+        ("comete", _scene_comete, ((None, "Comete"),)),
+        ("orbite", _scene_orbite, ((None, "La Terre vue d'orbite"),)),
+        ("constellations", _scene_constellations, ((None, "Constellations"),)))),
 )
 
 
