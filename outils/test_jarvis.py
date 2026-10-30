@@ -9735,6 +9735,60 @@ class RobustesseEtDiagnostic(unittest.TestCase):
         self.assertEqual(len(n), apres_un, "le magasin de certificats n'est pas relu a chaque question")
         self.assertIs(m._contexte_ssl(), m._contexte_ssl())
 
+    def test_le_contexte_ssl_complete_windows_par_certifi(self):
+        # « Verification impossible : certificate verify failed: unable to get issuer certificate » : le
+        # magasin de Windows avait l'intermediaire du certificat de GitHub, pas sa racine
+        import ssl
+        import types
+        m = self.m
+        lus = []
+
+        class Contexte:
+            verify_flags = 0
+
+            def load_verify_locations(self, cafile=None, **_):
+                lus.append(cafile)
+        vraie = ssl.create_default_context
+        self.addCleanup(lambda: setattr(ssl, "create_default_context", vraie))
+        self.addCleanup(m._oublier_contexte_ssl)
+        ssl.create_default_context = lambda *a, **k: Contexte()
+        certifi = types.ModuleType("certifi")
+        certifi.where = lambda: "/le/cacert.pem"
+        sauve = sys.modules.get("certifi")
+        self.addCleanup(lambda: sys.modules.__setitem__("certifi", sauve) if sauve else sys.modules.pop("certifi", None))
+        sys.modules["certifi"] = certifi
+        c = m._nouveau_contexte_ssl()
+        self.assertEqual(lus, ["/le/cacert.pem"], "les autorites de Mozilla EN PLUS de celles de Windows")
+        self.assertTrue(c.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN, "un intermediaire du magasin suffit")
+        sys.modules["certifi"] = None                   # certifi absent : Windows seul, sans planter
+        lus.clear()
+        self.assertIsInstance(m._nouveau_contexte_ssl(), Contexte)
+        self.assertEqual(lus, [])
+        ssl.create_default_context = vraie             # un vrai contexte verifie toujours les certificats
+        c = m._nouveau_contexte_ssl()
+        self.assertEqual(c.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(c.check_hostname)
+
+    def test_la_maj_dit_quoi_faire_si_le_certificat_est_refuse(self):
+        import ssl
+        m = self.m
+        sauve, vraie = dict(m.MAJ), m.derniere_publication
+        self.addCleanup(lambda: (m.MAJ.clear(), m.MAJ.update(sauve), setattr(m, "derniere_publication", vraie)))
+
+        def refusee(pre):
+            raise urllib.error.URLError(ssl.SSLCertVerificationError(
+                1, "certificate verify failed: unable to get issuer certificate"))
+        m.derniere_publication = refusee
+        m._SSL["contexte"] = "ANCIEN"
+        self.assertIsNone(m.verifier_maj({}))
+        self.assertEqual(m.MAJ["etat"], "erreur")
+        self.assertIn("certificat HTTPS de GitHub est refuse", m.MAJ["message"])
+        self.assertIn(m.PAGE_PUBLICATIONS, m.MAJ["message"], "ou la telecharger a la main")
+        self.assertIsNone(m._SSL["contexte"], "le magasin de certificats est relu au prochain essai")
+        m.derniere_publication = lambda pre: (_ for _ in ()).throw(urllib.error.URLError("hors ligne"))
+        m.verifier_maj({})
+        self.assertEqual(m.MAJ["message"], "Verification impossible : <urlopen error hors ligne>")
+
     def test_les_onglets_ne_retardent_pas_la_question(self):
         m = self.m
         m.CFG["jarvis_pc"] = True

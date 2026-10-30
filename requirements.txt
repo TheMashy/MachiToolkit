@@ -19,3 +19,7 @@ onnxruntime-directml; sys_platform == "win32"
 onnx-asr
 # Le panneau LED (MatrixPortal S3) : le port serie USB.
 pyserial
+# Les autorites de certification de Mozilla, en plus du magasin de Windows :
+# il peut lui manquer la racine d'un certificat (GitHub, et la mise a jour
+# devient impossible) -- voir _nouveau_contexte_ssl.
+certifi
