@@ -272,11 +272,16 @@ const float V3_CY_VITRES[4][3] = {{255, 175, 90}, {90, 205, 255}, {255, 110, 190
 
 struct V3Auto { float x, y, z, vx, vz, vie; int genre; };
 struct V3Objet { float zs, xa, xb, v0, v1, c[3], q; int32_t ident; int genre; };
+struct V3CyCase { float s, h, haut, bas; int32_t ix, iz; bool cote; };
 struct E_cyber_3d {
+  // (pas de grands tableaux sur la pile : la boucle de la carte n'a que 8 Ko)
+  V3CyCase cs[V3_CY_K];        // les tours traversees par le rayon d'une colonne
+  V3Objet obj[48];             // les enseignes et les passerelles
+  float sg_l[64], tsol_l[64], ciel_l[64][3];
   uint16_t brume[64 * 64];
   float zbuf[64][64];
   float lum[32][32][3];        // ce qui brille, en demi-image : la lueur
-  uint64_t pris[64];           // les pixels deja pris par une enseigne plus proche
+  uint32_t pris[64][2];        // les pixels deja pris par une enseigne plus proche (un bit chacun)
   float puiss[257];            // r^1,3
   V3Relire relire;
   V3Auto autos[4];
@@ -332,7 +337,8 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
   const int bix = (int)floorf(box), biy = (int)floorf(boy);
   const float bfx = box - bix, bfy = boy - biy;
   // le sol (la rue, noyee de brume) et le ciel ne dependent que de la ligne
-  float sg_l[64], tsol_l[64], ciel_l[64][3];
+  float *sg_l = e.sg_l, *tsol_l = e.tsol_l;
+  float (*ciel_l)[3] = e.ciel_l;
   for (int y = 0; y < 64; y++) {
     const float yc = y + 0.5f, kc = v3_01(yc / v3_mx(hz, 1.0f));
     ciel_l[y][0] = 14 + 82 * kc; ciel_l[y][1] = 7 + 25 * kc; ciel_l[y][2] = 32 + 72 * kc;
@@ -348,7 +354,7 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
     float ex = (fcx + (pas > 0) - cx) / dxs, ez = (fcz + 1 - cz) / dz;
     const float pex = fabsf(1 / dxs), pez = 1 / dz;
     int ix = (int)fcx, iz = (int)fcz, nx = 0;
-    struct Case { float s, h, haut, bas; int32_t ix, iz; bool cote; } cs[V3_CY_K];
+    V3CyCase *cs = e.cs;
     float S = ex <= ez ? ex : ez;
     uint8_t quelle[64];
     int cur = 64;
@@ -357,7 +363,7 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
       const bool cote = ex <= ez && nx <= V3_CY_K;
       if (cote) { ix += pas; ex += pex; nx++; } else { iz += 1; ez += pez; }
       const float s_out = ex <= ez ? ex : ez;
-      Case &c = cs[k];
+      V3CyCase &c = cs[k];
       c.ix = ix; c.iz = iz; c.cote = cote;
       c.s = v3_mx(S, 0.05f);
       c.h = v3_cy_hauteur(e, ix, iz + e.bz0);
@@ -402,7 +408,7 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
         }
         continue;
       }
-      const Case &c = cs[k];
+      const V3CyCase &c = cs[k];
       const float s = c.s, h = c.h;
       e.zbuf[y][col] = s;
       if (k != kc) {
@@ -487,7 +493,7 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
     }
   }
   // les passerelles au-dessus de l'avenue, et les enseignes en drapeau accrochees aux murs
-  V3Objet obj[48];
+  V3Objet *obj = e.obj;
   int nobj = 0;
   const int32_t iz0 = (int32_t)fcz;
   for (int n = 0; n < 22; n++) {
@@ -538,8 +544,8 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
       const float lampe_a = 0.7f + 0.3f * v3_sin(a * 40 + t * 1.5f);
       for (int y = max(0, (int)floorf(haut)); y < min(64, (int)ceilf(bas) + 1); y++) {
         const float k = v3_01(v3_mn(y + 1.0f, bas) - v3_mx((float)y, haut)) * kx;
-        if (k <= 0 || !(d < e.zbuf[y][col]) || (e.pris[y] >> col & 1)) continue;
-        e.pris[y] |= (uint64_t)1 << col;
+        if (k <= 0 || !(d < e.zbuf[y][col]) || (e.pris[y][col >> 5] >> (col & 31) & 1)) continue;
+        e.pris[y][col >> 5] |= 1u << (col & 31);
         const float b = v3_01((y + 0.5f - haut) / v3_mx(bas - haut, 1e-3f));
         float coul[3], em[3];
         if (o.genre == 1) {   // une passerelle : sombre, une rangee de lampes
@@ -645,7 +651,13 @@ void s_cyber_3d(int humeur, bool debut, float t, float ecoule, float dt) {
 // files de phares et de feux arriere sous les reverberes ; un horizon brumeux, ambre.
 
 const int V3_SV_K = 44;
+struct V3SvSol { float sg, pied, pz, ipied, ipz, ilat, ilg_ns, ilg_ew, k_ns, k_ew, voile, ke, cb[3]; };   // une ligne du sol
+struct V3SvCase { float s, h, haut, bas, hb; int32_t ix, iz; bool cote; };   // un bloc traverse
+struct V3SvFeu { int32_t x, z; float h; };
 struct E_survol {
+  V3SvSol sol[64];
+  V3SvCase cs[V3_SV_K + 1];
+  V3SvFeu feux[48];
   float lumiere[64][64][3];   // ce qui brille, pour la lueur
   V3Noyau noyau;
   float puiss[257];           // r^1,6
@@ -679,9 +691,9 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
   const float cap = 0.32f * sinf(tau * 0.031f) + 0.1f * sinf(tau * 0.083f), sc = sinf(cap), cc = cosf(cap);
   const float s0 = 0.85f * cy * F / (64 - hz);   // rien de plus pres n'est a l'ecran
   // le sol ne depend que de la ligne : sa distance, la largeur d'un pixel, la brume
-  struct Sol { float sg, pied, pz, ipied, ipz, ilat, ilg_ns, ilg_ew, k_ns, k_ew, voile, ke, cb[3]; } sol[64];
+  V3SvSol *sol = e.sol;
   for (int y = 0; y < 64; y++) {
-    Sol &q = sol[y];
+    V3SvSol &q = sol[y];
     const float yc = y + 0.5f, sg = v3_mx(cy * F / v3_mx(yc - hz, 0.3f), s0);
     q.sg = sg; q.pied = sg / F; q.pz = q.pied * sg / cy; q.ipied = 1 / q.pied; q.ipz = 1 / q.pz;
     q.ilat = 1 / v3_mx(q.pied * 1.1f, 0.03f);
@@ -692,8 +704,8 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
     q.cb[0] = 16 + 84 * ph; q.cb[1] = 20 + 48 * ph; q.cb[2] = 42 + 12 * ph;
   }
   struct File { int32_t ident; float v, d; } files[4];
-  for (int l = 0; l < 4; l++) files[l].ident = INT32_MIN;
-  struct Feu { int32_t x, z; float h; } feux[48];
+  for (int l = 0; l < 4; l++) files[l].ident = 0x7FFFFFFF;   // (aucune rue)
+  V3SvFeu *feux = e.feux;
   int nfeux = 0;
   for (int col = 0; col < 64; col++) {
     const float sx = col - 31.5f;
@@ -706,7 +718,7 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
     float ex = s0 + ((float)ix + (pas > 0) - x0) / dxs, ez = s0 + ((float)iz + 1 - z0) / dz;
     const float pex = fabsf(1 / dxs), pez = 1 / dz, idx = 1 / dxs, idz = 1 / dz;
     int nx = 0, nz = 0;
-    struct Case { float s, h, haut, bas, hb, voile, ke, cb[3]; int32_t ix, iz; bool cote; } cs[V3_SV_K + 1];
+    V3SvCase *cs = e.cs;
     uint8_t quelle[64];
     int cur = 64;
     float m = 1e30f;
@@ -715,7 +727,7 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
         if (ex <= ez && nx < V3_SV_K) { ix += pas; ex += pex; nx++; }
         else { iz += 1; ez += pez; nz++; }
       }
-      Case &c = cs[k];
+      V3SvCase &c = cs[k];
       c.ix = ix; c.iz = iz;
       const float H = v3_sv_hauteur(e, ix + e.bx0, iz + e.bz0);
       // le bloc en retrait dans sa case : par ou le rayon entre, par ou il sort
@@ -731,9 +743,6 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
       c.bas = touche ? hz + cy * F / sa : -1e9f;
       c.hb = v3_hasard(ix + e.bx0, iz + e.bz0, g + 3);
       if (touche) {
-        c.voile = 1 - v3_exp(-sa / 14.0f); c.ke = v3_exp(-sa / 24.0f);   // la brume, a la distance du bloc
-        const float q = v3_01((sa - 9.0f) / 16), ph = q * sqrtf(q);
-        c.cb[0] = 16 + 84 * ph; c.cb[1] = 20 + 48 * ph; c.cb[2] = 42 + 12 * ph;
         m = v3_mn(m, v3_mn(c.haut, hz + (cy - H) * F / v3_mx(sb, 0.1f)));
         if (H > 1.25f && nfeux < 48) {   // le feu rouge au sommet des tours
           bool deja = false;
@@ -747,7 +756,7 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
     }
     // ce qui ne depend que de la case vue (pour cette colonne) : calcule a sa premiere ligne
     int kc = -1;
-    float forme_u = 0, dens = 0, net = 0, pv75 = 0, fface = 1;
+    float forme_u = 0, dens = 0, net = 0, pv75 = 0, fface = 1, c_voile = 0, c_ke = 0, c_cb[3] = {0, 0, 0};
     int32_t tx = 0, tz = 0;
     int32_t parc_x = 1 << 30, parc_z = 0;
     bool parc = false;
@@ -762,7 +771,7 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
       float img[3], em[3] = {0, 0, 0};
       const bool vu = y >= cur && yc < cs[quelle[y]].bas;
       if (vu) {
-        const Case &c = cs[quelle[y]];
+        const V3SvCase &c = cs[quelle[y]];
         const float s = c.s, h = c.h;
         if (quelle[y] != kc) {
           kc = quelle[y];
@@ -776,6 +785,9 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
           tx = (c.ix + e.bx0) * 977 + (int32_t)floorf(fu) * 5 + (c.cote ? 2 : 0);
           tz = (c.iz + e.bz0) * 3001;
           fface = c.cote ? 1.0f : 1.3f;
+          c_voile = 1 - v3_exp(-s / 14.0f); c_ke = v3_exp(-s / 24.0f);   // la brume, a la distance du bloc
+          const float q = v3_01((s - 9.0f) / 16), ph = q * sqrtf(q);
+          c_cb[0] = 16 + 84 * ph; c_cb[1] = 20 + 48 * ph; c_cb[2] = 42 + 12 * ph;
         }
         if (yc < c.haut) {   // les toits : bleu nuit, leur rebord un peu plus clair
           const float sr = (cy - h) * F / v3_mx(yc - hz, 0.3f);
@@ -794,7 +806,7 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
           else { em[0] = fen * 255; em[1] = fen * 175; em[2] = fen * 90; }
         }
       } else {   // le sol : les rues, leurs reverberes, et les phares qui coulent
-        const Sol &q = sol[y];
+        const V3SvSol &q = sol[y];
         const float gx = cx + dx * q.sg, gz = cz + dz * q.sg;
         const float rgx = rintf(gx), rgz = rintf(gz), fx = gx - rgx, fz = gz - rgz;
         const int32_t px = (int32_t)floorf(gx), pz = (int32_t)floorf(gz);
@@ -834,7 +846,7 @@ void s_survol(int humeur, bool debut, float t, float ecoule, float dt) {
       // la brume de l'horizon, ambre au loin, bleu nuit en haut
       float voile, ke;
       const float *cb;
-      if (vu) { const Case &c = cs[quelle[y]]; voile = c.voile; ke = c.ke; cb = c.cb; }
+      if (vu) { voile = c_voile; ke = c_ke; cb = c_cb; }
       else { voile = sol[y].voile; ke = sol[y].ke; cb = sol[y].cb; }
       for (int c = 0; c < 3; c++) p[c] = img[c] * (1 - voile) + cb[c] * voile + em[c] * ke;
     }
@@ -915,7 +927,10 @@ struct E_ruelle {
   uint8_t jet[7][64][64];       // la lumiere que chaque enseigne jette (fois l'albedo), racine, sur 255
   uint8_t flaque[64][64];       // 0-255
   uint8_t brume[64][64];        // la vapeur
-  int16_t bloc[37][64][3];      // le reflet du sol (lignes 27 a 63), puis le flou sous la vapeur
+  union {
+    int16_t bloc[37][64][3];    // le reflet du sol (lignes 27 a 63), puis le flou sous la vapeur
+    uint8_t couv[64][64];       // (a la premiere image : la couverture d'une enseigne)
+  };
   uint8_t reserve[16384];       // les enseignes (couverture, dessin, halo), les lampes, les reflets fixes
   V3Boite ens[7], emis, refl;
   uint16_t couverts[600];       // les pixels qu'une enseigne couvre
@@ -1094,8 +1109,8 @@ void v3_rl_preparer(E_ruelle &e) {
   e.ncouverts = 0;
   for (int k = 0; k < 7; k++) {
     memset(scene, 0, sizeof(float) * 64 * 64 * 3);
-    uint8_t couv[64][64];
-    memset(couv, 0, sizeof couv);
+    uint8_t (*couv)[64] = e.couv;
+    memset(couv, 0, 64 * 64);
     int cx0 = 64, cy0 = 64, cx1 = 0, cy1 = 0;
     for (int y = 0; y < 64; y++)
       for (int x = 0; x < 64; x++) {
@@ -1390,7 +1405,10 @@ void s_ruelle(int humeur, bool debut, float t, float ecoule, float dt) {
 // vitre, une carte de l'eau (chaque goutte y pose son disque, son reflet vif, son bord sombre) que
 // l'essuie-glace efface la ou il passe, en laissant un film d'eau un instant.
 
+struct V3Disque { float x, y, r, c[3], f; };
 struct E_pare_brise {
+  V3Disque d[52];                                               // les lumieres de la ville, floues
+  float lueur_x[64], lueur_y[64];                               // la lueur sur le bas de la vitre
   uint8_t eau[64][64], film[64][64], hi[64][64], rim[64][64];   // 0-255
   float flou[64][64][3];                                        // le fond un peu flou (ce que voit le film d'eau)
   float large[32][32][3];                                       // tres flou, en demi-image (ce que voit une goutte)
@@ -1423,8 +1441,6 @@ void v3_pb_goutte(E_pare_brise &e) {   // une goutte se pose : son disque, son r
     }
 }
 
-struct V3Disque { float x, y, r, c[3], f; };
-
 void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
   E_pare_brise &e = etat_ecran<E_pare_brise>(debut);
   (void)humeur;
@@ -1439,6 +1455,8 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
       const float a = (i - 16) / 8.0f, b = (i - 59) / 3.0f, c = (i - 36) / 5.0f, d = (i - 59) / 2.5f;
       e.lueur[0][i] = expf(-a * a); e.lueur[1][i] = expf(-b * b); e.lueur[2][i] = 0.6f * expf(-c * c); e.lueur[3][i] = expf(-d * d);
       e.bord[i] = 55.5f - 2.0f * sinf(v3_01((i + 0.5f) / 64) * V3_PI);
+      const float u = (i - 18) / 14.0f, v = (i - 52) / 3.0f;
+      e.lueur_x[i] = expf(-u * u); e.lueur_y[i] = expf(-v * v) * 0.22f;
     }
   }
   dt = fminf(dt, 0.5f);
@@ -1453,7 +1471,7 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
   const float rouge = v3_01(feu / 0.02f) * v3_01((0.62f - feu) / 0.02f);
   const float vert = v3_01((feu - 0.63f) / 0.02f) * v3_01((0.92f - feu) / 0.02f);
   const float orange = v3_01((feu - 0.93f) / 0.01f) * v3_01((1.0f - feu) / 0.02f);
-  V3Disque d[52];
+  V3Disque *d = e.d;
   int n = 0;
   for (int i = 0; i < 26; i++) {   // des fenetres floues, loin
     const bool chaud = e.vp[i] < 4;
@@ -1563,11 +1581,7 @@ void s_pare_brise(int humeur, bool debut, float t, float ecoule, float dt) {
   v3_reduire(e.large);   // une goutte voit large : elle ramasse la lumiere
   // les balais (leur angle), la lueur du tableau de bord
   const float ca = cosf(a1), sa = -sinf(a1);
-  float lueur_x[64], lueur_y[64];
-  for (int i = 0; i < 64; i++) {
-    const float u = (i - 18) / 14.0f, v = (i - 52) / 3.0f;
-    lueur_x[i] = expf(-u * u); lueur_y[i] = expf(-v * v) * 0.22f;
-  }
+  const float *lueur_x = e.lueur_x, *lueur_y = e.lueur_y;
   for (int y = 0; y < 64; y++)
     for (int x = 0; x < 64; x++) {
       float *p = scene[y][x];
@@ -1891,6 +1905,7 @@ struct E_grande_roue {
   uint8_t fond[64][64][3];
   uint16_t halo[64][64][3];     // la lueur, x32
   V3Roue roue[1400];            // les pixels a moins de 20,3 du moyeu
+  float sb[64], cb[64], sd[64], cd[64];   // le reflet : sin(a + b) = sin a cos b + cos a sin b, une table par colonne
   float ep[40], phase;
   uint8_t ey[40], ex[40];
   int nroue, ne;
@@ -1946,6 +1961,7 @@ void s_grande_roue(int humeur, bool debut, float t, float ecoule, float dt) {
         e.roue[e.nroue++] = {(uint16_t)(y * 64 + x), r, atan2f(y + 0.5f - cy, x + 0.5f - cx), 0.55f + 0.45f * cosf(2 * V3_PI * r / 2.6f)};
       }
     e.phase = hasard(0, 6.3f);
+    for (int x = 0; x < 64; x++) { e.sb[x] = sinf(x * 0.5f); e.cb[x] = cosf(x * 0.5f); e.sd[x] = sinf(x * 0.15f); e.cd[x] = cosf(x * 0.15f); }
   }
   for (int y = 0; y < 64; y++)
     for (int x = 0; x < 64; x++)
@@ -2057,8 +2073,7 @@ void s_grande_roue(int humeur, bool debut, float t, float ecoule, float dt) {
     for (int x = 0; x < 64; x++)
       for (int c = 0; c < 3; c++) scene[y][x][c] += e.halo[y][x][c] * (0.6f / 32);
   // le sol mouille : le reflet de tout cela, retourne, sombre, qui ondule
-  float sb[64], cb[64], sd[64], cd[64];       // sin(a + b) = sin a cos b + cos a sin b : une table par colonne
-  for (int x = 0; x < 64; x++) { sb[x] = sinf(x * 0.5f); cb[x] = cosf(x * 0.5f); sd[x] = sinf(x * 0.15f); cd[x] = cosf(x * 0.15f); }
+  const float *sb = e.sb, *cb = e.cb, *sd = e.sd, *cd = e.cd;
   for (int y = (int)sol; y < 64; y++) {
     const float k = 0.5f - (y - sol) * 0.025f;
     const float sa = sinf(y * 1.3f + t * 1.6f), ca = cosf(y * 1.3f + t * 1.6f);
@@ -2098,6 +2113,7 @@ struct E_voxel {
     struct { float cr[V3_VX_NF], ci[V3_VX_NF]; int8_t i[V3_VX_NF], j[V3_VX_NF]; } dft;
   } c1;
   float Z[V3_VX_K], voile[V3_VX_K], lev[V3_VX_K];
+  float kc3[128], kcm[128], kc[128], nuage_el[128], nb_s[128], nb_c[128], nc_s[128], nc_c[128];   // le ciel, par demi-ligne
   float x0, y0, ph, hmax;
   uint16_t h_eau;
 };
@@ -2259,7 +2275,7 @@ void s_voxel(int humeur, bool debut, float t, float ecoule, float dt) {
   haut += 12.0f;
   const float hz = 21.0f + 1.5f * sinf(tau * 0.07f);
   // le ciel : du violet au rose, orange vers le soleil ; il ne depend que de la demi-ligne et de la colonne
-  float kc3[128], kcm[128], kc[128], nuage_el[128];
+  float *kc3 = e.kc3, *kcm = e.kcm, *kc = e.kc, *nuage_el = e.nuage_el;
   for (int r = 0; r < 128; r++) {
     const float el = (hz - (r + 0.5f) * 0.5f) / F, k = v3_01(el / 0.55f), q = 1 - k;
     kc[r] = k; kc3[r] = q * q * q;
@@ -2269,7 +2285,7 @@ void s_voxel(int humeur, bool debut, float t, float ecoule, float dt) {
   }
   const bool soleil_vu = fabsf(V3_VX_SOLEIL - cap) < 1.2f;
   const float soleil_x = 31.5f + tanf(V3_VX_SOLEIL - cap) * F, soleil_y = hz - 0.07f * F;
-  float nb_s[128], nb_c[128], nc_s[128], nc_c[128];   // les nuages : sin(a + b) = sin a cos b + cos a sin b
+  float *nb_s = e.nb_s, *nb_c = e.nb_c, *nc_s = e.nc_s, *nc_c = e.nc_c;   // les nuages : sin(a + b) = sin a cos b + cos a sin b
   for (int r = 0; r < 128; r++) {
     if (nuage_el[r] <= 0) continue;
     const float el = (hz - (r + 0.5f) * 0.5f) / F;
