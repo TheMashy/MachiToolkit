@@ -718,6 +718,9 @@ void ecran_neige(bool debut, float t, float dt) {
 #include "lot_cocon_reveries.h"
 #include "lot_neufs.h"
 #include "lot_villes3d.h"
+#include "lot_instants_a.h"
+#include "lot_instants_b.h"
+#include "lot_instants_c.h"
 #include "registre.h"
 
 int ecran = -1;

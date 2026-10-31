@@ -22514,6 +22514,3763 @@ def _scene_ocean(p, e, t, ecoule, dt):
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
+# LES INSTANTS. « Rajoute des scenes un peu comme ca » : l'utilisateur a montre un pixel art de
+# nuit (un arret de bus sous la neige, un lampadaire au sodium, un bus aux fenetres allumees). Douze petits
+# tableaux du quotidien, la nuit, dans ce ton-la (mais pas cette image) : la lumiere chaude dans le noir, tramee
+# (_tramer), des silhouettes nettes peintes par-dessus, une petite vie et un evenement doux qui revient.
+
+# LES INSTANTS (lot A, la rue la nuit). Des petits tableaux de nuit en pixel art trame : un arret de bus sous la
+# neige, une superette sous la pluie, un distributeur de boissons au coin d'une rue, une cabine telephonique dans la
+# neige. Chaque image : le fond fixe (calcule une fois) + les lumieres qui bougent -> _tramer -> les figures nettes
+# (sprites en chaines de caracteres) et les flocons ou les gouttes par-dessus. Les aplats du fond sont poses sur
+# les marches de la trame (_IA_NIV) : ils restent lisses, seuls les degrades de lumiere sont trames.
+
+_IA_FIGURES = {}
+_IA_NIV = (0.0, 5.2, 20.8, 46.8, 83.3, 130.1, 187.3, 255.0)    # les 8 marches de _tramer(img, 8)
+
+
+def _ia_niv(couleur, i):
+    """Une teinte posee sur la marche i de la trame (son canal le plus fort vaut _IA_NIV[i])."""
+    import numpy as np
+    c = np.asarray(couleur, float)
+    return c * (_IA_NIV[i] / c.max())
+
+
+def _ia_figure(lignes):
+    """Un sprite en chaines de caracteres -> (ys, xs, codes, (h, l)) ; '.' est transparent. En cache."""
+    import numpy as np
+    if lignes not in _IA_FIGURES:
+        larg = max(len(x) for x in lignes)
+        a = np.array([[ord(c) for c in x.ljust(larg, ".")] for x in lignes])
+        ys, xs = np.nonzero(a != ord("."))
+        _IA_FIGURES[lignes] = (ys, xs, a[ys, xs], a.shape)
+    return _IA_FIGURES[lignes]
+
+
+def _ia_peindre(img, lignes, palette, x, y, miroir=False, boite=None):
+    """Pose un sprite, coin haut-gauche en (x, y), avec sa palette {lettre: (r, g, b)} ou {lettre: (r, g, b, a)}.
+    Une lettre absente de la palette n'est pas peinte. `boite` = (x0, x1, y0, y1) : ne peint que dedans."""
+    import numpy as np
+    ys, xs, codes, (h, larg) = _ia_figure(lignes)
+    lut = np.zeros((128, 4))
+    for c, col in palette.items():
+        lut[ord(c)] = tuple(col) + (1.0,) * (4 - len(col))
+    if miroir:
+        xs = larg - 1 - xs
+    yy, xx = ys + int(np.floor(y + 0.5)), xs + int(np.floor(x + 0.5))
+    x0, x1, y0, y1 = boite if boite else (0, 64, 0, 64)
+    ok = (lut[codes, 3] > 0) & (yy >= max(0, y0)) & (yy < min(64, y1)) & (xx >= max(0, x0)) & (xx < min(64, x1))
+    yy, xx, c = yy[ok], xx[ok], lut[codes[ok]]
+    img[yy, xx] = img[yy, xx] * (1 - c[:, 3:]) + c[:, :3] * c[:, 3:]
+
+
+def _ia_flocons(e, img, t, dt, lumi, teinte, n=46, cle="ia_flocons", sol=(34, 64), froid=(150, 160, 195)):
+    """La neige : des flocons de 1 px qui tombent lentement en ondulant, chacun jusqu'a son sol (les lointains se
+    posent haut, les proches bas) ; dans la lumiere (`lumi`, 0..1 par pixel) ils prennent la `teinte` de la lampe et
+    les plus proches y font une petite croix."""
+    import numpy as np
+    rng = e["rng"]
+    if cle not in e:
+        z = rng.uniform(0, 1, n)
+        e[cle] = [rng.uniform(0, 64, n), rng.uniform(-4, 64, n), z, rng.uniform(0, 6.3, n),
+                  sol[0] + (sol[1] - sol[0]) * np.clip(z + rng.uniform(-0.15, 0.15, n), 0, 1)]
+    fx, fy, fz, fp, fs = e[cle]
+    pas = min(dt, 0.5)
+    fy += (2.5 + fz * 4.5) * pas                                       # les proches tombent plus vite
+    fx += (np.sin(t * 0.9 + fp) * 0.6 + 0.25) * (0.5 + fz) * pas * 2
+    fini = fy > fs
+    if fini.any():
+        m = int(fini.sum())
+        fy[fini] = rng.uniform(-6, -1, m)
+        fx[fini] = rng.uniform(-4, 64, m)
+    fx %= 64
+    yi, xi = np.floor(fy).astype(int), np.floor(fx).astype(int)
+    ok = (yi >= 0) & (yi < 64)
+    yi, xi, z = yi[ok], xi[ok], fz[ok]
+    lu = lumi[yi, xi][:, None]
+    col = np.asarray(froid, float) * (0.45 + 0.55 * z)[:, None] * (1 - lu) + np.asarray(teinte, float) * lu
+    lu = lu[:, 0]
+    _pointer(img, yi, xi, col)
+    croix = (lu > 0.45) & (z > 0.5)                                     # les plus proches, dans la lumiere : une croix
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        _pointer(img, yi[croix] + dy, xi[croix] + dx, col[croix] * 0.5)
+
+
+# --- 1. L'arret de bus sous la neige ------------------------------------------------------------------------------
+# De profil : la rue en travers ; le lampadaire au sodium et sa flaque de lumiere creme, quelqu'un qui attend
+# dedans, l'abri a droite (son affiche allumee). Chaque minute un bus glisse depuis la gauche, s'arrete porte
+# devant la personne, elle monte, il repart vers la droite ; puis quelqu'un d'autre arrive a pied par la droite.
+
+_IA_BUS_P = 60.0                     # un bus par minute
+_IA_BUS_L = 44                       # sa longueur (px)
+_IA_BUS_H = 22                       # y du haut de son sprite (la neige du toit)
+_IA_BUS_ARRET = 41                   # x de son avant a l'arret : la porte tombe devant la personne
+_IA_BUS_X = 30                       # x (coin gauche du sprite) de la personne qui attend
+_IA_BUS_PIEDS = 52                   # y de ses pieds
+_IA_SODIUM = (255, 196, 120)
+_IA_LAMPE = (33.5, 10.5)             # la vitre du lampadaire
+
+_IA_GENS_FACE = (                    # de face, qui attend (h = bonnet, f = visage, s = echarpe, c = manteau)
+    "..HHH..",
+    ".hhhhh.",
+    ".hfffh.",
+    "..fff..",
+    ".sssss.",
+    "CCCsCCC",
+    "dccsccd",
+    "dcccccd",
+    "dcccccd",
+    "dcccccd",
+    ".ccccc.",
+    "..p.p..",
+    "..p.p..",
+    ".bb.bb.",
+)
+_IA_GENS_FACE2 = (                   # le poids sur l'autre pied
+    "...HHH.",
+    "..hhhhh",
+    "..hfffh",
+    "...fff.",
+    "..sssss",
+    ".CCCsCC",
+    ".dccscd",
+    ".dccccd",
+    ".dccccd",
+    ".dccccd",
+    "..cccc.",
+    "..p..p.",
+    "..p..p.",
+    ".bb..bb",
+)
+_IA_GENS_DOS = (                     # de dos, qui monte dans le bus (deux pas)
+    (
+        "..HHH..",
+        ".hhhhh.",
+        ".hhhhh.",
+        "..hhh..",
+        ".sssss.",
+        "CCCCCCC",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        ".ccccc.",
+        "..p.p..",
+        "..p.p..",
+        ".bb.bb.",
+    ),
+    (
+        "..HHH..",
+        ".hhhhh.",
+        ".hhhhh.",
+        "..hhh..",
+        ".sssss.",
+        "CCCCCCC",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        ".ccccc.",
+        "..p.p..",
+        "..p.b..",
+        ".bb....",
+    ),
+)
+_IA_GENS_MARCHE = (                  # de profil vers la droite : quatre poses de marche
+    (
+        "..HHH..",
+        ".hhhhh.",
+        ".hhhff.",
+        "..hff..",
+        "..sss..",
+        ".CCCCC.",
+        ".ccdcc.",
+        ".ccdcc.",
+        ".ccdcc.",
+        ".ccdcc.",
+        ".ccccc.",
+        "...pp..",
+        "...pp..",
+        "...bbb.",
+    ),
+    (
+        "..HHH..",
+        ".hhhhh.",
+        ".hhhff.",
+        "..hff..",
+        "..sss..",
+        ".CCCCC.",
+        ".cccdc.",
+        ".ccccd.",
+        ".ccccd.",
+        ".ccccc.",
+        ".ccccc.",
+        "..p.p..",
+        ".p...p.",
+        "bb...bb",
+    ),
+    (
+        "..HHH..",
+        ".hhhhh.",
+        ".hhhff.",
+        "..hff..",
+        "..sss..",
+        ".CCCCC.",
+        ".ccdcc.",
+        ".ccdcc.",
+        ".ccdcc.",
+        ".ccdcc.",
+        ".ccccc.",
+        "...pp..",
+        "...pp..",
+        "..bbb..",
+    ),
+    (
+        "..HHH..",
+        ".hhhhh.",
+        ".hhhff.",
+        "..hff..",
+        "..sss..",
+        ".CCCCC.",
+        ".cdccc.",
+        ".dcccc.",
+        ".dcccc.",
+        ".ccccc.",
+        ".ccccc.",
+        "..p.p..",
+        ".p...p.",
+        "bb...bb",
+    ),
+)
+_IA_GENS_HABITS = (                  # (manteau, bonnet, echarpe) d'un voyageur a l'autre
+    ((96, 40, 38), (64, 70, 104), (196, 164, 92)),
+    ((40, 64, 72), (150, 52, 46), (180, 74, 60)),
+    ((92, 74, 44), (44, 52, 80), (200, 196, 184)),
+    ((58, 52, 80), (186, 146, 64), (150, 56, 56)),
+    ((34, 52, 42), (196, 186, 166), (96, 124, 156)),
+)
+
+
+def _ia_gens_palette(k, lumiere):
+    """La palette du voyageur k, eclaire d'en haut par la lampe (lumiere 0..1) : le haut du bonnet et les epaules
+    prennent la creme du sodium, le reste reste en ombre."""
+    import numpy as np
+    manteau, bonnet, echarpe = (np.asarray(c, float) for c in _IA_GENS_HABITS[k % len(_IA_GENS_HABITS)])
+    k = 0.5 + 0.5 * lumiere
+    creme = np.asarray(_IA_SODIUM, float)
+    return {"H": bonnet * 0.55 + creme * 0.42 * lumiere, "h": bonnet * k * 0.8, "f": np.array([200, 150, 116]) * k,
+            "s": echarpe * k * 0.9, "C": manteau * 0.75 + creme * 0.38 * lumiere, "c": manteau * k,
+            "d": manteau * k * 0.6, "p": np.array([30, 30, 42]) * k, "b": np.array([16, 14, 20]) + 10 * k}
+
+
+def _ia_bus_sprite():
+    """Le bus vu du cote des portes, l'avant a droite : (rgb, masque, colonnes des fenetres, colonnes de la porte)."""
+    import numpy as np
+    L, H = _IA_BUS_L, 21
+    rgb = np.zeros((H, L, 3))
+    m = np.zeros((H, L), bool)
+    m[2:17, :] = True
+    rgb[2:17, :] = (40, 62, 80)                                        # la caisse
+    rgb[2, 1:L - 1] = (88, 104, 118)                                   # l'arete du toit, qui prend la lumiere
+    rgb[2, 0], rgb[2, L - 1], m[2, 0], m[2, L - 1] = 0, 0, False, False
+    rgb[0, 3:L - 4] = (196, 200, 220)                                  # la neige sur le toit
+    rgb[1, 1:L - 2] = (150, 158, 184)
+    m[0, 3:L - 4] = True
+    m[1, 1:L - 2] = True
+    rgb[3, 9:27] = (26, 22, 22)                                        # la girouette de cote : des points ambre
+    rgb[3, 10:26:2] = (255, 160, 56)
+    rgb[13:17, :] = (24, 34, 46)                                       # la jupe, sombre
+    rgb[12, :] = (140, 58, 44)                                         # le lisere
+    fenetres = []
+    for i in range(6):
+        a = 1 + i * 5
+        fenetres.append((a, a + 4))
+        rgb[4:11, a:a + 4] = (232, 196, 128)                           # dedans, la lumiere chaude
+        rgb[4, a:a + 4] = (255, 230, 170)                              # la reglette du plafond
+        rgb[10, a:a + 4] = (150, 112, 70)                              # le dos des sieges
+    porte = (32, 37)
+    rgb[3:17, 31:38] = (22, 28, 38)                                    # le cadre de la porte
+    rgb[4:16, 32:37] = (196, 160, 104)                                 # ses vitres, eclairees du dedans
+    rgb[4:16, 34] = (120, 96, 66)
+    rgb[3:11, 38:43] = (120, 118, 98)                                  # le pare-brise, vu de biais
+    rgb[4:10, 39:42] = (170, 156, 118)
+    rgb[3, 39:43] = (255, 170, 60)                                     # la girouette de face
+    rgb[3:13, 43] = (28, 40, 52)
+    rgb[3, 43] = 0
+    m[3, 43] = False
+    rgb[14, 42:44] = (255, 246, 220)                                   # le phare
+    rgb[13:15, 0] = (210, 34, 30)                                      # le feu arriere
+    yy, xx = np.mgrid[0:H, 0:L]
+    for cx in (8.5, 27.5):                                             # les roues, dans leurs passages
+        d = np.hypot(xx - cx, yy - 17.0)
+        arc = (d < 3.8) & (yy >= 13)
+        rgb[arc], m[arc] = (10, 12, 16), True
+        pneu = d < 2.9
+        rgb[pneu], m[pneu] = (24, 24, 30), True
+        rgb[d < 1.2] = (96, 98, 110)
+    return rgb, m, fenetres, porte
+
+
+def _ia_arret_fond(e):
+    """Le decor fixe de l'arret de bus (flottant, avant la trame), et la carte de la lumiere de la lampe (0..1)."""
+    import numpy as np
+    Y, X = _xy()
+    nuit = _ia_niv((60, 80, 160), 2)
+    img = nuit * np.clip(0.45 + Y / 20.0, 0, 1)[..., None]             # le ciel : plus noir tout en haut
+    _halo(img, 14, 33, 12, (44, 30, 40), 0.55, 2.6)                    # la lueur de la ville, au ras des toits
+    # de l'autre cote de la rue : des maisons basses sous la neige, des fenetres, des sapins, un lampadaire lointain
+    murs, neige = _ia_niv((60, 64, 96), 2), _ia_niv((150, 160, 196), 3)
+    for x0, x1, bas_toit, faite in ((-3, 11, 27, 21), (22, 34, 28, 23), (50, 66, 26, 20)):
+        cx = (x0 + x1) / 2
+        img[(X >= x0) & (X < x1) & (Y >= bas_toit) & (Y < 34)] = murs
+        toit = (Y >= faite) & (Y < bas_toit) & (np.abs(X - cx) <= (Y - faite) * 1.25 + 1.5)
+        img[toit] = neige
+        img[toit & (Y == faite)] = _ia_niv((150, 160, 196), 4)
+    for fx, fy in ((3, 29), (7, 29), (27, 30), (56, 28)):
+        img[fy:fy + 2, fx:fx + 2] = _ia_niv((255, 170, 80), 6)
+        _halo(img, fx + 1, fy + 1, 1.5, (160, 100, 40), 0.4)
+    for sx, sh in ((13.5, 13), (39, 15), (43, 11)):         # des sapins sombres, un peu de neige dessus
+        corps = (Y >= 34 - sh) & (Y < 34) & (np.abs(X - sx) <= (Y - (34 - sh)) * 0.38 + 0.5)
+        img[corps] = _ia_niv((20, 44, 48), 2)
+        img[corps & ((Y.astype(int) - int(34 - sh)) % 3 == 2) & (X < sx)] = neige * 0.8
+    img[33:36] = neige                                                 # le trottoir d'en face
+    img[23:34, 18] = _ia_niv((60, 56, 60), 2)                          # un lampadaire, la-bas
+    img[22, 17:19] = _ia_niv((255, 190, 110), 6)
+    _halo(img, 17.5, 22.5, 1.6, (200, 130, 60), 0.5)
+    _halo(img, 17.5, 34.5, 3.2, (200, 140, 70), 0.5, 2.5)
+    # la rue : neige tassee, deux ornieres sombres
+    img[36:43] = _ia_niv((52, 56, 76), 2) * 1.35
+    img[37:39] = _ia_niv((52, 56, 76), 2)
+    img[40:42] = _ia_niv((52, 56, 76), 2)
+    img[43] = _ia_niv((150, 158, 190), 3) * 1.4                        # la bordure, sous la neige
+    img[44:] = neige                                                   # le trottoir enneige
+    img[44:47] = _ia_niv((150, 160, 196), 3) * 0.8
+    img[45:51, 47:] = _ia_niv((60, 64, 90), 2) * 1.3                   # sous l'abri, peu de neige
+    # la lampe : sa lueur dans l'air, son cone, sa flaque creme sur la neige
+    lx, ly = _IA_LAMPE
+    lumi = np.exp(-np.hypot(X - lx, Y - ly) / 3.6) * 0.95
+    cone = np.clip(1 - np.abs(X - lx) / (1.5 + (Y - ly) * 0.40), 0, 1) * (Y > ly) * (Y < 50)
+    lumi += cone * 0.16 * np.clip((Y - ly) / 8, 0, 1)
+    lumi += np.exp(-np.hypot((X - lx) / 11.5, (Y - 51.5) / 5.0) ** 1.7) * 1.1 * (Y >= 44)
+    lumi += np.exp(-np.hypot((X - lx) / 14.0, (Y - 41) / 4.0) ** 2) * 0.3 * (Y >= 36) * (Y < 44)
+    img += lumi[..., None] * np.array([205, 150, 88])
+    _halo(img, lx, ly, 11, (40, 26, 14), 0.8)
+    _halo(img, 55.5, 47.5, 3.0, (40, 60, 80), 0.7, 2.4)                # l'affiche de l'abri, sur la neige
+    e["ia_fond"] = img
+    e["ia_lumi"] = np.clip(lumi, 0, 1)
+    e["ia_bus"] = _ia_bus_sprite()
+
+
+def _ia_arret_avant(img):
+    """Ce qui est devant le bus : l'abri (toit enneige, vitre, affiche allumee, banc) et le lampadaire."""
+    import numpy as np
+    v = img[30:47, 48:64]
+    img[30:47, 48:64] = v * 0.7 + np.array([14, 20, 30])               # la vitre du fond de l'abri
+    img[31:46, 50] += np.array([16, 18, 22])                           # un reflet
+    img[33:43, 53:58] = (118, 136, 150)                                # l'affiche, eclairee du dedans
+    img[34:40, 54:57] = (54, 80, 108)
+    img[35:37, 55] = (190, 118, 72)
+    img[41, 54:57] = (96, 106, 120)
+    img[42, 59:64] = (64, 48, 40)                                      # le banc
+    img[43:47, 61] = (26, 24, 28)
+    img[26:30, 45:64] = (34, 40, 54)                                   # le toit
+    img[24:26, 45:64] = (170, 178, 204)                                # sa neige
+    img[24:26, 45:49] = (214, 196, 170)                                # la ou la lampe l'atteint
+    img[24, 45] = (150, 132, 116)
+    img[30, 45:64] = (20, 22, 32)
+    img[30:50, 47] = (22, 26, 36)                                      # le poteau
+    img[30:50, 46] = (52, 50, 56)
+    img[49:51, 45:49] = (140, 146, 176)                                # la neige au pied
+    img[12:48, 44] = (26, 26, 32)                                      # le mat du lampadaire
+    img[12:46, 43] = (92, 72, 54)                                      # son bord eclaire
+    img[46:48, 42:46] = (34, 32, 38)
+    img[45, 42:46] = (150, 144, 140)
+    img[10, 38:44] = (36, 34, 40)                                      # la crosse
+    img[11, 43:45] = (36, 34, 40)
+    img[8:10, 30:38] = (40, 36, 40)                                    # la tete
+    img[7, 31:37] = (196, 194, 212)                                    # sa neige
+    img[10, 31:37] = (255, 236, 186)                                   # la vitre
+    img[11, 32:36] = (255, 206, 136)
+
+
+def _ia_bus_poser(img, e, xf, porte, k, monte):
+    """Pose le bus (son avant en x = xf), ses voyageurs (selon le passage k), sa porte ouverte de `porte` (0..1)."""
+    import numpy as np
+    rgb, m, fenetres, (p0, p1) = e["ia_bus"]
+    x0 = int(np.floor(xf + 0.5)) - _IA_BUS_L + 1
+    xs = np.arange(_IA_BUS_L) + x0
+    ok = (xs >= 0) & (xs < 64)
+    if not ok.any():
+        return
+    bus = rgb.copy()
+    h = (k * 2654435761 + 12345) % (2 ** 32)
+    for i, (a, b) in enumerate(fenetres):                              # les voyageurs assis : des silhouettes
+        if (h >> (i * 3)) % 3 == 0:
+            continue
+        dx = a + ((h >> (i * 2 + 7)) % 2)
+        c = np.array([78, 56, 50]) if (h >> (i + 11)) % 2 else np.array([56, 50, 64])
+        bus[6:8, dx:dx + 2] = c                                        # la tete
+        bus[8:10, max(a, dx - 1):dx + 3] = c * 0.85                    # les epaules
+    if monte:                                                          # celui qui vient de monter, debout
+        bus[5:7, 28:30] = (70, 50, 46)
+        bus[7:11, 27:30] = (60, 44, 42)
+    if porte > 0:                                                      # la porte : les deux vantaux s'ecartent
+        o = int(round(porte * 2))
+        bus[4:16, p0:p1] = (255, 234, 180)
+        bus[15, p0:p1] = (130, 104, 70)                                # la marche
+        if o < 2:
+            bus[4:16, p0], bus[4:16, p1 - 1] = (196, 160, 104), (196, 160, 104)
+    w = np.exp(-np.abs(xs - _IA_LAMPE[0]) / 7.0)[None, :, None] * 0.75   # la neige du toit prend la creme de la lampe
+    bus[0:3] = bus[0:3] * (1 - w) + np.array([255, 222, 168]) * w * (bus[0:3].max(-1, keepdims=True) / 220)
+    sl = img[_IA_BUS_H:_IA_BUS_H + rgb.shape[0], xs[ok]]
+    mm = m[:, ok]
+    sl[mm] = bus[:, ok][mm]
+    img[_IA_BUS_H:_IA_BUS_H + rgb.shape[0], xs[ok]] = sl
+
+
+def _ia_traces(img, s):
+    """Les pas dans la neige, que la neige recouvre peu a peu : ceux du marcheur venu de la droite, ceux de
+    l'attente, ceux de la montee vers la porte. Tout se deduit de l'heure (pas d'etat)."""
+    import numpy as np
+    px = np.arange(_IA_BUS_X + 3.0, 66.0, 2.5)                       # en venant : un pas tous les 2,5 px
+    pas = [(x, _IA_BUS_PIEDS + (j % 2), 49 + (66 - x) / (66 - _IA_BUS_X) * 11) for j, x in enumerate(px)]
+    pas += [(_IA_BUS_X + 1.5, _IA_BUS_PIEDS + 1, 34.0), (_IA_BUS_X + 4.5, _IA_BUS_PIEDS, 34.0)]   # l'attente
+    pas += [(_IA_BUS_X + 2 + (j % 2) * 2, _IA_BUS_PIEDS - 2 - j * 2, 29.6 + j * 0.6) for j in range(4)]  # la montee
+    for x, y, n in pas:
+        age = (s - n) % _IA_BUS_P
+        a = 1 - age / 36.0
+        if a > 0:
+            img[int(y), int(x):int(x) + 2] *= 1 - 0.4 * a
+
+
+def _scene_arret_bus(p, e, t, ecoule, dt):
+    """Un arret de bus sous la neige, la nuit : le lampadaire au sodium, quelqu'un qui attend ; chaque minute un bus
+    glisse jusqu'a l'arret, la personne monte, il repart, et quelqu'un d'autre arrive."""
+    import numpy as np
+    if "ia_fond" not in e:
+        _ia_arret_fond(e)
+    img = e["ia_fond"].copy()
+    u = t / _IA_BUS_P
+    k = int(np.floor(u))
+    s = (u - k) * _IA_BUS_P                                           # ou en est la minute
+    # le bus : il arrive en freinant (18-28 s), attend porte ouverte, repart en accelerant (36-47 s)
+    xf = None
+    if 18 <= s < 28:
+        a = (s - 18) / 10
+        xf = -3 + (_IA_BUS_ARRET + 3) * (1 - (1 - a) ** 2)
+    elif 28 <= s < 36:
+        xf = _IA_BUS_ARRET
+    elif 36 <= s < 47:
+        a = (s - 36) / 11
+        xf = _IA_BUS_ARRET + 72 * a * a
+    porte = float(np.clip((s - 28.6) / 0.8, 0, 1) * np.clip((34.4 - s) / 0.8, 0, 1))
+    if xf is not None:                                                 # ses lumieres sur la rue et sur la neige
+        x0 = xf - _IA_BUS_L + 1
+        _halo(img, xf + 7, 41.5, 5.0, (255, 226, 160), 0.85, 1.6)
+        _halo(img, xf + 1, 36.5, 1.6, (255, 240, 200), 0.9)
+        _halo(img, x0, 35.5, 1.6, (220, 30, 20), 0.7)
+        for i in range(6):
+            _halo(img, x0 + 3 + i * 5, 45.5, 2.0, (150, 116, 66), 0.6, 2.6)
+        if porte > 0:
+            _halo(img, x0 + 34, 46, 2.4, (255, 220, 150), 0.9 * porte, 1.6)
+    img = _tramer(img, 8)
+    _ia_traces(img, s)
+    if xf is not None:
+        _ia_bus_poser(img, e, xf, porte, k, s >= 34.4)
+    _ia_arret_avant(img)
+    # la personne : elle attend (0-29.2 s), monte (29.2-33.2 s) ; une autre arrive par la droite (49-60 s)
+    y0 = _IA_BUS_PIEDS - 13
+    if s < 29.2:
+        pose = _IA_GENS_FACE if (t * 0.45) % 2 < 1 else _IA_GENS_FACE2
+        _ia_peindre(img, pose, _ia_gens_palette(k, 1.0), _IA_BUS_X, y0)
+        souffle = (t * 0.29) % 1                                       # le souffle, dans le froid
+        if souffle < 0.5:
+            a = souffle / 0.5
+            bx, by = _IA_BUS_X + 4.5 + a * 3.5, y0 + 3 - a * 3.5
+            c = np.array([236, 220, 190]) * (1 - a) ** 1.2 * 0.7
+            _pointer(img, [by, by - 1, by - 0.4], [bx, bx + 1, bx + 1.6], [c, c * 0.75, c * 0.5])
+    elif s < 33.2:
+        a = min(1.0, (s - 29.2) / 2.6)
+        y = y0 - a * 8 - min(1.0, max(0.0, s - 31.8) / 0.6) * 6       # il s'eloigne vers la porte, puis monte la marche
+        dx = -max(0.0, s - 32.4) * 7                                   # et disparait dans le bus
+        bob = int((s * 2.6) % 2) if a < 1 else 0
+        porte_x = int(_IA_BUS_ARRET) - _IA_BUS_L + 1 + 32              # vu dans l'encadrement de la porte
+        boite = (porte_x, porte_x + 5, _IA_BUS_H + 4, _IA_BUS_H + 16) if s > 32.0 else None
+        _ia_peindre(img, _IA_GENS_DOS[bob], _ia_gens_palette(k, 1.0 - a * 0.5), _IA_BUS_X + dx, y, boite=boite)
+    if s >= 49:
+        a = (s - 49) / 11
+        x = 68 + (_IA_BUS_X - 68) * a
+        pose = _IA_GENS_MARCHE[int(s * 3.0) % 4]
+        lum = float(np.clip(1 - abs(x - _IA_BUS_X) / 22, 0.15, 1))
+        _ia_peindre(img, pose, _ia_gens_palette(k + 1, lum), x, y0, miroir=True)
+    _ia_flocons(e, img, t, dt, e["ia_lumi"], (255, 226, 170))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- 2. La superette sous la pluie --------------------------------------------------------------------------------
+# De face : la vitrine blanche un peu cyan, les rayonnages et le vendeur derriere son comptoir ; le trottoir mouille
+# qui la reflete en long ; la pluie qu'on ne voit que dans la lumiere, les gouttes qui tombent de l'auvent. Un client
+# arrive sous son parapluie, entre, fait ses courses derriere la vitre, paie, ressort et s'en va.
+
+_IA_SUP_P = 80.0                     # une visite toutes les 80 s
+_IA_SUP_SOL = 47                     # le pied de la vitrine (la ligne du reflet)
+_IA_SUP_PIEDS = 53                   # les pieds des passants sur le trottoir
+_IA_SUP_PORTE = (42, 56)             # la porte automatique (x interieur)
+_IA_SUP_NEON = (205, 238, 248)
+
+_IA_PARAPLUIE = (                    # ouvert, au-dessus de la tete (la poignee descend vers la main)
+    "...LLL...",
+    ".uuuuuuu.",
+    "uuuuuuuuu",
+    "U.U.U.U.U",
+    "....i....",
+    "....i....",
+)
+_IA_PARAPLUIE_MI = (                 # a moitie replie
+    "...u...",
+    "..uuu..",
+    ".uuuuu.",
+    ".U.U.U.",
+    "...i...",
+    "...i...",
+)
+_IA_GENS_PLUIE = (                   # de face, sans bonnet (cheveux), qui tient son parapluie
+    "..hhh..",
+    ".hhhhh.",
+    ".hfffh.",
+    "..fff..",
+    ".CCCCC.",
+    "CCcccCC",
+    "dcccccd",
+    "dcccccd",
+    "dcccccd",
+    "dcccccd",
+    ".ccccc.",
+    "..p.p..",
+    "..p.p..",
+    ".bb.bb.",
+)
+_IA_VENDEUR = (                      # derriere le comptoir : tete, epaules, gilet de la boutique
+    (
+        "..hhh..",
+        ".hhhhh.",
+        ".hfffh.",
+        "..fff..",
+        ".vwwwv.",
+        "vvvwvvv",
+        "vvvvvvv",
+    ),
+    (                                # il lit, tete baissee
+        ".......",
+        "..hhh..",
+        ".hhhhh.",
+        ".hhffh.",
+        ".vwffv.",
+        "vvvwvvv",
+        "vvvvvvv",
+    ),
+)
+_IA_SUP_HABITS = (                   # (manteau, cheveux, parapluie)
+    ((60, 64, 92), (40, 30, 26), (210, 52, 56)),
+    ((96, 80, 60), (24, 22, 26), (226, 190, 70)),
+    ((40, 70, 64), (90, 56, 36), (170, 196, 210)),
+    ((84, 44, 60), (30, 26, 30), (60, 90, 170)),
+)
+
+
+def _ia_sup_fond(e):
+    """La superette : la facade et le trottoir (calque trame), et la vitrine avec l'etage (calque net + son masque)."""
+    import numpy as np
+    Y, X = _xy()
+    mur = _ia_niv((70, 60, 74), 2)
+    img = np.zeros((64, 64, 3)) + mur
+    for yy in range(1, 12, 3):                                         # les joints du bardage
+        img[yy, :] = mur * 0.55
+    img[3:48, 61] = _ia_niv((60, 66, 74), 3) * 0.8                     # la gouttiere
+    img[3:48, 62] = _ia_niv((60, 66, 74), 2)
+    img[20:48, 0:3] = _ia_niv((80, 84, 96), 2) * 1.2                   # le rideau baisse du voisin
+    img[21:48:2, 0:3] = _ia_niv((80, 84, 96), 2) * 0.6
+    img[_IA_SUP_SOL] = _ia_niv((90, 100, 120), 3)                      # la marche
+    img[48:] = _ia_niv((30, 44, 80), 2)                                # le trottoir mouille
+    img[60] = _ia_niv((80, 90, 110), 3)                                # la bordure
+    img[61:] = _ia_niv((30, 40, 70), 1)                                # la chaussee
+    lumi = np.zeros((64, 64))                                          # la lumiere de la vitrine, dehors
+    lumi += np.exp(-np.hypot((X - 30) / 27.0, (Y - 48) / 4.0) ** 1.5) * 0.45 * (Y >= 48) * (Y < 60)
+    lumi += np.exp(-np.hypot((X - 30) / 30.0, (Y - 34) / 16.0) ** 2) * 0.25 * ((X < 3) | (X > 58))
+    img += lumi[..., None] * np.array([140, 178, 190])
+    _halo(img, 31, 12, 9, (60, 70, 110), 0.5, 2.2)                     # l'enseigne eclaire le mur
+    e["ia_fond"] = img
+    lpluie = np.exp(-np.hypot((X - 30) / 30.0, (Y - 40) / 18.0) ** 2) * 0.95 * (Y > 19)
+    e["ia_lumi"] = np.clip(lpluie + 0.08, 0, 1)                        # la ou la pluie se voit
+    # le calque net : l'etage, l'enseigne, la vitrine et ce qu'il y a derriere
+    v = np.zeros((64, 64, 3))
+    m = np.zeros((64, 64), bool)
+    m[2:11, 6:17] = True                                               # la fenetre de l'etage : rideau, une plante
+    v[2:11, 6:17] = (40, 32, 34)
+    v[3:9, 7:16] = (214, 140, 72)
+    v[3:9, 7:10] = (160, 82, 56)                                       # le rideau tire d'un cote
+    v[3:9, 11] = (40, 32, 34)                                          # les montants
+    v[6, 7:16] = (40, 32, 34)
+    v[3, 12:16] = (240, 176, 96)
+    v[7:9, 13:15] = (36, 40, 30)                                       # la plante sur le rebord
+    v[6, 12:16:2] = (36, 40, 30)
+    v[5, 13] = (36, 40, 30)
+    v[9:11, 5:18], m[9:11, 5:18] = (76, 68, 76), True
+    v[10, 5:18] = (50, 44, 50)
+    m[3:9, 46:56] = True                                               # le climatiseur
+    v[3:9, 46:56] = (58, 60, 68)
+    v[4:8, 47:52] = (34, 36, 42)
+    v[4:8, 47:52:2] = (66, 68, 76)
+    v[3, 46:56] = (88, 90, 100)
+    m[12:20, 2:61] = True                                              # l'enseigne : un caisson bleu nuit
+    v[12:20, 2:61] = (26, 30, 42)
+    v[13:19, 3:60] = (30, 56, 104)
+    v[13, 3:60] = (60, 96, 150)
+    v[14:18, 6:10] = (250, 214, 110)                                   # son croissant de lune
+    for yy, xx in ((14, 6), (17, 6), (15, 8), (15, 9), (16, 8), (16, 9), (14, 9), (17, 9)):
+        v[yy, xx] = (30, 56, 104)
+    for x in range(13, 46, 2):                                         # un nom, en traits
+        v[16, x] = (190, 210, 226)
+        v[15 if x % 4 == 1 else 17, x] = (190, 210, 226)
+    v[12:19, 49:58] = (196, 56, 48)                                    # et un cartouche rouge : 24
+    for yy, ligne in enumerate(("XXX.X.X", "..X.X.X", "XXX.XXX", "X.....X", "XXX...X")):
+        for xx, c in enumerate(ligne):
+            if c == "X":
+                v[13 + yy, 50 + xx] = (250, 236, 220)
+    v[19, 2:61] = (20, 22, 28)                                         # l'auvent, mince
+    m[20:48, 3:59] = True
+    neon = np.array(_IA_SUP_NEON, float)
+    v[20:47, 3:59] = neon * 0.5                                        # le fond du magasin
+    v[21, 4:58] = (240, 252, 255)                                      # les tubes au plafond
+    v[22, 4:58] = neon * 0.8
+    v[23, 4:58] = neon * 0.62
+    v[43:47, 3:59] = neon * 0.66                                       # le carrelage
+    v[45, 3:59] = neon * 0.58
+    couleurs = np.array([[220, 60, 60], [240, 190, 60], [70, 150, 220], [90, 190, 110], [236, 236, 226],
+                         [230, 120, 50], [160, 90, 180], [250, 150, 160]], float)
+    rng = np.random.default_rng(11)                                    # les produits : toujours les memes
+    for x0, x1 in ((22, 40), (45, 55)):                                # les rayonnages (vitrine, et par la porte)
+        v[24:43, x0:x1] = neon * 0.36
+        for ry in (25, 30, 35, 40):
+            v[ry + 2, x0:x1] = neon * 0.72                             # la tablette
+            for x in range(x0, x1):
+                if rng.uniform() < 0.85:
+                    h = 2 if rng.uniform() < 0.6 else 1
+                    v[ry + 2 - h:ry + 2, x] = couleurs[rng.integers(0, len(couleurs))] * rng.uniform(0.6, 0.9)
+        v[24:43, x0 - 1] = neon * 0.3
+    v[32:46, 4:20] = (92, 70, 58)                                      # le comptoir
+    v[32, 4:20] = (176, 160, 146)
+    v[34:44, 5:19] = (74, 56, 48)
+    v[29:32, 15:19] = (34, 36, 44)                                     # la caisse
+    v[30, 16:18] = (90, 220, 140)
+    v[24:30, 4:9] = (176, 166, 132)                                    # une affiche au mur
+    v[25:28, 5:8] = (200, 100, 72)
+    v[20, 3:59] = (30, 34, 40)                                         # les cadres de la vitrine et de la porte
+    v[20:48, 3] = (30, 34, 40)
+    v[20:48, 40:42] = (30, 34, 40)
+    v[20:48, 56:59] = (30, 34, 40)
+    v[46, 3:41] = (30, 34, 40)
+    v[38:43, 24:31] = (220, 200, 120)                                  # une affiche collee sur la vitre
+    v[39:42, 25:30] = (190, 70, 56)
+    v[40, 26:29] = (240, 220, 180)
+    v[20:46, 4:40] = v[20:46, 4:40] * 0.93                             # la vitre, un rien plus terne
+    for i in range(6):                                                 # un reflet en biais sur la vitre
+        v[24 + i * 3:27 + i * 3, 33 - i:34 - i] += 22
+    e["ia_vitrine"] = (v, m)
+    e["ia_devant"] = np.zeros((64, 64), bool)
+    e["ia_devant"][20:48, 3] = e["ia_devant"][20:48, 40:42] = e["ia_devant"][20:48, 56:59] = True
+    e["ia_devant"][46, 3:41] = e["ia_devant"][38:43, 24:31] = e["ia_devant"][20, 3:59] = True
+    e["ia_flaques"] = ((((X - 19) / 9.0) ** 2 + ((Y - 53.5) / 2.2) ** 2 < 1)
+                       | (((X - 47) / 7.0) ** 2 + ((Y - 57) / 1.8) ** 2 < 1))
+
+
+def _ia_sup_client(s):
+    """Ou est le client a l'instant s du cycle : (ou, x, y des pieds, sprite, miroir, ouverture du parapluie) ou None.
+    `ou` : "dehors" (sur le trottoir), "porte" (dans l'encadrement), "dedans" (derriere la vitre)."""
+    porte_x, pieds, dedans_y = 46, _IA_SUP_PIEDS, _IA_SUP_SOL - 2
+    marche = _IA_GENS_MARCHE[int(s * 3) % 4]
+    if s < 9:                                                          # il arrive de la droite sous son parapluie
+        return ("dehors", 68 + (porte_x - 68) * s / 9, pieds, marche, True, 1.0)
+    if s < 10.5:                                                       # devant la porte, il replie son parapluie
+        return ("dehors", porte_x, pieds, _IA_GENS_DOS[0], False, 1.0 - (s - 9) / 1.5)
+    if s < 12.5:                                                       # il entre
+        return ("porte", porte_x, pieds + (dedans_y - pieds) * (s - 10.5) / 2, _IA_GENS_DOS[int(s * 3) % 2], False, 0.0)
+    if s < 57:                                                         # dedans : les rayons, la caisse, la porte
+        trajet = ((12.5, 46), (17, 32), (29, 32), (31, 26), (40, 26), (43, 20), (51, 20), (56, 46), (57, 46))
+        for (a, xa), (b, xb) in zip(trajet, trajet[1:]):
+            if a <= s < b:
+                x = xa + (xb - xa) * (s - a) / (b - a)
+                if xa == xb:                                           # arrete : de dos au rayon, de profil a la caisse
+                    return ("dedans", x, dedans_y, _IA_GENS_MARCHE[0] if xa == 20 else _IA_GENS_DOS[0], xa == 20, 0.0)
+                return ("dedans", x, dedans_y, marche, xb < xa, 0.0)
+    if s < 59:                                                         # il ressort, vers nous
+        return ("porte", porte_x, dedans_y + (pieds - dedans_y) * (s - 57) / 2, _IA_GENS_PLUIE, False, 0.0)
+    if s < 60.5:                                                       # il rouvre son parapluie
+        return ("dehors", porte_x, pieds, _IA_GENS_PLUIE, False, (s - 59) / 1.5)
+    if s < 73:                                                         # et s'en va vers la gauche
+        return ("dehors", porte_x + (-12 - porte_x) * (s - 60.5) / 12.5, pieds, marche, True, 1.0)
+    return None
+
+
+def _ia_sup_palette(k, lumiere, dos):
+    """Le client k : en contre-jour devant la vitrine (lumiere = le bord eclaire), de face ou de dos."""
+    import numpy as np
+    manteau, cheveux, para = (np.asarray(c, float) for c in _IA_SUP_HABITS[k % len(_IA_SUP_HABITS)])
+    neon = np.asarray(_IA_SUP_NEON, float)
+    k = 0.45 + 0.35 * lumiere
+    return {"H": cheveux * 0.6 + neon * 0.35 * lumiere, "h": cheveux * k, "f": np.array([190, 146, 116]) * k * 0.9,
+            "s": manteau * k * 1.1, "C": manteau * 0.6 + neon * 0.3 * lumiere, "c": manteau * k, "d": manteau * k * 0.6,
+            "p": np.array([30, 30, 42]) * k, "b": np.array([14, 14, 20]) + 8 * k,
+            "u": para * (0.55 + 0.25 * lumiere), "U": para * 0.4, "i": np.array([50, 50, 56]),
+            "L": para * 0.6 + neon * 0.3 * lumiere}
+
+
+def _ia_sup_porte(v, o):
+    """Les deux vantaux vitres de la porte automatique, ecartes de o (0 ferme .. 1 ouvert)."""
+    import numpy as np
+    p0, p1 = _IA_SUP_PORTE
+    d = int(round(o * 6))
+    for a, b, bord in ((p0 - d, p0 + 7 - d, p0 + 6 - d), (p0 + 7 + d, p1 + d, p0 + 7 + d)):
+        a, b = max(a, p0), min(b, p1)
+        if a < b:
+            v[21:46, a:b] = v[21:46, a:b] * 0.86 + np.array([10, 16, 20])
+        if p0 <= bord < p1:
+            v[21:46, bord] = (40, 46, 54)
+
+
+def _scene_superette(p, e, t, ecoule, dt):
+    """Une petite superette ouverte la nuit, sous la pluie : la vitrine qui eclaire le trottoir mouille, les reflets
+    etires, le vendeur derriere son comptoir ; de temps en temps la porte s'ouvre sur un client et son parapluie."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "ia_fond" not in e:
+        _ia_sup_fond(e)
+        e["ia_gicles"] = np.zeros((14, 3)) - 9                             # x, y, naissance des eclaboussures
+    u = t / _IA_SUP_P
+    k = int(np.floor(u))
+    s = (u - k) * _IA_SUP_P
+    v0, masque = e["ia_vitrine"]
+    v = v0.copy()
+    # le vendeur : il lit, leve la tete de temps en temps ; il regarde le client a la caisse
+    lit = (t * 0.07) % 1 < 0.62 and not (42 <= s < 52)
+    _ia_peindre(v, _IA_VENDEUR[1 if lit else 0], {"h": (40, 32, 30), "f": (196, 150, 120), "v": (40, 110, 104),
+                                                   "w": (220, 226, 226)}, 8, 26)
+    v[33, 4:20] = v0[33, 4:20]
+    v[33:46, 4:20] = v0[33:46, 4:20]                                   # le comptoir devant lui
+    ph = (t / 37.0) % 1                                                # le 24 gresille, rarement et doucement
+    if ph < 0.06:
+        v[12:19, 49:58] *= 1 - 0.28 * np.sin(np.pi * ph / 0.03) ** 2
+    client = _ia_sup_client(s)
+    if client and client[0] == "dedans":                               # derriere la vitre : une silhouette
+        _, x, y, sprite, miroir, _ = client
+        _ia_peindre(v, sprite, _ia_sup_palette(k, 0.2, True), x - 3, y - 13, miroir, boite=(4, 56, 21, 47))
+        v[e["ia_devant"]] = v0[e["ia_devant"]]
+    o = float(np.clip(min((s - 9.6) / 0.8, (13.2 - s) / 0.8), 0, 1)                # la porte : ouverte pour entrer,
+              + np.clip(min((s - 56.4) / 0.8, (60.0 - s) / 0.8), 0, 1))                # puis pour sortir
+    _ia_sup_porte(v, o)
+    img = e["ia_fond"].copy()
+    img[masque] = v[masque]
+    # le trottoir mouille : chaque colonne de la vitrine s'y etire en un long reflet, que la pluie fait trembler
+    col = v[24:46].mean(0)                                             # (64, 3) : la couleur moyenne de chaque colonne
+    col[:3] *= 0.2
+    col[59:] *= 0.2
+    d = Y[48:60] - 48
+    tremble = 0.6 + 0.4 * np.sin(d * 1.9 - t * 2.2 + np.sin(X[48:60] * 0.45 + t * 0.3) * 1.5)
+    img[48:60] += col[None] * (np.exp(-d / 7.0) * 0.8 * tremble)[..., None]
+    img[61:] += col[None] * 0.12
+    if o > 0:                                                          # la porte ouverte : plus de lumiere dehors
+        _halo(img, 49, 49.5, 3.5, (150, 190, 200), 0.6 * o, 1.6)
+    img = _tramer(img, 8)
+    img[masque] = v[masque]                                            # la vitrine reste nette
+    fl = e["ia_flaques"]                                               # dans les flaques, un vrai miroir qui ondule
+    yy, xx = np.nonzero(fl)
+    ond = np.round(np.sin(yy * 2.3 + t * 2.0) * 0.7).astype(int)
+    sy = np.clip(_IA_SUP_SOL - (yy - _IA_SUP_SOL) // 2 - 1, 21, 46)    # etire : une rangee de la vitrine pour deux
+    img[yy, xx] = img[yy, xx] * 0.35 + v[sy, np.clip(xx + ond, 0, 63)] * 0.5
+    # le client dehors (en contre-jour) et son reflet
+    if client and client[0] != "dedans":
+        ou, x, y, sprite, miroir, ouvert = client
+        lum = float(np.clip(1.2 - abs(x - 30) / 34, 0.2, 1))
+        pal = _ia_sup_palette(k, lum, False)
+        boite = (_IA_SUP_PORTE[0], _IA_SUP_PORTE[1], 21, 64) if ou == "porte" and y < _IA_SUP_PIEDS - 3 else None
+        if boite is None:                                              # son reflet dans l'eau, sombre
+            sombre = {c: tuple(np.asarray(col, float) * 0.5) + (0.55,) for c, col in pal.items()}
+            _ia_peindre(img, sprite[::-1][:7], sombre, x - 3, y + 1, miroir)
+        _ia_peindre(img, sprite, pal, x - 3, y - 13, miroir, boite=boite)
+        if ouvert > 0.66:
+            _ia_peindre(img, _IA_PARAPLUIE, pal, x - 4 + (-1 if miroir else 1) * 0, y - 18, miroir)
+        elif ouvert > 0.2:
+            _ia_peindre(img, _IA_PARAPLUIE_MI, pal, x - 3, y - 17, miroir)
+    # les gouttes qui tombent de l'auvent
+    for i, (gx, per) in enumerate(((7, 1.7), (16, 2.3), (27, 1.9), (36, 2.6), (58, 1.5))):
+        ph = (t / per + i * 0.37) % 1
+        if ph < 0.5:
+            img[20, gx] = np.maximum(img[20, gx], np.array([120, 150, 160]) * ph * 2)
+        else:
+            a = (ph - 0.5) / 0.5
+            gy = 20 + 27 * a * a
+            if gy < 47:
+                img[int(gy), gx] = np.maximum(img[int(gy), gx], (230, 246, 255))
+                if a > 0.4:
+                    img[int(gy) - 1, gx] = np.maximum(img[int(gy) - 1, gx], (110, 130, 140))
+    # la pluie : des traits fins, qu'on ne voit vraiment que dans la lumiere
+    if "ia_pluie" not in e:
+        e["ia_pluie"] = [rng.uniform(0, 64, 60), rng.uniform(-4, 64, 60), rng.uniform(42, 62, 60),
+                         rng.uniform(0, 1, 60)]
+    px, py, pv, pz = e["ia_pluie"]
+    pas = min(dt, 0.5)
+    py += pv * pas
+    px += pv * 0.12 * pas
+    fini = py > 48 + pz * 14
+    if fini.any():
+        G = e["ia_gicles"]
+        for j in np.nonzero(fini)[0][:4]:                              # une eclaboussure la ou elle touche
+            G[int(np.argmin(G[:, 2]))] = (px[j], 48 + pz[j] * 14, ecoule)
+        py[fini] -= 66 + rng.uniform(0, 6, int(fini.sum()))
+    px %= 64
+    lumi = e["ia_lumi"]
+    for j in range(3):
+        yy, xx = np.floor(py - j).astype(int), np.floor(px - j * 0.12).astype(int) % 64
+        ok = (yy >= 0) & (yy < 64)
+        lu = lumi[yy[ok], xx[ok]]
+        c = (np.array([60.0, 74, 96]) + np.array([170.0, 205, 215]) * lu[:, None]) * (0.5 + 0.5 * pz[ok])[:, None]
+        _pointer(img, yy[ok], xx[ok], c * (1 - j * 0.28))
+    G = e["ia_gicles"]
+    for gx, gy, n in G:
+        age = ecoule - n
+        if 0 <= age < 0.3:
+            lu = lumi[int(gy) % 64, int(gx) % 64]
+            c = np.array([150.0, 186, 200]) * (0.35 + 0.65 * lu) * (1 - age / 0.3)
+            if age < 0.12:
+                _pointer(img, [gy - 1], [gx], [c])
+            else:
+                _pointer(img, [gy - 1, gy - 1], [gx - 1, gx + 1], [c, c])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- 3. Le distributeur au coin de la rue -------------------------------------------------------------------------
+# Une rue endormie (facon Japon) : un mur de parpaings, un poteau et ses fils, un miroir de virage ; un distributeur
+# de boissons luit tout seul, sa lumiere deborde sur le mur et sur le sol. Des papillons de nuit tournent autour ;
+# un chat noir assis a cote bouge la queue, se leche, s'en va et revient. De temps en temps quelqu'un passe, s'arrete,
+# achete une canette (petit eclat dans la trappe), la ramasse et repart.
+
+_IA_DIS_X, _IA_DIS_Y = 21, 16        # le coin haut-gauche du distributeur (18 x 35)
+_IA_DIS_LUEUR = (190, 222, 255)
+_IA_DIS_P = 70.0                     # un passant toutes les 70 s
+_IA_CHAT_P = 97.0                    # la vie du chat, sur un autre rythme
+_IA_CHAT_X = 42                      # ou il s'assoit (coin gauche du sprite)
+
+_IA_CHAT = {                         # un chat noir (k), son bord eclaire (l), ses yeux (y)
+    "assis": (
+        ".k.k..",
+        ".kkk..",
+        ".yky..",
+        "..kk..",
+        "..kkk.",
+        ".lkkk.",
+        ".lkkkk",
+    ),
+    "leche": (
+        "......",
+        ".k.k..",
+        ".kkk..",
+        ".lkkk.",
+        "..kkk.",
+        ".lkkk.",
+        ".lkkkk",
+    ),
+    "leche2": (
+        "......",
+        ".k.k..",
+        ".kkk..",
+        "lkkkk.",
+        ".lkkk.",
+        ".lkkk.",
+        ".lkkkk",
+    ),
+    "marche1": (
+        "........",
+        "......k.k",
+        "kk....kkk",
+        "..kkkkkky",
+        "..lkkkkk.",
+        "..k.k.k.k",
+        "..k...k..",
+    ),
+    "marche2": (
+        "........",
+        "......k.k",
+        ".k....kkk",
+        "k.kkkkkky",
+        "..lkkkkk.",
+        "...kk..kk",
+        "...k...k.",
+    ),
+}
+_IA_CHAT_QUEUES = (                  # la queue, a droite du chat assis : couchee, qui se releve, qui ondule
+    ("...", "...", "...", "...", "kkk"),
+    ("...", "...", "..k", "..k", "kk."),
+    ("...", ".k.", "..k", ".k.", "k.."),
+    ("...", "..k", ".k.", ".k.", "k.."),
+)
+
+
+_IA_GENS_ACHAT = (                   # de dos devant la machine : il appuie, puis se penche pour ramasser
+    (
+        "..hhh..",
+        ".hhhhh.",
+        ".hhhhh.",
+        "..hhh..",
+        ".CCCCCm",
+        "CccccdC",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        ".ccccc.",
+        "..p.p..",
+        "..p.p..",
+        ".bb.bb.",
+    ),
+    (
+        ".......",
+        ".......",
+        ".......",
+        ".......",
+        "..hhh..",
+        ".hhhhh.",
+        ".CCCCC.",
+        "CcccccC",
+        "dcccccd",
+        "dccccmd",
+        ".ccccc.",
+        ".ppppp.",
+        ".p...p.",
+        "bb...bb",
+    ),
+)
+
+
+def _ia_dis_fond(e):
+    """La rue endormie (calque trame : ciel, jardin, mur, sol, et toute la lumiere du distributeur) et le
+    distributeur lui-meme (calque net, avec son masque)."""
+    import numpy as np
+    Y, X = _xy()
+    img = np.array([6.0, 8, 20]) + np.clip(Y / 30, 0, 1)[..., None] ** 1.6 * np.array([22.0, 28, 50])   # le ciel
+    ciel = np.ones((64, 64), bool)
+    for x0, x1, h in ((-6, 22, 15), (41, 70, 17)):                     # les arbres du jardin, derriere le mur
+        cx = (x0 + x1) / 2
+        bosse = h + 2.5 * np.sin(X * 0.7 + cx) + 1.5 * np.sin(X * 1.9 + 1)
+        arbre = (X >= x0) & (X < x1) & (Y >= bosse + np.abs(X - cx) * 0.3)
+        img[arbre], ciel[arbre] = np.array([9.0, 15, 16]), False
+    maison = (Y >= 20 + np.abs(X - 31) * 0.16) & (X > 12) & (X < 50)   # une maison au toit de tuiles
+    img[maison], ciel[maison] = np.array([14.0, 16, 24]), False
+    img[(Y >= 20 + np.abs(X - 31) * 0.16) & (Y < 21.2 + np.abs(X - 31) * 0.16) & (X > 13) & (X < 49)] = (30, 34, 48)
+    img[24:30, 14:48] = (13, 12, 14)
+    # le mur de parpaings et l'asphalte : des matieres (albedo), que la lumiere du distributeur eclaire
+    alb = np.zeros((64, 64, 3))
+    alb[30:50] = (104, 106, 114)
+    alb[30] = (150, 152, 158)                                          # le chaperon
+    for yy in range(33, 50, 3):
+        alb[yy] = (62, 62, 70)
+    for yy in range(31, 50, 3):
+        for xx in range(((yy // 3) % 2) * 4, 64, 8):
+            alb[yy:yy + 2, xx] = (62, 62, 70)
+    alb[50:] = (66, 68, 84)
+    alb[50] = (36, 36, 46)                                             # le caniveau
+    alb[59:61] = (170, 170, 160)                                       # la ligne blanche du bord
+    bx = np.clip(X, _IA_DIS_X, _IA_DIS_X + 19)                          # la distance au distributeur (un rectangle)
+    by = np.clip(Y, _IA_DIS_Y, _IA_DIS_Y + 34)
+    dbord = np.hypot(X - bx, Y - by)
+    lumi = np.exp(-np.hypot((X - 29.5) / 16.0, (Y - 32) / 16.0) ** 1.2) * 1.15 * (Y >= 30)
+    lumi += np.exp(-dbord / 4.5) * 0.7 * (Y >= 30)                      # tout pres, le mur est inonde
+    lumi += np.exp(-np.hypot((X - 29.5) / 14.0, (Y - 52.5) / 4.2) ** 1.3) * 1.5 * (Y >= 50)
+    eclaire = 0.2 + lumi[..., None] * np.array([1.15, 1.32, 1.55])
+    img[30:] = (alb * eclaire)[30:]
+    img += (np.exp(-dbord / 3.0) * (Y < 30))[..., None] * np.array([60, 80, 110])   # sa lueur dans l'air
+    e["ia_fond"] = img
+    e["ia_lumi"] = np.clip(lumi, 0, 1)
+    # le distributeur (et ses canettes : toujours les memes)
+    v = np.zeros((64, 64, 3))
+    m = np.zeros((64, 64), bool)
+    x0, y0 = _IA_DIS_X, _IA_DIS_Y
+    m[y0:y0 + 35, x0:x0 + 20] = True
+    v[y0:y0 + 35, x0:x0 + 18] = (40, 70, 120)                          # la caisse, bleue
+    v[y0:y0 + 35, x0 + 18:x0 + 20] = (22, 34, 56)                      # son flanc, dans l'ombre
+    v[y0, x0:x0 + 18] = (70, 100, 150)
+    v[y0 + 1:y0 + 5, x0 + 1:x0 + 17] = (214, 236, 255)                 # le bandeau lumineux du haut
+    v[y0 + 3, x0 + 1:x0 + 17] = (80, 150, 220)
+    v[y0 + 2, x0 + 3:x0 + 6] = (220, 70, 70)
+    v[y0 + 6:y0 + 22, x0 + 1:x0 + 17] = (196, 222, 246)                # la vitrine des boissons
+    canettes = ((220, 50, 50), (250, 200, 60), (60, 120, 220), (240, 240, 236), (80, 180, 100),
+                (250, 130, 50), (130, 70, 150), (50, 60, 70), (220, 100, 140))
+    rng = np.random.default_rng(23)
+    for r in range(3):
+        ry = y0 + 7 + r * 5
+        for c in range(5):
+            cx = x0 + 2 + c * 3
+            col = np.array(canettes[rng.integers(0, len(canettes))], float)
+            v[ry:ry + 3, cx:cx + 2] = col
+            v[ry, cx:cx + 2] = col * 0.6 + 100                         # le couvercle
+            v[ry + 3, cx:cx + 2] = (90, 110, 140)                      # le bouton dessous
+        v[ry + 4, x0 + 1:x0 + 17] = (150, 176, 206)
+    v[y0 + 22, x0:x0 + 18] = (30, 50, 90)
+    v[y0 + 23:y0 + 28, x0 + 1:x0 + 17] = (44, 74, 126)                 # le panneau : monnaie, billets, afficheur
+    v[y0 + 24:y0 + 26, x0 + 13:x0 + 16] = (30, 36, 50)
+    v[y0 + 24, x0 + 14] = (120, 200, 255)
+    v[y0 + 27, x0 + 13:x0 + 16] = (60, 200, 120)
+    v[y0 + 24:y0 + 27, x0 + 3:x0 + 9] = (190, 200, 210)                # une petite affiche
+    v[y0 + 25, x0 + 4:x0 + 8] = (210, 70, 60)
+    v[y0 + 29:y0 + 33, x0 + 2:x0 + 16] = (16, 18, 26)                  # la trappe
+    v[y0 + 29, x0 + 2:x0 + 16] = (70, 84, 104)
+    v[y0 + 33:y0 + 35, x0:x0 + 18] = (24, 30, 44)                      # le socle
+    # le poteau, ses fils, le miroir de virage : en ombre chinoise
+    m[0:51, 53:56] = True
+    v[0:51, 53:56] = (18, 18, 24)
+    v[0:51, 53] = (40, 42, 52)
+    v[26:51, 53] = (66, 80, 104)                                       # son bord, dans la lueur
+    m[5:7, 48:61] = True
+    v[5:7, 48:61] = (20, 20, 26)
+    m[9:15, 56:59] = True                                              # le transformateur
+    v[9:15, 56:59] = (34, 36, 44)
+    v[9, 56:59] = (60, 64, 76)
+    for a0, fleche in ((5.0, 6.0), (6.0, 9.0), (10.0, 4.0)):           # les fils, qui pendent un peu
+        for x in list(range(0, 48)) + list(range(61, 64)):
+            u = (48 - x) / 48.0 if x < 48 else 0.0
+            y = int(round(a0 + fleche * 4 * u * (1 - u) + u * 4 + (x - 60) * 0.4 * (x > 60)))
+            if 0 <= y < 64 and not m[y, x]:
+                m[y, x], v[y, x] = True, (26, 26, 36)
+    m[21:51, 9] = True                                                 # le miroir : son mat orange, son disque
+    v[21:51, 9] = (130, 60, 30)
+    mir = np.hypot(X - 9, Y - 18) < 3.6
+    m[mir] = True
+    v[mir] = (190, 90, 40)
+    dedans = np.hypot(X - 9, Y - 18) < 2.6
+    v[dedans] = (40, 56, 90)
+    v[(np.hypot(X - 10, Y - 19) < 1.2) & dedans] = (150, 180, 220)     # la lueur du distributeur, dans le miroir
+    m[25:28, 44:46] = True                                             # une fenetre encore allumee, la-bas
+    v[25:28, 44:46] = (196, 130, 70)
+    e["ia_dis"] = (v, m)
+    e["ia_mites"] = rng.uniform(0, 6.3, (5, 4))
+    cy, cx = np.nonzero(ciel & (Y < 22) & ~m)                          # des etoiles, seulement dans le ciel libre
+    i = rng.choice(len(cy), 22, replace=False)
+    e["ia_etoiles"] = (cy[i], cx[i], rng.uniform(0, 6.3, 22), rng.uniform(0.3, 1.0, 22))
+
+
+def _ia_chat(s):
+    """Le chat a l'instant s de sa vie : (x, sprite, miroir, queue ou None, yeux ouverts)."""
+    if s < 30 or 38 <= s < 60 or s >= 88:                              # assis, il bouge la queue
+        return _IA_CHAT_X, "assis", False, True
+    if s < 38:                                                         # il se leche la patte
+        return _IA_CHAT_X, "leche" if (s * 1.6) % 2 < 1 else "leche2", False, True
+    if s < 66:                                                         # il se leve et s'en va par la droite
+        return _IA_CHAT_X + (s - 60) * 4.4, "marche1" if (s * 3) % 2 < 1 else "marche2", False, False
+    if s < 80:
+        return None
+    if s < 88:                                                         # il revient, et se rassoit
+        a = min(1.0, (s - 80) / 6.5)
+        if a < 1:
+            return _IA_CHAT_X + 26 * (1 - a), "marche1" if (s * 3) % 2 < 1 else "marche2", True, False
+        return _IA_CHAT_X, "assis", False, True
+    return None
+
+
+def _ia_passant(s):
+    """Le passant a l'instant s : (x, sprite, miroir) ou None. Il vient de la gauche, achete, repart a droite."""
+    x = 26
+    if s < 9:
+        return -9 + (x + 9) * s / 9, _IA_GENS_MARCHE[int(s * 3) % 4], False
+    if s < 11 or 12 <= s < 13.5 or 15.5 <= s < 16.5:
+        return x, _IA_GENS_DOS[0], False
+    if s < 12:
+        return x, _IA_GENS_ACHAT[0], False                            # il appuie sur un bouton
+    if s < 15.5:
+        return x, _IA_GENS_ACHAT[1], False                            # il se penche, ramasse sa canette
+    if s < 28:
+        return x + (70 - x) * (s - 16.5) / 11.5, _IA_GENS_MARCHE[int(s * 3) % 4], False
+    return None
+
+
+def _scene_distributeur(p, e, t, ecoule, dt):
+    """Un distributeur de boissons qui luit tout seul au coin d'une rue endormie : les canettes eclairees, la lumiere
+    sur le mur et le sol, des papillons de nuit autour, un chat noir assis a cote ; parfois un passant achete a
+    boire."""
+    import numpy as np
+    if "ia_fond" not in e:
+        _ia_dis_fond(e)
+    img = e["ia_fond"].copy()
+    v0, masque = e["ia_dis"]
+    v = v0.copy()
+    x0, y0 = _IA_DIS_X, _IA_DIS_Y
+    u = t / _IA_DIS_P
+    s = (u - np.floor(u)) * _IA_DIS_P
+    clac = float(np.clip(1 - abs(s - 13.0) / 1.3, 0, 1)) ** 1.5         # la canette tombe : la trappe s'eclaire
+    if clac > 0:
+        v[y0 + 30:y0 + 33, x0 + 3:x0 + 15] += np.array([110, 140, 180]) * clac
+        _halo(img, x0 + 9, y0 + 36, 3, (90, 120, 160), 0.5 * clac, 2.0)
+    led = 0.5 + 0.5 * np.sin(t * 1.1)                                   # un voyant rouge qui respire
+    v[y0 + 20, x0 + 8:x0 + 10] = np.array([90, 110, 140]) * (1 - led) + np.array([255, 70, 60]) * led
+    img = _tramer(img, 8)
+    ey, ex, ep, el = e["ia_etoiles"]
+    _pointer(img, ey, ex, (el * (0.6 + 0.4 * np.sin(t * 0.7 + ep)))[:, None] * np.array([150, 160, 200]))
+    img[masque] = v[masque]
+    # le chat (sa propre horloge, plus lente)
+    uc = (t + 41) / _IA_CHAT_P
+    chat = _ia_chat((uc - np.floor(uc)) * _IA_CHAT_P)
+    if chat:
+        cx, pose, miroir, assis = chat
+        clin = (t * 0.17) % 1 < 0.03                                   # il cligne des yeux, rarement
+        pal = {"k": (14, 14, 20), "l": (92, 120, 164), "y": (14, 14, 20) if clin else (200, 226, 96)}
+        sp = _IA_CHAT[pose]
+        cy = 51 - len(sp)
+        _ia_peindre(img, sp, pal, cx, cy, miroir)
+        if assis:                                                      # la queue : un geste lent, puis le repos
+            g = np.sin(t * 0.55) * 1.6 + np.sin(t * 1.7) * 0.5
+            q = 0 if g < -0.2 else (1 if g < 0.6 else (2 if g < 1.2 else 3))
+            _ia_peindre(img, _IA_CHAT_QUEUES[q], pal, cx + 5, cy + 2)
+    # le passant, en contre-jour devant la machine
+    ps = _ia_passant(s)
+    if ps:
+        x, sprite, miroir = ps
+        devant = float(np.clip(1 - abs(x + 3.5 - 29.5) / 12, 0, 1))
+        bord = np.array([110, 150, 200]) * (0.35 + 0.65 * devant)
+        pal = {"h": (16, 14, 18), "H": (16, 14, 18), "f": np.array([170, 130, 108]) * (0.6 - 0.3 * devant),
+               "s": (40, 42, 52), "c": (30, 32, 44), "C": bord, "d": (18, 20, 28), "p": (22, 22, 30),
+               "b": (10, 10, 14), "m": np.array([150, 120, 100]) * 0.7}
+        _ia_peindre(img, sprite, pal, x, 56 - 13, miroir)
+    # les papillons de nuit autour du bandeau lumineux : sombres devant la lumiere, clairs ailleurs
+    M = e["ia_mites"]
+    mx = x0 + 9 + 10.5 * np.sin(t * (0.8 + M[:, 0] * 0.15) + M[:, 1]) + 2.0 * np.sin(t * 2.3 + M[:, 2] * 3)
+    my = y0 + 1 + 4.5 * np.sin(t * (1.1 + M[:, 3] * 0.12) + M[:, 2]) + 1.5 * np.cos(t * 2.7 + M[:, 0] * 2)
+    yi, xi = np.floor(my).astype(int), np.floor(mx).astype(int)
+    aile = (np.sin(t * 9 + M[:, 1] * 5) > 0).astype(int)              # les ailes : un pixel d'un cote ou de l'autre
+    for dx, poids in ((0, 1.0), (1, 0.55)):
+        xx = xi + dx * (2 * aile - 1)
+        ok = (yi >= 0) & (yi < 64) & (xx >= 0) & (xx < 64)
+        yy, xx = yi[ok], xx[ok]
+        clair = img[yy, xx].max(-1) > 150
+        _poser(img, yy[clair], xx[clair], np.array([50, 60, 84]) / poids ** 0.3)
+        _pointer(img, yy[~clair], xx[~clair], np.array([226, 232, 250]) * poids)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- 4. La cabine telephonique dans la neige ----------------------------------------------------------------------
+# La campagne, la nuit bleue sous la lune : une route qui s'en va en lacet vers un petit village, des poteaux et
+# leurs fils, des sapins. Au bord, une cabine allumee ; dedans quelqu'un telephone (il bouge, se retourne, essuie la
+# buee pour regarder dehors). Sa lumiere pose un rectangle trame sur la neige. Parfois une voiture s'eloigne vers le
+# village, ses feux rouges qui rapetissent.
+
+_IA_CAB_P = 75.0                     # le cycle des gestes (et une voiture par cycle)
+_IA_CAB = (12, 22, 27, 52)           # la cabine : x de la face, x du coin, x du flanc, y du pied
+_IA_CAB_LUEUR = (255, 214, 150)
+
+_IA_TEL_PROFIL = (                   # de profil vers le fond de la cabine, le combine a l'oreille
+    (
+        "...hhh.",
+        "..hhhhh",
+        "..hhhff",
+        ".mrhhff",
+        ".a.hff.",
+        ".aCCCC.",
+        "..ccccc",
+        "..cccc.",
+        "..cccc.",
+        "..cccc.",
+        "..cccc.",
+        "..cccc.",
+    ),
+    (                                # il baisse la tete
+        ".......",
+        "...hhh.",
+        "..hhhhh",
+        ".mrhhff",
+        ".a.hhff",
+        ".aCCCC.",
+        "..ccccc",
+        "..cccc.",
+        "..cccc.",
+        "..cccc.",
+        "..cccc.",
+        "..cccc.",
+    ),
+)
+_IA_TEL_FACE = (                     # tourne vers nous (vers la vitre), le combine a l'oreille ; il essuie la buee
+    (
+        "..hhh..",
+        ".hhhhh.",
+        ".hfffhr",
+        "..fffrm",
+        ".CCCCCa",
+        "CcccccC",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        ".ccccc.",
+        ".ccccc.",
+    ),
+    (
+        "..hhh..",
+        ".hhhhh.",
+        ".hfffhr",
+        "m.fffrm",
+        "aCCCCCa",
+        "acccccC",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        "dcccccd",
+        ".ccccc.",
+        ".ccccc.",
+    ),
+)
+
+
+def _ia_cab_route(u):
+    """Un point de la route (u = 0 au bord droit de l'image, 1 au village) : (x, y, largeur)."""
+    import numpy as np
+    pts = np.array([(70.0, 50.0), (44.0, 45.0), (34.0, 40.0), (44.0, 37.0), (51.0, 35.2)])
+    u = np.clip(u, 0, 1) * (len(pts) - 1)
+    i = np.minimum(np.floor(u).astype(int), len(pts) - 2)
+    f = u - i
+    f = f * f * (3 - 2 * f)
+    p = pts[i] * (1 - f)[..., None] + pts[i + 1] * f[..., None]
+    return p[..., 0], p[..., 1], 0.8 * (p[..., 1] - 34.5)
+
+
+def _ia_cab_fond(e):
+    """La campagne enneigee sous la lune (calque trame) et la cabine, les poteaux, les sapins (calque net)."""
+    import numpy as np
+    Y, X = _xy()
+    img = _ia_niv((24, 36, 90), 2) * 0.8 + np.clip((Y - 8) / 26, 0, 1)[..., None] ** 1.5 * np.array([10.0, 17, 34])
+    _halo(img, 46, 9, 5, (70, 84, 120), 0.8)                            # la lune et son halo
+    lune = np.hypot(X - 46, Y - 9) < 2.8
+    img[lune] = (226, 232, 214)
+    img[lune & (np.hypot(X - 47.4, Y - 8.2) < 2.4)] = (24, 32, 62)     # un croissant
+    ciel = ~lune & (np.hypot(X - 46, Y - 9) > 4)
+    x1 = X[0]
+    colline = 33.5 + 1.8 * np.sin(x1 * 0.08 + 0.4) + 1.2 * np.sin(x1 * 0.21 + 2) - 2.5 * np.exp(-((x1 - 12) / 9) ** 2)
+    neige_loin = _ia_niv((110, 130, 190), 3)
+    sous = Y >= colline[None, :]
+    img[sous] = neige_loin
+    img[sous & (Y < colline[None, :] + 1)] = _ia_niv((130, 150, 210), 4) * 0.8
+    ciel &= ~sous
+    for bx, bh in ((3, 6), (6, 4), (9, 7), (58, 5), (61, 7)):          # des bois au loin, sur les cretes
+        f = (Y >= colline[bx] - bh) & (Y < colline[bx] + 1) & (np.abs(X - bx) <= (Y - colline[bx] + bh) * 0.35)
+        img[f] = _ia_niv((20, 36, 50), 2)
+        ciel &= ~f
+    champ = Y >= 37                                                    # la neige du champ, bleue de lune
+    clair, ombre = _ia_niv((110, 130, 190), 4), _ia_niv((100, 120, 180), 3)
+    img[champ] = clair
+    img[champ & (Y < 40)] = (clair + ombre) / 2                       # au loin, un peu plus sombre
+    for cx, cy, dx in ((44, 48, 9), (57, 55, 7), (40, 60, 6), (31, 43, 5)):   # des congeres : leur ombre douce
+        y = cy - ((X - cx) / dx) ** 2 * 1.5
+        img[(np.abs(Y - y) < 0.5) & (np.abs(X - cx) < dx) & champ] = ombre
+    xf_, xs_, yb_ = _IA_CAB[0], _IA_CAB[2], _IA_CAB[3]                 # l'ombre de la cabine sous la lune
+    for d in range(1, 8):
+        img[yb_ + d // 2, max(0, xf_ - d * 2):max(0, xs_ - d * 2 - 3)] = ombre
+    # la route : neige tassee, plus sombre, deux ornieres
+    uu = np.linspace(0, 1, 400)
+    rx, ry, rw = _ia_cab_route(uu)
+    route = np.zeros((64, 64), bool)
+    ornieres = np.zeros((64, 64), bool)
+    for x, y, w in zip(rx, ry, rw):
+        yi = int(round(y))
+        a, b = int(round(x - w / 2)), int(round(x + w / 2))
+        route[yi, max(a, 0):max(min(b + 1, 64), 0)] = True
+        for o in (-0.25, 0.25):
+            xo = int(round(x + o * w))
+            if 0 <= xo < 64 and w > 4:
+                ornieres[yi, xo] = True
+    img[route] = _ia_niv((80, 92, 130), 3)
+    img[ornieres] = _ia_niv((60, 70, 104), 3) * 0.75
+    # le village : quelques maisons, un clocher, des fenetres chaudes
+    village = (X >= 46) & (X < 57) & (Y >= 33) & (Y < 36)
+    img[village] = (16, 18, 30)
+    img[27:33, 51] = (16, 18, 30)
+    img[30:33, 50:53] = (16, 18, 30)
+    img[32:34, 47:50] = (16, 18, 30)
+    img[31:33, 54:56] = (16, 18, 30)
+    for fx, fy in ((47, 34), (50, 35), (53, 34), (55, 35), (48, 33)):
+        img[fy, fx] = _ia_niv((255, 190, 100), 6)
+        _halo(img, fx + 0.5, fy + 0.5, 1.3, (120, 80, 40), 0.35)
+    # la lumiere de la cabine : une lueur autour, et le rectangle trame qu'elle pose sur la neige devant
+    xf, xc, xs, yb = _IA_CAB
+    lumi = np.zeros((64, 64))
+    for y in range(yb + 1, 64):                                        # devant : le rectangle des vitres, qui s'evase
+        d = y - yb
+        a, b = xf - d * 0.3, xc + 1 + d * 0.55
+        u = (X[y] - a) / max(b - a, 1)
+        bande = np.clip(np.minimum(u, 1 - u) * 8, 0, 1) * (1 - 0.55 * np.exp(-((u - 0.5) / 0.06) ** 2))
+        lumi[y] += bande * np.exp(-d / 8.0) * 1.05
+    lumi += np.exp(-np.hypot((X - 19) / 9.0, (Y - 36) / 13.0) ** 1.4) * 0.35
+    lumi += np.exp(-np.hypot((X - 19.5) / 11.0, (Y - yb - 1) / 2.5) ** 1.5) * 0.45 * (Y > yb)   # au pied
+    img += lumi[..., None] * np.array(_IA_CAB_LUEUR, float) * 0.85
+    e["ia_fond"] = img
+    e["ia_lumi"] = np.clip(np.exp(-np.hypot((X - 19) / 10.0, (Y - 38) / 15.0) ** 1.4) * 1.2 + lumi * 0.5, 0, 1)
+    e["ia_route"] = route
+    # le calque net : sapins, poteaux et fils, la cabine (sans ce qui bouge dedans)
+    v = np.zeros((64, 64, 3))
+    m = np.zeros((64, 64), bool)
+    for sx, sb, sh in ((2.5, 55, 24), (7.5, 50, 15), (31, 42, 9), (35, 41.5, 7), (-1, 60, 30)):   # des sapins
+        corps = (Y >= sb - sh) & (Y < sb) & (np.abs(X - sx) <= (Y - (sb - sh)) * 0.33 + 0.5)
+        m |= corps
+        v[corps] = (10, 22, 26)
+        etage = corps & ((Y.astype(int) - int(sb - sh)) % 4 == 1) & (X <= sx + 0.5)
+        v[etage] = (120, 140, 186)                                     # la neige sur les branches, cote lune
+        v[corps & ((Y.astype(int) - int(sb - sh)) % 4 == 2) & (X < sx - 0.5)] = (70, 86, 126)
+    sommets = []
+    for u in (0.08, 0.3, 0.52, 0.72, 0.9):                             # les poteaux, le long de la route
+        x, y, w = (float(a) for a in _ia_cab_route(u))
+        x, y = x + w * 0.6 + 1, y - w * 0.12
+        h = 1.25 * (y - 34.5) + 1
+        if x < 63:
+            m[int(y - h):int(y) + 1, int(x)] = True
+            v[int(y - h):int(y) + 1, int(x)] = (26, 26, 34)
+            if h > 8:
+                m[int(y - h) + 1, int(x) - 2:int(x) + 3] = True
+                v[int(y - h) + 1, int(x) - 2:int(x) + 3] = (26, 26, 34)
+        sommets.append((x, y - h + 1))
+    sommets.append((float(xs), 25.0))                                  # et le fil de la cabine
+    sommets.sort()
+    for (xa, ya), (xb, yb2) in zip(sommets, sommets[1:]):              # les fils, qui pendent entre deux poteaux
+        for x in range(int(np.ceil(xa)), int(xb) + 1):
+            f = (x - xa) / max(xb - xa, 1e-6)
+            y = int(round(ya + (yb2 - ya) * f + 4 * f * (1 - f) * min(3.0, (xb - xa) * 0.12)))
+            if 0 <= y < 64 and 0 <= x < 64 and not m[y, x]:
+                m[y, x], v[y, x] = True, (30, 32, 44)
+    m[20:yb + 1, xf:xs + 1] = True                                     # la cabine
+    v[20:yb + 1, xf:xs + 1] = (30, 34, 40)
+    v[20, xf + 1:xs] = (200, 208, 230)                                 # la neige sur le toit
+    v[19, xf + 2:xs - 1], m[19, xf + 2:xs - 1] = (160, 170, 204), True
+    v[21:23, xf:xs + 1] = (44, 46, 52)
+    v[23:26, xf + 1:xc] = (240, 200, 110)                              # le bandeau allume, son petit combine
+    v[24, xf + 3:xf + 8] = (60, 50, 40)
+    v[23, xf + 3], v[23, xf + 7] = (60, 50, 40), (60, 50, 40)
+    v[23:26, xc + 1:xs] = (170, 136, 80)
+    e["ia_cabine"] = (v, m)
+
+
+def _ia_cab_dedans(img, t, s):
+    """L'interieur de la cabine (lumiere, telephone, la personne), la buee sur les vitres, puis les montants."""
+    import numpy as np
+    xf, xc, xs, yb = _IA_CAB
+    y0, y1 = 27, 45                                                    # la partie vitree
+    Y, X = _xy()
+    lueur = np.array(_IA_CAB_LUEUR, float)
+    img[y0:y1 + 1, xf + 1:xc] = lueur * (0.7 - 0.016 * (Y[y0:y1 + 1, xf + 1:xc] - y0))[..., None]   # le fond eclaire
+    img[y0, xf + 1:xc] = (255, 242, 214)                               # la lampe du plafond
+    img[y0:y1 + 1, xc + 1:xs] = lueur * 0.42                           # le flanc, vu de biais
+    img[31:35, xc - 2:xc] = (44, 40, 40)                               # le telephone, au mur de droite
+    img[32, xc - 2] = (160, 150, 130)
+    img[35:40, xc - 1] = (34, 30, 30)                                  # son fil
+    # la personne : de profil le plus souvent ; elle se retourne vers la vitre, essuie la buee, regarde dehors
+    pal = {"h": (40, 30, 28), "f": (214, 164, 124), "r": (26, 26, 30), "m": (200, 152, 118), "a": (40, 48, 76),
+           "C": (120, 110, 120), "c": (44, 54, 86), "d": (30, 36, 60)}
+    boite = (xf + 1, xc, y0 + 1, y1 + 1)
+    face = 14 <= s < 40
+    if face:
+        dx = 1 if (s > 27 and (s * 0.4) % 2 < 1) else 0
+        _ia_peindre(img, _IA_TEL_FACE[0], pal, xf + 1 + dx, 33, boite=boite)
+        if 22 <= s < 25.5:                                             # sa main qui essuie la vitre, en rond
+            w = (s - 22) * 5.0
+            hx, hy = xf + 4.5 + 1.8 * np.cos(w), 37.5 + 1.2 * np.sin(w)
+            img[int(hy):int(hy) + 2, int(hx):int(hx) + 2] = pal["m"]
+    else:
+        baisse = (s * 0.21) % 1 < 0.3
+        lean = 1 if 46 <= s < 54 else 0
+        _ia_peindre(img, _IA_TEL_PROFIL[1 if baisse else 0], pal, xf + 1 + lean, 33, boite=boite)
+    # la buee : laiteuse en bas, plus dense la ou il souffle ; une trouee la ou il a essuye, qui se referme lentement
+    zone = (slice(y0 + 1, y1 + 1), slice(xf + 1, xs))
+    yy, xx = Y[zone], X[zone]
+    a = 0.2 + 0.45 * np.clip((yy - y0) / (y1 - y0), 0, 1) ** 1.3
+    a = a + 0.18 * np.exp(-((xx - (xf + 5)) / 4.0) ** 2 - ((yy - 36) / 3.0) ** 2)
+    a = a * (0.9 + 0.1 * np.sin(xx * 1.1 + yy * 0.5 + t * 0.15))
+    k = float(np.clip((s - 22) / 3.0, 0, 1))                          # la trouee grandit sous la main...
+    if s >= 22:
+        age = s - 25.0
+        refait = float(np.clip(age / 32.0, 0, 1)) if age > 0 else 0.0  # ...puis la buee revient
+        trou = np.clip(1.6 - np.hypot((xx - (xf + 4.5)) / (3.2 * k + 0.6), (yy - 37.5) / (2.6 * k + 0.6)), 0, 1)
+        a = a * (1 - trou * (1 - refait) ** 0.8)
+    a = np.clip(a, 0, 0.85)
+    img[zone] = img[zone] * (1 - a[..., None]) + np.array([200, 204, 206]) * a[..., None]
+    img[y0:yb + 1, xf] = (30, 34, 40)                                  # les montants, le bas plein
+    img[y0:yb + 1, xc] = (44, 48, 56)
+    img[y0:yb + 1, xs] = (22, 24, 30)
+    img[31, xf:xc] = (40, 44, 52)                                      # une traverse fine
+    img[31, xc:xs] = (32, 34, 40)
+    img[y1 + 1:yb + 1, xf:xs + 1] = (40, 44, 54)
+    img[y1 + 1, xf:xs + 1] = (64, 66, 74)
+    img[y1 + 2:yb, xc + 1:xs] = (30, 32, 40)
+    img[yb, xf - 1:xs + 2] = (150, 160, 196)                           # la neige au pied
+
+
+def _scene_cabine(p, e, t, ecoule, dt):
+    """Une cabine telephonique allumee dans la neige, au bord d'une route de campagne, la nuit bleue : dedans quelqu'un
+    telephone et la buee couvre les vitres ; sa lumiere dessine un rectangle trame sur la neige."""
+    import numpy as np
+    if "ia_fond" not in e:
+        _ia_cab_fond(e)
+    img = e["ia_fond"].copy()
+    u = t / _IA_CAB_P
+    s = (u - np.floor(u)) * _IA_CAB_P
+    voiture = None
+    if 28 <= s < 44:                                                   # une voiture s'en va vers le village
+        a = (s - 28) / 16
+        uu = 1 - (1 - a) ** 2                                          # elle ralentit en s'eloignant
+        vx, vy, vw = (float(q) for q in _ia_cab_route(uu))
+        fin = min(1.0, (1 - a) / 0.25)                                 # et s'efface dans les lumieres du village
+        voiture = (vx, vy, max(vw * 0.62, 0.8), fin)
+        hx, hy, _ = _ia_cab_route(min(1.0, uu + 0.12))
+        _halo(img, float(hx), float(hy), 2.0 + vw * 0.25, (255, 226, 170), 0.6 * (1 - a * 0.6) * fin, 1.6)
+        _halo(img, vx, vy, 0.8 + vw * 0.2, (220, 40, 30), 0.5 * (1 - a * 0.5) * fin)
+    img = _tramer(img, 8)
+    if voiture:                                                        # vue de derriere : une ombre, deux feux
+        vx, vy, w, fin = voiture
+        if w >= 2.5:
+            h = max(1, int(round(w * 0.35)))
+            xa, xb = int(round(vx - w / 2)), int(round(vx + w / 2))
+            img[int(vy) - h:int(vy) + 1, max(xa, 0):max(min(xb + 1, 64), 0)] = (14, 16, 26)
+            c = max(1, int(round(w * 0.3)))
+            img[int(vy) - h - c:int(vy) - h, max(xa + 1, 0):max(min(xb, 64), 0)] = (20, 22, 34)
+            _pointer(img, [vy - 1, vy - 1], [xa, xb], [(255, 50, 40), (255, 50, 40)])
+        else:
+            _pointer(img, [vy], [vx], [np.array([255, 60, 40]) * (0.4 + 0.6 * fin) * fin])
+    v, m = e["ia_cabine"]                                              # devant elle : sapins, poteaux, la cabine
+    img[m] = v[m]
+    _ia_cab_dedans(img, t, s)
+    _ia_flocons(e, img, t, dt, e["ia_lumi"], (255, 226, 176), n=50, sol=(36, 64), froid=(170, 184, 225))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# LES INSTANTS, lot B : les gens et leurs lumieres. Une echoppe de ramen sous la bruine, une laverie au neon, un
+# petit cafe ouvert tard, une station-service au milieu de rien. Pixel art de nuit : la lumiere tramee (_tramer),
+# les silhouettes et les sprites peints nets par-dessus, des petites vies qui font une chose simple.
+
+_IB_MOTIFS = {}
+
+
+def _ib_motif(lignes):
+    """Un sprite en chaines de caracteres -> {caractere: (ys, xs)} ('.' est transparent), garde en cache."""
+    import numpy as np
+    m = _IB_MOTIFS.get(lignes)
+    if m is None:
+        m = {}
+        for y, ligne in enumerate(lignes):
+            for x, c in enumerate(ligne):
+                if c != ".":
+                    m.setdefault(c, ([], []))
+                    m[c][0].append(y)
+                    m[c][1].append(x)
+        m = {c: (np.array(a), np.array(b)) for c, (a, b) in m.items()}
+        _IB_MOTIFS[lignes] = m
+    return m
+
+
+def _ib_dessin(img, lignes, x, y, pal, miroir=False):
+    """Pose un sprite, son coin haut-gauche en (x, y), avec la palette {caractere: couleur} (absent = transparent)."""
+    larg = len(lignes[0])
+    x, y = int(round(x)), int(round(y))
+    for c, (ys, xs) in _ib_motif(lignes).items():
+        if c in pal:
+            _poser(img, ys + y, (larg - 1 - xs if miroir else xs) + x, pal[c])
+
+
+def _ib_trait(img, x0, y0, x1, y1, couleur):
+    """Un trait d'un pixel entre deux points."""
+    import numpy as np
+    s = np.linspace(0, 1, int(max(abs(x1 - x0), abs(y1 - y0))) + 2)
+    _poser(img, np.round(y0 + (y1 - y0) * s), np.round(x0 + (x1 - x0) * s), couleur)
+
+
+def _ib_tamponner(ys, xs, vals):
+    """Des points poses entre les pixels (partages sur leurs quatre voisins) -> un champ 64 x 64 : ils glissent
+    sans sauter de pixel en pixel."""
+    import numpy as np
+    ys, xs, vals = np.asarray(ys, float), np.asarray(xs, float), np.asarray(vals, float)
+    y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+    fy, fx = ys - y0, xs - x0
+    idx, poids = [], []
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        ok = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+        idx.append((yy * 64 + xx)[ok])
+        poids.append((w * vals)[ok])
+    return np.bincount(np.concatenate(idx), np.concatenate(poids), minlength=4096).reshape(64, 64)
+
+
+def _ib_vapeur(e, cle, t, x, y, n, haut, vitesse, larg, vent, force):
+    """Un panache de vapeur : n bouffees qui montent de (x, y) sur `haut` pixels, s'elargissent, ondulent et
+    s'effilochent. Tout est fonction de t (pas d'etat qui derive) ; rend un champ 64 x 64 (0..~1)."""
+    import numpy as np
+    if cle not in e:
+        r = e["rng"]
+        e[cle] = (r.uniform(0, 1, n), r.uniform(-1, 1, n), r.uniform(0, 2 * np.pi, n), r.uniform(0.75, 1.25, n))
+    ph, dx0, pp, vv = e[cle]
+    age = (ph + t * vitesse * vv) % 1.0
+    ys = y - age * haut
+    ondule = np.sin(age * 7 + pp + t * 0.8) * (0.4 + age * larg) + np.sin(age * 3.1 - t * 0.5 + pp * 2) * age * 1.5
+    xs = x + dx0 * larg * 0.35 + vent * age ** 1.5 * haut / 10 + ondule
+    a = np.sin(np.pi * np.clip(age * 1.6, 0, 1)) ** 0.7 * (1 - age) ** 1.3 * force
+    buf = _ib_tamponner(ys, xs, a)
+    large = age > 0.25                                           # en montant, la bouffee s'etale sur ses voisins
+    for ddx, ddy in ((-1, 0), (1, 0), (0, -1)):
+        buf += _ib_tamponner(ys[large] + ddy, xs[large] + ddx, a[large] * np.clip(age[large] * 1.2 - 0.2, 0, 0.6))
+    return buf
+
+
+_IB_MARCHES = tuple((k / 7) ** 2 * 255 for k in range(8))     # les marches de _tramer(img, 8)
+
+
+def _ib_niv(couleur, k):
+    """La couleur ramenee pile sur la marche k de la trame : un aplat qui reste uni une fois trame."""
+    m = max(couleur)
+    return tuple(c * _IB_MARCHES[k] / m for c in couleur)
+
+
+def _ib_lueur(img, x, y, rayon, couleur, force=1.0, aplati=1.0):
+    """Une lueur ronde a bord fini ((1 - d / rayon)^2) : elle s'arrete net, sans longue traine qui ferait tramer
+    tout un aplat."""
+    import numpy as np
+    r = int(rayon) + 1
+    x0, x1 = max(0, int(x) - r), min(64, int(x) + r + 2)
+    y0, y1 = max(0, int((y - r / aplati)) - 1), min(64, int(y + r / aplati) + 2)
+    if x0 >= x1 or y0 >= y1:
+        return
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    k = np.clip(1 - np.hypot(xx - x, (yy - y) * aplati) / rayon, 0, 1) ** 2
+    img[y0:y1, x0:x1] += (k * force)[..., None] * np.asarray(couleur, float)
+
+
+def _ib_calque():
+    """Un calque net vide (image, masque) et son pinceau : peint(masque, couleur)."""
+    import numpy as np
+    net, nm = np.zeros((64, 64, 3)), np.zeros((64, 64), bool)
+
+    def peint(m, c):
+        net[m] = c
+        nm[m] = True
+    return net, nm, peint
+
+
+# --- 1. L'echoppe de ramen ---------------------------------------------------------------------------------------
+
+_IB_RAMEN_SOL = 52                        # la premiere ligne de la chaussee
+_IB_RAMEN_NOREN = (                       # quatre signes sur les rideaux : des traits qui suggerent, rien de lisible
+    ("www", "..w", ".w."),
+    ("...", "www", "..."),
+    ("w..", ".w.", "w.w"),
+    ("w..", "..w", "ww."),
+)
+_IB_RAMEN_TETE = ("..rrr..", ".rhhhr.", ".hhhhh.", ".hhhhh.", "..hhh..")
+_IB_RAMEN_DOS = (
+    "....nnn....",
+    "..rjjjjjr..",
+    ".rjjjjjjjq.",
+    ".jjjjjjjjq.",
+    ".jjjjjjjjq.",
+    ".jjjjjjjjq.",
+    "..jjjjjjq..",
+    "..jjjjjjq..",
+    "..jjjjjjq..",
+    "..jjjjjjq..",
+    "..ppppppp..",
+    "..ppppppp..",
+)
+_IB_RAMEN_CUISINIER = (
+    "..cccc..",
+    ".wwwwwwh",
+    "..pppp.h",
+    "..oppo..",
+    "...oo...",
+    ".jjjjjj.",
+    "jjjaajjj",
+    "jJjaajJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+    "jJaaaaJj",
+)
+_IB_RAMEN_LANTERNE = (".kkk.", "rRRRr", "RLLLR", "RLWLR", "rLWLr", "RLWLR", "RLLLR", "rRRRr", ".kkk.", "..t..")
+
+
+def _ib_ramen_decor(e):
+    """Le decor fixe de l'echoppe : le calque de lumiere (a tramer) et le calque net (pose par-dessus)."""
+    import numpy as np
+    Y, X = _xy()
+    S = _IB_RAMEN_SOL
+    f = _degrade(_ib_niv((8, 9, 20), 1), (15, 13, 28), 0, 18)        # le ciel de la ville, sa lueur derriere les toits
+    for x0, x1, h in ((0, 4, 10), (4, 11, 15), (11, 20, 5), (20, 30, 7), (30, 41, 3), (41, 49, 6), (49, 56, 9),
+                      (56, 64, 4)):
+        f[h:S, x0:x1] = _ib_niv((8, 8, 14), 1)                       # les immeubles du fond, en silhouette
+    for y, x, c in ((13, 1, 0), (19, 1, 2), (25, 1, 0), (18, 6, 1), (18, 8, 2), (24, 6, 0), (24, 8, 0), (30, 8, 2),
+                    (36, 6, 1), (8, 14, 0), (8, 17, 2), (9, 24, 1), (9, 27, 0), (5, 34, 2), (5, 37, 0), (8, 44, 1),
+                    (11, 51, 0), (7, 58, 0), (7, 61, 2), (13, 58, 2), (13, 61, 1), (19, 61, 0), (25, 58, 0)):
+        f[y:y + 2, x] = ((110, 74, 34), (46, 60, 104), (24, 20, 26))[c]   # des fenetres, quelques-unes allumees
+    f[S:] = _degrade(_ib_niv((10, 10, 16), 2), _ib_niv((10, 10, 16), 2), S, 64)[S:]   # la chaussee mouillee
+    mur = np.zeros((64, 64, 3)) + _ib_niv((40, 24, 14), 2)          # l'interieur : le mur du fond sous l'ampoule
+    _halo(mur, 29, 11, 7.5, (255, 160, 76), 1.3)
+    dedans = (X >= 10) & (X <= 48) & (Y >= 13) & (Y <= 34)
+    f[dedans] = mur[dedans]
+    f[35, 6:53] = np.array([180.0, 116, 62]) * (0.5 + 0.5 * np.exp(-np.abs(np.arange(6, 53) - 29) / 13))[:, None]
+    f[36, 6:53] = _ib_niv((34, 20, 13), 2)
+    f[37:47, 8:51] = _ib_niv((36, 22, 15), 2)                         # la facade du comptoir, dans l'ombre
+    f[47:S, 8:51] = _ib_niv((14, 10, 12), 1)                          # le dessous de la charrette
+    sol = np.zeros((64, 64, 3))                                       # la flaque de lumiere devant
+    _halo(sol, 29, S, 9, (255, 140, 60), 0.75, 2.4)
+    reflet = np.exp(-(Y - S) / 6.0) * np.clip(1 - np.abs(X - 29) / 21, 0, 1) ** 0.7 * (Y >= S)
+    sol += reflet[..., None] * np.array([150.0, 86, 40]) * 0.9
+    e["fond"], e["sol"] = f, sol[S:]
+    e["eclair"] = np.clip(mur.max(2) / 190, 0, 1) * dedans + np.clip(sol.max(2) / 60, 0, 1) * 0.4
+    net, nm, peint = _ib_calque()                                     # le calque net, par-dessus la trame
+    for y, x0, x1, c in ((9, 11, 47, (34, 22, 18)), (10, 9, 49, (44, 28, 21)), (11, 7, 51, (52, 33, 24)),
+                         (12, 6, 52, (118, 72, 40)), (13, 9, 49, (56, 32, 20))):
+        peint((Y == y) & (X >= x0) & (X <= x1), c)
+    peint((Y == 9) & (X >= 11) & (X <= 47) & (X % 4 == 1), (60, 40, 30))   # les planches du toit
+    peint((Y == 12) & (X >= 52) & (X <= 54), (70, 44, 28))           # le bras qui porte la lanterne
+    peint(((X == 9) | (X == 49)) & (Y >= 13) & (Y <= 36), (30, 19, 14))
+    for i in range(4):                                                # les noren : quatre pans d'indigo
+        x0 = 10 + i * 10
+        pan = (X >= x0) & (X <= x0 + 8) & (Y >= 14) & (Y <= 18)
+        peint(pan, (24, 26, 62))
+        peint(pan & (Y >= 17), (34, 36, 84))                          # le bas, que la lampe traverse
+        peint(pan & (Y == 18) & ((X - x0) % 3 == 1), (44, 46, 102))
+        for gy, ligne in enumerate(_IB_RAMEN_NOREN[i]):
+            for gx, c in enumerate(ligne):
+                if c == "w":
+                    peint((Y == 15 + gy) & (X == x0 + 3 + gx), (190, 178, 156))
+    peint((Y == 25) & (X >= 10) & (X <= 48), (46, 27, 17))           # l'etagere et ses bols
+    for x, h in ((11, 2), (13, 3), (40, 2), (42, 3), (45, 2)):
+        bol = (X >= x) & (X <= x + 1) & (Y >= 25 - h) & (Y < 25)
+        peint(bol, (190, 170, 140))
+        peint(bol & (Y == 25 - h), (226, 210, 182))
+    for x in range(36, 48, 2):                                        # le menu : des fiches de bois au mur
+        peint((X == x) & (Y >= 19) & (Y <= 22), (170, 142, 98))
+        peint((X == x) & (Y == 20 + (x // 2) % 2), (74, 42, 26))
+    pot = (np.abs(X - 16) <= 4.5 - (Y >= 33)) & (Y >= 28) & (Y <= 34)   # la grande marmite
+    peint(pot, (62, 62, 68))
+    peint(pot & (X <= 13), (134, 130, 124))                           # son flanc qui prend la lampe
+    peint(pot & (X == 14), (96, 94, 96))
+    peint(pot & (Y == 30), (44, 44, 50))
+    peint((Y == 28) & (np.abs(X - 16) <= 5), (204, 194, 172))         # le bord, brillant
+    peint((Y == 27) & (np.abs(X - 16) <= 3), (90, 88, 90))
+    peint(((X == 21) & (Y == 26)) | ((X == 22) & (Y == 25)), (150, 146, 140))   # le manche de la louche
+    peint((Y >= 37) & (Y <= 46) & (X >= 8) & (X <= 50) & ((X - 8) % 7 == 0), (20, 12, 9))
+    peint((Y == 41) & (X >= 8) & (X <= 50), (24, 15, 11))
+    for rx in (14.5, 43.5):                                           # les roues
+        d = np.hypot(X - rx, Y - 49.0)
+        peint((d <= 3.6) & (d >= 2.4), (44, 29, 21))
+        peint((d <= 3.6) & (d >= 2.4) & (Y <= 47), (70, 46, 31))
+        peint(d < 1.0, (58, 38, 27))
+    for sx in (17, 35):                                               # les tabourets
+        peint((Y >= 44) & (Y <= S - 1) & ((X == sx + 1) | (X == sx + 5)), (56, 35, 24))
+        peint((Y == 43) & (X >= sx) & (X <= sx + 6), (104, 66, 40))
+    _ib_trait(net, 53, 39, 55, S - 1, (30, 30, 52))                  # un parapluie ferme, appuye au comptoir
+    _ib_trait(net, 54, 40, 55, 46, (44, 44, 76))
+    _poser(net, [38, 37, 37], [52, 52, 51], [(70, 52, 40)] * 3)
+    e["net"] = (net, nm | (net.sum(2) > 0))
+
+
+def _ib_ramen_cuisinier(img, t):
+    """Le cuisinier derriere le comptoir : il remue la marmite, egoutte les nouilles, essuie le comptoir."""
+    import numpy as np
+    cx, hy = 25, 19
+    pal = {"c": (24, 17, 15), "w": (228, 222, 206), "h": (184, 178, 164), "p": (218, 162, 114), "o": (160, 106, 72),
+           "j": (182, 172, 150), "J": (130, 120, 104), "a": (36, 38, 76)}
+    manche, peau = (176, 166, 146), (218, 162, 114)
+    ph = (t / 30.0) % 1.0                                              # son cycle : 30 s
+    ep_g, ep_d = (cx, hy + 6), (cx + 7, hy + 6)
+    outil, regard = None, 0
+    if ph < 0.38:                                                      # il remue le bouillon a la louche
+        a = t * 2.2
+        main_g = (20.5 + 1.4 * np.cos(a), 26.0 + 0.6 * np.sin(a))
+        main_d = (cx + 7, hy + 15)
+        outil, regard = "louche", -1
+    elif ph < 0.55:                                                    # il egoutte les nouilles, d'un coup sec
+        main_g = (20, 21 if (t * 2.6) % 1.0 < 0.5 else 23.4)
+        main_d = (cx + 7, hy + 15)
+        outil, regard = "tamis", -1
+    elif ph < 0.84:                                                    # il essuie le comptoir, d'un geste lent
+        main_g = (cx, hy + 15)
+        main_d = (cx + 10 + 3.0 * np.sin(t * 1.2), hy + 15)
+        outil = "torchon"
+    else:                                                              # il souffle, les mains sur le comptoir
+        main_g = (cx - 1, hy + 15)
+        main_d = (cx + 8, hy + 15)
+    _ib_dessin(img, _IB_RAMEN_CUISINIER, cx, hy, pal)
+    if regard:                                                         # la tete tournee vers la marmite
+        _poser(img, [hy + 2, hy + 3], [cx + 5, cx + 5], [pal["o"]] * 2)
+    for (sx, sy), (mx, my) in ((ep_g, main_g), (ep_d, main_d)):
+        ex = sx + (mx - sx) * 0.4 + (-1 if mx < sx else 1)
+        ey = sy + max(3.0, (my - sy) * 0.6)
+        _ib_trait(img, sx, sy, ex, ey, manche)
+        _ib_trait(img, ex, ey, mx, my, manche)
+        _poser(img, [round(my)], [round(mx)], [peau])
+    mx, my = main_g if outil in ("louche", "tamis") else main_d
+    mx, my = round(mx), round(my)
+    if outil == "louche":
+        _ib_trait(img, mx, my + 1, mx - 1, my + 3, (176, 172, 164))
+    elif outil == "tamis":
+        _ib_trait(img, mx - 1, my + 1, mx - 2, my + 2, (150, 140, 120))
+        _poser(img, [my + 3, my + 3, my + 4], [mx - 3, mx - 2, mx - 3], [(208, 192, 150)] * 3)
+    elif outil == "torchon":
+        _poser(img, [my, my], [mx - 1, mx + 1], [(222, 218, 202)] * 2)
+
+
+def _ib_ramen_client(img, t, rouge):
+    """Le client, de dos sur son tabouret : il pioche, porte les baguettes a la bouche, boit le bouillon."""
+    import numpy as np
+    x0, y0 = 33, 29
+    q = tuple(np.array([40.0, 46, 50]) + np.array([150.0, 40, 26]) * rouge)
+    pal = {"h": (16, 13, 16), "r": (150, 96, 54), "n": (24, 36, 40), "j": (30, 46, 50), "q": q, "p": (18, 18, 26)}
+    cyc = t / 6.0
+    n, ph = int(np.floor(cyc)), cyc % 1.0
+    dy, coudes = 0, ()
+    if n % 5 == 2:                                                     # il leve le bol a deux mains, et boit
+        if 0.12 < ph < 0.8:
+            dy = -1
+            coudes = ((x0, y0 + 2), (x0 + 10, y0 + 2))
+    elif ph < 0.14 or 0.40 < ph < 0.54:                               # il pioche dans le bol
+        dy = 1
+        coudes = ((x0 + 10, y0 + 4),)
+    elif ph < 0.28 or 0.54 < ph < 0.68:                               # les baguettes a la bouche
+        coudes = ((x0 + 10, y0 + 2),)
+    _ib_dessin(img, _IB_RAMEN_DOS, x0, y0, pal)
+    _ib_dessin(img, _IB_RAMEN_TETE, x0 + 2, y0 - 5 + dy, pal)
+    for cx, cy in coudes:
+        _poser(img, [cy, cy + 1], [cx, cx], [pal["j"], pal["j"]])
+        _poser(img, [cy - 1], [cx], [q if cx > x0 + 5 else pal["r"]])
+
+
+def _scene_ramen(p, e, t, ecoule, dt):
+    """Une echoppe de ramen sous la bruine : la lanterne rouge qui se balance, les noren, la vapeur de la marmite
+    dans la lumiere, le cuisinier qui s'active, un client de dos qui mange."""
+    import numpy as np
+    Y, X = _xy()
+    S = _IB_RAMEN_SOL
+    if "fond" not in e:
+        _ib_ramen_decor(e)
+        r = e["rng"]
+        e["bruine"] = (r.uniform(0, 64, 46), r.uniform(0, 72, 46), r.uniform(0.8, 1.2, 46))
+    theta = 0.17 * np.sin(t * 0.83) + 0.06 * np.sin(t * 1.91 + 1.3)    # la lanterne : un pendule lent
+    piv_x, piv_y = 53.5, 12.0
+    lx, ly = piv_x + np.sin(theta) * 7.5, piv_y + np.cos(theta) * 7.5
+    souffle = 0.92 + 0.05 * np.sin(t * 2.3) + 0.03 * np.sin(t * 5.1)  # la bougie dedans respire
+    img = e["fond"].copy()
+    _halo(img, lx, ly, 5.0, (255, 70, 36), 0.8 * souffle)
+    lum = np.zeros((64, 64, 3))
+    _halo(lum, lx, S + 1, 4.5, (255, 60, 30), 0.35 * souffle, 2.5)   # sa flaque sur la chaussee
+    _halo(lum, lx, S + 6, 2.0, (255, 60, 30), 0.30 * souffle, 0.22)  # et son reflet etire
+    rides = 0.62 + 0.38 * np.sin(Y[S:] * 1.7 - t * 1.1 + np.sin(X[S:] * 0.3 + t * 0.4) * 1.5)
+    img[S:] += (lum[S:] + e["sol"]) * rides[..., None]                # des rides lentes cassent les reflets
+    img = _tramer(img, 8)
+    net, masque = e["net"]
+    img[masque] = net[masque]
+    rouge = souffle * float(np.clip(1.1 - abs(lx - 53.5) * 0.08, 0, 1))
+    _ib_ramen_cuisinier(img, t)
+    _ib_ramen_client(img, t, rouge)
+    pal = {c: tuple(np.array(v) * souffle) for c, v in (("r", (168.0, 34, 26)), ("R", (232.0, 58, 38)),
+                                                        ("L", (255.0, 132, 70)), ("W", (255.0, 196, 120)))}
+    pal.update(k=(34, 14, 12), t=(150, 30, 24))
+    hx, hy = piv_x - 2.5 + np.sin(theta) * 7.5, piv_y + 3 * np.cos(theta)
+    _ib_trait(img, piv_x - 0.5, piv_y + 1, round(hx) + 2, round(hy) - 1, (64, 42, 34))   # la ficelle
+    _ib_dessin(img, _IB_RAMEN_LANTERNE, hx, hy, pal)
+    v = _ib_vapeur(e, "v_marmite", t, 16.0, 27.0, 56, 30, 0.17, 3.2, 5.0, 2.4)
+    v += _ib_vapeur(e, "v_bol", t, 38.5, 25.0, 8, 9, 0.26, 1.0, 1.5, 0.5)
+    teinte = np.array([84.0, 82, 86]) + np.array([160.0, 130, 100]) * e["eclair"][..., None]   # la lampe la colore
+    img += _tramer(np.clip(v, 0, 1.3)[..., None] * teinte, 8)          # la vapeur, tramee a part, par-dessus
+    bx, by, bv = e["bruine"]                                           # la bruine : on la voit dans la lumiere
+    yy = (by + t * 26 * bv) % 72 - 4
+    xx = (bx - t * 3.0 * bv) % 64
+    pied = S + 1 + np.arange(len(bx)) % 11
+    lumi = np.clip(img.max(2), 0, 255)
+    for k, f in ((0, 1.0), (1, 0.55)):
+        ys, xs = np.round(yy - k).astype(int), np.round(xx + k * 0.12).astype(int) % 64
+        ok = (ys >= 0) & (ys < pied)
+        img[ys[ok], xs[ok]] += (np.array([16.0, 18, 26]) + lumi[ys[ok], xs[ok], None] * 0.42) * f
+    ecl = (yy >= pied) & (yy < pied + 3)                               # l'eclaboussure, un instant
+    if ecl.any():
+        ys, xs = pied[ecl], np.round(xx[ecl]).astype(int) % 64
+        c = np.array([20.0, 20, 28]) + lumi[ys, xs, None] * 0.5
+        for ddx in (-1, 1):
+            _pointer(img, ys - 1, xs + ddx, c)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- 2. La laverie -----------------------------------------------------------------------------------------------
+
+_IB_LAV_SOL = 43                          # le carrelage de la laverie (la ligne des pieds)
+_IB_LAV_X = (6, 15, 24, 33)              # les quatre colonnes de machines (lave-linge en bas, sechoirs dessus)
+_IB_LAV_CYCLE = 200.0                     # l'histoire de la cliente : charger, passer au sechoir, plier
+_IB_LAV_LINGE = ((200, 62, 60), (214, 170, 62), (84, 146, 214), (222, 220, 212), (86, 164, 104), (214, 110, 170),
+                 (120, 90, 190), (60, 190, 196))
+_IB_LAV_DEBOUT = (
+    "...hhh.",
+    "..hhhhh",
+    ".sshhhh",
+    "..sshh.",
+    "...cc..",
+    "..cccc.",
+    "..cacc.",
+    "..cacc.",
+    "..cmcc.",
+    "..jjjj.",
+    "..jjjj.",
+    "...jj..",
+    "...jj..",
+    "...jj..",
+    "...jj..",
+    "..kkk..",
+)
+_IB_LAV_MARCHE = _IB_LAV_DEBOUT[:11] + ("..j..j.", ".jj..jj", ".j....j", "jj....j", "kk....k")
+_IB_LAV_ASSISE = (
+    "....hhh.",
+    "...hhhhh",
+    "..sshhhh",
+    "...sshh.",
+    "....cc..",
+    "...cccc.",
+    "...cacc.",
+    "...cacc.",
+    "...jjjjj",
+    ".jjjjjjj",
+    ".jj.....",
+    ".jj.....",
+    ".jj.....",
+    "kkk.....",
+)
+_IB_LAV_ACCROUPIE = (
+    "...hhh.",
+    "..hhhhh",
+    ".sshhhh",
+    "..sshh.",
+    "...cc..",
+    "..ccccc",
+    "..caccc",
+    "..jjjjj",
+    ".jjj.jj",
+    ".jj..jj",
+    "kkk.kkk",
+)
+_IB_LAV_CHAT = ("k...k..", "kkkkk..", "kkkkk..", ".kkk...", "kkkkk..", "kkkkkk.", "kkkkkk.")
+
+
+def _ib_lav_rampe(ph, a, b, v0, v1):
+    """Une valeur qui passe de v0 a v1 entre les instants a et b (lineaire, bornee)."""
+    k = min(1.0, max(0.0, (ph - a) / (b - a)))
+    return v0 + (v1 - v0) * k
+
+
+def _ib_lav_histoire(t):
+    """L'histoire de la cliente sur un cycle de 200 s, en fonction de t seul. Rend un dict : sa pose, sa place, son
+    sens, et ce que contiennent le lave-linge 2, le sechoir 2, ses bras, le panier, le sac."""
+    ph = t % _IB_LAV_CYCLE
+    R = _ib_lav_rampe
+    h = {"porte_l": False, "porte_s": False}
+
+    def aller(debut, dest, retour, fin):                  # se lever, marcher jusqu'a dest, ..., revenir s'asseoir
+        if ph < debut + 1.2:
+            return "debout", 46.0, -1
+        if ph < debut + 1.2 + abs(46 - dest) / 5:
+            return "marche", 46 + (dest - 46) * (ph - debut - 1.2) / (abs(46 - dest) / 5), -1
+        if ph < retour:
+            return None, dest, -1
+        if ph < retour + abs(46 - dest) / 5:
+            return "marche", dest + (46 - dest) * (ph - retour) / (abs(46 - dest) / 5), 1
+        if ph < fin:
+            return "debout", 46.0, -1
+        return "lit", 46.0, -1
+    # C [0, 22) : elle prend son sac et charge le lave-linge 2 ; A [72, 94) : du lave-linge au sechoir ;
+    # B [150, 170) : elle vide le sechoir dans le panier ; puis elle plie et range dans le sac [170, 196)
+    h["sac"] = R(ph, 7, 13, 1, 0) if ph < 100 else R(ph, 172, 192, 0, 1)
+    h["lave"] = R(ph, 7, 13, 0, 1) - R(ph, 77, 82, 0, 1)
+    h["bras"] = R(ph, 77, 82, 0, 1) - R(ph, 84, 87, 0, 1)
+    h["seche"] = R(ph, 84, 87, 0, 1) - R(ph, 156, 161, 0, 1)
+    h["panier"] = R(ph, 156, 161, 0, 1) - R(ph, 172, 192, 0, 1)
+    h["lave_tourne"] = 14.5 < ph < 64
+    h["essore_l"] = 56 < ph < 64
+    h["fini_l"] = 64 <= ph < 76.5
+    h["seche_tourne"] = 88 < ph < 142
+    h["fini_s"] = 142 <= ph < 155.5
+    if ph < 22:
+        pose, x, sens = aller(0, 31, 15, 20.5)
+        if pose is None:
+            pose = "accroupie" if ph < 14 else "debout"
+        h["porte_l"] = 6.5 < ph < 13.5
+        h["tient_sac"] = ph < 7
+    elif 72 <= ph < 94:
+        pose, x, sens = aller(72, 31, 88, 93.5)
+        if pose is None:
+            pose = "accroupie" if ph < 82.5 else "tend"
+        h["porte_l"] = 76.5 < ph < 82.5
+        h["porte_s"] = 83.5 < ph < 87.5
+    elif 150 <= ph < 170:
+        pose, x, sens = aller(150, 31, 162, 168.5)
+        if pose is None:
+            pose = "tend" if ph < 161.2 else "debout"
+        h["porte_s"] = 155.5 < ph < 161.2
+        h["tient_panier"] = 155 < ph < 168
+    elif 170 <= ph < 192:
+        pose, x, sens = "plie", 46.0, -1
+    else:
+        pose, x, sens = ("plie" if ph < 196 else "lit"), 46.0, -1
+    h.update(pose=pose, x=x, sens=sens, ph=ph)
+    return h
+
+
+def _ib_lav_decor(e):
+    """La laverie vue du trottoir : la facade, la grande vitre, les machines, le banc ; lumiere et calque net."""
+    import numpy as np
+    Y, X = _xy()
+    S = _IB_LAV_SOL
+    f = np.zeros((64, 64, 3)) + _ib_niv((14, 16, 26), 1)                # la facade dans la nuit
+    vitre = (X >= 4) & (X <= 59) & (Y >= 11) & (Y <= S + 1)
+    mur = np.zeros((64, 64, 3)) + _ib_niv((84, 100, 106), 4)          # le mur du fond, sous le neon
+    for nx in (13, 31, 49):
+        _halo(mur, nx, 12, 3.2, (70, 84, 84), 0.9, 1.0)
+    f[vitre] = mur[vitre]
+    carrelage = vitre & (Y >= S - 1)
+    f[carrelage] = _ib_niv((80, 90, 96), 4)
+    f[1:9, 5:59] = _ib_niv((20, 24, 34), 2)                             # le bandeau de l'enseigne
+    trottoir = Y >= 47                                                  # le trottoir, et la vitre posee dessus
+    f[trottoir] = _ib_niv((16, 18, 26), 2)
+    eloigne = np.clip((Y - 47) / 9.0, 0, 1)
+    gauche, droite = 4 - eloigne * 6, 59 + eloigne * 6
+    bord = np.clip(np.minimum(X - gauche, droite - X) / 3 + 0.3, 0, 1)
+    ombre_meneau = np.clip(1 - np.abs(X - 32) / (0.8 + eloigne * 1.5), 0, 1)
+    tache = (Y >= 47) * np.clip(1 - eloigne, 0, 1) ** 1.6 * bord * (1 - 0.6 * ombre_meneau)
+    f += tache[..., None] * np.array([62.0, 76, 80])
+    f[58:] = _ib_niv((10, 10, 16), 1)                                   # la chaussee, plus bas
+    f[58] = _ib_niv((40, 44, 52), 3)                                    # le bord du trottoir
+    f[58] *= 1 + 0.6 * np.clip(1 - np.abs(X[58] - 32) / 34, 0, 1)[:, None]
+    lueur = np.zeros((64, 64, 3))                                       # le neon de l'enseigne et sa lueur
+    _halo(lueur, 17, 5, 2.2, (60, 170, 230), 0.8)
+    _halo(lueur, 38, 5, 3.2, (120, 200, 230), 0.45, 0.5)
+    f[:10] += lueur[:10]
+    e["fond"] = f
+    net, nm, peint = _ib_calque()
+    peint(((X == 3) | (X == 60)) & (Y >= 10) & (Y <= S + 3), (44, 48, 58))      # le cadre de la vitrine
+    peint((Y == 10) & (X >= 3) & (X <= 60), (44, 48, 58))
+    peint((X == 32) & (Y >= 10) & (Y <= S + 3), (36, 40, 50))
+    peint((Y >= S + 2) & (Y <= 46) & (X >= 3) & (X <= 60), (30, 32, 40))         # le soubassement
+    peint((Y == 46) & (X >= 2) & (X <= 61), (52, 56, 64))
+    for x0, x1 in ((7, 19), (24, 38), (43, 56)):                        # les tubes au plafond
+        peint((Y == 12) & (X >= x0) & (X <= x1), (226, 240, 240))
+        peint((Y == 11) & (X >= x0) & (X <= x1), (90, 100, 104))
+    d = np.maximum(np.abs(X - 17), np.abs(Y - 5))                      # l'enseigne : une machine en neon...
+    peint(d == 3, (90, 200, 255))
+    peint((np.hypot(X - 17, Y - 5.5) < 1.6) & (np.hypot(X - 17, Y - 5.5) > 0.6), (90, 200, 255))
+    for x in range(24, 54):                                             # ... et une ecriture penchee, illisible
+        y = 5 + 1.6 * np.sin(x * 1.25) + 0.5 * np.sin(x * 0.4)
+        peint((X == x) & (Y == int(round(y))), (190, 236, 250))
+        if x in (25, 31, 38, 44, 50):
+            peint((X == x) & (Y >= 2) & (Y <= int(round(y))), (190, 236, 250))
+    peint(carrelage & ((X + Y) % 2 == 0), (64, 72, 78))
+    for mx in _IB_LAV_X:                                                # les machines : sechoir sur lave-linge
+        for y0 in (22, 33):
+            corps = (X >= mx) & (X <= mx + 7) & (Y >= y0) & (Y <= y0 + 9)
+            peint(corps, (168, 176, 180))
+            peint(corps & (X == mx + 7), (124, 132, 138))
+            peint(corps & (Y == y0 + 9), (110, 118, 124))
+            peint(corps & (Y == y0), (196, 204, 206))
+            peint((Y == y0 + 1) & (X >= mx + 1) & (X <= mx + 4), (70, 78, 86))   # le panneau de commande
+            d = np.hypot(X - (mx + 3.5), Y - (y0 + 5.5))
+            peint((d <= 3.4) & (d > 2.4) & corps, (96, 104, 112))                # le hublot (le verre a part)
+            peint((d <= 3.4) & (d > 2.4) & corps & (Y < y0 + 4) & (X < mx + 4), (150, 160, 168))
+    peint((Y == 32) & (X >= 5) & (X <= 41), (60, 66, 72))                       # la tablette entre les deux
+    peint((Y == 37) & (X >= 44) & (X <= 58), (120, 92, 64))                     # le banc
+    peint((Y == 38) & (X >= 44) & (X <= 58), (84, 64, 46))
+    peint((Y >= 39) & (Y <= S) & ((X == 45) | (X == 57)), (60, 60, 66))
+    for x0, y0, w, hh, c in ((41, 21, 3, 4, (214, 206, 160)), (45, 22, 2, 3, (196, 210, 220)),
+                             (42, 26, 3, 2, (222, 160, 150))):                   # des affichettes au mur
+        peint((X >= x0) & (X < x0 + w) & (Y >= y0) & (Y < y0 + hh), c)
+    peint((X == 42) & (Y == 22), (120, 110, 90))
+    peint((X >= 57) & (X <= 58) & (Y >= S - 3) & (Y <= S), (150, 84, 60))          # une plante en pot
+    for dy, x in ((4, 57), (5, 58), (6, 57), (5, 56), (7, 58), (4, 59), (8, 57), (6, 59)):
+        peint((Y == S - dy) & (X == x), (70, 140, 84))
+    d = np.hypot(X - 52, Y - 19)                                                 # l'horloge
+    peint(d <= 2.6, (210, 214, 210))
+    peint((d <= 2.6) & (d > 1.9), (60, 64, 70))
+    e["net"] = (net, nm)
+    e["reflets"] = vitre & (Y < 24) & (X > 36) & (((X + Y) == 66) | ((X + Y) == 68) | ((X + Y) == 71))
+    r = e["rng"]
+    e["machines"] = [(r.uniform(38, 70), r.uniform(0, 1), r.integers(0, 8, 3), r.uniform(0.55, 0.9)) for _ in range(8)]
+    dy, dx = np.mgrid[-3:4, -3:4]
+    dedans = dx ** 2 + dy ** 2 <= 5.3
+    e["hublot"] = (dy[dedans], dx[dedans], np.arctan2(dy[dedans], dx[dedans]))
+
+
+def _ib_lav_hublot(img, e, mx, y0, quantite, mode, couleurs, t, ouvert):
+    """Le hublot d'une machine : le linge qui tourne (mode 1), essore (2), repose (0) ; ou la porte ouverte."""
+    import numpy as np
+    dy, dx, ang = e["hublot"]
+    cx, cy = mx + 3, y0 + 5
+    pal = np.array([_IB_LAV_LINGE[int(c)] for c in couleurs], float)
+    if mode == 1:
+        phi, w = 0.55 * np.sin(t * 0.7) + 0.6, t * 2.6                  # le tas penche dans le sens du tambour
+    elif mode == 2:
+        phi, w = 0.0, t * 9.0
+    else:
+        phi, w = 0.0, 0.0
+    niveau = 1.6 - 3.6 * quantite
+    if mode == 2:                                                       # l'essorage : plaque contre le tambour
+        haut = (dx ** 2 + dy ** 2 >= 2.5) & (quantite > 0.05)
+    else:
+        haut = dy * np.cos(phi) - dx * np.sin(phi) >= niveau
+    k = np.floor(((ang - w) / (2 * np.pi)) * 3 % 3).astype(int)
+    coul = pal[k] * (0.72 if not ouvert else 0.85)
+    if mode == 2:
+        coul = coul * 0.3 + pal.mean(0) * 0.45
+    fond = np.array([34.0, 40, 48]) if not ouvert else np.array([18.0, 18, 22])
+    c = np.where(haut[:, None], coul, fond)
+    _poser(img, cy + dy, cx + dx, c)
+    if not ouvert:
+        _poser(img, [cy - 2], [cx - 1], [(206, 222, 230)])               # l'eclat sur le verre
+    else:                                                                 # la porte ouverte, vue de profil
+        _poser(img, cy + np.arange(-3, 4), np.full(7, cx - 5), [(150, 158, 166)] * 7)
+        _poser(img, cy + np.arange(-2, 3), np.full(5, cx - 4), [(90, 98, 106)] * 5)
+
+
+def _scene_laverie(p, e, t, ecoule, dt):
+    """Une laverie automatique la nuit, vue du trottoir : le neon blanc, les hublots ou le linge colore tourne, une
+    cliente qui lit sur le banc et se leve pour ses machines ; un chat regarde, dehors, dans la lumiere de la vitre."""
+    import numpy as np
+    S = _IB_LAV_SOL
+    if "fond" not in e:
+        _ib_lav_decor(e)
+    h = _ib_lav_histoire(t)
+    img = e["fond"].copy()
+    img = _tramer(img, 8)
+    net, masque = e["net"]
+    img[masque] = net[masque]
+    gres = max(0.0, np.sin(t * 0.21)) ** 60 * (0.5 + 0.5 * np.sin(t * 7.0))   # le tube de droite gresille, rarement
+    img[12, 43:57] *= 1 - 0.45 * gres
+    img[e["reflets"]] += 14                                               # deux reflets obliques sur la vitre
+    # les machines
+    for i, mx in enumerate(_IB_LAV_X):
+        for j, y0 in enumerate((22, 33)):
+            per, ph0, coul, q = e["machines"][i * 2 + j]
+            ouvert = False
+            if i == 2:                                                    # la paire de la cliente
+                if j == 1:
+                    mode = (2 if h["essore_l"] else 1) if h["lave_tourne"] else 0
+                    q, ouvert = h["lave"], h["porte_l"]
+                    led = (60, 220, 120) if h["lave_tourne"] else ((255, 150, 40) if h["fini_l"] else (34, 40, 44))
+                else:
+                    q, mode, ouvert = h["seche"], 1 if h["seche_tourne"] else 0, h["porte_s"]
+                    led = (60, 220, 120) if h["seche_tourne"] else ((255, 150, 40) if h["fini_s"] else (34, 40, 44))
+                coul = (0, 2, 1) if j == 1 else (0, 2, 3)
+            elif i == 0 and j == 1:                                       # une machine libre, vide
+                q, mode, led = 0.0, 0, (34, 40, 44)
+            else:                                                         # les autres tournent, s'arretent, repartent
+                c = (t / per + ph0) % 1.0
+                mode = 1 if c < 0.62 else (2 if c < 0.72 else 0)
+                led = (60, 220, 120) if c < 0.72 else (255, 150, 40)
+            if led[0] == 255:
+                led = tuple(np.array(led) * (0.75 + 0.25 * np.sin(t * 2.2)))
+            _ib_lav_hublot(img, e, mx, y0, q, mode, coul, t, ouvert)
+            _poser(img, [y0 + 1], [mx + 6], [led])
+    # l'horloge : l'heure qu'il est vraiment
+    hm = (t / 3600.0) % 12
+    for ang, long, c in ((hm / 12 * 2 * np.pi, 1.2, (40, 40, 44)), ((t / 3600.0 % 1) * 2 * np.pi, 1.9, (70, 70, 76))):
+        _poser(img, [round(19 - np.cos(ang) * long)], [round(52 + np.sin(ang) * long)], [c])
+    _poser(img, [19], [52], [(40, 40, 44)])
+    # la cliente, et ce qu'elle porte
+    pal = {"h": (70, 40, 30), "s": (214, 168, 132), "c": (176, 64, 70), "a": (130, 44, 52), "m": (214, 168, 132),
+           "j": (52, 62, 96), "k": (30, 30, 34)}
+    pose, x, sens = h["pose"], h["x"], h["sens"]
+    linge = np.array(_IB_LAV_LINGE, float)
+    if pose in ("lit", "plie"):
+        _ib_dessin(img, _IB_LAV_ASSISE, 45, S - 13, pal)
+        if pose == "lit":                                                 # le livre ouvert, une page tourne parfois
+            tourne = (t % 9.0) < 0.5
+            _poser(img, [S - 8, S - 8, S - 7, S - 7], [44, 45, 44, 45],
+                   [(226, 222, 206), (196, 192, 178) if not tourne else (240, 236, 220), (60, 90, 140), (60, 90, 140)])
+            _poser(img, [S - 7], [46], [pal["m"]])
+        else:                                                             # elle plie : les mains vont et viennent
+            g = np.sin(t * 2.4)
+            _poser(img, [S - 6, S - 6], [44 + round(g), 45 + round(g)], [linge[int(t / 2.6) % 3 * 2 % 8]] * 2)
+            _poser(img, [S - 7], [46 + round(g)], [pal["m"]])
+    else:
+        corps = {"debout": _IB_LAV_DEBOUT, "tend": _IB_LAV_DEBOUT, "accroupie": _IB_LAV_ACCROUPIE}.get(pose)
+        if pose == "marche":
+            corps = _IB_LAV_MARCHE if (t * 3.2) % 1.0 < 0.5 else _IB_LAV_DEBOUT
+        haut = len(corps)
+        _ib_dessin(img, corps, x - 1, S - haut + 1, pal, miroir=sens > 0)
+        if pose == "tend":                                                # le bras tendu vers le sechoir
+            _ib_trait(img, x + 1, S - 11, x - 1, S - 14, pal["a"])
+            _poser(img, [S - 15], [x - 2], [pal["m"]])
+        if pose == "accroupie":
+            _poser(img, [S - 5], [x - 1], [pal["m"]])
+        if h["bras"] > 0.02 or h.get("tient_panier"):                    # une brassee de linge, ou le panier
+            bx, by = (x - 2 if sens < 0 else x + 4), S - 9
+            if h.get("tient_panier"):
+                _poser(img, [by + 1, by + 1, by + 1, by + 2, by + 2, by + 2], [bx - 1, bx, bx + 1, bx - 1, bx, bx + 1],
+                       [(110, 170, 210)] * 6)
+                _poser(img, [by, by], [bx - 1, bx + 1], [linge[1], linge[3]])
+            else:
+                _poser(img, [by, by, by + 1], [bx, bx + 1, bx], [linge[0], linge[2], linge[1]])
+        if h.get("tient_sac"):
+            _poser(img, [S - 7, S - 6, S - 6, S - 5], [x + 4, x + 4, x + 5, x + 4], [(170, 150, 110)] * 4)
+    # le panier sur le banc, le sac par terre
+    if not h.get("tient_panier"):                                       # sauf quand elle le porte
+        _poser(img, [35, 35, 35, 35, 36, 36, 36, 36], [53, 54, 55, 56, 53, 54, 55, 56], [(110, 170, 210)] * 8)
+        n = int(round(h["panier"] * 4))
+        _poser(img, [34] * n, [53, 54, 55, 56][:n], linge[[0, 3, 2, 1]][:n])
+    sac = h["sac"]
+    if not h.get("tient_sac"):
+        hs = int(round(1 + sac * 3))
+        for k in range(hs):                                             # un sac de toile, plus ou moins plein
+            larg = 3 if 0 < k < hs - 1 or hs <= 2 else 2
+            c = (170, 150, 110) if k < hs - 1 else (196, 178, 136)
+            _poser(img, [S - k] * larg, list(range(54, 54 + larg)), [c] * larg)
+    # le chat, dehors, qui regarde tourner le linge ; sa queue bat lentement
+    cx, cy = 13, 48
+    _ib_dessin(img, _IB_LAV_CHAT, cx, cy, {"k": (12, 12, 18)})
+    _poser(img, [cy, cy, cy + 1, cy + 1, cy + 1, cy + 4, cy + 4], [cx, cx + 4, cx + 1, cx + 2, cx + 3, cx, cx + 4],
+           [(110, 128, 134)] * 5 + [(60, 70, 74)] * 2)                    # le bord des oreilles, de la tete, eclaire
+    q = np.sin(t * 0.9) + 0.3 * np.sin(t * 2.3)
+    queue = [(cy + 6, cx + 6), (cy + 5, cx + 7 + (q > 0.2)), (cy + 4 - (q > 0.8), cx + 7 + (q > -0.3))]
+    _poser(img, [a for a, b in queue], [b for a, b in queue], [(12, 12, 18)] * 3)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- 3. Le petit cafe ouvert tard --------------------------------------------------------------------------------
+
+_IB_CAFE_RUE = 50                         # la premiere ligne de la chaussee mouillee
+_IB_CAFE_LETTRES = (                      # C A F E, en tubes de neon
+    (".www", "w...", "w...", "w...", ".www"),
+    (".ww.", "w..w", "wwww", "w..w", "w..w"),
+    ("wwww", "w...", "www.", "w...", "w..."),
+    ("wwww", "w...", "www.", "w...", "wwww"),
+)
+_IB_CAFE_TASSE = ("..w.w..", ".w.w...", "wwwwww.", "w....ww", "w....w.", ".wwww..")
+_IB_CAFE_SERVEUR = (
+    "..hhh..",
+    ".hhhhh.",
+    ".spsps.",
+    ".sssss.",
+    "..sss..",
+    ".wwrww.",
+    "wwvvvww",
+    "wwvvvww",
+    "wwvvvww",
+    "wwvvvww",
+)
+_IB_CAFE_DOS_A = (                        # une cliente de dos, le chignon
+    "..hh...",
+    ".hhhh..",
+    ".hhhhh.",
+    ".hhhhh.",
+    "..ss...",
+    ".ccccc.",
+    "ccccccc",
+    "ccccccc",
+    "ccccccc",
+    ".ccccc.",
+    ".jjjjj.",
+)
+_IB_CAFE_DOS_B = (                        # un client de dos, la casquette
+    ".qqqq..",
+    "qqqqqq.",
+    ".hhhh..",
+    ".hhhh..",
+    "..ss...",
+    "ccccccc",
+    "ccccccc",
+    "ccccccc",
+    "ccccccc",
+    ".ccccc.",
+    ".jjjjj.",
+)
+_IB_CAFE_PROFIL = (                       # le client de la fenetre, de profil, tourne vers la droite
+    "..hhh..",
+    ".hhhhh.",
+    ".hhhss.",
+    "..hsss.",
+    "...ss..",
+    "..cccc.",
+    ".cccccc",
+    ".ccccc.",
+    ".cccc..",
+    ".jjjjjj",
+    ".jj..jj",
+    ".j....j",
+    ".j....j",
+    "kk...kk",
+)
+_IB_CAFE_PASSANT = (
+    "..hhh..",
+    ".hhhhh.",
+    ".hhhhs.",
+    ".hhhss.",
+    "..ccc..",
+    ".ccccc.",
+    ".ccccc.",
+    ".ccccc.",
+    ".ccccc.",
+    ".ccccc.",
+    "..jjj..",
+    "..jjj..",
+    "..j.j..",
+    "..j.j..",
+    "..j.j..",
+    ".kk.kk.",
+)
+_IB_CAFE_PASSANT_PAS = _IB_CAFE_PASSANT[:12] + (".j...j.", ".j...j.", "j.....j", "k.....k")
+_IB_CAFE_CHIEN = ("....kk", "k..kkk", ".kkkk.", ".k..k.")
+_IB_CAFE_CHIEN_PAS = ("....kk", "k..kkk", ".kkkk.", "k....k")
+
+
+def _ib_cafe_decor(e):
+    """La facade du cafe : la vitrine chaude, la marquise, l'enseigne ; le reflet dans la rue mouillee."""
+    import numpy as np
+    Y, X = _xy()
+    R = _IB_CAFE_RUE
+    f = np.zeros((64, 64, 3)) + _ib_niv((30, 16, 20), 2)               # la brique, dans la nuit
+    f[:2] = _ib_niv((10, 10, 22), 1)
+    f[2:9, 46:53] = _ib_niv((150, 96, 50), 4)                          # la fenetre de l'etage, encore allumee
+    vitrine = (X >= 2) & (X <= 48) & (Y >= 22) & (Y <= 43)
+    porte = (X >= 51) & (X <= 58) & (Y >= 23) & (Y <= 45)
+    mur = np.zeros((64, 64, 3)) + _ib_niv((224, 170, 100), 5)         # le mur du fond, chaud
+    for lx in (10, 24, 38):
+        _ib_lueur(mur, lx, 27, 7, (255, 200, 120), 0.75, 0.9)
+    mur[33:37] = _ib_niv((150, 90, 50), 4)                             # le lambris
+    mur[37] = (196, 136, 74)                                           # le zinc du comptoir
+    for lx in (10, 24, 38):
+        mur[37, max(0, lx - 5):lx + 6] = (236, 176, 100)
+    mur[38:44] = _ib_niv((40, 76, 74), 3)                              # la facade du comptoir, carrelee
+    mur[38:44, :14] = _ib_niv((150, 90, 50), 4)
+    f[vitrine | porte] = mur[vitrine | porte]
+    f[porte & (Y >= 38)] = _ib_niv((150, 90, 50), 4)
+    trottoir = (Y >= 46) & (Y < R)
+    f[trottoir] = _ib_niv((24, 22, 30), 2)
+    spill = np.zeros((64, 64, 3))                                      # la vitrine posee sur le trottoir
+    _halo(spill, 25, 46, 9, (255, 170, 90), 0.5, 3.0)
+    _halo(spill, 55, 46, 4, (255, 170, 90), 0.4, 3.0)
+    f[trottoir] += spill[trottoir]
+    f[R - 1] = _ib_niv((60, 50, 54), 3)                                # le bord du trottoir
+    f[R:] = _ib_niv((12, 10, 22), 1)                                   # la rue mouillee
+    lueur = np.zeros((64, 64, 3))                                      # le halo du neon sur la brique
+    _halo(lueur, 34, 13, 5, (255, 70, 160), 0.6, 0.55)
+    _halo(lueur, 19, 13, 3, (60, 170, 255), 0.5, 0.8)
+    e["lueur"] = lueur * (Y < 22)[..., None]
+    # le reflet : des trainees verticales sous chaque lumiere, que les rides casseront
+    ref = np.zeros((64, 64, 3))
+    prof = np.clip((Y - R) / 14.0, 0, 1)
+    vit = ((X >= 2) & (X <= 48)) * np.exp(-prof * 2.2) * (Y >= R)
+    ref += vit[..., None] * np.array([120.0, 76, 36]) * (0.7 + 0.3 * np.cos(X * 0.42))[..., None]
+    ref += (((X >= 51) & (X <= 58)) * np.exp(-prof * 2.0) * (Y >= R))[..., None] * np.array([110.0, 70, 34])
+    e["reflet_vitre"] = ref[R:]
+    neon = np.zeros(64)
+    for i, lettre in enumerate(_IB_CAFE_LETTRES):
+        for x in range(4):
+            neon[25 + i * 6 + x] += sum(r[x] == "w" for r in lettre)
+    bande = np.exp(-((Y[R:] - R - 6) / 5.0) ** 2)
+    e["reflet_neon"] = (neon[None, :] / 5 * bande)[..., None] * np.array([255.0, 70, 160])
+    e["reflet_tasse"] = ((np.abs(X[R:] - 19) < 2.5) * bande)[..., None] * np.array([50.0, 150, 255])
+    e["fond"] = f
+    net, nm, peint = _ib_calque()
+    bande = (Y >= 17) & (Y <= 20) & (X <= 60)                           # la marquise rayee, festonnee
+    raie = (X // 3) % 2 == 0
+    peint(bande & raie, (128, 32, 44))
+    peint(bande & ~raie, (186, 166, 140))
+    peint(bande & (Y == 17) & raie, (160, 52, 66))
+    peint(bande & (Y == 17) & ~raie, (216, 196, 170))
+    peint((Y == 21) & (X <= 60) & raie & (X % 3 != 2), (100, 24, 34))
+    peint((Y == 21) & (X <= 60) & ~raie & (X % 3 == 1), (150, 132, 112))
+    cadre = (44, 30, 30)
+    peint(((X == 1) | (X == 49) | (X == 50) | (X == 59)) & (Y >= 22) & (Y <= 45), cadre)
+    peint((X == 25) & (Y >= 22) & (Y <= 43), (54, 38, 36))              # le meneau
+    peint((Y >= 44) & (Y <= 45) & (X >= 1) & (X <= 49), (36, 22, 24))   # le soubassement
+    peint((Y == 34) & (X >= 52) & (X <= 53), (200, 180, 120))           # la poignee de la porte
+    peint((Y >= 2) & (Y <= 8) & ((X == 45) | (X == 53)) | (Y == 1) & (X >= 45) & (X <= 53), (40, 26, 26))
+    peint((Y == 9) & (X >= 44) & (X <= 54), (74, 54, 50))              # son rebord, ses rideaux, un pot de fleurs
+    peint((Y >= 2) & (Y <= 8) & ((X == 46) | (X == 52)) | (Y >= 2) & (Y <= 4) & ((X == 47) | (X == 51)), (110, 40, 44))
+    peint((Y == 8) & (X >= 48) & (X <= 50), (60, 36, 30))
+    peint((Y == 7) & ((X == 48) | (X == 50)), (40, 90, 50))
+    peint((Y == 6) & (X == 49), (200, 90, 110))
+    for lx in (10, 24, 38):                                             # les suspensions
+        peint((X == lx) & (Y >= 22) & (Y <= 23), (40, 30, 26))
+        peint((Y == 24) & (np.abs(X - lx) <= 1), (34, 74, 54))
+        peint((Y == 25) & (np.abs(X - lx) <= 2), (46, 96, 70))
+        peint((Y == 26) & (np.abs(X - lx) <= 1), (255, 228, 170))
+    peint((Y == 27) & (X >= 41) & (X <= 47), (90, 56, 34))              # l'etagere, ses tasses et ses bocaux
+    for x in (42, 44):
+        peint((Y == 26) & (X == x), (230, 222, 206))
+    peint((Y >= 25) & (Y <= 26) & (X == 46), (200, 160, 70))
+    peint((Y == 27) & (X >= 14) & (X <= 20), (90, 56, 34))
+    peint((Y >= 25) & (Y <= 26) & (X == 15), (150, 90, 60))
+    peint((Y == 26) & ((X == 17) | (X == 19)), (230, 222, 206))
+    mach = (X >= 33) & (X <= 38) & (Y >= 30) & (Y <= 36)                # le percolateur, chrome
+    peint(mach, (150, 150, 158))
+    peint(mach & (X == 33), (210, 210, 214))
+    peint(mach & (Y == 30), (190, 190, 196))
+    peint((X >= 34) & (X <= 37) & (Y >= 34) & (Y <= 35), (60, 50, 50))
+    peint((Y == 29) & (X >= 34) & (X <= 37) & (X % 2 == 0), (230, 222, 206))
+    peint((X == 38) & (Y >= 31) & (Y <= 32), (100, 70, 50))
+    peint((Y >= 37) & (Y <= 43) & (X >= 7) & (X <= 8), (60, 40, 30))    # la table de la fenetre
+    peint((Y == 36) & (X >= 4) & (X <= 12), (176, 120, 70))
+    peint((Y == 43) & (X >= 6) & (X <= 9), (60, 40, 30))
+    for sx in (27,):                                                    # un tabouret libre
+        peint((Y == 40) & (X >= sx) & (X <= sx + 3), (190, 50, 50))
+        peint((Y >= 41) & (Y <= 43) & (X == sx + 1), (170, 170, 176))
+    peint((Y == 38) & (X >= 14) & (X <= 48), (24, 50, 50))              # l'ombre sous le zinc
+    # l'enseigne : la tasse bleue et CAFE en rose (dessinees a part, elles vibrent)
+    e["net"] = (net, nm)
+    r = e["rng"]
+    e["gouttes"] = (np.array([6.0, 17.0, 31.0, 44.0, 57.0]), r.uniform(3.5, 7, 5), r.uniform(0, 1, 5))
+
+
+def _ib_cafe_neon(img, t, ron):
+    """L'enseigne : la tasse bleue, et CAFE en tubes roses qui ronronnent ; le E faiblit parfois, en douceur."""
+    import numpy as np
+    ph = (t / 47.0) % 1.0
+    faible = (1 - 0.55 * np.sin(np.pi * np.clip((ph - 0.5) / 0.04, 0, 1)) ** 2
+              - 0.35 * np.sin(np.pi * np.clip((ph - 0.56) / 0.03, 0, 1)) ** 2)
+    for i, lettre in enumerate(_IB_CAFE_LETTRES):
+        k = ron * (faible if i == 3 else 1.0)
+        _ib_dessin(img, lettre, 25 + i * 6, 11, {"w": tuple(np.array([255.0, 96, 186]) * k)})
+    _ib_dessin(img, _IB_CAFE_TASSE, 16, 10, {"w": tuple(np.array([90.0, 196, 255]) * ron)})
+
+
+def _ib_cafe_gens(img, t):
+    """Le serveur qui essuie le zinc et sert, deux clients de dos, un client a la fenetre."""
+    import numpy as np
+    ph = (t / 44.0) % 1.0 * 44
+    # le serveur : il essuie, va au percolateur, sert la cliente, revient
+    if ph < 18:
+        sx, geste = 23.0, "essuie"
+    elif ph < 20:
+        sx, geste = 23 + (ph - 18) / 2 * 4, "marche"
+    elif ph < 25:
+        sx, geste = 27.0, "verse"
+    elif ph < 28:
+        sx, geste = 27 - (ph - 25) / 3 * 8, "marche"
+    elif ph < 31:
+        sx, geste = 19.0, "sert"
+    elif ph < 33:
+        sx, geste = 19 + (ph - 31) / 2 * 4, "marche"
+    else:
+        sx, geste = 23.0, "attend"
+    pal = {"h": (34, 24, 20), "s": (220, 170, 126), "p": (160, 108, 80), "w": (236, 232, 222), "r": (40, 20, 24),
+           "v": (34, 30, 36)}
+    sx = round(sx)
+    _ib_dessin(img, _IB_CAFE_SERVEUR, sx, 27, pal)
+    bras = (236, 232, 222)
+    if geste == "essuie":                                              # le torchon va et vient sur le zinc
+        mx = sx + 3 + round(3.2 * np.sin(t * 1.4))
+        _ib_trait(img, sx + (0 if mx < sx + 3 else 6), 33, mx, 36, bras)
+        _poser(img, [36, 36], [mx - 1, mx], [(250, 250, 244)] * 2)
+    elif geste == "verse":                                             # la tasse sous le percolateur
+        _ib_trait(img, sx + 6, 33, sx + 7, 35, bras)
+        _poser(img, [35], [sx + 8], [(230, 222, 206)])
+    elif geste == "sert":                                              # il pose la tasse pres de la cliente
+        _ib_trait(img, sx + 6, 33, sx + 7, 36, bras)
+        _poser(img, [36], [sx + 8], [(230, 222, 206)])
+    elif geste == "attend":
+        _poser(img, [33, 34, 33, 34], [sx, sx, sx + 6, sx + 6], [bras] * 4)
+    # la cliente A, de dos : elle porte sa tasse a ses levres, tourne la tete vers son voisin
+    ca = (t / 13.0) % 1.0
+    pa = {"h": (60, 34, 26), "s": (200, 150, 110), "c": (40, 54, 92), "j": (28, 28, 36)}
+    _ib_dessin(img, _IB_CAFE_DOS_A, 13, 30, pa)
+    if 0.55 < ca < 0.72:
+        _poser(img, [33, 34, 32], [19, 19, 18], [pa["c"], pa["c"], (230, 222, 206)])
+    else:
+        _poser(img, [36], [20], [(230, 222, 206)])                     # sa tasse sur le zinc
+    if 0.2 < ca < 0.35:
+        _poser(img, [32], [18], [pa["s"]])                             # elle tourne la tete : une joue
+    _poser(img, [39, 40, 41, 42, 43], [16, 16, 16, 16, 16], [(170, 170, 176)] * 5)
+    _poser(img, [40, 40], [14, 18], [(190, 50, 50)] * 2)
+    # le client B, de dos, accoude, sa casquette
+    pb = {"q": (150, 60, 44), "h": (40, 30, 26), "s": (190, 140, 100), "c": (60, 70, 50), "j": (30, 30, 34)}
+    hoche = 1 if (t / 7.0) % 1.0 < 0.12 else 0
+    _ib_dessin(img, _IB_CAFE_DOS_B[:5], 40, 29 + hoche, pb)
+    _ib_dessin(img, _IB_CAFE_DOS_B[5:], 40, 34, pb)
+    _poser(img, [36, 37], [47, 47], [pb["c"]] * 2)                      # son coude sur le zinc
+    _poser(img, [36], [39], [(230, 222, 206)])                          # sa tasse
+    _poser(img, [41, 42, 43], [43, 43, 43], [(170, 170, 176)] * 3)
+    # le client de la fenetre, de profil : il boit son cafe de temps en temps
+    pc = {"h": (90, 80, 70), "s": (210, 160, 120), "c": (120, 70, 50), "j": (40, 40, 50), "k": (26, 22, 22)}
+    _ib_dessin(img, _IB_CAFE_PROFIL, 1, 30, pc)
+    cc = (t / 11.0) % 1.0
+    if 0.3 < cc < 0.5:
+        _ib_trait(img, 5, 36, 6, 33, pc["c"])
+        _poser(img, [33, 33], [7, 7], [(236, 230, 214)] * 2)
+    else:
+        _ib_trait(img, 5, 36, 7, 36, pc["c"])
+        _poser(img, [35, 35], [9, 10], [(236, 230, 214)] * 2)
+    return sx, geste
+
+
+def _scene_diner(p, e, t, ecoule, dt):
+    """Un petit cafe ouvert tard, vu de l'autre trottoir : la vitrine ambre, l'enseigne rose qui ronronne, le serveur
+    qui essuie le zinc, des clients, des tasses qui fument ; la rue mouillee en garde le reflet."""
+    import numpy as np
+    Y, X = _xy()
+    R = _IB_CAFE_RUE
+    if "fond" not in e:
+        _ib_cafe_decor(e)
+    ron = 0.93 + 0.04 * np.sin(t * 1.7) + 0.03 * np.sin(t * 6.3)      # le neon ronronne
+    img = e["fond"].copy()
+    img += e["lueur"] * ron
+    rides = 0.6 + 0.4 * np.sin(Y[R:] * 1.9 - t * 1.3 + np.sin(X[R:] * 0.25 + t * 0.3) * 1.2)
+    rides2 = 0.55 + 0.45 * np.sin(Y[R:] * 2.3 - t * 1.0 + np.sin(X[R:] * 0.31 - t * 0.5) * 1.6)
+    lignes = np.arange(64 - R)[:, None]                                # chaque rang du reflet ondule un peu
+    dec = np.round(0.9 * np.sin(lignes * 1.1 + t * 1.2) + 0.5 * np.sin(lignes * 0.37 - t * 0.7)).astype(int)
+    cols = np.clip(X[R:].astype(int) + dec, 0, 63)
+    neon = (e["reflet_neon"] + e["reflet_tasse"])[lignes, cols]
+    img[R:] += e["reflet_vitre"][lignes, cols] * rides[..., None] + neon * (ron * rides2)[..., None]
+    img = _tramer(img, 8)
+    net, masque = e["net"]
+    img[masque] = net[masque]
+    _ib_cafe_neon(img, t, ron)
+    sx, geste = _ib_cafe_gens(img, t)
+    # les tasses qui fument
+    v = _ib_vapeur(e, "v_fenetre", t, 9.5, 34.0, 14, 9, 0.22, 0.9, 1.0, 1.5)
+    v += _ib_vapeur(e, "v_comptoir", t, 35.5, 28.5, 10, 6, 0.25, 0.8, -1.0, 1.0)
+    v += _ib_vapeur(e, "v_tasse_b", t, 39.0, 35.0, 6, 6, 0.3, 0.6, 0.5, 0.6)
+    if geste == "verse":
+        v += _ib_vapeur(e, "v_perco", t, sx + 8.0, 34.0, 8, 6, 0.4, 0.8, 0.5, 0.7)
+    img += _tramer(np.clip(v, 0, 1.2)[..., None] * np.array([150.0, 130, 110]), 8)
+    # un passant et son chien, de temps en temps, sur le trottoir d'en face (devant la vitrine)
+    cyc = (t / 70.0) % 1.0
+    if cyc < 0.32:
+        px = -8 + cyc / 0.32 * 80
+        pas = (t * 2.6) % 1.0 < 0.5
+        corps = _IB_CAFE_PASSANT_PAS if pas else _IB_CAFE_PASSANT
+        pp = {"h": (14, 12, 16), "s": (90, 60, 44), "c": (16, 14, 20), "j": (12, 12, 16), "k": (10, 10, 12)}
+        _ib_dessin(img, corps, px, 32, pp)
+        _poser(img, [32, 33, 34], [round(px) + 2, round(px) + 1, round(px) + 1], [(150, 100, 60)] * 3)   # son bord
+        cx = px + 9
+        _ib_dessin(img, _IB_CAFE_CHIEN_PAS if pas else _IB_CAFE_CHIEN, cx, 44, {"k": (14, 12, 16)})
+        _ib_trait(img, px + 5, 40, cx + 4, 44, (60, 44, 40))
+        ys = np.concatenate([a for a, b in _ib_motif(corps).values()])  # son reflet sombre, la tete en bas
+        xs = np.concatenate([b for a, b in _ib_motif(corps).values()]) + round(px)
+        ok = (ys >= len(corps) - 7) & (xs >= 0) & (xs < 64)
+        img[R + len(corps) - 1 - ys[ok], xs[ok]] *= 0.35
+    # des gouttes qui tombent encore du bord de la marquise
+    gx, gp, g0 = e["gouttes"]
+    age = (t / gp + g0) % 1.0 * gp
+    for x, a, per in zip(gx, age, gp):
+        if a < 0.6:
+            y = 22 + 25 * (a / 0.6) ** 2
+            _pointer(img, [y, y - 1], [x, x], [(230, 190, 140), (120, 90, 70)])
+        elif a < 0.75:
+            _pointer(img, [47, 47], [x - 1, x + 1], [(160, 120, 90)] * 2)
+        elif a > per - 1.2:                                              # la goutte suivante grossit
+            _pointer(img, [22], [x], [np.array([200.0, 160, 120]) * (a - per + 1.2) / 1.2])
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- 4. La station-service au milieu de nulle part ---------------------------------------------------------------
+
+_IB_ST_HORIZON = 38                       # la ligne de la plaine
+_IB_ST_PISTE = 48                         # la ligne des roues a l'arret, devant les pompes
+_IB_ST_ROUTE = 52                         # la ligne des roues sur la route
+_IB_ST_CYCLE = 80.0                       # une voiture toutes les 80 s
+_IB_ST_VOITURE = (
+    ".......rrrrrrrr.......",
+    "......rgGgggrgggr.....",
+    "....rrgggggrggggrr....",
+    ".bbbbbbbbbbbbbbbbbbbb.",
+    "Hbbbbbbbbbbbbbbbbbbbbt",
+    "bbbkkkbbbbbbbbbbkkkbbb",
+    "...kkk..........kkk...",
+)
+_IB_ST_HOMME = (".hh.", "shh.", ".cc.", "cccc", "cacc", ".cc.", ".jj.", ".jj.", ".jj.", ".kk.")
+_IB_ST_HOMME_PAS = _IB_ST_HOMME[:7] + ("j..j", "j..j", "k..k")
+_IB_ST_POMPE = ("vvvv", "wwwW", "wddW", "wwwW", "wnwW", "wnwW", "wwwW", "wwwW", "ssss")
+
+
+def _ib_st_trajet(c):
+    """La voiture sur son cycle (c en s) : (x de son nez, y de ses roues, phares, feux stop, conducteur) ou None."""
+    import numpy as np
+    P, R = _IB_ST_PISTE, _IB_ST_ROUTE
+    if c < 9.0:                                                        # elle arrive par la droite et ralentit
+        k = c / 9.0
+        x = 70 - (70 - 13) * (1 - (1 - k) ** 2.2)
+        u = float(np.clip((48 - x) / 26, 0, 1))
+        return x, R - (R - P) * u * u * (3 - 2 * u), 1.0, k > 0.55, None
+    if c < 33.0:                                                       # a l'arret, le plein
+        phares = 1.0 if c < 9.6 else (0.25 if c < 32.2 else 1.0)
+        return 13.0, float(P), phares, False, c - 9.0
+    if c < 43.0:                                                       # elle repart vers la gauche, dans la nuit
+        k = (c - 33.0) / 10.0
+        x = 13 - 60 * k ** 1.8
+        u = float(np.clip((8 - x) / 14, 0, 1))
+        return x, P + (R - P) * u * u * (3 - 2 * u), 1.0, False, None
+    return None
+
+
+def _ib_st_decor(e):
+    """La plaine, le ciel, l'auvent, les pompes, la boutique et le panneau : lumiere et calque net."""
+    import numpy as np
+    Y, X = _xy()
+    H, P, R = _IB_ST_HORIZON, _IB_ST_PISTE, _IB_ST_ROUTE
+    f = _degrade(_ib_niv((6, 8, 22), 1), (18, 26, 44), 24, H)          # le ciel, plus clair vers l'horizon
+    f[H:] = _ib_niv((10, 10, 14), 1)                                   # la plaine noire
+    f[P - 3:R + 3] = _ib_niv((22, 22, 28), 2)                          # le bitume de la piste et de la route
+    f[R + 3:] = _ib_niv((10, 12, 12), 1)                               # le bas-cote
+    lum = np.zeros((64, 64, 3))                                        # la lumiere de l'auvent
+    _ib_lueur(lum, 28, 46, 30, (150, 220, 180), 1.0, 2.6)              # sur la piste
+    _ib_lueur(lum, 28, 52, 30, (90, 130, 110), 0.45, 1.8)              # et jusque sur la route
+    lum[:H - 16] = 0
+    volume = np.zeros((64, 64, 3))                                     # dans l'air, sous l'auvent
+    _ib_lueur(volume, 28, 24, 22, (70, 110, 90), 0.75, 1.0)
+    volume *= ((Y >= 22) & (Y < P - 1))[..., None]
+    _ib_lueur(lum, 54, 46, 12, (200, 170, 110), 0.55, 2.4)             # la vitrine de la boutique sur le sol
+    sol = (Y >= P - 3)
+    f += lum * sol[..., None] + volume
+    vit = (X >= 49) & (X <= 57) & (Y >= 36) & (Y <= 42)                # la vitrine de la boutique
+    v = np.zeros((64, 64, 3)) + _ib_niv((210, 196, 150), 5)
+    _ib_lueur(v, 53, 37, 6, (40, 40, 30), 1.0)
+    f[vit] = v[vit]
+    _ib_lueur(f, 7, 9, 9, (40, 70, 60), 0.6)                            # le halo du panneau
+    for x, y in ((3, 37), (58, 37), (43, 37)):                         # des fermes, tres loin
+        f[y, x] = (90, 70, 40)
+    e["fond"] = f
+    net, nm, peint = _ib_calque()
+    peint((Y == 18) & (X >= 9) & (X <= 47), (40, 46, 50))              # l'auvent : sa tranche, sa bande verte
+    peint((Y >= 19) & (Y <= 20) & (X >= 9) & (X <= 47), (52, 196, 128))
+    peint((Y == 21) & (X >= 9) & (X <= 47), (176, 188, 184))
+    peint((Y == 22) & (X >= 10) & (X <= 46), (70, 80, 78))
+    for x0 in (12, 21, 30, 39):                                        # les tubes dessous
+        peint((Y == 22) & (X >= x0) & (X <= x0 + 5), (226, 255, 236))
+    peint(((X == 12) | (X == 44)) & (Y >= 23) & (Y <= P - 4), (96, 110, 106))   # les piliers
+    peint(((X == 12) | (X == 44)) & (Y >= 23) & (Y <= P - 4) & (Y % 3 == 0), (130, 146, 140))
+    peint((Y >= P - 5) & (Y <= P - 4) & (X >= 16) & (X <= 33), (120, 130, 124))   # l'ilot des pompes
+    peint((Y == P - 5) & (X >= 16) & (X <= 33), (170, 182, 176))
+    pal = {"v": (52, 196, 128), "w": (176, 188, 184), "W": (118, 128, 124), "d": (20, 40, 40), "n": (34, 36, 40),
+           "s": (90, 98, 96)}
+    for px in (19, 27):
+        _ib_dessin(net, _IB_ST_POMPE, px, P - 13, pal)
+    _ib_trait(net, 23, P - 9, 24, P - 6, (30, 32, 36))                 # le tuyau de la premiere pompe
+    peint((Y >= 33) & (Y <= P - 4) & (X >= 47) & (X <= 62) & ~vit & ~((X >= 59) & (X <= 61) & (Y >= 37)),
+          (54, 52, 50))                                                # la boutique
+    peint((Y == 33) & (X >= 46) & (X <= 63), (84, 82, 78))
+    peint((Y == 34) & (X >= 47) & (X <= 62), (40, 38, 38))
+    peint((X >= 59) & (X <= 61) & (Y >= 37) & (Y <= P - 4), (150, 140, 110))    # la porte vitree
+    peint(((X == 48) | (X == 58)) & (Y >= 35) & (Y <= 43) | ((Y == 35) | (Y == 43)) & (X >= 48) & (X <= 58),
+          (70, 68, 64))                                                # le cadre de la vitrine
+    peint((X == 59) & (Y == 42), (60, 60, 60))
+    for x in range(50, 57, 2):                                         # les rayons et leurs produits
+        peint((Y == 40) & (X == x), ((200, 60, 60), (60, 140, 200), (220, 180, 60), (80, 170, 90))[(x // 2) % 4])
+        peint((Y == 38) & (X == x + 1), ((220, 180, 60), (200, 60, 60), (80, 170, 90), (60, 140, 200))[(x // 2) % 4])
+    peint((Y == 42) & (X >= 49) & (X <= 57), (120, 100, 70))          # le comptoir
+    peint((X == 7) & (Y >= 17) & (Y <= P - 3), (60, 64, 66))           # le mat du panneau
+    box = (X >= 3) & (X <= 11) & (Y >= 4) & (Y <= 11)
+    peint(box, (176, 190, 186))
+    peint(box & ((X == 3) | (X == 11) | (Y == 4) | (Y == 11)), (60, 66, 66))
+    goutte = (np.hypot(X - 7, Y - 8.6) < 1.9) | ((np.abs(X - 7) <= 0.6) & (Y >= 5.6) & (Y <= 7))
+    peint(goutte & box, (40, 170, 110))
+    prix = (X >= 3) & (X <= 11) & (Y >= 12) & (Y <= 16)
+    peint(prix, (24, 26, 28))
+    for y in (13, 15):                                                 # les prix : des chiffres qui suggerent
+        for x in (5, 7, 9):
+            peint((Y == y) & (X == x), (255, 168, 60))
+            peint((Y == y) & (X == x + 1) & (x != 9), (200, 120, 40))
+    for x in range(1, 64, 6):                                          # les pointilles de la route
+        peint((Y == R + 1) & (X >= x) & (X <= x + 2), (90, 88, 70))
+    r = e["rng"]
+    for x in r.choice(np.arange(2, 62), 7, replace=False):            # des touffes d'herbe au premier plan
+        for dx, h in ((-1, 1), (0, 3), (1, 2)):
+            peint((X == x + dx) & (Y >= 63 - h) & (Y <= 63), (14, 20, 16))
+            peint((X == x + dx) & (Y == 63 - h), (30, 40, 32))
+    e["net"] = (net, nm | (net.sum(2) > 0))
+    n = 60
+    e["etoiles"] = (r.integers(0, H - 6, n), r.integers(0, 64, n), r.uniform(0, 2 * np.pi, n), r.uniform(0.3, 1.0, n))
+    e["papillons"] = (r.uniform(0, 2 * np.pi, 11), r.uniform(0.5, 1.6, 11), r.uniform(12, 44, 11), r.uniform(0, 1, 11))
+
+
+def _scene_station_service(p, e, t, ecoule, dt):
+    """Une station-service au milieu de nulle part : l'auvent qui eclaire les pompes d'un blanc vert, la boutique
+    allumee, les papillons de nuit sous les neons, la plaine et les etoiles ; une voiture arrive, fait le plein,
+    repart dans la nuit."""
+    import numpy as np
+    Y, X = _xy()
+    H, P = _IB_ST_HORIZON, _IB_ST_PISTE
+    if "fond" not in e:
+        _ib_st_decor(e)
+    img = e["fond"].copy()
+    c = t % _IB_ST_CYCLE
+    v = _ib_st_trajet(c)
+    if v is not None:                                                  # les phares devant elle, sur le bitume
+        vx, vy, ph, stop, _ = v
+        lum = np.zeros((64, 64, 3))
+        _ib_lueur(lum, vx - 10, vy, 13 * ph, (255, 236, 190), 0.55 * ph, 2.8)
+        _ib_lueur(lum, vx - 1, vy - 3, 4 * ph, (255, 240, 200), 0.5 * ph)
+        if stop or c > 33:
+            _ib_lueur(lum, vx + 23, vy - 3, 3.5, (255, 30, 20), 0.45)
+        img += lum
+    far = (t / 47.0) % 1.0                                             # une autre voiture, tres loin sur l'horizon
+    if far < 0.45:
+        fx = 66 - far / 0.45 * 70
+        _ib_lueur(img, fx, H - 0.5, 2.2, (255, 220, 160), 0.35, 1.5)
+    img = _tramer(img, 8)
+    net, masque = e["net"]
+    img[masque] = net[masque]
+    ey, ex, ep, el = e["etoiles"]                                      # les etoiles, qui scintillent doucement
+    _pointer(img, ey, ex, (el * (0.6 + 0.4 * np.sin(t * 1.3 + ep)))[:, None] * np.array([200.0, 210, 236]))
+    if far < 0.45:
+        _pointer(img, [H - 1, H - 1], [fx, fx + 1], [(255, 230, 180)] * 2)
+    # la voiture
+    if v is not None:
+        vx, vy, ph, stop, plein = v
+        dessous = float(np.clip(1 - np.abs(vx + 11 - 28) / 26, 0, 1)) ** 0.7  # sous l'auvent, elle prend la lumiere
+        corps = np.array([44.0, 20, 28]) + np.array([90.0, 28, 34]) * dessous
+        pal = {"r": tuple(corps * 1.15 + np.array([60.0, 80, 70]) * dessous), "g": (18, 24, 30),
+               "G": tuple(np.array([30.0, 40, 50]) + np.array([90.0, 120, 110]) * dessous),
+               "b": tuple(corps), "k": (12, 12, 14), "H": tuple(np.array([255.0, 240, 200]) * (0.45 + 0.55 * ph)),
+               "t": (255, 40, 30) if (stop or c > 33) else (150, 20, 20)}
+        _ib_dessin(img, _IB_ST_VOITURE, vx, vy - 6, pal)
+        if plein is not None:                                          # la portiere, le conducteur, le tuyau
+            pc = {"h": (40, 32, 28), "s": (210, 176, 140), "c": (176, 140, 64), "a": (130, 100, 44),
+                  "m": (210, 176, 140), "j": (44, 50, 70), "k": (20, 20, 22)}
+            if 1.0 < plein < 23.0:
+                if plein < 2.5 or plein > 21.5:
+                    _poser(img, [P - 5, P - 4, P - 3], [vx + 9] * 3, [(150, 170, 160)] * 3)   # la portiere ouverte
+                    ddx = vx + 10
+                elif plein < 4.5:
+                    ddx = vx + 10 + (plein - 2.5) / 2 * 13
+                elif plein < 19.5:
+                    ddx = vx + 23
+                else:
+                    ddx = vx + 23 - (plein - 19.5) / 2 * 13
+                marche = 2.5 < plein < 4.5 or 19.5 < plein < 21.5
+                corps_c = _IB_ST_HOMME_PAS if marche and (t * 3) % 1.0 < 0.5 else _IB_ST_HOMME
+                _ib_dessin(img, corps_c, ddx, P - 9, pc, miroir=2.5 < plein < 4.5)
+                if 4.5 <= plein < 19.5:                               # le pistolet dans le reservoir
+                    _ib_trait(img, 31, P - 9, ddx - 1, P - 5, (30, 32, 36))
+                    _poser(img, [P - 5], [ddx], [pc["m"]])
+            if 4.5 <= plein < 19.5:                                    # le compteur de la pompe defile
+                n = int((plein - 4.5) * 3)
+                _poser(img, [P - 11, P - 11, P - 11, P - 11], [28, 29, 28, 29],
+                       [(80, 255, 170) if (n >> k) & 1 else (30, 90, 70) for k in range(4)])
+    # le vendeur, derriere sa vitrine, qui va et vient lentement
+    vx_ = 51.5 + 2.5 * np.sin(t * 0.13) + 0.6 * np.sin(t * 0.41)
+    _ib_dessin(img, (".kk.", ".kk.", "kkkk", "kkkk"), vx_, 38, {"k": (56, 50, 44)})
+    # les papillons de nuit, qui tournent sous les tubes
+    pa, pv, px, pp = e["papillons"]
+    ang = pa + t * pv * 2.2
+    bx = px + np.sin(ang) * 2.5 + np.sin(t * 3.1 + pp * 9) * 1.0
+    by = 24.5 + np.abs(np.cos(ang * 1.3)) * 2.4 + np.sin(t * 2.3 + pp * 7) * 0.8 + pp * 1.5
+    battement = 0.55 + 0.45 * np.abs(np.sin(t * 9 + pp * 20))
+    _pointer(img, by, bx, battement[:, None] * np.array([210.0, 220, 200]))
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# LES INSTANTS (lot C) : les voyages et la ville d'en haut. Un quai de gare sous la neige, un quai de metro tard le
+# soir, un toit au-dessus de la ville, un carrefour sous la pluie a 3 h du matin. Pixel art de nuit, trame.
+
+_IC_CACHE = {}
+
+
+def _ic_motif(lignes):
+    """Un sprite en chaines ('.' = transparent) -> (ys, xs, {lettre: indices}, largeur, ses points), en cache."""
+    import numpy as np
+    m = _IC_CACHE.get(lignes)
+    if m is None:
+        pts = [(y, x, c) for y, rang in enumerate(lignes) for x, c in enumerate(rang) if c != "."]
+        ys = np.array([q[0] for q in pts], int)
+        xs = np.array([q[1] for q in pts], int)
+        par = {}
+        for i, q in enumerate(pts):
+            par.setdefault(q[2], []).append(i)
+        par = {c: np.array(v, int) for c, v in par.items()}
+        m = (ys, xs, par, max(len(rang) for rang in lignes), {(q[0], q[1]) for q in pts})
+        _IC_CACHE[lignes] = m
+    return m
+
+
+def _ic_bords(lignes, dx, dy):
+    """Les points du sprite dont le voisin (dy, dx) est vide : le lisere eclaire du cote d'une lampe."""
+    import numpy as np
+    cle = (lignes, dx, dy)
+    if cle not in _IC_CACHE:
+        ys, xs, _, _, pts = _ic_motif(lignes)
+        _IC_CACHE[cle] = np.array([(y + dy, x + dx) not in pts for y, x in zip(ys, xs)], bool)
+    return _IC_CACHE[cle]
+
+
+def _ic_dessiner(img, lignes, x, y, palette, miroir=False, force=1.0, bord=None):
+    """Pose un sprite, coin haut gauche en (x, y). palette : lettre -> couleur (absente : transparente). force < 1 :
+    en fondu. bord = [(dx, dy, couleur, part), ...] : le lisere du cote (dx, dy) prend un peu de cette lumiere."""
+    import numpy as np
+    ys, xs, par, larg, _ = _ic_motif(lignes)
+    if miroir:
+        xs = larg - 1 - xs
+    yy, xx = ys + int(np.floor(y + 0.5)), xs + int(np.floor(x + 0.5))
+    dedans = (yy >= 0) & (yy < 64) & (xx >= 0) & (xx < 64)
+    for c, i in par.items():
+        if c not in palette:
+            continue
+        i = i[dedans[i]]
+        coul = np.asarray(palette[c], float)
+        img[yy[i], xx[i]] = coul if force >= 1 else img[yy[i], xx[i]] * (1 - force) + coul * force
+    for bx, by, coul, part in bord or ():
+        b = _ic_bords(lignes, -bx if miroir else bx, by) & dedans
+        for c in par:                                          # les lettres hors palette restent transparentes
+            if c not in palette:
+                b[par[c]] = False
+        part = part * min(force, 1.0)
+        img[yy[b], xx[b]] = img[yy[b], xx[b]] * (1 - part) + np.asarray(coul, float) * part
+
+
+def _ic_integrale(tex):
+    """Les sommes cumulees d'une texture (H, L, c) le long de L, une colonne de zeros devant."""
+    import numpy as np
+    c = np.zeros((tex.shape[0], tex.shape[1] + 1, tex.shape[2]))
+    c[:, 1:] = np.cumsum(tex, 1)
+    return c
+
+
+def _ic_moyenne(cum, a, b):
+    """La moyenne exacte de la texture entre les abscisses a et b (a < b, une paire par colonne d'ecran) : un filtre
+    boite qui adoucit ce qui defile (pas de stroboscope). Hors de la texture : zero. Rend (H, n, c)."""
+    import numpy as np
+    n = cum.shape[1] - 1
+
+    def prim(s):
+        s = np.clip(s, 0, n)
+        i = np.minimum(s.astype(int), n - 1)
+        f = (s - i)[None, :, None]
+        return cum[:, i] * (1 - f) + cum[:, i + 1] * f
+    return (prim(b) - prim(a)) / np.maximum(b - a, 1e-6)[None, :, None]
+
+
+def _ic_lisse(u):
+    """0 -> 1 en douceur (smoothstep), borne."""
+    import numpy as np
+    u = np.clip(u, 0.0, 1.0)
+    return u * u * (3 - 2 * u)
+
+
+def _ic_flocons(e, img, t, dt, n, lampes, cle="flocons", haut=0, bas=64, vitesse=(4.0, 9.0)):
+    """La neige : des flocons d'un pixel qui tombent en ondulant ; pres d'une lampe ils brillent, en petite croix."""
+    import numpy as np
+    rng = e["rng"]
+    if cle not in e:
+        e[cle] = [rng.uniform(0, 64, n), rng.uniform(haut, bas, n), rng.uniform(*vitesse, n), rng.uniform(0, 6.3, n)]
+    fx, fy, fv, fp = e[cle]
+    fy += fv * min(dt, 0.5)
+    fx += (np.sin(t * 0.7 + fp) * 0.6 + 0.25) * min(dt, 0.5) * 3
+    fy[:] = haut + (fy - haut) % (bas - haut)
+    fx %= 64
+    proche = (fv - vitesse[0]) / (vitesse[1] - vitesse[0])       # 0 loin (lent, pale), 1 pres
+    eclat = 0.45 + 0.35 * proche
+    croix = np.zeros(n, bool)
+    for lx, ly, r in lampes:                                    # dans la lumiere d'une lampe : plus clair, en croix
+        d = np.hypot(fx - lx, (fy - ly) * 0.8)
+        pres = np.clip(1.4 - d / r, 0, 1)
+        eclat = eclat + pres * 0.6
+        croix |= (d < r * 0.7) & (proche > 0.45)
+    coul = np.minimum(eclat, 1.15)[:, None] * np.array([215, 222, 240])
+    _pointer(img, fy, fx, coul)
+    if croix.any():
+        c = coul[croix] * 0.45
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            _pointer(img, fy[croix] + dy, fx[croix] + dx, c)
+
+
+# --- Le quai de gare ---------------------------------------------------------------------------------------------
+
+_IC_GARE_L = 134            # la rame : trois voitures de 43 px, 2 px entre elles, la tete a droite
+_IC_GARE_HAUT = 28          # la ligne du toit de la rame
+_IC_GARE_ARRET = 110        # la tete de la rame quand elle est arretee (hors champ a droite)
+_IC_GARE_LAMPES = ((10.5, 9.5, 9.0), (49.0, 11.5, 8.0))        # (x, y, rayon de la lueur) : reverbere, auvent
+
+_IC_VOYAGEUR = (            # face a droite ; h bonnet, s visage, e echarpe, k manteau, p jambes, b bottes
+    "..hhh..",
+    ".hhhhh.",
+    ".hhhss.",
+    "..hss..",
+    ".eeee..",
+    ".kkkkk.",
+    "kkkkkkk",
+    "kkkkkkk",
+    "kkkkk.k",
+    "kkkkk.k",
+    "kkkkk.s",
+    ".kkkk..",
+    ".kkkk..",
+)
+_IC_JAMBES = (              # debout, puis quatre poses de marche
+    ("..p.p..", "..p.p..", ".bb.bb."),
+    ("..p.p..", ".p...p.", "bb...bb"),
+    ("...pp..", "..p.p..", "..bbbb."),
+    ("..p.p..", "..p..p.", ".bb..bb"),
+    ("...pp..", "...pp..", "..bbb.."),
+)
+_IC_VALISE = (
+    "m...",
+    "m...",
+    "vvvv",
+    "vwvv",
+    "vvvv",
+    "vvvv",
+    "vvvv",
+    "o..o",
+)
+
+
+def _ic_gare_rame(rng):
+    """La rame vue de cote : texture premultipliee RGBA (23 lignes x _IC_GARE_L, la tete a droite) et le profil de
+    la lumiere de ses fenetres, colonne par colonne (pour le quai)."""
+    import numpy as np
+    H, L = 23, _IC_GARE_L
+    col = np.zeros((H, L, 3))
+    a = np.zeros((H, L))
+    lum = np.zeros(L)
+    for v in range(3):
+        u0 = v * 45
+        u1 = u0 + 43
+        a[0:20, u0:u1] = 1
+        col[0, u0:u1] = (88, 94, 118)                          # un peu de neige sur le toit
+        col[1:3, u0:u1] = (30, 33, 46)
+        col[3:20, u0:u1] = (44, 50, 70)
+        col[4, u0:u1] = (60, 30, 36)                           # le lisere rouge de la livree
+        col[15, u0:u1] = (96, 76, 52)                          # et sa bande creme
+        col[19, u0:u1] = (22, 24, 34)
+        a[20, u0 + 2:u1 - 2] = 1
+        col[20, u0 + 2:u1 - 2] = (16, 16, 22)
+        for b0 in (u0 + 3, u0 + 33):                           # les bogies
+            a[20:23, b0:b0 + 7] = 1
+            col[20:23, b0:b0 + 7] = (14, 14, 20)
+            col[21, b0 + 1] = col[21, b0 + 5] = (52, 52, 62)
+        for p0 in (u0 + 9, u0 + 30):                           # les portes, leur hublot allume
+            col[5:19, p0:p0 + 4] = (36, 40, 58)
+            col[5:19, p0] = col[5:19, p0 + 3] = (24, 26, 38)
+            col[6:11, p0 + 1:p0 + 3] = (236, 186, 116)
+            lum[p0 + 1:p0 + 3] = 0.55
+        for wa, wb in ((u0 + 2, u0 + 9), (u0 + 14, u0 + 30), (u0 + 35, u0 + 42)):
+            x = wa
+            while x + 5 <= wb:
+                chaud = rng.uniform(0.8, 1.0)
+                col[6:13, x:x + 5] = np.array([255, 208, 128]) * chaud
+                col[6, x:x + 5] = np.array([255, 224, 160]) * chaud     # le plafonnier, plus clair en haut
+                lum[x:x + 5] = chaud
+                if rng.random() < 0.45:                        # un passager : la tete, les epaules
+                    q = x + int(rng.integers(0, 2))
+                    col[8:10, q + 1:q + 3] = (58, 38, 34)
+                    col[10:13, q:q + 4] = (50, 34, 32)
+                x += 6
+    u1 = 2 * 45 + 43                                            # le nez de la voiture de tete
+    for k, h0 in enumerate((5, 2, 1)):
+        a[0:h0, u1 - 1 - k] = 0
+    col[6:10, u1 - 3:u1] = (110, 100, 84)                       # le pare-brise
+    col[13:15, u1 - 1] = (255, 244, 210)                        # le phare
+    tex = np.concatenate([col * a[..., None], a[..., None]], -1)
+    return _ic_integrale(tex), _ic_integrale(lum[None, :, None])
+
+
+def _ic_gare_decor(rng):
+    """Le fond fixe (ciel, foret, champ, voie, quai et ses flaques de lumiere), les lueurs des lampes, et le calque des
+    silhouettes du premier plan (reverbere, auvent, colonnes, banc, horloge)."""
+    import numpy as np
+    Y, X = _xy()
+    fond = _degrade((5, 6, 17), (30, 34, 56), 4, 34)
+    x = np.arange(64.0)
+    crete = 33 - 1.5 * np.sin(x * 0.11 + 0.8)                  # la foret de sapins, au loin
+    c = 0
+    while c < 66:
+        h = rng.uniform(3, 8)
+        crete = np.minimum(crete, 33 - h + np.abs(x - c) * 1.6)
+        c += rng.uniform(2.5, 5)
+    _peindre_sous(fond, crete, (10, 13, 26), 34)
+    fond[34:41] = _degrade((40, 44, 64), (50, 54, 76), 34, 41)[34:41]    # le champ enneige
+    for hx, hl in ((15, 6), (46, 5)):                           # deux fermes, au loin
+        fond[35:39, hx:hx + hl] = (14, 16, 28)
+        fond[34, hx - 1:hx + hl + 1] = (78, 84, 110)            # la neige sur le toit
+        fond[33, hx:hx + hl] = (64, 70, 96)
+    fond[41:49] = (22, 22, 32)                                  # le ballast
+    fond[42:48, ::4] = (30, 32, 44)                             # la neige entre les traverses
+    fond[44] = (70, 72, 90)                                     # rail du fond
+    fond[47] = (84, 86, 104)                                    # rail de devant
+    fond[49:51] = (14, 14, 22)                                  # le flanc du quai
+    fond[51] = (120, 118, 108)                                  # la bordure
+    fond[52:64] = _degrade((30, 34, 46), (34, 38, 48), 52, 64)[52:64]   # le quai sous la neige
+    for lx, ly, r in _IC_GARE_LAMPES:                           # les flaques de lumiere sur la neige
+        _halo(fond, lx, 59.5, 8.5, (255, 196, 120), 0.85, aplati=2.6)
+        _halo(fond, lx, 44, 6, (255, 190, 110), 0.28, aplati=2.0)          # et sur les rails
+    lueurs = np.zeros((64, 64, 3))
+    _halo(lueurs, 10.5, 9.5, 2.0, (255, 176, 92), 1.1)
+    _halo(lueurs, 10.5, 9.5, 6.0, (255, 160, 80), 0.28)
+    _halo(lueurs, 49.0, 11.5, 2.0, (255, 214, 150), 1.0)
+    _halo(lueurs, 49.0, 11.5, 6.0, (255, 196, 130), 0.26)
+    lueurs = _tramer(lueurs, 8)
+    dessus = np.zeros((64, 64, 3))
+    m = np.zeros((64, 64), bool)
+
+    def peindre(masque, coul):
+        dessus[masque] = coul
+        m[masque] = True
+    sombre = (20, 20, 28)
+    peindre((X >= 5) & (X <= 6) & (Y >= 9) & (Y <= 61), sombre)            # le reverbere
+    peindre((X >= 4) & (X <= 7) & (Y >= 58) & (Y <= 61), sombre)
+    peindre((X == 7) & (Y >= 7) & (Y <= 8), sombre)
+    peindre((X >= 8) & (X <= 11) & (Y == 6), sombre)
+    peindre((X >= 9) & (X <= 12) & (Y == 7), (34, 30, 30))
+    peindre((X == 6) & (Y >= 10) & (Y <= 40), (66, 50, 36))                # son lisere, du cote de la lampe
+    peindre((Y >= 3) & (Y <= 6) & (X >= 33), (24, 22, 30))                 # l'auvent
+    peindre((Y == 2) & (X >= 34), (128, 134, 162))                         # la neige sur l'auvent
+    peindre((Y == 7) & (X >= 33) & (X % 2 == 0), (24, 22, 30))             # son lambrequin
+    peindre((Y == 6) & (X >= 40) & (X <= 58), (70, 54, 40))                # le dessous, eclaire par la lampe
+    for cx, cote in ((36, 1), (61, -1)):                                   # les colonnes en fonte
+        peindre((X == cx) & (Y >= 7) & (Y <= 60), (22, 22, 30))
+        peindre((np.abs(X - cx) <= 1) & (Y >= 7) & (Y <= 8), (22, 22, 30))
+        peindre((np.abs(X - cx) <= 1) & (Y >= 59) & (Y <= 60), (22, 22, 30))
+        peindre((X == cx + cote) & (Y >= 9) & (Y <= 40), (54, 42, 34))
+    peindre((X == 49) & (Y >= 7) & (Y <= 9), (24, 22, 30))                 # la suspension
+    peindre((X >= 48) & (X <= 50) & (Y == 10), (40, 34, 30))
+    peindre((X == 55) & (Y >= 7) & (Y <= 9), (24, 22, 30))                 # l'horloge
+    cadran = np.hypot(X - 55, Y - 13.5) <= 3.6
+    peindre(cadran, (30, 28, 34))
+    peindre(np.hypot(X - 55, Y - 13.5) <= 2.7, (212, 196, 160))
+    bois, dessus_bois = (46, 32, 26), (138, 96, 60)                        # le banc
+    peindre((X >= 42) & (X <= 55) & ((Y == 53) | (Y == 55)), bois)
+    peindre((X >= 42) & (X <= 55) & (Y == 53), dessus_bois)
+    peindre((X >= 41) & (X <= 56) & (Y == 57), dessus_bois)
+    peindre((X >= 41) & (X <= 56) & (Y == 58), bois)
+    for lx in (42, 55):
+        peindre((X == lx) & (Y >= 53) & (Y <= 61), (30, 24, 24))
+    return fond, lueurs, dessus, m
+
+
+def _scene_quai_gare(p, e, t, ecoule, dt):
+    """Le quai d'une petite gare de campagne sous la neige : le reverbere, l'auvent, son horloge et son banc ;
+    quelqu'un attend avec sa valise, et toutes les minutes un train arrive, s'arrete, l'emmene, repart."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "fond" not in e:
+        e["fond"], e["lueurs"], e["dessus"], e["dessus_m"] = _ic_gare_decor(rng)
+        e["rame"], e["vitres"] = _ic_gare_rame(rng)
+        ec = np.ones((21, 64))                                  # les lampes du quai eclairent un peu la rame
+        for lx, ly, r in _IC_GARE_LAMPES:
+            ec += 0.9 * np.exp(-np.hypot(X[:21] - lx, (Y[:21] + _IC_GARE_HAUT - ly) * 0.8) / 11)
+        e["eclairage"] = ec[..., None]
+        e["villages"] = (np.array([36, 37, 36, 32, 33]), np.array([17, 19, 48, 4, 58]))
+    P = (t + 14.0) % 60.0                                       # la minute du train
+    L = _IC_GARE_L
+    if P < 20:                                                  # il arrive, de plus en plus lentement
+        u = P / 20
+        tete, vit = _IC_GARE_ARRET - 150 * (1 - u) ** 2, 300 * (1 - u) / 20
+    elif P < 36:
+        tete, vit = float(_IC_GARE_ARRET), 0.0
+    else:                                                       # il repart, de plus en plus vite
+        u = min((P - 36) / 18, 1.0)
+        tete, vit = _IC_GARE_ARRET + 96 * u * u, 192 * u / 18
+    img = e["fond"].copy()
+    queue = tete - L
+    h0 = _IC_GARE_HAUT
+    phare = float(np.clip(1 - (tete - 70) / 60, 0, 1)) if tete < 130 else 0.0
+    if phare > 0:                                               # la lumiere du phare, devant lui, sur la voie
+        _halo(img, tete + 9, 45, 7, (255, 236, 190), 0.9 * phare, aplati=2.4)
+    present = queue < 64 and tete > -2
+    ouv = 0.0
+    if present:
+        m = vit / 30                                            # le flou du mouvement (une image)
+        a, b = X[0] - queue - m, X[0] + 1 - queue
+        vit_ = _ic_moyenne(e["vitres"], a, b)[0, :, 0]          # la lumiere des fenetres, sur la neige du quai
+        for y in range(52, 62):
+            dec = np.clip(X[0] - (y - 51) * 0.7, 0, 63).astype(int)
+            img[y] += (vit_[dec] * 0.38 * np.exp(-(y - 52) / 3.5))[:, None] * np.array([255, 196, 116])
+        if 21 <= P < 33:                                        # la porte s'ouvre (x = 28..31)
+            ouv = float(_ic_lisse((P - 21.0) / 1.2) * _ic_lisse((32.0 - P) / 1.2))
+            _halo(img, int(round(queue)) + 56, 55, 4, (255, 200, 130), 0.6 * ouv, aplati=2.0)
+    img = _tramer(img, 8)
+    if present:                                                 # la rame, en aplats nets, eclairee par les lampes
+        A = _ic_moyenne(e["rame"], a, b)[:21]
+        zone = img[h0:h0 + 21]
+        img[h0:h0 + 21] = zone * (1 - A[..., 3:]) + A[..., :3] * e["eclairage"]
+        if ouv > 0:
+            px = int(round(queue)) + 54
+            img[h0 + 5:h0 + 19, px + 1:px + 3] = img[h0 + 5:h0 + 19, px + 1:px + 3] * (1 - ouv) + \
+                np.array([255, 220, 160]) * ouv
+        if -2 < tete < 66:
+            _halo(img, tete, h0 + 13.5, 1.4, (255, 240, 200), 1.0 * phare)
+    img += e["lueurs"]
+    vy, vx = e["villages"]                                      # quelques fenetres du village, au loin
+    if queue >= 64 or tete < 0:
+        _pointer(img, vy, vx, [[200, 140, 70]] * len(vx))
+    else:
+        _pointer(img, vy, vx, (np.array([200, 140, 70]) * ((vx < queue) | (vx > tete))[:, None]))
+    dm = e["dessus_m"]
+    img[dm] = e["dessus"][dm]
+    img[9, 9:12] = (255, 214, 140)                              # les ampoules, nettes
+    img[11, 48:51] = (255, 230, 180)
+    mn = (t / 60.0) % 60 / 60 * 2 * np.pi                       # l'horloge donne l'heure (UTC)
+    hr = (t / 3600.0) % 12 / 12 * 2 * np.pi
+    for ang, lg in ((mn, (0.9, 1.9, 2.6)), (hr, (0.9, 1.6))):
+        for r in lg:
+            img[int(round(13.5 - np.cos(ang) * r)), int(round(55 + np.sin(ang) * r))] = (40, 30, 30)
+    img[13, 55] = (40, 30, 30)
+    # le voyageur
+    sombre = {"h": (110, 34, 40), "s": (150, 104, 84), "e": (40, 70, 96), "k": (32, 30, 42), "p": (24, 24, 32),
+              "b": (14, 14, 18), "v": (88, 44, 38), "w": (130, 74, 60), "m": (60, 60, 70), "o": (20, 20, 24)}
+    vers, pose, px, py, force, voit = 1, 0, 24.0, 39.0, 1.0, True
+    if P < 20:
+        vers = -1                                               # il regarde arriver le train
+    elif 22.5 <= P < 25:
+        u = (P - 22.5) / 2.5
+        px, pose = 24 + 3 * u, 1 + int(P * 4) % 4
+    elif 25 <= P < 26.5:
+        u = (P - 25) / 1.5
+        px, py, force = 27.0, 39 - 2 * u, 1 - u                 # il monte, et disparait dans la lumiere
+    elif 26.5 <= P < 38:
+        voit = False
+    elif 38 <= P < 49:                                          # le suivant arrive, sa valise derriere lui
+        u = (P - 38) / 11
+        px, pose = -9 + 33 * u, 1 + int(P * 3.5) % 4
+    if voit:
+        k = float(_ic_lisse((P - 14) / 4) * _ic_lisse((40 - P) / 4))   # le train, derriere lui, l'eclaire aussi
+        lumiere = np.array([230, 170, 110]) * (1 - k) + np.array([255, 214, 150]) * k
+        corps = _IC_VOYAGEUR + _IC_JAMBES[pose]
+        _ic_dessiner(img, corps, px, py, sombre, miroir=vers < 0, force=force,
+                     bord=[(-1, 0, lumiere, 0.55), (0, -1, lumiere, 0.35)])
+        if pose == 0:
+            _ic_dessiner(img, _IC_VALISE, px + 7 if vers > 0 else px - 4, py + 8, sombre, miroir=vers < 0,
+                         force=force, bord=[(-1, 0, lumiere, 0.4)])
+        else:                                                   # en marchant, elle roule derriere lui
+            _ic_dessiner(img, _IC_VALISE, px - 4, py + 8, sombre, miroir=True, force=force)
+        souffle = (P * 0.29) % 1.0                              # son souffle, dans le froid
+        if pose == 0 and souffle < 0.45 and force >= 1:
+            s = souffle / 0.45
+            bx = px + (6 if vers > 0 else 0) + vers * (0.5 + s * 2.5)
+            _pointer(img, [py + 3 - s * 3], [bx], [np.array([150, 160, 180]) * (1 - s)])
+        if px < 9:                                              # le reverbere reste devant lui
+            dm = e["dessus_m"] & (X <= 12) & (Y >= 9)
+            img[dm] = e["dessus"][dm]
+    _ic_flocons(e, img, t, dt, 34, _IC_GARE_LAMPES)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Le metro ------------------------------------------------------------------------------------------------------
+# On est sur le quai, on regarde vers le tunnel : tout ce qui longe la voie fuit vers le point (14, 36). Le decor
+# est lance en rayons une seule fois (profondeur z en metres, ecart lateral, hauteur sous l'oeil) ; la rame est une
+# texture qui glisse sur son flanc, filtree colonne par colonne (aucun stroboscope).
+
+_IC_M_VX, _IC_M_VY, _IC_M_F, _IC_M_BOUT = 14.0, 36.0, 40.0, 18.0   # point de fuite, focale, fond de la station
+_IC_M_LAT = (-1.2, 4.8, 5.2, 8.0, 9.0)      # notre mur, le bord du quai, les deux flancs de la rame, le mur d'en face
+_IC_M_NIVEAUX = 10          # une trame un peu plus fine : beaucoup de surfaces a mi-ombre
+_IC_M_PAS = 0.08            # metres par colonne de texture de la rame
+_IC_M_LONG = 46.4           # la rame : trois voitures de 15.2 m, 0.8 m entre elles
+_IC_M_ARRET = -6.0          # la tete quand elle est arretee (derriere nous)
+_IC_M_PORTES = (2.2, 6.6, 11.0)                                 # le debut de chaque porte (1.3 m), dans une voiture
+
+_IC_PASSANTE = (            # face a droite, la tete penchee sur son telephone ; t : l'ecran
+    "..hhh...",
+    ".hhhhh..",
+    ".hhhss..",
+    ".hhsss..",
+    ".hhss...",
+    ".hkkk...",
+    "kkkkkk..",
+    "kkkkkkst",
+    "kkkkkk..",
+    "kkkkkk..",
+    "kkkkkk..",
+    "kkkkkk..",
+    ".kkkkk..",
+    ".kkkkk..",
+    "..p.p...",
+    "..p.p...",
+    ".bb.bb..",
+)
+_IC_PASSANTE_LEVE = (       # elle a leve la tete vers la rame, le telephone baisse
+    "..hhh...",
+    ".hhhhh..",
+    ".hhsss..",
+    ".hhsss..",
+    ".hhs....",
+    ".hkkk...",
+    "kkkkkk..",
+    "kkkkkk..",
+    "kkkkks..",
+    "kkkkkd..",
+    "kkkkkk..",
+    "kkkkkk..",
+    ".kkkkk..",
+    ".kkkkk..",
+    "..p.p...",
+    "..p.p...",
+    ".bb.bb..",
+)
+
+
+def _ic_metro_textures():
+    """Le flanc de la rame (portes fermees, puis ouvertes) : textures premultipliees RGBA, 32 lignes de hauteur
+    (de h = -2.0 a +2.6 m) sur _IC_M_LONG metres (la tete en u = 0) ; et le profil de la lumiere qu'elle jette."""
+    import numpy as np
+    n = int(round(_IC_M_LONG / _IC_M_PAS))
+    u = (np.arange(n) + 0.5) * _IC_M_PAS
+    h = -2.0 + (np.arange(32) + 0.5) * 4.6 / 32
+    U, H = np.meshgrid(u, h)
+    dans = U % 16.0                                              # la position dans la voiture
+    caisse = dans < 15.2
+    bleu = np.array([30, 50, 98])
+    col = np.zeros((32, n, 3))
+    col[:] = bleu
+    col[H < -1.85] = (120, 130, 136)                             # le bord du toit
+    vitre = (H > -1.35) & (H < 0.0)
+    pilier = (dans % 1.3) < 0.3
+    verre = vitre & ~pilier
+    col[verre] = (206, 214, 180)
+    col[verre & (H < -1.15)] = (230, 236, 206)                   # les plafonniers, en haut
+    for c0 in (0.0, 16.0, 32.0):                                 # quelques voyageurs, tard le soir
+        for q, debout in ((3.9, 0), (9.4, 1), (13.2, 0), (5.1, 0)):
+            if (c0 * 1.7 + q * 3.1) % 5 < 2.6:
+                x = c0 + q
+                hd = -0.95 if debout else -0.7
+                col[vitre & (np.abs(U - x) < 0.16) & (H > hd) & (H < hd + 0.3)] = (54, 54, 64)
+                col[vitre & (np.abs(U - x) < 0.3) & (H >= hd + 0.3)] = (48, 48, 58)
+    col[(H >= 0.0) & (H < 0.2)] = (176, 182, 186)                # la bande blanche
+    col[H >= 1.75] = (18, 20, 28)
+    col[H >= 2.0] = (12, 12, 14)
+    porte = np.zeros_like(U, bool)
+    milieu = np.zeros_like(U, bool)
+    for p0 in _IC_M_PORTES:
+        porte |= (dans >= p0) & (dans < p0 + 1.3) & (H > -1.5) & (H < 1.7)
+        milieu |= np.abs(dans - p0 - 0.65) < 0.05
+    ouverte = col.copy()
+    col[porte] = (42, 66, 116)
+    col[porte & (H > -1.2) & (H < -0.25) & (((dans - 0.1) % 0.65) < 0.5)] = (190, 200, 172)   # les hublots
+    col[porte & milieu] = (18, 26, 44)
+    ouverte[porte] = (226, 230, 204)                             # porte ouverte : l'interieur, sa barre, le sol
+    ouverte[porte & milieu & (H > -1.4)] = (110, 112, 104)
+    ouverte[porte & (H > 1.4)] = (140, 140, 128)
+    cab = U < 1.6                                                # la cabine de tete
+    col[cab & vitre] = (50, 62, 78)
+    ouverte[cab & vitre] = (50, 62, 78)
+    a = caisse.astype(float)
+    texs = [_ic_integrale(np.concatenate([c * a[..., None], a[..., None]], -1)) for c in (col, ouverte)]
+    lum = ((verre & ~cab).any(0) & caisse[0]) * 1.0
+    pr = (porte.any(0) & caisse[0]) * 1.0
+    k = np.ones(9) / 9                                           # adoucie : c'est une lumiere diffuse
+    return texs, np.convolve(lum + pr * 0.3, k, "same"), np.convolve(lum + pr * 2.4, k, "same")
+
+
+def _ic_metro_decor():
+    """Lance les rayons du decor : couleur fixe, profondeur, et les masques de la rame, du sol, du tunnel."""
+    import numpy as np
+    Y, X = _xy()
+    f, zb = _IC_M_F, _IC_M_BOUT
+    l_mur, l_bord, l_rame, _, l_face = _IC_M_LAT
+    dx, dy = X + 0.5 - _IC_M_VX, Y + 0.5 - _IC_M_VY
+    INF = 1e9
+    with np.errstate(divide="ignore", invalid="ignore"):
+        def plan_h(h, l0, l1, z0, z1):                           # un plan horizontal (h > 0 : sous l'oeil)
+            z = f * h / dy
+            lat = dx * z / f
+            return np.where((z > z0) & (z <= z1) & (lat >= l0) & (lat <= l1), z, INF)
+
+        def plan_v(lat, h0, h1, z0, z1):                         # un plan vertical, le long de la voie
+            z = f * lat / dx
+            h = dy * z / f
+            return np.where((z > z0) & (z <= z1) & (h >= h0) & (h <= h1), z, INF)
+        zs = [plan_h(1.6, l_mur, l_bord, 0, zb),                 # 0 notre quai
+              plan_v(l_bord, 1.6, 2.6, 0, zb),                   # 1 son flanc
+              plan_h(2.6, l_bord, l_face, 0, zb),                # 2 la voie
+              plan_v(l_face, -4.2, 2.6, 0, zb),                  # 3 le mur d'en face
+              plan_v(l_mur, -4.2, 1.6, 0, zb),                   # 4 notre mur
+              plan_h(-4.2, l_mur, l_face, 0, zb)]                # 5 la voute
+        lat_b, h_b = dx * zb / f, dy * zb / f                    # 6 le mur du fond, et la bouche du tunnel
+        arche = -1.3 - 1.5 * np.sqrt(np.clip(1 - ((lat_b - 6.95) / 1.95) ** 2, 0, 1))
+        bouche = (lat_b >= 5.0) & (lat_b <= 8.9) & (h_b >= arche) & (h_b <= 2.6)
+        zs.append(np.where((lat_b >= l_mur) & (lat_b <= l_face) & (h_b >= -4.2) & (h_b <= 2.6) & ~bouche, zb, INF))
+        zs += [plan_v(8.9, -2.8, 2.6, zb, 90), plan_h(2.6, 5.0, 8.9, zb, 90), plan_h(-2.8, 5.0, 8.9, zb, 90)]
+        Z = np.stack(zs)
+        quoi = Z.argmin(0)
+        z = Z.min(0)
+        lat, h = dx * z / f, dy * z / f
+    albedo = np.zeros((64, 64, 3))
+    teintes = {0: (70, 64, 60), 1: (20, 20, 22), 2: (18, 16, 16), 3: (160, 174, 160), 4: (96, 106, 96),
+               5: (52, 58, 54), 6: (84, 94, 86), 7: (12, 12, 14), 8: (10, 10, 12), 9: (10, 10, 12)}
+    for k, c in teintes.items():
+        albedo[quoi == k] = c
+    albedo[(quoi == 0) & (lat > l_bord - 0.45)] = (176, 176, 160)          # le bord du quai, en pierre claire
+    albedo[(quoi == 0) & (lat > l_bord - 0.85) & (lat <= l_bord - 0.65)] = (130, 116, 64)   # la bande d'eveil
+    albedo[(quoi == 2) & ((np.abs(lat - 5.85) < 0.1) | (np.abs(lat - 7.35) < 0.1))] = (120, 126, 126)
+    albedo[(quoi == 3) & (np.abs(h + 2.45) < 0.13)] = (40, 96, 72)          # la frise de carreaux verts
+    albedo[(quoi == 4) & (np.abs(h + 2.45) < 0.13)] = (40, 96, 72)
+    albedo[(quoi == 3) & (h > 1.5)] = (60, 64, 60)
+    albedo[(quoi == 6) & (np.hypot(lat_b - 6.95, np.minimum(h_b - arche, 0)) < 2.3) & ~bouche & (lat_b > 4.6)] = \
+        (150, 160, 146)                                                     # l'encadrement du tunnel
+    sieges = (quoi == 4) & (h > 0.72) & (h < 1.15) & (z > 3) & (z < 14) & ((z % 0.62) > 0.1)
+    albedo[sieges] = (210, 96, 40)                               # la rangee de sieges orange
+    plaque = (quoi == 3) & (h > -2.75) & (h < -2.1) & (z > 6.6) & (z < 9.0)
+    albedo[plaque] = (30, 52, 130)                               # la plaque du nom de la station
+    lettres = plaque & (h > -2.58) & (h < -2.27) & (((z - 6.8) % 0.4) < 0.26) & (z > 6.85) & (z < 8.75)
+    albedo[lettres] = (240, 240, 230)
+    d1 = np.hypot(lat - 1.8, h + 4.0)                            # la lumiere des deux rangees de neons
+    d2 = np.hypot(lat - 7.4, h + 4.0)
+    lum = 1.0 / (1 + (d1 / 1.5) ** 2) + 0.8 / (1 + (d2 / 1.5) ** 2)
+    flaques = np.zeros((64, 64))                                 # sous chaque tube, une flaque sur le sol
+    for zc in np.arange(2.0, zb, 3.5) + 1.2:
+        flaques += np.exp(-((z - zc) / 1.5) ** 2)
+    sol = quoi == 0
+    lum = np.where(sol, 0.25 * lum + 0.75 * flaques * np.exp(-((lat - 1.8) / 1.9) ** 2), lum)
+    lum = (0.05 + 1.2 * lum) * (0.45 + 0.55 * np.exp(-z / 9))
+    lum = np.where(quoi == 6, 0.5 + 0.4 * np.exp(-np.abs(h_b + 1.0) / 2), lum)   # le fond, sous le dernier tube
+    lum = np.where(quoi >= 7, 0.25, lum)
+    fond = albedo * lum[..., None] * np.array([0.84, 1.0, 0.88])  # un peu verdatre
+    affiche = (quoi == 3) & (z > 8.4) & (z < 12.2) & (h > -1.75) & (h < 0.35)
+    au, av = (12.2 - z) / 3.8, (h + 1.75) / 2.1                  # l'affiche lumineuse : un coucher de soleil
+    ciel = np.clip(av / 0.6, 0, 1)[..., None]
+    img_a = np.array([170, 60, 100]) * (1 - ciel) + np.array([255, 160, 80]) * ciel
+    mer = np.array([26, 50, 110]) + 40 * ((((av - 0.6) * 12 + au * 2) % 1) < 0.3)[..., None] * np.array([1, 1, 0.6])
+    img_a = np.where((av > 0.62)[..., None], mer, img_a)
+    soleil = np.hypot((au - 0.62) * 1.7, av - 0.5) < 0.15
+    img_a = np.where(soleil[..., None], np.array([255, 236, 170]), img_a)
+    bordure = affiche & ((au < 0.05) | (au > 0.95) | (av < 0.08) | (av > 0.92))
+    fond[affiche] = img_a[affiche]
+    fond[bordure] = (64, 54, 40)
+    ay, ax = np.nonzero(affiche)
+    _halo(fond, ax.mean(), ay.mean(), 5, (255, 140, 90), 0.3, aplati=0.9)
+    plan = (quoi == 4) & (z > 3.6) & (z < 6.4) & (h > -1.1) & (h < 0.4)     # le plan du quartier, eclaire
+    pu, pv = (z - 3.6) / 2.8, (h + 1.1) / 1.5
+    carte = np.zeros((64, 64, 3))
+    carte[:] = (128, 142, 134)
+    carte[np.abs(pv - 0.35) < 0.06] = (170, 70, 64)
+    carte[np.abs(pu - 0.45) < 0.08] = (70, 96, 160)
+    carte[(pu < 0.08) | (pu > 0.92) | (pv < 0.06) | (pv > 0.94)] = (40, 44, 48)
+    fond[plan] = carte[plan]
+    _halo(fond, 4, 32, 4, (150, 200, 190), 0.25, aplati=0.7)
+    _halo(fond, 6, 45, 5, (150, 200, 190), 0.3, aplati=2.0)     # sa lueur sur le sol
+    tubes, tz = [], np.arange(2.0, zb, 0.03)                     # les tubes : 2.4 m allumes, 1.1 m d'ombre
+    for lt in (1.8, 7.4):
+        seg = (tz % 3.5) < 2.4
+        tx, ty = _IC_M_VX + f * lt / tz[seg], _IC_M_VY - f * 4.0 / tz[seg]
+        ok = (ty >= 0) & (ty < 64) & (tx >= 0) & (tx < 64)
+        tubes.append((ty[ok].astype(int), tx[ok].astype(int), (tz[seg][ok] // 3.5).astype(int) + int(lt * 10)))
+        for k in range(0, int(ok.sum()), 5):                     # leur lueur
+            _halo(fond, tx[ok][k], ty[ok][k], 1.6, (150, 220, 170), 0.10)
+    ty = np.concatenate([q[0] for q in tubes])
+    tx = np.concatenate([q[1] for q in tubes])
+    tid = np.concatenate([q[2] for q in tubes])
+    zt = np.where(dx > 0.6, f * l_rame / np.maximum(dx, 0.6), INF)  # le flanc de la rame, colonne par colonne
+    ht = dy * zt / f
+    flanc = (zt < z) & (ht >= -2.0) & (ht < 2.6) & (dx > 0.6)
+    ligne = np.clip(((ht + 2.0) / 4.6 * 32).astype(int), 0, 31)
+    hr = 3.2 - ht                                                # le sol lisse reflete la rame, a l'envers
+    reflet = (quoi == 0) & (dx > 0.6) & (hr >= -2.0) & (hr < 1.6)
+    ry, rx = np.nonzero(reflet)
+    sol = (quoi == 0) & (lat > 2.2)                              # le sol qui recoit la lumiere de la rame
+    tunnel = quoi >= 7
+    fy, fx = np.nonzero(flanc)
+    return dict(fond=fond, z=z, tubes=(ty, tx, tid), flanc=(fy, fx), ligne=ligne[fy, fx],
+                flanc_t=np.clip((zt[fy, fx] - zb + 1.5) / 2, 0, 1), sol=np.nonzero(sol), sol_z=z[sol],
+                sol_l=np.exp(-(l_bord - lat[sol]) / 0.9), tunnel=tunnel, tunnel_z=z[tunnel], reflet=(ry, rx),
+                reflet_l=np.clip(((hr[ry, rx] + 2.0) / 4.6 * 32).astype(int), 0, 31),
+                reflet_k=0.16 + 0.12 * np.clip((z[ry, rx] - 3) / 8, 0, 1))
+
+
+def _scene_metro(p, e, t, ecoule, dt):
+    """Un quai de metro tard le soir : les neons verdatres, le carrelage, l'affiche lumineuse, le tunnel noir ; une
+    passante seule sur son telephone. La lumiere des phares nait dans le tunnel, la rame glisse, s'arrete, repart."""
+    import numpy as np
+    Y, X = _xy()
+    if "d" not in e:
+        e["d"] = _ic_metro_decor()
+        e["tex"], e["lum_f"], e["lum_o"] = _ic_metro_textures()
+    d = e["d"]
+    f = _IC_M_F
+    l_rame, l_rame2 = _IC_M_LAT[2], _IC_M_LAT[3]
+    P = (t + 8.0) % 60.0
+    if P < 16:                                                   # elle arrive du tunnel et ralentit
+        u = P / 16
+        sh, v = _IC_M_ARRET + 81 * (1 - u) ** 2, 2 * 81 * (1 - u) / 16
+    elif P < 32:
+        sh, v = _IC_M_ARRET, 0.0
+    else:                                                        # elle repart vers nous
+        u = min((P - 32) / 16, 1.0)
+        sh, v = _IC_M_ARRET - 48 * u * u, 2 * 48 * u / 16
+    ouv = float(_ic_lisse((P - 17.5) / 1.0) * _ic_lisse((29.0 - P) / 1.0))
+    img = d["fond"].copy()
+    lueur = float(np.clip((80 - sh) / 45, 0, 1)) if sh > 16 else float(np.clip((sh - 6) / 10, 0, 1))
+    if lueur > 0:                                                # les phares eclairent le tunnel avant elle
+        zt = d["tunnel_z"]
+        img[d["tunnel"]] += (lueur * np.exp(-np.abs(sh - 2 - zt) / 7.0) * (zt < sh + 1))[:, None] * \
+            np.array([150, 160, 140])
+        _halo(img, _IC_M_VX + f * 7 / _IC_M_BOUT, _IC_M_VY + 2, 4.5, (200, 210, 180), 0.4 * lueur, aplati=1.2)
+    present = sh + _IC_M_LONG > 2.0
+    if present:
+        xs = np.arange(64) - _IC_M_VX                            # chaque colonne voit un bout du flanc de la rame
+        z0 = np.where(xs + 1 > 0.6, f * l_rame / np.maximum(xs + 1, 0.6), 1e9)
+        z1 = np.where(xs > 0.3, f * l_rame / np.maximum(xs, 0.3), 1e9)
+        m = v / 30 / 2                                           # et le flou du mouvement
+        a = (np.minimum(z0, 400) - sh - m) / _IC_M_PAS
+        b = (np.minimum(z1, 400) - sh + m) / _IC_M_PAS
+        A = _ic_moyenne(e["tex"][0], a, b)
+        if ouv > 0:
+            A = A * (1 - ouv) + _ic_moyenne(e["tex"][1], a, b) * ouv
+        ry, rx = d["reflet"]                                     # son reflet dans le sol
+        img[ry, rx] += A[d["reflet_l"], rx, :3] * d["reflet_k"][:, None]
+        prof = e["lum_f"] * (1 - ouv) + e["lum_o"] * ouv         # la lumiere qu'elle jette sur le bord du quai
+        uu = (d["sol_z"] - sh) / _IC_M_PAS
+        li = np.interp(uu, np.arange(len(prof)), prof, left=0, right=0) * d["sol_l"]
+        img[d["sol"]] += li[:, None] * np.array([110, 116, 96])
+        if 2.5 < sh < 30:                                        # le faisceau des phares sur la voie, devant
+            zf = max(sh - 3.0, 1.5)
+            _halo(img, _IC_M_VX + f * 6.6 / zf, _IC_M_VY + f * 2.4 / zf, 1.5 + 12 / zf, (230, 236, 210),
+                  0.5 * min(1.0, (30 - sh) / 6), aplati=2.0)
+    img = _tramer(img, _IC_M_NIVEAUX)
+    ty, tx, tid = d["tubes"]                                     # les tubes, nets ; l'un gresille rarement
+    gres = 1.0
+    cy = t % 47.0
+    if cy < 1.6:
+        gres = 1 - 0.45 * np.sin(cy / 1.6 * np.pi) * (0.7 + 0.3 * np.sin(cy * 11) ** 2)
+    img[ty, tx] = np.where(tid == 18 + 2, gres, 1.0)[:, None] * np.array([200, 255, 220])
+    if present:                                                  # le flanc, en aplats nets
+        yy, xx = d["flanc"]
+        s = A[d["ligne"], xx]
+        corps = s[:, :3] * (1 - 0.8 * d["flanc_t"])[:, None]       # dans le tunnel, elle est dans le noir
+        img[yy, xx] = img[yy, xx] * (1 - s[:, 3:]) + corps
+    if 2.0 < sh < 60:                                            # la face avant, qui grandit en sortant du tunnel
+        lat = (X + 0.5 - _IC_M_VX) * sh / f
+        hh = (Y + 0.5 - _IC_M_VY) * sh / f
+        face = (lat >= l_rame) & (lat <= l_rame2) & (hh >= -2.0) & (hh <= 1.8) & (sh < d["z"])
+        if face.any():
+            fy, fx = np.nonzero(face)
+            la, ha = lat[face] - l_rame, hh[face]
+            coul = np.zeros((len(fy), 3))
+            coul[:] = (30, 50, 98)
+            pare = (ha > -1.3) & (ha < -0.3) & (np.abs(la - 1.4) > 0.15) & (la > 0.25) & (la < 2.55)
+            coul[pare] = (50, 62, 76)
+            coul[(ha > -1.8) & (ha < -1.45) & (la > 0.6) & (la < 2.2)] = (255, 170, 60)    # la girouette
+            coul[ha > 1.55] = (16, 18, 24)
+            img[fy, fx] = coul * (1 - 0.75 * np.clip((sh - _IC_M_BOUT + 1) / 3, 0, 1))
+        for pl in (l_rame + 0.5, l_rame2 - 0.5):                 # les deux phares
+            px_, py_ = _IC_M_VX + f * pl / sh, _IC_M_VY + f * 0.75 / sh
+            if 0 <= px_ < 64 and 0 <= py_ < 64 and sh < d["z"][int(py_), int(px_)] + 0.5:
+                _halo(img, px_, py_, 0.6 + 3 / sh, (255, 250, 225), 1.0)
+                img[int(py_), int(px_)] = (255, 252, 236)
+    pas = {"h": (44, 30, 26), "s": (150, 112, 96), "k": (40, 46, 54), "p": (26, 26, 34), "b": (14, 14, 18),
+           "t": (190, 230, 255), "d": (40, 50, 60)}
+    bord = [(0, -1, (170, 220, 190), 0.45), (-1, 0, (140, 190, 160), 0.3)]
+    if 3.0 < P < 22.0:                                           # elle leve la tete vers la rame
+        _ic_dessiner(img, _IC_PASSANTE_LEVE, 40, 35, pas, miroir=True, bord=bord)
+    else:
+        pas["s"] = (120, 150, 190)                               # l'ecran bleuit son visage
+        _ic_dessiner(img, _IC_PASSANTE, 40, 35, pas, miroir=True, bord=bord)
+        _halo(img, 40.5, 42.5, 1.0, (90, 140, 220), 0.5)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Le toit -------------------------------------------------------------------------------------------------------
+
+_IC_T_LUNE = (41.0, 9.0)
+_IC_T_AMPOULE = (56, 33)
+_IC_T_TROUEE = (31, 42)     # entre ces colonnes, la ville est basse : le chat se decoupe sur la brume
+_IC_CHAT_DOS = (            # assis, de dos, il regarde la ville
+    ".k...k.",
+    ".kk.kk.",
+    ".kkkkk.",
+    ".kkkkk.",
+    "..kkk..",
+    ".kkkkk.",
+    "kkkkkkk",
+    "kkkkkkk",
+    "kkkkkkk",
+)
+_IC_CHAT_TOURNE = (         # il tourne la tete vers la gauche (le museau depasse)
+    "..k...k.",
+    "..kk.kk.",
+    ".kkkkkk.",
+    "kkkkkkk.",
+    "...kkk..",
+    "..kkkkk.",
+    ".kkkkkkk",
+    ".kkkkkkk",
+    ".kkkkkkk",
+)
+_IC_LINGE = (               # (motif, x, couleur, phase, souplesse) : drap, chemise, deux chaussettes, serviette
+    (("dddddddd",) * 9, 18, (150, 158, 182), 0.0, 1.7),
+    (("cccccc", "cccccc", ".cccc.", ".cccc.", ".cccc."), 28, (80, 124, 172), 0.9, 1.2),
+    (("r", "r", "rr"), 36, (176, 62, 64), 1.7, 0.8),
+    (("r", "r", "rr"), 38, (176, 62, 64), 2.2, 0.8),
+    (("ssss",) * 6, 41, (212, 158, 74), 2.9, 1.2),
+)
+
+
+def _ic_toit_fil(x):
+    """Le fil a linge, du reservoir (16, 19) a la cage d'escalier (49, 21), et sa courbe."""
+    import numpy as np
+    return 19 + 2 * (x - 16) / 33 + 4 * np.sin(np.pi * np.clip((x - 16) / 33, 0, 1))
+
+
+def _ic_toit_decor(rng):
+    """Le ciel, la ville (deux plans d'immeubles et leurs fenetres), et le calque net du premier plan : le reservoir
+    d'eau, la cage d'escalier et son antenne, le parapet, le toit."""
+    import numpy as np
+    Y, X = _xy()
+    fond = _degrade((5, 6, 20), (62, 36, 46), 2, 46)
+    _halo(fond, 36, 47, 12, (130, 66, 40), 0.6, aplati=1.6)     # la brume orangee de la ville, dans la trouee
+    _halo(fond, *_IC_T_LUNE, 7, (110, 120, 150), 0.45)
+    fenetres = []
+    ta, tb = _IC_T_TROUEE
+    for plan, (hmin, hmax, coul, lmin, lmax) in enumerate(((31, 39, (30, 22, 40), 3, 6), (24, 37, (13, 12, 24), 4, 8))):
+        x0 = int(rng.integers(-3, 1))
+        while x0 < 64:
+            larg = int(rng.integers(lmin, lmax + 1))
+            haut = int(rng.integers(hmin, hmax + 1))
+            if x0 + larg > ta and x0 < tb:                       # la trouee : des toits bas
+                haut = max(haut, 42 if plan else 40)
+            fond[haut:47, max(0, x0):min(64, x0 + larg)] = coul
+            for fy in range(haut + 2, 46, 2 if plan == 0 else 3):
+                for fx in range(x0 + 1, x0 + larg - 1, 2):
+                    if 0 <= fx < 64 and rng.random() < 0.75:
+                        fenetres.append((fy, fx, plan))
+            x0 += larg + int(rng.integers(0, 2))
+    fond[18:47, 43:48] = (13, 12, 24)                            # la tour, et son feu rouge en haut
+    fenetres += [(fy, fx, 1) for fy in range(21, 46, 3) for fx in (44, 46)]
+    fy, fx, fp = (np.array(v) for v in zip(*fenetres))
+    n = len(fy)
+    fen = dict(y=fy, x=fx, plan=fp, periode=rng.uniform(40, 220, n), phase=rng.uniform(0, 1, n),
+               part=rng.uniform(0.25, 0.75, n), teinte=rng.random(n))
+    dessus = np.zeros((64, 64, 3))
+    m = np.zeros((64, 64), bool)
+
+    def peindre(masque, c):
+        dessus[masque] = c
+        m[masque] = True
+    sil = (16, 16, 28)
+    lune = (88, 96, 126)                                         # le lisere que la lune pose a droite
+    cuve = (X >= 3) & (X <= 13) & (Y >= 10) & (Y <= 21)          # le reservoir d'eau : sa cuve en douves
+    peindre(cuve, sil)
+    peindre(cuve & (X == 13), lune)                               # la lune l'eclaire par la droite
+    peindre(cuve & (X == 12), (34, 36, 54))
+    peindre(cuve & (X == 3), (34, 30, 44))
+    for yc in (12, 16, 20):                                      # ses cerclages, un peu bombes
+        arc = cuve & (Y == yc + ((X >= 5) & (X <= 11)))
+        peindre(arc, (30, 30, 46))
+        peindre(arc & (X >= 10), (74, 80, 108))
+    toit = (Y >= 4) & (Y <= 9) & (np.abs(X - 8) <= (Y - 3.5) * 1.25)
+    peindre(toit, sil)
+    peindre(toit & (X > 8) & (np.abs(X - 8) >= (Y - 3.5) * 1.25 - 1.1), lune)
+    peindre((Y == 9) & (np.abs(X - 8) <= 7), (40, 40, 58))       # le bord du chapeau, qui deborde
+    peindre((X == 8) & (Y >= 2) & (Y <= 3), sil)
+    peindre((X >= 2) & (X <= 14) & (Y == 22), sil)
+    peindre((X >= 2) & (X <= 14) & (Y == 22) & (X >= 10), (60, 56, 70))
+    for lx in (3, 8, 13):                                        # ses pieds, ses croisillons
+        peindre((X == lx) & (Y >= 23) & (Y <= 46), sil)
+    for a, b in ((3, 8), (8, 13)):
+        for y0 in (24, 32):
+            k = np.arange(7)
+            xs = np.round(a + k * (b - a) / 6).astype(int)
+            peindre(np.isin(Y * 64 + X, (y0 + k) * 64 + xs), sil)
+            peindre(np.isin(Y * 64 + X, (y0 + k) * 64 + (a + b - xs)), sil)
+    peindre((X >= 22) & (X <= 25) & (Y >= 43) & (Y <= 45), (96, 50, 38))    # un pot de fleurs sur la margelle
+    peindre((X >= 22) & (X <= 25) & (Y == 43), (130, 70, 50))
+    for py, px in ((42, 23), (41, 23), (40, 24), (41, 22), (42, 24), (39, 22), (40, 21), (41, 25), (39, 25)):
+        peindre((Y == py) & (X == px), (24, 40, 30))
+    peindre((X >= 50) & (Y >= 24) & (Y <= 54), (30, 24, 30))   # la cage d'escalier
+    peindre((X >= 49) & (Y >= 22) & (Y <= 23), (54, 50, 64))     # son rebord
+    peindre((X >= 53) & (X <= 59) & (Y >= 37) & (Y <= 54), (38, 26, 24))   # sa porte
+    peindre((X >= 54) & (X <= 58) & (Y >= 39) & (Y <= 43), (50, 36, 30))
+    peindre((X == 58) & (Y == 46), (110, 90, 60))                 # la poignee
+    antenne = (56, 60, 82)                                       # l'antenne de television, sous la lune
+    peindre((X == 60) & (Y >= 5) & (Y <= 21), antenne)
+    for y0, lg in ((6, 3), (9, 4), (12, 5)):
+        peindre((Y == y0) & (np.abs(X - 60) <= lg), antenne)
+    peindre((Y >= 46) & (Y <= 47) & (X <= 49), (66, 58, 72))     # le parapet, sa margelle
+    peindre((Y == 46) & (X <= 49), (100, 88, 100))
+    peindre((Y >= 48) & (Y <= 54) & (X <= 49), (24, 20, 28))
+    peindre((Y >= 48) & (Y <= 54) & (X <= 49) & (Y % 3 == 0), (20, 16, 24))
+    peindre(Y >= 55, (20, 18, 22))                               # le toit, son gravier
+    peindre((X >= 27) & (X <= 28) & (Y >= 51) & (Y <= 58), (44, 40, 50))    # un tuyau d'aeration
+    peindre((X == 27) & (Y >= 51) & (Y <= 58), (60, 56, 70))
+    peindre((X >= 26) & (X <= 29) & (Y == 50), (70, 66, 80))
+    lumiere = np.zeros((64, 64))                                  # l'ampoule eclaire le mur et le toit
+    ax, ay = _IC_T_AMPOULE
+    lumiere += np.exp(-np.hypot(X - ax, Y - ay) / 6.0) * 1.3
+    lumiere += np.exp(-np.hypot((X - ax) * 0.45, (Y - 60) * 1.2) / 3.0) * 1.4
+    lumiere += np.exp(-np.hypot((X - 44) * 0.5, (Y - 50)) / 4.0) * 0.6 * (X <= 49)
+    dessus += (lumiere * m)[..., None] * np.array([120, 80, 40])
+    return fond, fen, dessus, m
+
+
+def _scene_toit(p, e, t, ecoule, dt):
+    """Un toit au-dessus de la ville, la nuit : un reservoir d'eau, une antenne, du linge qui bouge sur son fil, un chat
+    assis sur le rebord ; en bas la ville et ses fenetres qui s'allument une a une, une enseigne, un avion qui passe."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "fond" not in e:
+        e["fond"], e["fen"], e["dessus"], e["dessus_m"] = _ic_toit_decor(rng)
+    img = e["fond"].copy()
+    souffle = 0.86 + 0.1 * np.sin(t * 0.6) + 0.04 * np.sin(t * 1.7)   # l'enseigne respire, gresille rarement
+    cy = t % 41.0
+    if cy < 1.2:
+        souffle *= 1 - 0.45 * np.sin(cy / 1.2 * np.pi)
+    _halo(img, 22, 34, 3.5, (255, 60, 110), 0.5 * souffle)
+    ax, ay = _IC_T_AMPOULE
+    _halo(img, ax, ay, 2.0, (255, 190, 110), 0.9)
+    _halo(img, ax, ay, 7.0, (255, 170, 90), 0.25)
+    img = _tramer(img, 8)
+    f = e["fen"]                                                 # les fenetres, une a une
+    c = (t / f["periode"] + f["phase"]) % 1.0
+    eps = 1.5 / f["periode"]
+    allume = _ic_lisse(c / eps) * _ic_lisse((f["part"] - c) / eps)
+    tele = f["teinte"] > 0.93
+    chaud = np.where(f["teinte"][:, None] < 0.6, np.array([255, 196, 110]), np.array([250, 226, 170]))
+    chaud = np.where(tele[:, None], np.array([110, 150, 255]) * (0.7 + 0.3 * np.sin(t * 1.3 + f["phase"] * 40))[
+        :, None], chaud)
+    k = allume * np.where(f["plan"] == 0, 0.45, 0.8)
+    img[f["y"], f["x"]] = np.maximum(img[f["y"], f["x"]], chaud * k[:, None])
+    rouge = 0.5 + 0.5 * np.cos(np.clip(((t % 2.4) - 0.6) / 0.6, -1, 1) * np.pi)   # le feu de la tour
+    img[17, 45] = np.maximum(img[17, 45], np.array([255, 40, 40]) * (0.25 + 0.75 * rouge))
+    rose = np.array([255, 70, 120]) * souffle                    # l'enseigne : des traits qui font des lettres
+    for x in (19, 21, 22, 24, 25):
+        img[33, x] = rose
+    for x in (19, 20, 21, 23, 25):
+        img[35, x] = rose
+    img[34, 19] = img[34, 21] = img[34, 23] = img[34, 25] = rose
+    lx, ly = _IC_T_LUNE                                          # la lune
+    img[np.hypot(X - lx, Y - ly) <= 3.3] = (232, 228, 204)
+    img[int(ly) - 1, int(lx) + 1] = img[int(ly) + 1, int(lx) - 1] = img[int(ly), int(lx) + 2] = (204, 198, 176)
+    P = (t + 30.0) % 70.0                                        # l'avion, une fois par minute et quelque
+    if P < 46:
+        u = P / 46
+        avx, avy = 68 - 76 * u, 16 - 5 * u
+        flash = np.exp(-(((t % 1.5) - 0.2) / 0.12) ** 2)          # doux : il monte et redescend
+        _pointer(img, [avy], [avx], [np.array([255, 70, 60]) * 0.7])
+        _pointer(img, [avy], [avx + 1], [np.array([255, 255, 255]) * (0.2 + 0.8 * flash)])
+        if flash > 0.3:
+            _pointer(img, [avy - 1, avy + 1, avy, avy], [avx + 1, avx + 1, avx, avx + 2],
+                     [np.array([200, 210, 255]) * (flash - 0.3)] * 4)
+    dm = e["dessus_m"]
+    img[dm] = e["dessus"][dm]
+    img[ay, ax - 1:ax + 2] = (255, 220, 160)                     # l'ampoule, sa grille
+    img[ay - 1, ax] = (90, 70, 50)
+    vent = 0.6 * np.sin(t * 0.7) + 0.4 * np.sin(t * 1.27 + 1.0)  # le linge sur le fil
+    xs = np.arange(16, 50)
+    img[np.round(_ic_toit_fil(xs)).astype(int), xs] = (74, 70, 86)
+    for motif, x0, coul, ph, souple in _IC_LINGE:
+        ys, xs, _, larg, _ = _ic_motif(motif)
+        n = len(motif)
+        y0 = int(np.round(_ic_toit_fil(x0 + larg / 2))) + 1
+        dec = (vent * np.cos(ph) + 0.4 * np.sin(t * 1.9 + ph)) * souple * (ys / n) ** 1.3   # le bas bouge plus
+        xx, yy = np.floor(x0 + xs + dec + 0.5).astype(int), y0 + ys
+        chaleur = min(max((x0 - 18) / 26, 0.0), 1.0) * 0.5       # l'ampoule rechauffe ce qui est pres d'elle
+        ombre = 0.8 + 0.25 * (ys == 0) - 0.15 * (ys == n - 1) - 0.16 * ((larg == 8) & ((xs == 2) | (xs == 6)))
+        cc = np.asarray(coul, float) * (ombre * (1 - chaleur * 0.3))[:, None] + np.array([110, 70, 30]) * chaleur
+        ok = (xx >= 0) & (xx < 64)
+        img[yy[ok], xx[ok]] = cc[ok]
+    if "vapeur" not in e:                                        # la vapeur du tuyau d'aeration
+        e["vapeur"] = rng.uniform(0, 1, 9)
+    age = (e["vapeur"] + t / 3.2) % 1.0
+    vx_ = 27.5 + age * 5 * (0.6 + 0.4 * vent) + np.sin(age * 5 + e["vapeur"] * 9) * 0.8
+    vy_ = 49 - age * 9
+    gris = ((1 - age) ** 1.3 * np.minimum(age * 6, 1) * 0.85)[:, None] * np.array([176, 176, 192])
+    _pointer(img, vy_, vx_, gris)                                 # des bouffees qui grossissent en montant
+    _pointer(img, vy_, vx_ + 1, gris * 0.7)
+    gros = age > 0.3
+    _pointer(img, vy_[gros] - 1, vx_[gros], gris[gros] * 0.6)
+    _pointer(img, vy_[gros] - 1, vx_[gros] + 1, gris[gros] * 0.45)
+    tour = (t % 23.0) > 18.5                                     # le chat, sur la margelle, de dos
+    cx = 34 - (1 if tour else 0)
+    _ic_dessiner(img, _IC_CHAT_TOURNE if tour else _IC_CHAT_DOS, cx, 37, {"k": (12, 10, 16)},
+                 bord=[(0, -1, (88, 92, 120), 0.55), (1, 0, (150, 86, 56), 0.5), (-1, 0, (150, 86, 56), 0.45)])
+    q = np.sin(t * 0.9) * 1.2 + np.sin(t * 2.3) * 0.4            # la queue pend et se balance
+    for qx, qy in ((40, 45), (41, 46), (41 + q * 0.3, 47), (41 + q * 0.7, 48), (41 + q * 1.1, 49), (41 + q * 1.4, 50)):
+        img[qy, int(np.floor(qx + 0.5))] = (12, 10, 16)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# --- Le carrefour sous la pluie -------------------------------------------------------------------------------------
+
+_IC_C_FEU = (44, 11)        # le coin haut gauche de la tete du feu tricolore
+_IC_C_LAMPE = (14.0, 9.0)   # la tete du lampadaire
+_IC_C_COULEURS = ((70, 255, 150), (255, 170, 30), (255, 50, 40))   # vert, orange, rouge
+_IC_VOITURE = (             # de profil, vers la droite ; f phare, r feu arriere, w vitre, o roue
+    ".....kkkkk......",
+    "....kwwkwwk.....",
+    "..kkkkkkkkkkkk..",
+    ".kkkkkkkkkkkkkkf",
+    "rkkkkkkkkkkkkkkk",
+    "..ooo......ooo..",
+)
+_IC_CHAT_MARCHE = (         # quatre poses de marche, vers la droite
+    ("k.....k.", ".k...kkk", "..kkkkk.", "..kkkk..", "..k..k.."),
+    ("k.....k.", ".k...kkk", "..kkkkk.", "..kkkk..", ".k....k."),
+    ("k.....k.", ".k...kkk", "..kkkkk.", "..kkkk..", "...kk..."),
+    ("k.....k.", ".k...kkk", "..kkkkk.", "..kkkk..", ".k...k.."),
+)
+
+
+def _ic_carrefour_decor(rng):
+    """Le decor fixe : le ciel bas, les deux immeubles et la rue qui s'enfonce entre eux, les trottoirs, la chaussee
+    mouillee et son passage pieton. Et le calque net : le lampadaire, le feu et son poteau."""
+    import numpy as np
+    Y, X = _xy()
+    fond = _degrade((10, 8, 18), (54, 34, 44), 0, 30)             # un ciel bas, roussi par la ville
+    gauche = (X >= 24) & (X < 33) & (Y >= 6 + (X - 24) * 1.4) & (Y <= 41 - (X - 24) * 1.5)
+    fond[gauche] = (12, 11, 18)                                  # les facades de la rue qui s'enfonce
+    droite = (X > 33) & (X < 42) & (Y >= 4 + (42 - X) * 1.6) & (Y <= 41 - (42 - X) * 1.5)
+    fond[droite] = (10, 10, 16)
+    rue = (Y > 28) & (Y <= 41) & (np.abs(X - 33) <= (Y - 28) * 0.65)
+    fond[rue] = (14, 14, 20)                                     # sa chaussee, au loin
+    fen = []
+    for x0, x1, toit, col_f, rangs, cols in ((0, 24, 2, (31, 29, 46), (9, 16, 23), (2, 6, 10, 15, 19)),
+                                              (42, 64, 1, (29, 29, 46), (7, 14, 21), (44, 48, 52, 56, 60))):
+        fond[toit:toit + 5, x0:x1] = (20, 20, 30)                # le toit de zinc, ses lucarnes
+        fond[toit + 1:toit + 4, x0 + 4:x0 + 6] = (40, 38, 52)
+        fond[toit + 1:toit + 4, x1 - 8:x1 - 6] = (40, 38, 52)
+        fond[toit + 5, x0:x1] = (52, 48, 62)                     # la corniche
+        fond[toit + 6:41, x0:x1] = col_f
+        for ry in rangs:                                         # les fenetres, et leurs balcons
+            for cx in cols:
+                fond[ry:ry + 3, cx:cx + 2] = (8, 8, 13)
+                fen.append((ry, cx, 0))
+            fond[ry + 3, x0 + 1:x1 - 1] = (14, 12, 18)
+            fond[ry + 2, x0 + 1:x1 - 1][::2] = (16, 14, 20)
+    fond[0:2, 8:10] = (24, 22, 30)                               # des cheminees
+    fond[0:1, 57:59] = (24, 22, 30)
+    for i in rng.choice(len(fen), 4, replace=False):             # quatre insomniaques, a 3 h du matin
+        fen[i] = (fen[i][0], fen[i][1], 1)
+        fond[fen[i][0]:fen[i][0] + 3, fen[i][1]:fen[i][1] + 2] = (110, 76, 42)
+    fond[40:42] = (34, 32, 46)                                   # le trottoir d'en face
+    fond[42] = (60, 58, 70)                                      # sa bordure
+    fond[43:57] = (14, 15, 21)                                   # la chaussee mouillee
+    fond[57] = (66, 64, 74)                                      # notre bordure
+    fond[58:64] = (34, 33, 46)                                   # notre trottoir
+    for y0, ep in ((44, 1), (46, 1), (48, 2), (51, 2), (54, 2)):  # le passage pieton, plus epais pres de nous
+        k = (y0 - 44) / 10
+        fond[y0:y0 + ep, int(25 - k * 2):int(42 + k * 2)] = (78, 78, 84)
+    fond[49, :][((X[0] % 7) < 4) & ((X[0] < 22) | (X[0] > 45))] = (70, 68, 60)   # la ligne au milieu
+    fond[61:63, 36:47] = (20, 22, 30)                            # une flaque sur notre trottoir
+    fond[60, 38:45] = (20, 22, 30)
+    fond[32:40, 2:22] = (40, 40, 48)                             # le rideau de fer du cafe
+    fond[32:40, 2:22][(np.arange(32, 40) % 2 == 0)] = (32, 32, 40)
+    fond[30:32, 1:23] = (56, 24, 28)                             # son store rouge, replie
+    fond[33:40, 48:61] = (70, 104, 112)                          # une laverie ouverte toute la nuit
+    for mx in (50, 54, 58):
+        fond[35:38, mx:mx + 3] = (40, 56, 64)
+        fond[36, mx + 1] = (120, 160, 170)
+    _halo(fond, 54.5, 36.5, 5, (90, 150, 160), 0.35, aplati=1.2)
+    _halo(fond, 54.5, 41, 5, (90, 150, 160), 0.4, aplati=3)      # sa lumiere sur le trottoir
+    lx, ly = _IC_C_LAMPE
+    _halo(fond, lx + 1, 41.5, 8, (255, 170, 90), 0.55, aplati=3.0)   # la flaque du lampadaire
+    _halo(fond, lx, ly + 1, 2.2, (255, 170, 90), 0.9)            # sa lueur, sur la facade
+    _halo(fond, lx, ly + 3, 4.5, (255, 150, 80), 0.2)
+    _halo(fond, 33, 30.5, 1.0, (255, 180, 100), 0.8)             # un reverbere tout au fond de la rue
+    dessus = np.zeros((64, 64, 3))
+    m = np.zeros((64, 64), bool)
+
+    def peindre(masque, c):
+        dessus[masque] = c
+        m[masque] = True
+    sombre = (12, 12, 18)
+    peindre((X == 12) & (Y >= 10) & (Y <= 41), sombre)           # le lampadaire, sa crosse
+    peindre((X >= 11) & (X <= 13) & (Y >= 39) & (Y <= 41), sombre)
+    peindre((Y == 8) & (X >= 12) & (X <= 15), sombre)
+    peindre((X == 12) & (Y == 9), sombre)
+    peindre((X == 13) & (Y >= 12) & (Y <= 38), (54, 40, 30))
+    fx, fy = _IC_C_FEU
+    peindre((X == fx + 2) & (Y >= fy + 13) & (Y <= 41), sombre)  # le poteau du feu
+    peindre((X >= fx) & (X <= fx + 4) & (Y >= fy) & (Y <= fy + 12), (20, 20, 24))   # sa tete
+    return fond, dessus, m, fen
+
+
+def _scene_carrefour(p, e, t, ecoule, dt):
+    """Un carrefour desert sous la pluie a 3 h du matin : un feu passe du vert a l'orange au rouge pour personne et
+    s'etire en reflets sur l'asphalte mouille ; le passage pieton, un lampadaire ; parfois un chat, une voiture."""
+    import numpy as np
+    rng = e["rng"]
+    Y, X = _xy()
+    if "fond" not in e:
+        e["fond"], e["dessus"], e["dessus_m"], e["fen"] = _ic_carrefour_decor(rng)
+        e["gouttes"] = [rng.uniform(0, 64, 46), rng.uniform(0, 64, 46), rng.uniform(55, 80, 46)]
+        e["eclats"] = [rng.uniform(0, 64, 10), rng.uniform(43, 64, 10), rng.uniform(0, 1, 10)]
+    img = e["fond"].copy()
+    Pl = t % 31.5                                                 # le feu : vert 14 s, orange 3.5 s, rouge 14 s
+    poids = np.array([_ic_lisse((14.0 - Pl) / 0.35) * _ic_lisse((Pl + 0.35) / 0.35) + _ic_lisse((Pl - 31.15) / 0.35),
+                      _ic_lisse((Pl - 14.0) / 0.35) * _ic_lisse((17.5 - Pl) / 0.35),
+                      _ic_lisse((Pl - 17.5) / 0.35) * _ic_lisse((31.5 - Pl) / 0.35)])
+    couleur = sum(w * np.array(c, float) for w, c in zip(poids, _IC_C_COULEURS))
+    fx, fy = _IC_C_FEU
+    lampes_y = (fy + 9.5, fy + 6, fy + 2.5)                       # vert en bas, orange, rouge en haut
+    for w, c, ly in zip(poids, _IC_C_COULEURS, lampes_y):
+        if w > 0.01:
+            _halo(img, fx + 2, ly, 2.2, c, 0.75 * w)
+            _halo(img, fx + 2, ly, 4.5, c, 0.1 * w)
+    rows = np.arange(43, 64)                                     # les reflets etires sur l'asphalte mouille
+    ride = np.sin(rows * 1.7 + t * 3.1) * 0.7 + np.sin(rows * 0.6 - t * 1.3) * 0.4
+    lx, ly = _IC_C_LAMPE
+    profil = np.exp(-((rows - 55) / 6.0) ** 2) * 0.8 + 0.25 * np.exp(-(rows - 43) / 3.0)
+    for sx, larg, c, force in ((fx + 2, 1.1, couleur, 0.9), (lx + 1.5, 1.6, (255, 170, 90), 0.75),
+                               (54.5, 3.5, (90, 150, 160), 0.35), (33, 0.8, (255, 180, 100), 0.4)):
+        bande = np.exp(-((X[0][None, :] - sx - ride[:, None] * (0.6 + larg * 0.3)) / larg) ** 2) * profil[:, None]
+        img[43:64] += bande[..., None] * np.asarray(c, float) * force
+    img[57] = np.maximum(img[57], e["fond"][57])
+    Pc = (t + 28.0) % 47.0                                       # une voiture, de temps en temps
+    vx = -26 + Pc * 15.0
+    if -40 < vx < 90:
+        _halo(img, vx + 26, 53.5, 6, (255, 236, 190), 0.75, aplati=2.6)    # ses phares balaient la chaussee
+        _halo(img, vx + 16, 54, 1.5, (255, 240, 200), 0.6)
+        bande = np.exp(-((X[0] - vx - 15.5) / 1.0) ** 2)[None, :] * np.exp(-(rows - 58) ** 2 / 10.0)[:, None]
+        img[43:64] += bande[..., None] * np.array([255, 236, 190]) * 0.5
+        bande = np.exp(-((X[0] - vx) / 0.8) ** 2)[None, :] * np.exp(-(rows - 57) ** 2 / 8.0)[:, None]
+        img[43:64] += bande[..., None] * np.array([255, 40, 30]) * 0.4
+    img = _tramer(img, 8)
+    for fy_, fx_, al in e["fen"]:                                 # les fenetres allumees, nettes
+        if al:
+            img[fy_:fy_ + 3, fx_:fx_ + 2] = (200, 140, 70)
+            img[fy_, fx_:fx_ + 2] = (150, 100, 56)                # le haut du rideau
+    dm = e["dessus_m"]
+    img[dm] = e["dessus"][dm]
+    img[int(ly), int(lx) - 1:int(lx) + 2] = (255, 200, 120)       # l'ampoule du lampadaire
+    img[int(ly) - 1, int(lx) - 1:int(lx) + 2] = (30, 26, 26)
+    for w, c, ly_ in zip(poids, _IC_C_COULEURS, lampes_y):        # les trois feux : un allume, deux eteints
+        allume = np.asarray(c, float) * (0.16 + 0.84 * w)
+        img[int(ly_) - 1:int(ly_) + 1, fx + 1:fx + 4] = allume
+    Pk = (t + 8.0) % 73.0
+    if Pk < 9:                                                   # un chat traverse sur le passage pieton
+        u = Pk / 9
+        cx, cy = 20 + 22 * u, 52 - 13 * u
+        pose = _IC_CHAT_MARCHE[int(Pk * 6) % 4]
+        _ic_dessiner(img, pose, cx, cy, {"k": (120, 116, 124)}, bord=[(0, -1, (190, 170, 150), 0.5)])
+        _ic_dessiner(img, pose[::-1], cx, cy + 5, {"k": (40, 38, 46)}, force=0.5)   # son reflet
+    if -20 < vx < 70:                                            # la voiture
+        vy = 50
+        pal = {"k": (76, 30, 36), "w": (96, 104, 124), "f": (255, 250, 220), "r": (255, 40, 30), "o": (10, 10, 12)}
+        _ic_dessiner(img, _IC_VOITURE, vx, vy, pal, bord=[(0, -1, (200, 150, 110), 0.5)])
+    gx, gy, gv = e["gouttes"]                                    # la pluie : de fins traits obliques
+    d = min(dt, 0.5)
+    gy += gv * d
+    gx += gv * 0.18 * d
+    gy %= 66
+    gx %= 64
+    pres = np.exp(-np.hypot(gx - lx, gy - ly - 6) / 9) + np.exp(-np.hypot(gx - fx - 2, gy - fy - 6) / 6)
+    c = (0.35 + 0.65 * np.minimum(pres, 1))[:, None] * np.array([120, 130, 160])
+    for k in range(3):
+        _pointer(img, gy - k, gx - k * 0.18, c * (1 - k * 0.28))
+    ex, ey, ea = e["eclats"]                                      # les eclaboussures, au sol
+    ea += d * 3.0
+    neuf = ea >= 1
+    if neuf.any():
+        ea[neuf] -= 1
+        ex[neuf] = rng.uniform(0, 64, int(neuf.sum()))
+        ey[neuf] = rng.uniform(43, 64, int(neuf.sum()))
+    k = (ea < 0.35) & (np.abs(ey - 57.5) > 1)
+    if k.any():
+        cc = ((1 - ea[k] / 0.35) * 0.6)[:, None] * np.array([150, 160, 190])
+        _pointer(img, ey[k] - 1, ex[k], cc)
+        _pointer(img, ey[k], ex[k] - 1, cc * 0.6)
+        _pointer(img, ey[k], ex[k] + 1, cc * 0.6)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# (fin des instants)
+
+
 # Les ambiances d'abord (la page les montre dans cet ordre), puis les jeux de lumiere.
 ECRANS = {
     "aurore": ("Aurore boreale", _ecran_aurore),
@@ -22640,6 +26397,20 @@ DECORS = (   # (famille, sa ligne sur la page, ((scene, son moteur, ((humeur ou 
         ("comete", _scene_comete, ((None, "Comete"),)),
         ("orbite", _scene_orbite, ((None, "La Terre vue d'orbite"),)),
         ("constellations", _scene_constellations, ((None, "Constellations"),)))),
+    ("instants", "Les instants : arret de bus sous la neige, superette, distributeur, cabine, ramen, laverie, cafe, "
+                 "station-service, quai de gare, metro, toit, carrefour", (
+        ("arret_bus", _scene_arret_bus, ((None, "Arret de bus sous la neige"),)),
+        ("superette", _scene_superette, ((None, "Superette sous la pluie"),)),
+        ("distributeur", _scene_distributeur, ((None, "Distributeur au coin de la rue"),)),
+        ("cabine", _scene_cabine, ((None, "Cabine dans la neige"),)),
+        ("ramen", _scene_ramen, ((None, "Echoppe de ramen"),)),
+        ("laverie", _scene_laverie, ((None, "Laverie de nuit"),)),
+        ("diner", _scene_diner, ((None, "Cafe ouvert tard"),)),
+        ("station_service", _scene_station_service, ((None, "Station au milieu de rien"),)),
+        ("quai_gare", _scene_quai_gare, ((None, "Quai de gare sous la neige"),)),
+        ("metro", _scene_metro, ((None, "Dernier metro"),)),
+        ("toit", _scene_toit, ((None, "Toit sur la ville"),)),
+        ("carrefour", _scene_carrefour, ((None, "Carrefour a trois heures"),)))),
 )
 
 

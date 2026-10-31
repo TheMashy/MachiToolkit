@@ -613,7 +613,7 @@ class AL_Ecran(unittest.TestCase):
             # lesquels : une case par ecran, une par famille de decors, « Tous », « Les ambiances et les decors »
             self.assertEqual(set(p.vars_ecrans), set(M.ECRANS) - set(M.ECRANS_DECORS))
             self.assertEqual(set(p.vars_familles), {"sous_l_eau", "ciel_et_eau", "villes", "paysages", "cocon", "reveries", "espace",
-                                                    "boreales", "tunnels"})
+                                                    "instants", "boreales", "tunnels"})
             p.vars_ecrans["matrice"].set(0)
             p.choisir_ecrans()
             self.assertEqual(M.CFG["panneau_ecrans_sans"], ["matrice"])
