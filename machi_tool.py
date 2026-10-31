@@ -16179,6 +16179,25 @@ def _halo(img, x, y, rayon, couleur, force=1.0, aplati=1.0):
     img[y0:y1, x0:x1] += (np.exp(-d / max(rayon, 1e-3)) * force)[..., None] * np.asarray(couleur, float)
 
 
+_TRAME_BAYER = []
+
+
+def _tramer(img, niveaux=8, force=1.0):
+    """Le grain des pixel arts : l'eclat de chaque pixel (son canal le plus fort) ramene a quelques niveaux, avec une
+    trame de Bayer 4 x 4 FIXE (elle ne grouille pas : ce sont les lumieres qui bougent dessous). La teinte ne bouge
+    pas (pas de mouchetures colorees). Niveaux pris en racine carree : plus de marches dans le noir, ou l'oeil les
+    voit. Renvoie une nouvelle image (flottante)."""
+    import numpy as np
+    if not _TRAME_BAYER:
+        b = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]], float) / 16 - 15 / 32
+        _TRAME_BAYER.append(np.tile(b, (16, 16)))
+    img = np.clip(img, 0, 255)
+    v = img.max(2)
+    n = niveaux - 1
+    q = np.clip(np.floor(np.sqrt(v / 255) * n + 0.5 + _TRAME_BAYER[0] * force), 0, n)
+    return img * ((q / n) ** 2 * 255 / np.maximum(v, 1e-3))[..., None]
+
+
 def _poser(img, ys, xs, couleurs):
     """Pose des points par-dessus (meme sombres, a l'inverse de _pointer), hors du panneau ignores."""
     import numpy as np
