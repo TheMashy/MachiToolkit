@@ -48,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.129.0"
+VERSION = "1.130.0"
 
 NOM_APP = "Machi Tool"          # ce que lit l'utilisateur
 NOM_COURT = "MachiTool"         # dossiers et fichiers, sans espace ni accent
@@ -394,7 +394,10 @@ CONFIG_DEFAUT = {
     "panneau_veille_luminosite": 32,  # basse : l'USB d'un PC eteint donne peu
     "panneau_veille_arret_h": 0,      # s'eteindre au bout de (heures) ; 0 : jamais
     "panneau_eq_sensibilite": 1.0,    # l'egaliseur : 0,2 (calme) a 3 (tout monte)
-    "meteo_ville": "",                # vide : le lieu approximatif de la connexion
+    # « laisse l'egaliseur lorsque Spotify joue, tu peux laisser d'autres choses en fond » : le cycle
+    # reste sur la musique, les ecrans plein panneau passent dessous
+    "panneau_eq_garde": True,
+    "meteo_ville": "",             # vide : le lieu approximatif de la connexion
     "meteo_lieu": None,               # la ville situee (nom, latitude, longitude), gardee
     "jarvis_hey": True,               # « Hey Jarvis », le modele anglais d'openWakeWord
     "jarvis_ma_voix": True,           # seulement ta voix apprise, dite a ton volume (voir MA_VOIX_VOLUME)
@@ -11720,7 +11723,7 @@ PANNEAU_VERROU = threading.Lock()      # le fil et l'extinction ecrivent sur la 
 PANNEAU = {"etat": "absent", "port": None, "message": "", "image": None, "envoyees": 0, "pyserial": True,
            "teinte": None, "jarvis": None, "mire": False, "ips": 0.0, "perdues": 0,
            "croquis": None, "calcul_ms": 0.0, "envoi_ms": 0.0, "carte_recues": None, "carte_jetees": None}
-PANNEAU_CROQUIS = 10                   # carte/machi_panneau/machi_panneau.ino
+PANNEAU_CROQUIS = 11                   # carte/machi_panneau/machi_panneau.ino
 PANNEAU_BILAN_S = 2.0                  # « MS » : combien d'images la carte a jetees
 
 _CHIFFRES_5X7 = {
@@ -12197,6 +12200,36 @@ def cycle_disponible(maintenant, cfg=None):
     return d
 
 
+def egaliseur_garde(cfg, maintenant):
+    """« Laisse l'egaliseur lorsque Spotify joue » : Spotify joue un morceau (vu dans les 10 dernieres
+    secondes), et on n'a coupe ni ce reglage, ni le cycle, ni sa vue musique."""
+    cfg = cfg or {}
+    return bool(cfg.get("panneau_eq_garde", True) and cfg.get("panneau_cycle", True)
+                and cfg.get("panneau_cycle_musique", True)
+                and 0 <= maintenant - float(PANNEAU.get("spotify_vu") or 0) < MUSIQUE_VUE_S)
+
+
+# l'egaliseur par-dessus un ecran plein panneau : un voile sombre sous lui, aux bords adoucis
+EQ_VOILE = {36: 0.8, 37: 0.6, 38: 0.45, 59: 0.45, 60: 0.6, 61: 0.8}
+EQ_VOILE_FOND = 0.35
+
+
+def poser_egaliseur(img, t, cfg, accent=None):
+    """« Tu peux laisser d'autres choses en fond, mais juste laisser l'egaliseur » : l'egaliseur du
+    cycle (ses barres, le morceau qui defile), a sa place sous la date, par-dessus `img` -- un ecran
+    plein panneau qui devient son fond, assombri juste sous lui. Rend une nouvelle image."""
+    import numpy as np
+    c = PANNEAU.get("cycle") or {}
+    ecoule = max(0.0, t - float(c.get("depuis") or t))   # le titre defile comme dans le cycle : pas de saut
+    zone = _zone_du_cycle("musique", t, accent or accent_panneau(), None, None, ecoule, sensibilite_eq(cfg))
+    out = img.astype(np.float32)
+    voile = np.array([EQ_VOILE.get(y, EQ_VOILE_FOND if 39 <= y <= 58 else 1.0) for y in range(PANNEAU_H)], np.float32)
+    out *= voile[:, None, None]
+    allume = zone.max(axis=2) > 0
+    out[allume] = zone[allume]
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
 def cycle_urgent(minuteurs, rdv, maintenant):
     """Un minuteur qui va sonner, un rendez-vous qui arrive : l'heure reste."""
     for m in minuteurs or []:
@@ -12221,6 +12254,8 @@ def cycle_du_panneau(maintenant, disponibles, urgent=False, saut=None, duree=CYC
             passer("heure")
     elif saut and saut in disponibles and c["actuel"] != saut:
         passer(saut)
+    elif saut and c["actuel"] == saut and maintenant - c["depuis"] >= fondu_s:
+        c.update(depuis=maintenant, precedent=None, precedent_depuis=None)   # un autre morceau : son titre repart
     elif c["actuel"] not in disponibles or maintenant - c["depuis"] >= duree:
         i = CYCLE_ORDRE.index(c["actuel"])
         for k in range(1, len(CYCLE_ORDRE) + 1):
@@ -25864,181 +25899,178 @@ def _scene_metro(p, e, t, ecoule, dt):
 
 
 # --- Le toit -------------------------------------------------------------------------------------------------------
+# Un plan simple : le rebord du toit en bas, la ville en contrebas qui s'etale jusqu'a l'horizon et sa brume orangee
+# qui monte, le ciel au-dessus. Le chat, sur le pilier d'angle, se decoupe sur cette lueur.
 
-_IC_T_LUNE = (41.0, 9.0)
-_IC_T_AMPOULE = (56, 33)
-_IC_T_TROUEE = (31, 42)     # entre ces colonnes, la ville est basse : le chat se decoupe sur la brume
+_IC_T_HORIZON = 44          # la ligne d'horizon : la ville au-dessous, la lueur juste au-dessus
+_IC_T_LUNE = (53.0, 11.0)
+_IC_T_TOURS = (             # le centre-ville au loin : (x0, x1, sommet, toit) ; chaque tour sa silhouette
+    (14, 18, 31, "antenne"),
+    (19, 24, 22, "gradins"),
+    (25, 28, 33, "plat"),
+    (29, 33, 26, "pointe"),
+    (34, 38, 35, "enseigne"),
+    (39, 41, 38, "plat"),
+)
 _IC_CHAT_DOS = (            # assis, de dos, il regarde la ville
-    ".k...k.",
-    ".kk.kk.",
-    ".kkkkk.",
-    ".kkkkk.",
-    "..kkk..",
-    ".kkkkk.",
-    "kkkkkkk",
-    "kkkkkkk",
-    "kkkkkkk",
+    "...k...k...",
+    "...kk.kk...",
+    "...kkkkk...",
+    "..kkkkkkk..",
+    "..kkkkkkk..",
+    "...kkkkk...",
+    "....kkk....",
+    "...kkkkk...",
+    "..kkkkkkk..",
+    ".kkkkkkkkk.",
+    ".kkkkkkkkk.",
+    "kkkkkkkkkkk",
+    "kkkkkkkkkkk",
+    ".kkkkkkkkk.",
 )
-_IC_CHAT_TOURNE = (         # il tourne la tete vers la gauche (le museau depasse)
-    "..k...k.",
-    "..kk.kk.",
-    ".kkkkkk.",
-    "kkkkkkk.",
-    "...kkk..",
-    "..kkkkk.",
-    ".kkkkkkk",
-    ".kkkkkkk",
-    ".kkkkkkk",
+_IC_CHAT_TOURNE = (         # il tourne la tete vers la gauche : on voit son museau
+    "..k...k....",
+    "..kk.kk....",
+    "..kkkkk....",
+    ".kkkkkkk...",
+    "kkkkkkkk...",
+    "..kkkkk....",
+    "....kkk....",
+    "...kkkkk...",
+    "..kkkkkkk..",
+    ".kkkkkkkkk.",
+    ".kkkkkkkkk.",
+    "kkkkkkkkkkk",
+    "kkkkkkkkkkk",
+    ".kkkkkkkkk.",
 )
-_IC_LINGE = (               # (motif, x, couleur, phase, souplesse) : drap, chemise, deux chaussettes, serviette
-    (("dddddddd",) * 9, 18, (150, 158, 182), 0.0, 1.7),
-    (("cccccc", "cccccc", ".cccc.", ".cccc.", ".cccc."), 28, (80, 124, 172), 0.9, 1.2),
-    (("r", "r", "rr"), 36, (176, 62, 64), 1.7, 0.8),
-    (("r", "r", "rr"), 38, (176, 62, 64), 2.2, 0.8),
-    (("ssss",) * 6, 41, (212, 158, 74), 2.9, 1.2),
+_IC_LINGE = (               # (motif, x, couleur, phase) : une chemise et deux chaussettes, au bout du fil
+    (("ccccc", "ccccc", ".ccc.", ".ccc."), 0, (168, 176, 202), 0.0),
+    (("r", "r", "rr"), 5, (186, 70, 72), 1.3),
+    (("r", "r", "rr"), 7, (186, 70, 72), 2.1),
 )
-
-
-def _ic_toit_fil(x):
-    """Le fil a linge, du reservoir (16, 19) a la cage d'escalier (49, 21), et sa courbe."""
-    import numpy as np
-    return 19 + 2 * (x - 16) / 33 + 4 * np.sin(np.pi * np.clip((x - 16) / 33, 0, 1))
 
 
 def _ic_toit_decor(rng):
-    """Le ciel, la ville (deux plans d'immeubles et leurs fenetres), et le calque net du premier plan : le reservoir
-    d'eau, la cage d'escalier et son antenne, le parapet, le toit."""
+    """Le fond fixe (le ciel et sa lueur, les tours, la ville en contrebas), les fenetres et les lumieres de la ville,
+    et le calque net du premier plan : le rebord, le pilier d'angle, l'antenne, le tuyau d'aeration."""
     import numpy as np
     Y, X = _xy()
-    fond = _degrade((5, 6, 20), (62, 36, 46), 2, 46)
-    _halo(fond, 36, 47, 12, (130, 66, 40), 0.6, aplati=1.6)     # la brume orangee de la ville, dans la trouee
-    _halo(fond, *_IC_T_LUNE, 7, (110, 120, 150), 0.45)
-    fenetres = []
-    ta, tb = _IC_T_TROUEE
-    for plan, (hmin, hmax, coul, lmin, lmax) in enumerate(((31, 39, (30, 22, 40), 3, 6), (24, 37, (13, 12, 24), 4, 8))):
-        x0 = int(rng.integers(-3, 1))
-        while x0 < 64:
-            larg = int(rng.integers(lmin, lmax + 1))
-            haut = int(rng.integers(hmin, hmax + 1))
-            if x0 + larg > ta and x0 < tb:                       # la trouee : des toits bas
-                haut = max(haut, 42 if plan else 40)
-            fond[haut:47, max(0, x0):min(64, x0 + larg)] = coul
-            for fy in range(haut + 2, 46, 2 if plan == 0 else 3):
-                for fx in range(x0 + 1, x0 + larg - 1, 2):
-                    if 0 <= fx < 64 and rng.random() < 0.75:
-                        fenetres.append((fy, fx, plan))
-            x0 += larg + int(rng.integers(0, 2))
-    fond[18:47, 43:48] = (13, 12, 24)                            # la tour, et son feu rouge en haut
-    fenetres += [(fy, fx, 1) for fy in range(21, 46, 3) for fx in (44, 46)]
-    fy, fx, fp = (np.array(v) for v in zip(*fenetres))
-    n = len(fy)
-    fen = dict(y=fy, x=fx, plan=fp, periode=rng.uniform(40, 220, n), phase=rng.uniform(0, 1, n),
-               part=rng.uniform(0.25, 0.75, n), teinte=rng.random(n))
+    hz = _IC_T_HORIZON
+    fond = _degrade((5, 6, 20), (26, 18, 44), 0, hz)
+    lueur = np.exp(-np.clip(hz - Y, 0, None) / 9.0) * (Y <= hz)   # la brume orangee qui monte de la ville
+    fond += lueur[..., None] * np.array([150, 76, 44])
+    _halo(fond, *_IC_T_LUNE, 7, (100, 110, 140), 0.4)
+    bas = (Y > hz)                                               # la ville en contrebas, plus sombre vers nous
+    k = np.clip((Y - hz) / 10.0, 0, 1)[..., None]
+    fond[bas] = (np.array([84, 46, 50]) * (1 - k) + np.array([16, 12, 24]) * k)[bas]
+    etages, lampes = [], []
+    tour = (16, 12, 26)
+    for x0, x1, haut, toit in _IC_T_TOURS:
+        corps = (X >= x0) & (X < x1) & (Y >= haut) & (Y <= hz)
+        if toit == "gradins":                                    # un sommet en gradins
+            corps &= (Y >= haut + 4) | ((X >= x0 + 1) & (X < x1 - 1))
+            corps |= (X == (x0 + x1) // 2) & (Y >= haut - 2) & (Y < haut)
+            lampes.append((haut - 3, (x0 + x1) // 2))
+        if toit == "pointe":                                     # un toit en pointe
+            corps &= (Y >= haut + 2) | (np.abs(X - (x0 + x1 - 1) / 2) <= (Y - haut + 0.5))
+        if toit == "antenne":                                    # un mat sur le toit
+            corps |= (X == x0 + 2) & (Y >= haut - 6) & (Y < haut)
+            lampes.append((haut - 7, x0 + 2))
+        fond[corps] = tour
+        for fy in range(haut + 3, hz - 1, 2):                    # ses etages, qui s'allument chacun a son tour
+            etages.append((fy, x0 + 1, x1 - 1))
+    bande = X < 42                                               # la ligne basse des immeubles, a gauche
+    crete = hz - 2 - (np.sin(X[0] * 1.3) > 0.2) - (np.sin(X[0] * 0.55 + 1) > 0.5) * 2
+    fond[bande & (Y >= crete[None, :]) & (Y <= hz)] = (20, 14, 30)
+    points = []                                                  # les rues : des lampadaires en rangees
+    for ry, pas in ((45, 2), (46, 3), (48, 4), (50, 5), (53, 6)):
+        dec = int(rng.integers(0, pas))
+        for x in range(dec, 64, pas):
+            if rng.random() < 0.8 and not (42 <= x <= 58 and ry >= 46):
+                points.append((ry, x, rng.random() < 0.8))
+    n = len(etages)
+    fen = dict(etages=etages, periode=rng.uniform(50, 220, n), phase=rng.uniform(0, 1, n),
+               part=rng.uniform(0.3, 0.75, n), blanc=rng.random(n) < 0.3)
     dessus = np.zeros((64, 64, 3))
     m = np.zeros((64, 64), bool)
 
     def peindre(masque, c):
         dessus[masque] = c
         m[masque] = True
-    sil = (16, 16, 28)
-    lune = (88, 96, 126)                                         # le lisere que la lune pose a droite
-    cuve = (X >= 3) & (X <= 13) & (Y >= 10) & (Y <= 21)          # le reservoir d'eau : sa cuve en douves
-    peindre(cuve, sil)
-    peindre(cuve & (X == 13), lune)                               # la lune l'eclaire par la droite
-    peindre(cuve & (X == 12), (34, 36, 54))
-    peindre(cuve & (X == 3), (34, 30, 44))
-    for yc in (12, 16, 20):                                      # ses cerclages, un peu bombes
-        arc = cuve & (Y == yc + ((X >= 5) & (X <= 11)))
-        peindre(arc, (30, 30, 46))
-        peindre(arc & (X >= 10), (74, 80, 108))
-    toit = (Y >= 4) & (Y <= 9) & (np.abs(X - 8) <= (Y - 3.5) * 1.25)
-    peindre(toit, sil)
-    peindre(toit & (X > 8) & (np.abs(X - 8) >= (Y - 3.5) * 1.25 - 1.1), lune)
-    peindre((Y == 9) & (np.abs(X - 8) <= 7), (40, 40, 58))       # le bord du chapeau, qui deborde
-    peindre((X == 8) & (Y >= 2) & (Y <= 3), sil)
-    peindre((X >= 2) & (X <= 14) & (Y == 22), sil)
-    peindre((X >= 2) & (X <= 14) & (Y == 22) & (X >= 10), (60, 56, 70))
-    for lx in (3, 8, 13):                                        # ses pieds, ses croisillons
-        peindre((X == lx) & (Y >= 23) & (Y <= 46), sil)
-    for a, b in ((3, 8), (8, 13)):
-        for y0 in (24, 32):
-            k = np.arange(7)
-            xs = np.round(a + k * (b - a) / 6).astype(int)
-            peindre(np.isin(Y * 64 + X, (y0 + k) * 64 + xs), sil)
-            peindre(np.isin(Y * 64 + X, (y0 + k) * 64 + (a + b - xs)), sil)
-    peindre((X >= 22) & (X <= 25) & (Y >= 43) & (Y <= 45), (96, 50, 38))    # un pot de fleurs sur la margelle
-    peindre((X >= 22) & (X <= 25) & (Y == 43), (130, 70, 50))
-    for py, px in ((42, 23), (41, 23), (40, 24), (41, 22), (42, 24), (39, 22), (40, 21), (41, 25), (39, 25)):
-        peindre((Y == py) & (X == px), (24, 40, 30))
-    peindre((X >= 50) & (Y >= 24) & (Y <= 54), (30, 24, 30))   # la cage d'escalier
-    peindre((X >= 49) & (Y >= 22) & (Y <= 23), (54, 50, 64))     # son rebord
-    peindre((X >= 53) & (X <= 59) & (Y >= 37) & (Y <= 54), (38, 26, 24))   # sa porte
-    peindre((X >= 54) & (X <= 58) & (Y >= 39) & (Y <= 43), (50, 36, 30))
-    peindre((X == 58) & (Y == 46), (110, 90, 60))                 # la poignee
-    antenne = (56, 60, 82)                                       # l'antenne de television, sous la lune
-    peindre((X == 60) & (Y >= 5) & (Y <= 21), antenne)
-    for y0, lg in ((6, 3), (9, 4), (12, 5)):
-        peindre((Y == y0) & (np.abs(X - 60) <= lg), antenne)
-    peindre((Y >= 46) & (Y <= 47) & (X <= 49), (66, 58, 72))     # le parapet, sa margelle
-    peindre((Y == 46) & (X <= 49), (100, 88, 100))
-    peindre((Y >= 48) & (Y <= 54) & (X <= 49), (24, 20, 28))
-    peindre((Y >= 48) & (Y <= 54) & (X <= 49) & (Y % 3 == 0), (20, 16, 24))
-    peindre(Y >= 55, (20, 18, 22))                               # le toit, son gravier
-    peindre((X >= 27) & (X <= 28) & (Y >= 51) & (Y <= 58), (44, 40, 50))    # un tuyau d'aeration
-    peindre((X == 27) & (Y >= 51) & (Y <= 58), (60, 56, 70))
-    peindre((X >= 26) & (X <= 29) & (Y == 50), (70, 66, 80))
-    lumiere = np.zeros((64, 64))                                  # l'ampoule eclaire le mur et le toit
-    ax, ay = _IC_T_AMPOULE
-    lumiere += np.exp(-np.hypot(X - ax, Y - ay) / 6.0) * 1.3
-    lumiere += np.exp(-np.hypot((X - ax) * 0.45, (Y - 60) * 1.2) / 3.0) * 1.4
-    lumiere += np.exp(-np.hypot((X - 44) * 0.5, (Y - 50)) / 4.0) * 0.6 * (X <= 49)
-    dessus += (lumiere * m)[..., None] * np.array([120, 80, 40])
-    return fond, fen, dessus, m
+    peindre((Y >= 55) & (Y <= 63), (26, 20, 30))                 # le rebord : sa face de briques
+    peindre((Y >= 57) & ((Y - 57) % 3 == 2), (20, 15, 24))
+    peindre((Y >= 57) & ((Y - 57) % 3 != 2) & (((X + (Y // 3) * 3) % 7) == 0), (20, 15, 24))
+    peindre(Y == 55, (118, 96, 104))                              # sa margelle, que la lueur eclaire
+    peindre(Y == 56, (62, 50, 60))
+    pilier = (X >= 42) & (X <= 58) & (Y >= 47) & (Y <= 54)       # le pilier d'angle, ou le chat s'assoit
+    peindre(pilier, (30, 23, 34))
+    peindre(pilier & ((Y - 47) % 3 == 2), (22, 17, 26))
+    peindre((X >= 41) & (X <= 59) & (Y == 46), (132, 104, 108))
+    peindre((X >= 41) & (X <= 59) & (Y == 47), (70, 54, 62))
+    antenne = (60, 64, 90)                                       # l'antenne de television, sur le rebord
+    peindre((X == 9) & (Y >= 13) & (Y <= 54), antenne)
+    for y0, lg in ((14, 2), (17, 3), (20, 4)):
+        peindre((Y == y0) & (np.abs(X - 9) <= lg), antenne)
+    peindre((X >= 23) & (X <= 27) & (Y >= 49) & (Y <= 54), (34, 26, 36))   # une cheminee sur le rebord
+    peindre((X >= 23) & (X <= 27) & (Y >= 49) & (Y <= 54) & ((Y - 49) % 3 == 2), (24, 18, 28))
+    peindre((X >= 22) & (X <= 28) & (Y == 48), (120, 96, 104))
+    peindre((X >= 22) & (X <= 28) & (Y == 49), (60, 48, 58))
+    return fond, fen, lampes, points, dessus, m
 
 
 def _scene_toit(p, e, t, ecoule, dt):
-    """Un toit au-dessus de la ville, la nuit : un reservoir d'eau, une antenne, du linge qui bouge sur son fil, un chat
-    assis sur le rebord ; en bas la ville et ses fenetres qui s'allument une a une, une enseigne, un avion qui passe."""
+    """Sur un toit, la nuit, au-dessus de la ville : un chat assis sur le pilier d'angle se decoupe sur la brume
+    orangee ; en contrebas la ville s'etale jusqu'a l'horizon, ses tours allument un etage puis un autre. La lune,
+    un avion qui passe en clignotant, la vapeur d'une cheminee, du linge au bout du fil de l'antenne."""
     import numpy as np
     rng = e["rng"]
     Y, X = _xy()
     if "fond" not in e:
-        e["fond"], e["fen"], e["dessus"], e["dessus_m"] = _ic_toit_decor(rng)
+        e["fond"], e["fen"], e["lampes"], e["points"], e["dessus"], e["dessus_m"] = _ic_toit_decor(rng)
+        e["etoiles"] = (rng.integers(0, 64, 14), rng.integers(1, 20, 14), rng.uniform(0, 6.3, 14))
+        e["vapeur"] = rng.uniform(0, 1, 9)
+    hz = _IC_T_HORIZON
     img = e["fond"].copy()
-    souffle = 0.86 + 0.1 * np.sin(t * 0.6) + 0.04 * np.sin(t * 1.7)   # l'enseigne respire, gresille rarement
+    souffle = 0.85 + 0.1 * np.sin(t * 0.6) + 0.05 * np.sin(t * 1.7)   # l'enseigne respire, gresille rarement
     cy = t % 41.0
     if cy < 1.2:
-        souffle *= 1 - 0.45 * np.sin(cy / 1.2 * np.pi)
-    _halo(img, 22, 34, 3.5, (255, 60, 110), 0.5 * souffle)
-    ax, ay = _IC_T_AMPOULE
-    _halo(img, ax, ay, 2.0, (255, 190, 110), 0.9)
-    _halo(img, ax, ay, 7.0, (255, 170, 90), 0.25)
+        souffle *= 1 - 0.4 * np.sin(cy / 1.2 * np.pi)
+    _halo(img, 36, 33, 3.0, (255, 70, 130), 0.55 * souffle)
     img = _tramer(img, 8)
-    f = e["fen"]                                                 # les fenetres, une a une
-    c = (t / f["periode"] + f["phase"]) % 1.0
-    eps = 1.5 / f["periode"]
-    allume = _ic_lisse(c / eps) * _ic_lisse((f["part"] - c) / eps)
-    tele = f["teinte"] > 0.93
-    chaud = np.where(f["teinte"][:, None] < 0.6, np.array([255, 196, 110]), np.array([250, 226, 170]))
-    chaud = np.where(tele[:, None], np.array([110, 150, 255]) * (0.7 + 0.3 * np.sin(t * 1.3 + f["phase"] * 40))[
-        :, None], chaud)
-    k = allume * np.where(f["plan"] == 0, 0.45, 0.8)
-    img[f["y"], f["x"]] = np.maximum(img[f["y"], f["x"]], chaud * k[:, None])
-    rouge = 0.5 + 0.5 * np.cos(np.clip(((t % 2.4) - 0.6) / 0.6, -1, 1) * np.pi)   # le feu de la tour
-    img[17, 45] = np.maximum(img[17, 45], np.array([255, 40, 40]) * (0.25 + 0.75 * rouge))
-    rose = np.array([255, 70, 120]) * souffle                    # l'enseigne : des traits qui font des lettres
-    for x in (19, 21, 22, 24, 25):
-        img[33, x] = rose
-    for x in (19, 20, 21, 23, 25):
-        img[35, x] = rose
-    img[34, 19] = img[34, 21] = img[34, 23] = img[34, 25] = rose
+    ex, ey, ep = e["etoiles"]                                    # quelques etoiles, en haut
+    img[ey, ex] = np.maximum(img[ey, ex], ((0.5 + 0.3 * np.sin(t * 0.8 + ep)) * 150)[:, None] * np.array(
+        [1.0, 1.0, 1.15]))
     lx, ly = _IC_T_LUNE                                          # la lune
-    img[np.hypot(X - lx, Y - ly) <= 3.3] = (232, 228, 204)
-    img[int(ly) - 1, int(lx) + 1] = img[int(ly) + 1, int(lx) - 1] = img[int(ly), int(lx) + 2] = (204, 198, 176)
+    img[np.hypot(X - lx, Y - ly) <= 3.4] = (234, 230, 206)
+    img[int(ly) - 1, int(lx) + 1] = img[int(ly) + 1, int(lx) - 1] = img[int(ly), int(lx) + 2] = (206, 200, 178)
+    f = e["fen"]                                                 # les etages des tours, un a un, en fondu
+    c = (t / f["periode"] + f["phase"]) % 1.0
+    eps = 1.8 / f["periode"]
+    allume = _ic_lisse(c / eps) * _ic_lisse((f["part"] - c) / eps)
+    for (fy, x0, x1), a, blanc in zip(f["etages"], allume, f["blanc"]):
+        if a > 0.02:
+            coul = np.array([200, 210, 230] if blanc else [255, 184, 100]) * (0.25 + 0.6 * a)
+            img[fy, x0:x1:2] = np.maximum(img[fy, x0:x1:2], coul)
+    for py, px, chaud in e["points"]:                            # les rues, en contrebas
+        img[py, px] = (255, 170, 80) if chaud else (210, 214, 230)
+        if py > hz + 4:
+            img[py, px] = img[py, px] * 0.9
+    for k, (ry, vit, coul) in enumerate(((49, 3.0, (255, 240, 210)), (49, -2.4, (230, 50, 40)),
+                                        (52, 4.0, (255, 240, 210)), (52, -3.2, (230, 50, 40)))):
+        vx = (k * 17.0 + t * vit) % 80 - 8                      # des voitures, tout en bas, dans les rues
+        if not 41 <= vx <= 59:
+            _pointer(img, [ry], [vx], [coul])
+    rouge = 0.5 + 0.5 * np.cos(np.clip(((t % 2.4) - 0.6) / 0.6, -1, 1) * np.pi)   # les feux des tours
+    for qy, qx in e["lampes"]:
+        img[qy, qx] = np.array([255, 50, 40]) * (0.3 + 0.7 * rouge)
+    rose = np.array([255, 80, 140]) * souffle                    # l'enseigne, sur le toit de sa tour
+    img[33, 34:38] = rose
+    img[32, 34] = img[32, 36] = rose
     P = (t + 30.0) % 70.0                                        # l'avion, une fois par minute et quelque
     if P < 46:
         u = P / 46
-        avx, avy = 68 - 76 * u, 16 - 5 * u
+        avx, avy = 68 - 76 * u, 17 - 6 * u
         flash = np.exp(-(((t % 1.5) - 0.2) / 0.12) ** 2)          # doux : il monte et redescend
         _pointer(img, [avy], [avx], [np.array([255, 70, 60]) * 0.7])
         _pointer(img, [avy], [avx + 1], [np.array([255, 255, 255]) * (0.2 + 0.8 * flash)])
@@ -26047,40 +26079,35 @@ def _scene_toit(p, e, t, ecoule, dt):
                      [np.array([200, 210, 255]) * (flash - 0.3)] * 4)
     dm = e["dessus_m"]
     img[dm] = e["dessus"][dm]
-    img[ay, ax - 1:ax + 2] = (255, 220, 160)                     # l'ampoule, sa grille
-    img[ay - 1, ax] = (90, 70, 50)
-    vent = 0.6 * np.sin(t * 0.7) + 0.4 * np.sin(t * 1.27 + 1.0)  # le linge sur le fil
-    xs = np.arange(16, 50)
-    img[np.round(_ic_toit_fil(xs)).astype(int), xs] = (74, 70, 86)
-    for motif, x0, coul, ph, souple in _IC_LINGE:
-        ys, xs, _, larg, _ = _ic_motif(motif)
+    vent = 0.6 * np.sin(t * 0.7) + 0.4 * np.sin(t * 1.27 + 1.0)
+    xs = np.arange(0, 9)                                         # le fil, de l'antenne au bord de l'image
+    fil = 25 + 1.2 * np.sin(np.pi * xs / 9)
+    img[np.round(fil).astype(int), xs] = (70, 70, 92)
+    for motif, x0, coul, ph in _IC_LINGE:                        # le linge : le bas bouge plus que le haut
+        ys, xs_, _, larg, _ = _ic_motif(motif)
         n = len(motif)
-        y0 = int(np.round(_ic_toit_fil(x0 + larg / 2))) + 1
-        dec = (vent * np.cos(ph) + 0.4 * np.sin(t * 1.9 + ph)) * souple * (ys / n) ** 1.3   # le bas bouge plus
-        xx, yy = np.floor(x0 + xs + dec + 0.5).astype(int), y0 + ys
-        chaleur = min(max((x0 - 18) / 26, 0.0), 1.0) * 0.5       # l'ampoule rechauffe ce qui est pres d'elle
-        ombre = 0.8 + 0.25 * (ys == 0) - 0.15 * (ys == n - 1) - 0.16 * ((larg == 8) & ((xs == 2) | (xs == 6)))
-        cc = np.asarray(coul, float) * (ombre * (1 - chaleur * 0.3))[:, None] + np.array([110, 70, 30]) * chaleur
+        y0 = int(np.round(25 + 1.2 * np.sin(np.pi * (x0 + larg / 2) / 9))) + 1
+        dec = (vent * np.cos(ph) + 0.4 * np.sin(t * 1.9 + ph)) * 1.2 * (ys / n) ** 1.3
+        xx = np.floor(x0 + xs_ + dec + 0.5).astype(int)
+        cc = np.asarray(coul, float) * (0.85 + 0.2 * (ys == 0) - 0.15 * (ys == n - 1))[:, None]
         ok = (xx >= 0) & (xx < 64)
-        img[yy[ok], xx[ok]] = cc[ok]
-    if "vapeur" not in e:                                        # la vapeur du tuyau d'aeration
-        e["vapeur"] = rng.uniform(0, 1, 9)
-    age = (e["vapeur"] + t / 3.2) % 1.0
-    vx_ = 27.5 + age * 5 * (0.6 + 0.4 * vent) + np.sin(age * 5 + e["vapeur"] * 9) * 0.8
-    vy_ = 49 - age * 9
-    gris = ((1 - age) ** 1.3 * np.minimum(age * 6, 1) * 0.85)[:, None] * np.array([176, 176, 192])
-    _pointer(img, vy_, vx_, gris)                                 # des bouffees qui grossissent en montant
+        img[(y0 + ys)[ok], xx[ok]] = cc[ok]
+    age = (e["vapeur"] + t / 3.4) % 1.0                          # la vapeur de la cheminee, en bouffees
+    vx_ = 25 + age * 6 * (0.6 + 0.4 * vent) + np.sin(age * 5 + e["vapeur"] * 9) * 0.8
+    vy_ = 47 - age * 12
+    gris = ((1 - age) ** 1.2 * np.minimum(age * 6, 1) * 0.95)[:, None] * np.array([200, 192, 206])
+    _pointer(img, vy_, vx_, gris)
     _pointer(img, vy_, vx_ + 1, gris * 0.7)
     gros = age > 0.3
     _pointer(img, vy_[gros] - 1, vx_[gros], gris[gros] * 0.6)
     _pointer(img, vy_[gros] - 1, vx_[gros] + 1, gris[gros] * 0.45)
-    tour = (t % 23.0) > 18.5                                     # le chat, sur la margelle, de dos
-    cx = 34 - (1 if tour else 0)
-    _ic_dessiner(img, _IC_CHAT_TOURNE if tour else _IC_CHAT_DOS, cx, 37, {"k": (12, 10, 16)},
-                 bord=[(0, -1, (88, 92, 120), 0.55), (1, 0, (150, 86, 56), 0.5), (-1, 0, (150, 86, 56), 0.45)])
-    q = np.sin(t * 0.9) * 1.2 + np.sin(t * 2.3) * 0.4            # la queue pend et se balance
-    for qx, qy in ((40, 45), (41, 46), (41 + q * 0.3, 47), (41 + q * 0.7, 48), (41 + q * 1.1, 49), (41 + q * 1.4, 50)):
-        img[qy, int(np.floor(qx + 0.5))] = (12, 10, 16)
+    noir = (10, 8, 14)                                           # le chat, sur le pilier, contre la lueur
+    q = np.sin(t * 0.8) * 1.0 + np.sin(t * 2.1) * 0.35           # sa queue, posee sur le pilier, le bout qui bat
+    for qx, qy in ((54, 45), (55, 45), (56, 45), (57, 44), (57.6 + q * 0.4, 43), (57.8 + q, 42)):
+        img[qy, int(np.floor(qx + 0.5))] = noir
+    tour = (t % 23.0) > 18.5
+    _ic_dessiner(img, _IC_CHAT_TOURNE if tour else _IC_CHAT_DOS, 44, 32, {"k": noir},
+                 bord=[(0, -1, (236, 150, 96), 0.55), (1, 0, (210, 120, 80), 0.45), (-1, 0, (210, 120, 80), 0.45)])
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
@@ -26885,7 +26912,10 @@ def _image_du_contenu(cfg, contenu, t, eclat):
             PANNEAU["musique_saut"] = None
             saut = "musique" if cfg.get("panneau_cycle_saut", True) else None
         duree, fondu_s = reglages_cycle(cfg)
-        cycle = cycle_du_panneau(t, cycle_disponible(t, cfg), cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
+        disponibles = cycle_disponible(t, cfg)
+        if "musique" in disponibles and egaliseur_garde(cfg, t):
+            disponibles = ["musique"]                    # Spotify joue : l'egaliseur reste
+        cycle = cycle_du_panneau(t, disponibles, cycle_urgent(JARVIS.get("minuteurs"), rdv, t), saut,
                                  duree, fondu_s)
         cycle["sensibilite"] = sensibilite_eq(cfg)
     return image_panneau(contenu, t, minuteurs=JARVIS.get("minuteurs"), eclat=eclat, rdv=rdv, cycle=cycle)
@@ -26935,6 +26965,8 @@ def image_du_panneau(cfg, contenu, t):
             img = assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
     elif ecran is not None:
         img = image_de_l_ecran(ecran, t, reglages_ecrans(cfg)[1], lambda: _image_du_contenu(cfg, contenu, t, None))
+        if egaliseur_garde(cfg, t) and not _ecran_retenu(cfg, t):
+            img = poser_egaliseur(img, t, cfg)          # l'ecran passe dessous
         if eclat is not None:
             img = assombrir(img, max(PANNEAU_ECLAT_MIN, eclat))
     else:
@@ -27163,7 +27195,7 @@ def suivre_musique(cfg, maintenant=None, morceau=None):
     t = time.time() if maintenant is None else maintenant
     m = morceau_en_cours(cfg) if morceau is None else morceau
     if m and m.get("titre"):
-        PANNEAU["musique_vue"] = t
+        PANNEAU["musique_vue"] = PANNEAU["spotify_vu"] = t
         cle = (m["titre"], m.get("artistes") or "")
         if cle != PANNEAU.get("morceau_cle"):
             PANNEAU.update(morceau_cle=cle, morceau=dict(m), musique_saut=t)
@@ -27519,7 +27551,11 @@ def etat_veille_lisible(cfg):
     if croquis >= 10 and PANNEAU.get("carte_ecrans") is not None:
         k = PANNEAU["carte_ecrans"]
         texte = "La carte a ses reglages : %d ecran%s quand le PC s'eteindra." % (k, "s" if k > 1 else "")
-        if k < tous:
+        if k < tous and croquis < PANNEAU_CROQUIS:
+            # une carte plus ancienne ne connait pas les ecrans venus depuis : pas la memoire, le croquis
+            texte += (" Televerse le croquis v%d (carte/machi_panneau, tout le dossier) pour les %d autre%s."
+                      % (PANNEAU_CROQUIS, tous - k, "s" if tous - k > 1 else ""))
+        elif k < tous:
             texte += (" %d autre%s ne tien%s pas dans sa memoire : active la PSRAM (IDE Arduino, Outils > PSRAM) "
                       "et televerse le croquis a nouveau." % (tous - k, "s" if tous - k > 1 else "",
                                                                 "nent" if tous - k > 1 else "t"))
@@ -31295,7 +31331,7 @@ class Panneau:
                     "panneau_cycle_notes", "panneau_ecrans", "panneau_ecrans_intervalle", "panneau_ecrans_duree",
                     "panneau_ecrans_sans", "panneau_veille", "panneau_veille_sans", "panneau_veille_luminosite",
                     "panneau_veille_arret_h", "panneau_veille_tous",
-                    "panneau_eq_sensibilite"):
+                    "panneau_eq_sensibilite", "panneau_eq_garde"):
             self.cfg.setdefault(cle, CONFIG_DEFAUT[cle])          # une config d'avant n'a pas ces cles
         f = self.nouvelle_page("panneau", defilante=True)
         self.texte(f, "MACHI LED WALL", CRAIE, 9).pack(fill="x")
@@ -31364,6 +31400,12 @@ class Panneau:
         self.var_panneau_cycle_saut = tk.IntVar(value=1 if self.cfg.get("panneau_cycle_saut", True) else 0)
         c = self.case(col, "Quand le morceau change, montrer la musique tout de suite", self.var_panneau_cycle_saut,
                       lambda: self.regler_panneau("panneau_cycle_saut"))
+        c.configure(wraplength=self.px(360))
+        c.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
+        self.var_panneau_eq_garde = tk.IntVar(value=1 if self.cfg.get("panneau_eq_garde", True) else 0)
+        c = self.case(col, "Tant que Spotify joue, garder l'egaliseur : les autres vues attendent, les ecrans plein "
+                           "panneau passent dessous", self.var_panneau_eq_garde,
+                      lambda: self.regler_panneau("panneau_eq_garde"))
         c.configure(wraplength=self.px(360))
         c.pack(fill="x", pady=(4, 0), padx=(self.px(22), 0))
         reglettes = tk.Frame(col, bg=NUIT)
@@ -31621,7 +31663,7 @@ class Panneau:
                 PANNEAU["discord"] = None
         elif cle in ("panneau_cycle", "panneau_cycle_meteo", "panneau_cycle_musique", "panneau_cycle_bonhomme",
                      "panneau_cycle_saut", "panneau_cycle_chat", "panneau_cycle_maid", "panneau_cycle_notes",
-                     "panneau_ecrans"):
+                     "panneau_ecrans", "panneau_eq_garde"):
             self.cfg[cle] = bool(getattr(self, "var_" + cle).get())
         elif cle == "meteo_ville":
             ville = self.champ_meteo_ville.get().strip()[:60]

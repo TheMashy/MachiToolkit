@@ -18,6 +18,7 @@ Tenu ici :
   - v7 : PC eteint, la carte dessine elle-meme les ambiances (« MA », gardes
     dans sa memoire ; « MW », « MO »), et reste noire apres une baisse de tension ;
   - v10 : elle connait tous les ecrans de Machi Tool, permis par leurs noms
+  - v11 : les douze instants (des scenes de nuit tramees)
     (« ME »), et chacun se dessine, bouge et reste leger.
 
     python outils/test_carte.py        (sans g++ ou sans numpy, il se saute)
@@ -351,7 +352,7 @@ class LaCarte(unittest.TestCase):
         flux = b"MV" + self.M.trame_image(donnees, 3) + b"MS"
         panneau, reponses, _ = self.envoyer(flux)
         self.assertTrue((panneau == self.attendu(donnees)).all())
-        self.assertIn("MACHI 10", reponses)
+        self.assertIn("MACHI 11", reponses)
         self.assertIn("STATS 1 0", reponses)
         self.assertEqual(self.M.trame_image(donnees, 3)[:2], b"MG")
         self.assertEqual(self.M.trame_image(donnees, 2)[:2], b"MF", "a un croquis v2 : l'ancienne trame")
