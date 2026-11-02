@@ -105,6 +105,24 @@ void halo(float x, float y, float rayon, float r, float v, float b, float force 
     }
 }
 
+// _tramer : l'eclat de chaque pixel (son canal le plus fort) ramene a quelques
+// niveaux (en racine carree) avec une trame de Bayer 4 x 4 fixe ; la teinte reste
+void tramer(int niveaux = 8, float force = 1.0f) {
+  static const uint8_t BAYER[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+  const float n = (float)(niveaux - 1), echelle = 255.0f / (n * n);
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++) {
+      float *p = scene[y][x];
+      for (int c = 0; c < 3; c++) p[c] = borne(p[c], 0, 255);
+      const float v = fmaxf(p[0], fmaxf(p[1], p[2]));
+      if (v <= 0) continue;
+      float q = floorf(sqrtf(v * (1.0f / 255)) * n + 0.5f + (BAYER[y & 3][x & 3] * (1.0f / 16) - 15.0f / 32) * force);
+      q = borne(q, 0, n);
+      const float k = q * q * echelle / v;
+      p[0] *= k; p[1] *= k; p[2] *= k;
+    }
+}
+
 // --- les champs doux (_brume, _fenetre) en n'importe quelle taille (64 ou 128) ---
 
 // un champ doux (0-1, en uint16) de taille x taille qui se raccorde sur ses

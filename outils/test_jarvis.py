@@ -3093,7 +3093,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_luminosite=0))[4], 4)
         self.assertEqual(m.trame_veille(dict(cfg, panneau_veille_arret_h="n'importe"))[9:11], b"\x00\x00")
         self.assertTrue(m.CONFIG_DEFAUT["panneau_veille"])
-        self.assertEqual(m.PANNEAU_CROQUIS, 10)
+        self.assertEqual(m.PANNEAU_CROQUIS, 11)
         # « le sketch display les screen savers avec un angle de 90 degres » : le sens du panneau, bits 1-2
         for degres, octet in ((0, 1), (90, 3), (180, 5), (270, 7), (450, 3)):
             self.assertEqual(m.trame_veille(dict(cfg, panneau_rotation=degres))[3], octet, degres)
@@ -3170,7 +3170,7 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(carte.ecrit, [b"MO"])
         # ce que la page en dit
         m.PANNEAU.update(etat="connecte", croquis=6, carte_veille=None)
-        self.assertIn("televerse la v10", m.etat_veille_lisible({}))
+        self.assertIn("televerse la v11", m.etat_veille_lisible({}))
         m.PANNEAU["croquis"] = 7
         self.assertIn("ne suivent pas le sens", m.etat_veille_lisible({"panneau_rotation": 90}))
         self.assertNotIn("v7", m.etat_veille_lisible({"panneau_rotation": 0}), "droit, la v7 suffit")
@@ -3259,13 +3259,18 @@ class DansMachiTool(unittest.TestCase):
                 return b"ECRANS 154\n"
         m.lire_bilan_carte(Bavarde())
         self.assertEqual(m.PANNEAU["carte_ecrans"], 154)
-        m.PANNEAU.update(etat="connecte", croquis=10)
+        m.PANNEAU.update(etat="connecte", croquis=m.PANNEAU_CROQUIS)
         self.assertIn("154 ecrans", m.etat_veille_lisible({}))
         self.assertIn("active la PSRAM", m.etat_veille_lisible({}), "il en manque : sa memoire")
+        # « rajoute des scenes un peu comme ca » : une v10 ne connait pas les instants -- pas la memoire, le croquis
+        m.PANNEAU["croquis"] = 10
+        self.assertIn("televerse le croquis v11", m.etat_veille_lisible({}).lower())
+        self.assertNotIn("PSRAM", m.etat_veille_lisible({}))
+        m.PANNEAU["croquis"] = m.PANNEAU_CROQUIS
         m.PANNEAU["carte_ecrans"] = len(m.ecrans_de_la_carte({}))
         self.assertNotIn("PSRAM", m.etat_veille_lisible({}), "tous : rien a dire")
         m.PANNEAU.update(croquis=9, carte_veille=(1, 1023))
-        self.assertIn("televerse le croquis v10", m.etat_veille_lisible({}).lower())
+        self.assertIn("televerse le croquis v11", m.etat_veille_lisible({}).lower())
         self.assertIn("Aucun ecran", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}))
         m.PANNEAU["croquis"] = 10
         self.assertNotIn("Aucun ecran", m.etat_veille_lisible({"panneau_veille_sans": list(m.ECRANS_AMBIANCES)}),
@@ -3574,6 +3579,58 @@ class DansMachiTool(unittest.TestCase):
         m.image_du_panneau(dict(cfg, panneau_cycle_saut=False), "horloge", t0 + 16)
         self.assertEqual(m.PANNEAU["cycle"]["actuel"], "heure", "saut coupe : le cycle suit son cours")
         self.assertIsNone(m.PANNEAU["musique_saut"])
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_l_egaliseur_reste_tant_que_spotify_joue(self):
+        # « tu peux faire en sorte de laisser l'egaliseur lorsque Spotify joue, tu peux laisser d'autres choses en
+        # fond, mais juste laisser l'egaliseur »
+        m = self.m
+        cles = ("cycle", "meteo", "musique_vue", "musique_saut", "spotify_vu", "morceau", "morceau_cle", "cretes",
+                "ecran", "ecran_fin", "ecran_demande", "ecrans_sac", "ecran_dernier")
+        sauve = {k: m.PANNEAU[k] for k in cles if k in m.PANNEAU}
+        sauve_audio = {k: m.AUDIO.get(k) for k in ("actif", "spectre")}
+
+        def remettre():
+            for k in cles:
+                m.PANNEAU.pop(k, None)
+            m.PANNEAU.update(sauve)
+            m.AUDIO.update(sauve_audio)
+        self.addCleanup(remettre)
+        self.assertTrue(m.CONFIG_DEFAUT["panneau_eq_garde"], "par defaut")
+        t0 = 1_800_000_000.0
+        cfg = {"panneau_contenu": "horloge", "panneau_suit_eclat": False, "panneau_rdv": False, "panneau_ecrans": False}
+        morceau = {"titre": "Nightcall", "artistes": "Kavinsky"}
+        m.AUDIO.update(actif=True, spectre=[0.8] * 12)
+        m.PANNEAU.update(cycle=None, musique_saut=None, morceau_cle=None, spotify_vu=None,
+                         meteo={"temp": 12, "code": 3, "quand": t0})
+
+        def vues(debut, fin, reglages, joue):
+            vu = set()
+            for s in range(debut, fin, 5):
+                if joue:
+                    m.suivre_musique(reglages, t0 + s, morceau=morceau)
+                m.image_du_panneau(reglages, "horloge", t0 + s + 4)
+                vu.add(m.PANNEAU["cycle"]["actuel"])
+            return vu
+        self.assertEqual(vues(0, 600, cfg, True), {"musique"}, "dix minutes de musique : l'egaliseur, rien d'autre")
+        self.assertIn("meteo", vues(600, 800, cfg, False), "Spotify s'arrete : les autres vues reviennent")
+        # du son sans Spotify (une video) : le cycle tourne comme avant
+        m.PANNEAU["spotify_vu"] = t0
+        self.assertFalse(m.egaliseur_garde(cfg, t0 + 800))
+        # le reglage coupe : le cycle tourne meme pendant la musique
+        m.PANNEAU["cycle"] = None
+        self.assertGreater(len(vues(800, 1100, dict(cfg, panneau_eq_garde=False), True)), 2)
+        # un ecran plein panneau passe DESSOUS : l'egaliseur reste, a sa place sous la date
+        avec = dict(cfg, panneau_ecrans=True)
+        m.suivre_musique(avec, t0 + 2000, morceau=morceau)
+        m.PANNEAU.update(ecran=None, ecran_fin=t0 + 2000)
+        m.demander_ecran("aurore_lac")
+        m.image_du_panneau(avec, "horloge", t0 + 2000)
+        img = m.image_du_panneau(avec, "horloge", t0 + 2008)
+        self.assertEqual(m.PANNEAU["ecran"]["nom"], "aurore_lac", "l'ecran passe bien")
+        barres = m._zone_du_cycle("musique", t0 + 2008, m.accent_panneau(), None, None, 0.0, 1.0)
+        self.assertTrue((img[45:51, 3:6] == barres[45:51, 3:6]).all(), "les barres, par-dessus")
+        self.assertGreater(len({tuple(p) for p in img[:34].reshape(-1, 3)}), 40, "l'aurore en fond, pas l'horloge")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_le_petit_3_et_la_sensibilite_de_l_egaliseur(self):
@@ -4369,7 +4426,8 @@ class DansMachiTool(unittest.TestCase):
         self.assertEqual(m.ECRANS["boreale_montagnes"][0], presets[0][1], "le meme reglage d'une fois sur l'autre")
         # des familles, sur la page : chaque decor dans une seule ; les ambiances et les jeux de lumiere a part
         self.assertEqual([f[0] for f in m.FAMILLES_ECRANS],
-                         ["sous_l_eau", "ciel_et_eau", "villes", "paysages", "cocon", "reveries", "espace", "boreales", "tunnels"])
+                         ["sous_l_eau", "ciel_et_eau", "villes", "paysages", "cocon", "reveries", "espace", "instants",
+                          "boreales", "tunnels"])
         membres = [n for f in m.FAMILLES_ECRANS for n in f[2]]
         self.assertEqual(len(membres), len(set(membres)), "chaque decor dans une seule famille")
         self.assertEqual(tuple(membres), m.ECRANS_DECORS)
@@ -4401,6 +4459,30 @@ class DansMachiTool(unittest.TestCase):
                 self.assertGreater(float(a.std()), 8, "une scene, pas un aplat")
                 self.assertLess(float(a.mean()), 200, "pas un ecran blanc")
                 self.assertFalse((a == b).all(), "il bouge encore")
+
+    @unittest.skipUnless(NUMPY, "numpy absent")
+    def test_les_instants_ont_le_grain_des_pixel_arts(self):
+        # « rajoute des scenes un peu comme ca » (un pixel art de nuit : un arret de bus sous la neige, un lampadaire
+        # au sodium) : douze petites scenes de nuit, leurs lumieres tramees
+        import numpy as np
+        m = self.m
+        instants = dict((f[0], f[2]) for f in m.FAMILLES_ECRANS)["instants"]
+        self.assertEqual(len(instants), 12)
+        # la trame : quelques marches d'eclat, la teinte gardee, un motif fixe (il ne grouille pas)
+        Y, X = m._xy()
+        degrade = np.stack([X * 3, X * 2, X], axis=2)
+        trame = m._tramer(degrade, 8)
+        self.assertLessEqual(len(np.unique(np.round(trame.max(axis=2), 3))), 8, "huit marches")
+        np.testing.assert_allclose(trame[..., 1] * 3, trame[..., 0] * 2, atol=1e-6, err_msg="la teinte reste")
+        self.assertTrue((m._tramer(degrade, 8) == trame).all(), "un motif fixe")
+        self.assertGreater(len(np.unique(trame[20:24, 20:40].max(axis=2))), 1, "un degrade devient une trame")
+        # des scenes de nuit : sombres, avec leur lumiere
+        t0 = 1_800_000_000.0
+        for cle in instants:
+            with self.subTest(ecran=cle):
+                img = m.ECRANS[cle][1]({"rng": np.random.default_rng(5)}, t0 + 40.0, 40.0, 0.0)
+                self.assertLess(float(img.mean()), 90, "la nuit")
+                self.assertGreater(int((img.max(axis=2) > 150).sum()), 30, "et sa lumiere")
 
     @unittest.skipUnless(NUMPY, "numpy absent")
     def test_la_neige_fait_des_tas(self):

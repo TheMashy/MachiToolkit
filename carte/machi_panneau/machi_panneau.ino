@@ -4,7 +4,7 @@
 //        (Fletcher-16, poids fort d'abord) = une image controlee,
 //   "MF" + 8 192 octets = une image sans controle (Machi Tool avant la v1.90),
 //   "MB" + 1 octet = la luminosite (0-255, jamais au-dessus de PLAFOND),
-//   "MV"           = il repond "MACHI 10" (Machi Tool sait quel croquis il a),
+//   "MV"           = il repond "MACHI 11" (Machi Tool sait quel croquis il a),
 //   "MS"           = il repond "STATS recues jetees" (les images abimees),
 //   "MA" + 12 octets + 2 de controle = les reglages des ecrans de veille
 //                    (gardes dans la carte : ils survivent a une coupure),
@@ -89,6 +89,10 @@
 // recente que Machi Tool ignore ceux qu'elle ne connait pas. L'etat d'un ecran
 // (ses particules, ses champs) vit dans l'« arene », reservee une fois dans la
 // PSRAM de la carte : un seul ecran tourne a la fois.
+//
+// v11 : « rajoute des scenes un peu comme ca » (un pixel art de nuit, un arret
+// de bus sous la neige) : les douze « instants » (lot_instants_a/b/c.h), des
+// petites scenes de nuit tramees (tramer, dans commun.h).
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Preferences.h>
 #include <esp_system.h>
@@ -718,6 +722,9 @@ void ecran_neige(bool debut, float t, float dt) {
 #include "lot_cocon_reveries.h"
 #include "lot_neufs.h"
 #include "lot_villes3d.h"
+#include "lot_instants_a.h"
+#include "lot_instants_b.h"
+#include "lot_instants_c.h"
 #include "registre.h"
 
 int ecran = -1;
@@ -924,7 +931,7 @@ void loop() {
       if (etat != VEILLE) panneau->setBrightness8(min(b, PLAFOND));
     }
   } else if (genre == 'V') {
-    Serial.println("MACHI 10");
+    Serial.println("MACHI 11");
   } else if (genre == 'S') {
     Serial.printf("STATS %lu %lu\n", (unsigned long)recues, (unsigned long)jetees);
   } else if (genre == 'A') {
